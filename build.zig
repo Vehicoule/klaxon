@@ -562,6 +562,65 @@ fn addIosApp(
     app.root_module.addImport("kx_c", translate_kx.createModule());
     b.installArtifact(app);
 
+    // Build the kx_skia iOS shim: compile the C++/ObjC++ sources with xcrun
+    // clang++ and archive into libkx_skia_ios.a. Not compiled by Zig (ObjC++).
+    const shim_obj_dir = "zig-out/lib/kx_skia_ios_obj";
+    const mkdir_shim = b.addSystemCommand(&.{ "mkdir", "-p", shim_obj_dir });
+    const shim_sources = [_][]const u8{
+        "kx_skia/src/kx_skia_common.cpp",
+        "kx_skia/src/kx_skia_ios.mm",
+        "kx_skia/src/kx_a11y_ios.mm",
+        "kx_skia/src/kx_ios_sdl_main.c",
+    };
+    var shim_objs: [4][]const u8 = undefined;
+    var last_compile_step: *std.Build.Step = &mkdir_shim.step;
+    const version_min_flag = if (is_sim) "-mios-simulator-version-min=15.0" else "-mios-version-min=15.0";
+    for (shim_sources, 0..) |src, i| {
+        const obj_path = b.fmt("{s}/{d}.o", .{ shim_obj_dir, i });
+        shim_objs[i] = obj_path;
+        const is_c = std.mem.endsWith(u8, src, ".c");
+        const is_objcpp = std.mem.endsWith(u8, src, ".mm");
+        const lang = if (is_c) "c" else if (is_objcpp) "objective-c++" else "c++";
+        const std_flag = if (is_c) "-std=c11" else "-std=c++20";
+        const compile_cmd = if (is_c)
+            &[_][]const u8{
+                "xcrun", "clang", b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}),
+                std_flag, "-arch", "arm64",
+                version_min_flag,
+                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
+                "-I", "kx_skia/include",
+                "-I", "deps/skia",
+                "-I", "deps/skia/include",
+                "-I", "deps/SDL/include",
+                "-c", src,
+                "-o", obj_path,
+            }
+        else
+            &[_][]const u8{
+                "xcrun", "clang++", b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}),
+                std_flag, "-arch", "arm64",
+                version_min_flag,
+                "-fno-exceptions", "-fno-rtti",
+                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
+                "-I", "kx_skia/include",
+                "-I", "deps/skia",
+                "-I", "deps/skia/include",
+                "-I", "deps/SDL/include",
+                "-c", src,
+                "-o", obj_path,
+            };
+        const compile = b.addSystemCommand(compile_cmd);
+        compile.step.dependOn(last_compile_step);
+        last_compile_step = &compile.step;
+    }
+    const archive = b.addSystemCommand(&.{
+        "xcrun", "ar", "rcs", "zig-out/lib/libkx_skia_ios.a",
+        shim_objs[0], shim_objs[1], shim_objs[2], shim_objs[3],
+    });
+    archive.step.dependOn(last_compile_step);
+
     // Final link: xcrun clang++ compiles the SDL_main TU + links the static
     // lib + shim .o + Skia .a + SDL .a + iOS frameworks. The shim and deps
     // are not yet built for iOS — this step may fail at link time; the graph
@@ -578,7 +637,12 @@ fn addIosApp(
     argv.append(b.allocator, "-std=c++20") catch unreachable;
     argv.append(b.allocator, "-arch") catch unreachable;
     argv.append(b.allocator, "arm64") catch unreachable;
-    argv.append(b.allocator, "-mios-version-min=15.0") catch unreachable;
+    // Simulator vs device: different version-min flags.
+    if (is_sim) {
+        argv.append(b.allocator, "-mios-simulator-version-min=15.0") catch unreachable;
+    } else {
+        argv.append(b.allocator, "-mios-version-min=15.0") catch unreachable;
+    }
     argv.append(b.allocator, "zig-out/lib/libgallery.a") catch unreachable;
     // kx_skia shim .o (compiled by xcrun clang++ from kx_skia_common.cpp + kx_skia_ios.mm)
     argv.append(b.allocator, "zig-out/lib/libkx_skia_ios.a") catch unreachable;
@@ -597,6 +661,8 @@ fn addIosApp(
         "-framework", "QuartzCore",
         "-framework", "Metal",
         "-framework", "IOSurface",
+        "-framework", "OpenGLES",
+        "-framework", "CoreVideo",
         "-framework", "AudioToolbox",
         "-framework", "AVFoundation",
         "-framework", "CoreAudio",
@@ -612,6 +678,8 @@ fn addIosApp(
     link.step.dependOn(&mkdir.step);
     // Installs libgallery.a into zig-out/lib (path referenced above).
     link.step.dependOn(b.getInstallStep());
+    // The link references libkx_skia_ios.a — built by the shim archive step.
+    link.step.dependOn(&archive.step);
 
     // Steps: "ios" (hello placeholder) and "ios-gallery" (default).
     const ios_step = b.step("ios", "Build the iOS app (hello placeholder)");
