@@ -38,10 +38,20 @@ extern "C" {
         KX_A11Y_ANNOUNCE = 2,
         KX_A11Y_CONTROL_CHANGED = 3,
     };
+    // BridgeEventC — extern struct passed BY VALUE (mirrors BridgeEventC in
+    // ui/semantics.zig, field for field). Do NOT flatten it to scalar
+    // parameters: on arm64 a struct passed by value rides in registers
+    // differently than flattened scalars, and a flattened callback reads
+    // garbage.
+    typedef struct {
+        uint32_t kind;       // 0=tree_dirty 1=focus_changed 2=announce 3=control_changed
+        uint64_t node_id;    // Node pointer (decimal in the dump)
+        const uint8_t* text; // announce payload (borrowed during the call only)
+        size_t text_len;
+        uint32_t region;     // LiveRegion: 0=off 1=polite 2=assertive
+    } KxBridgeEventC;
     // Install the C bridge callback (from ui/semantics.zig).
-    void kx_a11y_set_bridge(void (*fn)(void* userdata, uint32_t kind, uint64_t node_id,
-                                       const char* text, size_t text_len, uint32_t region),
-                            void* userdata);
+    void kx_a11y_set_bridge(void (*fn)(void* userdata, KxBridgeEventC event), void* userdata);
     // Flat semantic-tree dump. malloc'd — free with kx_a11y_free_string.
     char* kx_a11y_dump_tree(void* root_node);
     void kx_a11y_free_string(char* s);
@@ -259,11 +269,12 @@ static KXUIAccessibilityElement* findElementByPtr(uint64_t ptr) {
 }
 
 // --- Bridge event callback (called from Zig via setBridgeC) ---
-static void a11y_bridge_callback(void* userdata, uint32_t kind, uint64_t node_id,
-                                 const char* text, size_t text_len, uint32_t region) {
+// The event arrives as a BridgeEventC struct BY VALUE (see the typedef
+// above) — read the fields off `ev`, never as scalar parameters.
+static void a11y_bridge_callback(void* userdata, KxBridgeEventC ev) {
     (void)userdata;
-    (void)region; // announcement priority is a macOS (NSAccessibility) concept
-    switch (kind) {
+    (void)ev.region; // announcement priority is a macOS (NSAccessibility) concept
+    switch (ev.kind) {
         case KX_A11Y_TREE_DIRTY: {
             // Rebuild the flat element list from the semantic tree dump.
             if (g_zig_root_node) {
@@ -280,16 +291,16 @@ static void a11y_bridge_callback(void* userdata, uint32_t kind, uint64_t node_id
         case KX_A11Y_FOCUS_CHANGED: {
             // Klaxon's focus moved (keyboard/pointer) → move VoiceOver's
             // cursor to the matching element.
-            KXUIAccessibilityElement* el = findElementByPtr(node_id);
+            KXUIAccessibilityElement* el = findElementByPtr(ev.node_id);
             if (el) {
                 UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, el);
             }
             break;
         }
         case KX_A11Y_ANNOUNCE: {
-            if (text && text_len > 0) {
-                NSString* msg = [[NSString alloc] initWithBytes:text
-                                                          length:text_len
+            if (ev.text && ev.text_len > 0) {
+                NSString* msg = [[NSString alloc] initWithBytes:ev.text
+                                                          length:ev.text_len
                                                         encoding:NSUTF8StringEncoding];
                 if (msg) {
                     UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, msg);
@@ -300,7 +311,7 @@ static void a11y_bridge_callback(void* userdata, uint32_t kind, uint64_t node_id
         }
         case KX_A11Y_CONTROL_CHANGED: {
             // A control's value/checked changed — refresh that element.
-            KXUIAccessibilityElement* el = findElementByPtr(node_id);
+            KXUIAccessibilityElement* el = findElementByPtr(ev.node_id);
             if (el) {
                 UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, el);
             }

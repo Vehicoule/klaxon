@@ -32,8 +32,11 @@
 #include <jni.h>
 #include <android/log.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -112,6 +115,17 @@ static unsigned long long parseU64(const char* s, size_t len) {
     return v;
 }
 
+// Bounds may be fractional: the dump carries mapRectToRoot's f32 rects in
+// decimal notation ("10.5"). Parse as float and round to nearest — the
+// digit-only parseInt would read the '.' as a digit and turn 10.5 into 985.
+static int parseCoord(const char* s, size_t len) {
+    char buf[32];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    return (int)lroundf(strtof(buf, nullptr));
+}
+
 // Parse the flat dump — one line per visible semantic node:
 //   "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
 // Parent links are resolved with a depth stack, the same algorithm as the
@@ -145,10 +159,10 @@ static void parseDump(const char* dump) {
             node.ptr = parseU64(fields[5], lens[5]);
             node.checked = parseInt(fields[6], lens[6]);
             if (nfields >= 11) {
-                node.x = parseInt(fields[7], lens[7]);
-                node.y = parseInt(fields[8], lens[8]);
-                node.w = parseInt(fields[9], lens[9]);
-                node.h = parseInt(fields[10], lens[10]);
+                node.x = parseCoord(fields[7], lens[7]);
+                node.y = parseCoord(fields[8], lens[8]);
+                node.w = parseCoord(fields[9], lens[9]);
+                node.h = parseCoord(fields[10], lens[10]);
             }
             while ((int)stack.size() > node.depth) stack.pop_back();
             node.parent = stack.empty() ? -1 : stack.back();
@@ -188,13 +202,18 @@ static jclass findClass(JNIEnv* env, jobject activity, const char* name) {
     return result;
 }
 
-// The SDLSurface the app draws on (SDLActivity.mSurface, a static field).
-// Returns a local ref, or null when the surface is not created yet.
+// The SDLSurface the app draws on. SDLActivity.mSurface is a STATIC field
+// ("protected static SDLSurface mSurface") — it must be looked up with
+// GetStaticFieldID. GetFieldID is for instance fields only and returns null
+// here, which made kx_a11y_init bail out before installing the delegate.
+// GetStaticFieldID resolves inherited static fields, so looking it up on the
+// activity's (sub)class is fine. Returns a local ref, or null when the
+// surface is not created yet.
 static jobject getSurface(JNIEnv* env, jobject activity) {
     jclass activity_class = env->GetObjectClass(activity);
     if (!activity_class) return nullptr;
     jfieldID field =
-        env->GetFieldID(activity_class, "mSurface", "Lorg/libsdl/app/SDLSurface;");
+        env->GetStaticFieldID(activity_class, "mSurface", "Lorg/libsdl/app/SDLSurface;");
     jobject surface = field ? env->GetStaticObjectField(activity_class, field) : nullptr;
     env->DeleteLocalRef(activity_class);
     return surface;

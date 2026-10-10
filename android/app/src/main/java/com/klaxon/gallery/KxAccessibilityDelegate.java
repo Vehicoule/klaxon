@@ -161,9 +161,21 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
 
         @Override
         public AccessibilityNodeInfo createAccessibilityNodeInfo(int virtualDescendantId) {
-            if (virtualDescendantId == AccessibilityNodeProvider.HOST_NODE_ID
-                    || virtualDescendantId < 0
-                    || virtualDescendantId >= mPtrs.size()) {
+            if (virtualDescendantId == AccessibilityNodeProvider.HOST_NODE_ID) {
+                // Host node: the surface itself. Populate it through the
+                // delegate's onInitializeAccessibilityNodeInfo and advertise
+                // every virtual node as a child — without the addChild calls
+                // TalkBack swipes on the surface but finds nothing to descend
+                // into.
+                AccessibilityNodeInfo info = AccessibilityNodeInfo.obtain(mHost);
+                KxAccessibilityDelegate.this.onInitializeAccessibilityNodeInfo(mHost, info);
+                int childCount = nativeGetNodeCount();
+                for (int i = 0; i < childCount; i++) {
+                    info.addChild(mHost, i);
+                }
+                return info;
+            }
+            if (virtualDescendantId < 0 || virtualDescendantId >= mPtrs.size()) {
                 return null;
             }
             String role = nativeGetNodeRole(virtualDescendantId);
