@@ -25,9 +25,19 @@ const demo_mod = @import("demo.zig");
 const gallery_mod = @import("gallery.zig");
 const platform_ios = @import("platform_ios.zig");
 const sdl = @import("sdl.zig");
+const ios_io = @import("ios_io.zig");
 
 const Host = host_mod.Host;
 const Node = ui.node.Node;
+
+/// Override std.Options.debug_io (fix compile iOS, Zig 0.17): le défaut
+/// std.Io.Threaded lit NullFile.fd — champ inexistant sur iOS — donc tout
+/// std.debug.print / @panic atteignable (37 sites dans 10 fichiers) cassait
+/// la compile aarch64-ios. std.zig consulte std_options_debug_io à la racine
+/// du module: on branche l'Io minimal de ios_io.zig, qui route stderr vers
+/// SDL_Log sans toucher à Threaded. Les builds natifs n'ont pas cette
+/// déclaration: ils gardent le Threaded par défaut.
+pub const std_options_debug_io: std.Io = ios_io.io;
 
 comptime {
     if (builtin.os.tag != .ios) @compileError("main_ios.zig is iOS-only (aarch64-ios)");

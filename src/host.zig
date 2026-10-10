@@ -342,8 +342,9 @@ pub const Host = struct {
             platform_wasm.runWasm(host, root, max_frames, on_frame, on_frame_ctx);
             return;
         }
-        // macOS: initialize the NSAccessibility bridge.
-        if (builtin.os.tag == .macos) {
+        // macOS: the NSAccessibility bridge; Android: the TalkBack bridge
+        // (kx_a11y_android.cpp attaches the delegate over JNI).
+        if (builtin.os.tag == .macos or is_android) {
             kx.a11yInit(@ptrCast(root));
             defer kx.a11yShutdown();
         }

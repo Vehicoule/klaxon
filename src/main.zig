@@ -177,4 +177,5 @@ test "i18n demo" {
 
 test "a11y demo" {
     std.testing.refAllDecls(@import("a11y_main.zig"));
+    std.testing.refAllDecls(@import("a11y_bridge.zig")); // dump format + VoiceOver exports
 }

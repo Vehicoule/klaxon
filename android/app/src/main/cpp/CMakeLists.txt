@@ -40,7 +40,8 @@ endforeach()
 # OUTPUT_NAME main -> libmain.so (loaded by SDLActivity as "main").
 add_library(main SHARED
     "${KLAXON_ROOT}/kx_skia/src/kx_skia_common.cpp"
-    "${KLAXON_ROOT}/kx_skia/src/kx_skia_android.cpp")
+    "${KLAXON_ROOT}/kx_skia/src/kx_skia_android.cpp"
+    "${KLAXON_ROOT}/kx_skia/src/kx_a11y_android.cpp")
 set_target_properties(main PROPERTIES OUTPUT_NAME "main")
 
 target_include_directories(main PRIVATE
