@@ -145,12 +145,11 @@ void gpu_end_frame(GpuState* state) {
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {
-    // AFontMgr over the NDK font API — requires API >= 29 (the Skia android
-    // build targets ndk_api=29); returns nullptr on older devices.
-    if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_AndroidNDK(false, nullptr)) {
-        return mgr;
-    }
-    // Fallback: FreeType over the system font directory.
+    // SkFontMgr_New_AndroidNDK internally calls
+    // SkFontMgr_Android_Parser::GetSystemFontFamilies which is stubbed out
+    // (the parser source is not in the prebuilt Skia libs) — calling it
+    // crashes with a null pointer dereference. Skip it and use FreeType
+    // over the system font directory directly.
     if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Directory("/system/fonts")) {
         return mgr;
     }

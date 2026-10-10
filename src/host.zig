@@ -177,11 +177,24 @@ pub const Host = struct {
             sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else
             0;
-        const window = sdl.c.SDL_CreateWindow("klaxon hello", width, height, window_flags) orelse {
+        // Android: SDLActivity already created the window + surface before
+        // SDL_main runs — reuse it instead of creating a second (surface-less)
+        // window that renders into the void. Don't destroy it (SDLActivity owns it).
+        const window: *sdl.c.SDL_Window = if (is_android) blk: {
+            var count: c_int = 0;
+            const windows = sdl.c.SDL_GetWindows(&count);
+            if (count > 0) {
+                if (windows[0]) |win| break :blk win;
+            }
+            log("SDL_GetWindows returned no windows on Android", .{});
+            return error.SdlWindow;
+        } else sdl.c.SDL_CreateWindow("klaxon hello", width, height, window_flags) orelse {
             log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
             return error.SdlWindow;
         };
-        errdefer sdl.c.SDL_DestroyWindow(window);
+        if (!is_android) {
+            errdefer sdl.c.SDL_DestroyWindow(window);
+        }
 
         // Emscripten (wasm) + mobile: create the GL context and make it
         // current BEFORE kx.create — gpu_init checks SDL_GL_GetCurrentContext.
