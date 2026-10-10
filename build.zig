@@ -453,19 +453,40 @@ fn addAndroidLib(
     const root_src: []const u8 = if (is_hello) "src/main.zig" else "src/gallery_main.zig";
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c, with the
-    // android target (Zig provides bionic libc headers for android targets).
+    // android target + NDK sysroot include paths (Zig 0.17 does not bundle
+    // bionic headers — clang falls back to the host SDK without these).
+    const ndk = b.graph.env_map.get("ANDROID_NDK_HOME") orelse blk: {
+        const android_home = b.graph.env_map.get("ANDROID_HOME") orelse break :blk "";
+        // Pick the highest NDK version under $ANDROID_HOME/ndk/
+        var dir = std.fs.cwd().openDir(b.fmt("{s}/ndk", .{android_home}), .{ .iterate = true }) catch break :blk "";
+        defer dir.close();
+        var best: []const u8 = "";
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| {
+            if (entry.kind == .directory and (best.len == 0 or std.mem.order(u8, entry.name, best) == .gt)) {
+                best = b.dupe(entry.name);
+            }
+        }
+        break :blk if (best.len > 0) b.fmt("{s}/ndk/{s}", .{ android_home, best }) else "";
+    };
+    const sysroot_inc = b.fmt("{s}/toolchains/llvm/prebuilt/darwin-x86_64/sysroot/usr/include", .{ndk});
+    const sysroot_arch_inc = b.fmt("{s}/aarch64-linux-android", .{sysroot_inc});
     const translate_sdl = b.addTranslateC(.{
         .root_source_file = b.path("src/sdl_c.h"),
         .target = target,
         .optimize = optimize,
     });
     translate_sdl.addIncludePath(b.path("deps/SDL/include"));
+    translate_sdl.addIncludePath(.{ .cwd_relative = sysroot_arch_inc });
+    translate_sdl.addIncludePath(.{ .cwd_relative = sysroot_inc });
 
     const translate_kx = b.addTranslateC(.{
         .root_source_file = b.path("kx_skia/include/kx_skia.h"),
         .target = target,
         .optimize = optimize,
     });
+    translate_kx.addIncludePath(.{ .cwd_relative = sysroot_arch_inc });
+    translate_kx.addIncludePath(.{ .cwd_relative = sysroot_inc });
 
     // App as a static library (Zig provides bionic libc for android targets).
     const app = b.addLibrary(.{
