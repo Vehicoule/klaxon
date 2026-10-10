@@ -84,5 +84,7 @@ export fn SDL_AppIterate(appstate: ?*anyopaque) callconv(.c) sdl.c.SDL_AppResult
 export fn SDL_AppQuit(appstate: ?*anyopaque, result: sdl.c.SDL_AppResult) callconv(.c) void {
     _ = result;
     const state: *AppState = @ptrCast(@alignCast(appstate orelse return));
+    // VoiceOver bridge shutdown (a11yInit was called in main_ios.start).
+    @import("kx.zig").a11yShutdown();
     state.host.deinit();
 }

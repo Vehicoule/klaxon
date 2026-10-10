@@ -104,6 +104,11 @@ pub fn start() !*platform_ios.AppState {
     // mobile — the 0x0 passed to init is just a placeholder).
     root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host_ptr.width), .h = @floatFromInt(host_ptr.height) });
 
+    // VoiceOver bridge (Phase 3e.2): host.run() is not called on iOS (SDL
+    // main callbacks), so a11yInit must be wired here directly. The shutdown
+    // is deferred to SDL_AppQuit (platform_ios.zig).
+    kx.a11yInit(@ptrCast(root));
+
     const state = try stable.create(platform_ios.AppState);
     state.* = .{
         .host = host_ptr,
