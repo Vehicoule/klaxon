@@ -24,6 +24,7 @@
 #include "include/gpu/graphite/mtl/MtlGraphiteTypes_cpp.h"
 #include "include/ports/SkCFObject.h"
 #include "include/ports/SkFontMgr_mac_ct.h"
+#include "include/ports/SkFontMgr_directory.h"
 
 #include <memory>
 
@@ -36,6 +37,7 @@ struct GpuState {
     CAMetalLayer* layer = nil;
     SDL_MetalView metal_view = nullptr;
     id<CAMetalDrawable> drawable = nil;
+    id<MTLTexture> drawable_texture = nil; // retained: BackendTextures::MakeMetal does NOT retain
     int width = 0;      // pixels (host passes SDL_GetWindowSizeInPixels)
     int height = 0;     // pixels
     float scale = 1.0f; // device pixel ratio: pixels per point
@@ -107,6 +109,8 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
 void gpu_shutdown(GpuState* state) {
     if (!state) return;
     state->frame_surface = nullptr;
+    state->drawable_texture = nil;
+    state->drawable = nil;
     state->recorder.reset();
     if (state->context) {
         state->context->submit(skgpu::graphite::SyncToCpu::kYes);
@@ -127,11 +131,14 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
     if (!state || !state->context || !state->layer) return nullptr;
     state->drawable = [state->layer nextDrawable];
     if (!state->drawable) return nullptr;
+    // BackendTextures::MakeMetal does NOT retain the texture — keep our own
+    // strong reference alive until the frame surface is released.
+    state->drawable_texture = state->drawable.texture;
     state->recorder = state->context->makeRecorder();
     if (!state->recorder) return nullptr;
     const skgpu::graphite::BackendTexture backend_tex = skgpu::graphite::BackendTextures::MakeMetal(
         SkISize::Make(state->width, state->height),
-        (__bridge CFTypeRef)state->drawable.texture);
+        (__bridge CFTypeRef)state->drawable_texture);
     state->frame_surface = SkSurfaces::WrapBackendTexture(
         state->recorder.get(), backend_tex, kBGRA_8888_SkColorType, nullptr, nullptr);
     if (!state->frame_surface) return nullptr;
@@ -156,15 +163,26 @@ void gpu_end_frame(GpuState* state) {
         }
         state->recorder.reset();
     }
-    state->context->submit();
+    // Synchronous submit: ensures GPU work completes before we release the
+    // drawable texture. The simulator's Metal is software-emulated and may
+    // have different timing than real hardware.
+    state->context->submit(skgpu::graphite::SyncToCpu::kYes);
+    // Release the frame surface BEFORE presenting: the surface holds a
+    // BackendTexture referencing drawable_texture.
+    state->frame_surface = nullptr;
+    state->drawable_texture = nil; // release our texture reference
     if (state->drawable) {
         [state->drawable present];
         state->drawable = nil;
     }
-    state->frame_surface = nullptr;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {
+    // CoreText font manager can crash on the iOS simulator (SkRefCntBase::unref
+    // in typeface lifecycle). Try directory-based first, fall back to empty.
+    if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Directory("/System/Library/Fonts")) {
+        return mgr;
+    }
     return SkFontMgr_New_CoreText(nullptr);
 }
 
