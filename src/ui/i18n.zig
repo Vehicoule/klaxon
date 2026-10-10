@@ -714,7 +714,7 @@ pub const I18n = struct {
 
 // --- process-global current i18n (single-window P0, like the router) ---
 
-threadlocal var current_i18n: ?*I18n = null;
+var current_i18n: ?*I18n = null;
 
 pub fn setCurrent(i: ?*I18n) void {
     current_i18n = i;

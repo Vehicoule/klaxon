@@ -12,7 +12,7 @@ const node_mod = @import("node.zig");
 
 const Node = node_mod.Node;
 
-threadlocal var current_effect: ?*Effect = null;
+var current_effect: ?*Effect = null;
 
 // --- Subscriber (ADR-0009: maps 1:1 to C fn ptrs + userdata) ---
 

@@ -571,7 +571,7 @@ pub const Timeline = struct {
     }
 };
 
-threadlocal var current_timeline: ?*Timeline = null;
+var current_timeline: ?*Timeline = null;
 
 /// Install the process-global timeline (the host does this at init;
 /// single-window P0). Null clears it (tests).

@@ -77,9 +77,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// App body, shared by the native entry point (main) and the Android
 /// SDL_main entry point above.
 fn galleryMain(opts: Options) !void {
+    // DebugAllocator uses Io.Threaded mutexes (TLS Local Exec) — can't link
+    // into Android's libmain.so. Use c_allocator (bionic malloc) on Android.
+    const is_android = builtin.os.tag == .linux and builtin.abi == .android;
     var debug_alloc = std.heap.DebugAllocator(.{}){};
     defer _ = debug_alloc.deinit();
-    const allocator = debug_alloc.allocator();
+    const allocator: std.mem.Allocator = if (is_android)
+        std.heap.c_allocator
+    else
+        debug_alloc.allocator();
 
     var host = try host_mod.Host.init(allocator, width, height, opts.backend, null);
     defer host.deinit();

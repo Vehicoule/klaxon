@@ -203,7 +203,7 @@ pub const SemanticsBridge = struct {
     userdata: ?*anyopaque,
 };
 
-threadlocal var current_bridge: ?SemanticsBridge = null;
+var current_bridge: ?SemanticsBridge = null;
 
 pub fn setBridge(b: ?SemanticsBridge) void {
     current_bridge = b;
@@ -480,7 +480,7 @@ pub const FocusManager = struct {
 
 // --- process-global focus manager (single-window P0, like the router) ---
 
-threadlocal var current_focus: ?*FocusManager = null;
+var current_focus: ?*FocusManager = null;
 
 pub fn setCurrentFocus(fm: ?*FocusManager) void {
     current_focus = fm;

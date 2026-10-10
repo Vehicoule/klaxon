@@ -35,7 +35,8 @@ const File = Io.File;
 const Terminal = Io.Terminal;
 
 comptime {
-    if (builtin.os.tag != .ios) @compileError("ios_io.zig is iOS-only (aarch64-ios)");
+    if (builtin.os.tag != .ios and !(builtin.os.tag == .linux and builtin.abi == .android))
+        @compileError("ios_io.zig is mobile-only (aarch64-ios / aarch64-linux-android)");
 }
 
 /// Instance unique. userdata = null: l'état (writer stderr, protection
@@ -285,12 +286,12 @@ fn failingFileWriteFilePositional(userdata: ?*anyopaque, file: File, header: []c
 
 fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
     _ = userdata;
-    // Même mapping Darwin que std.Io.Threaded.clockToPosix (UPTIME_RAW pour
-    // .awake, MONOTONIC_RAW pour .boot sur la famille Darwin).
+    // Darwin: UPTIME_RAW (.awake) / MONOTONIC_RAW (.boot). Android/Linux:
+    // MONOTONIC for both (UPTIME_RAW / MONOTONIC_RAW are Darwin-only).
     const clock_id: std.posix.clockid_t = switch (clock) {
         .real => std.posix.CLOCK.REALTIME,
-        .awake => std.posix.CLOCK.UPTIME_RAW,
-        .boot => std.posix.CLOCK.MONOTONIC_RAW,
+        .awake => if (builtin.os.tag == .ios) std.posix.CLOCK.UPTIME_RAW else std.posix.CLOCK.MONOTONIC,
+        .boot => if (builtin.os.tag == .ios) std.posix.CLOCK.MONOTONIC_RAW else std.posix.CLOCK.MONOTONIC,
         .cpu_process => std.posix.CLOCK.PROCESS_CPUTIME_ID,
         .cpu_thread => std.posix.CLOCK.THREAD_CPUTIME_ID,
     };

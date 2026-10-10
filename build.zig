@@ -450,7 +450,7 @@ fn addAndroidLib(
     const app_opt = b.option([]const u8, "android-app", "Android app to build: gallery|hello") orelse "gallery";
     const is_hello = std.mem.eql(u8, app_opt, "hello");
     const app_name: []const u8 = if (is_hello) "hello" else "gallery";
-    const root_src: []const u8 = if (is_hello) "src/main.zig" else "src/gallery_main.zig";
+    const root_src: []const u8 = if (is_hello) "src/main.zig" else "src/gallery_android.zig";
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c.
     // Use the NATIVE target for translate-c: Zig 0.17's NativePaths adds the
@@ -481,6 +481,7 @@ fn addAndroidLib(
             .target = target,
             .optimize = optimize,
             .link_libc = true, // Zig provides Android bionic libc
+            .pic = true, // required: linked into libmain.so (shared)
         }),
     });
     app.root_module.addImport("sdl_c", translate_sdl.createModule());

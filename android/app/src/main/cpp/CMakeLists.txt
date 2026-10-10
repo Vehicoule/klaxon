@@ -41,7 +41,8 @@ endforeach()
 add_library(main SHARED
     "${KLAXON_ROOT}/kx_skia/src/kx_skia_common.cpp"
     "${KLAXON_ROOT}/kx_skia/src/kx_skia_android.cpp"
-    "${KLAXON_ROOT}/kx_skia/src/kx_a11y_android.cpp")
+    "${KLAXON_ROOT}/kx_skia/src/kx_a11y_android.cpp"
+    "${KLAXON_ROOT}/kx_skia/src/kx_skia_android_fontmgr_stub.cpp")
 set_target_properties(main PROPERTIES OUTPUT_NAME "main")
 
 target_include_directories(main PRIVATE
@@ -68,6 +69,7 @@ target_link_libraries(main PRIVATE
     kx_skia_skia kx_skia_skparagraph kx_skia_skshaper
     kx_skia_skunicode_core kx_skia_skunicode_icu kx_skia_zlib
     "-Wl,--end-group"
+    c++_static
     log EGL GLESv2 android)
 
 # AGP packages every .so found in the CMake output dir into lib/<abi>/ —

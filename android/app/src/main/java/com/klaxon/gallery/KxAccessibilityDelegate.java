@@ -66,7 +66,7 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
             event.setSource(mHost);
             event.setContentChangeTypes(AccessibilityEvent.CONTENT_CHANGE_TYPE_SUBTREE);
-            mHost.sendAccessibilityEvent(event);
+            mHost.sendAccessibilityEventUnchecked(event);
         });
     }
 
@@ -124,10 +124,10 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
             // Attribute the announcement to the focused control when there is
             // one, so TalkBack speaks it in context.
             event.setSource(mHost, index);
-            mProvider.sendAccessibilityEventForVirtualViewId(index, event);
+            mHost.sendAccessibilityEventUnchecked(event);
         } else {
             event.setSource(mHost);
-            mHost.sendAccessibilityEvent(event);
+            mHost.sendAccessibilityEventUnchecked(event);
         }
     }
 
@@ -137,7 +137,7 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
         AccessibilityEvent event = AccessibilityEvent.obtain(
                 AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
         event.setSource(mHost, index);
-        mProvider.sendAccessibilityEventForVirtualViewId(index, event);
+        mHost.sendAccessibilityEventUnchecked(event);
     }
 
     // --- View.AccessibilityDelegate: the host view itself ---
@@ -161,7 +161,7 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
 
         @Override
         public AccessibilityNodeInfo createAccessibilityNodeInfo(int virtualDescendantId) {
-            if (virtualDescendantId == AccessibilityNodeProvider.HOST_NODE_ID) {
+            if (virtualDescendantId == AccessibilityNodeProvider.HOST_VIEW_ID) {
                 // Host node: the surface itself. Populate it through the
                 // delegate's onInitializeAccessibilityNodeInfo and advertise
                 // every virtual node as a child — without the addChild calls
