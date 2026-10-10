@@ -538,13 +538,14 @@ fn addIosApp(
     });
     translate_kx.addIncludePath(b.graph.cwdRelativePath(sdk_path));
 
-    // App as a static library. src/main_ios.zig will be the iOS entry point;
-    // for now gallery_main.zig is used as a placeholder so the graph evaluates.
+    // App as a static library. src/main_ios.zig est la racine du graphe iOS
+    // (callbacks SDL + start(), avec l'override std_options_debug_io —
+    // gallery_main.zig n'était qu'un placeholder).
     const app = b.addLibrary(.{
         .name = "gallery",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/gallery_main.zig"), // placeholder for src/main_ios.zig
+            .root_source_file = b.path("src/main_ios.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,

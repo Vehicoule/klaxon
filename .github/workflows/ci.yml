@@ -145,3 +145,153 @@ jobs:
           test -f zig-out/web/hello.js
           test -f zig-out/web/hello.wasm
           echo "All wasm artifacts present."
+
+  # Phase 3d — Android target (aarch64-linux-android). Separate job, runs in
+  # parallel with build-test. Zig builds the app as a static lib
+  # (`zig build -Dtarget=aarch64-linux-android android-lib` ->
+  # zig-out/lib/libgallery.a); Gradle + CMake/NDK link the kx_skia shim +
+  # Skia + SDL3 into libmain.so and package the APK. assembleDebug only:
+  # auto-signed with the SDK debug key, no keystore in CI. Non-blocking for
+  # the first iteration — the native build-test job remains the merge gate.
+  build-android:
+    name: build-android (Linux)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.0 (pinned, ADR-0001)
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz"
+          tar -xf zig.tar.xz
+          zig_dir="$(pwd)/zig-x86_64-linux-0.17.0"
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
+          zig version
+
+      - name: Setup JDK 17 (temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build deps (ninja, cmake, clang, python3, unzip)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake clang python3 unzip
+
+      - name: Install Android SDK (cmdline-tools, platform 35, build-tools 35, NDK 27.1)
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006"
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: deps-android-${{ hashFiles('scripts/fetch-deps.sh') }}
+
+      - name: Fetch + build Android deps (Skia + SDL3, android-arm64)
+        run: scripts/fetch-deps.sh android-arm64
+        # NOTE: lourd (~1-2 GB, 15-45 min au premier run). Le cache deps
+        # accélère les runs suivants. Requires ANDROID_HOME/ANDROID_NDK_HOME
+        # (exported by the SDK step above — fetch-deps.sh detect_ndk).
+
+      - name: Build Android static lib (zig)
+        run: zig build -Dtarget=aarch64-linux-android android-lib
+
+      - name: Build debug APK (Gradle assembleDebug — auto-signed)
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          cd android && ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klaxon-android-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+
+      - name: Size gate (APK < 40 Mo)
+        run: |
+          APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -n 1)
+          SIZE=$(stat -c%s "$APK")
+          echo "APK size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+          # Budget: < 40 MB (placeholder). Fail si depasse.
+          if [ "$SIZE" -ge 41943040 ]; then echo "APK TOO LARGE: $SIZE >= 40 MB"; exit 1; fi
+
+  # Phase 3e — iOS target (aarch64-ios.15.0 / aarch64-ios.15.0-simulator).
+  # Separate job on macOS arm64: Xcode is required (Skia + SDL3 iOS deps via
+  # scripts/fetch-deps.sh ios, and the xcrun clang++ link step in build.zig).
+  # Builds the simulator binary first (best-effort simctl smoke), then the
+  # device binary (size gate). Non-blocking for the first iteration — the ios
+  # deps take 30-90 min on first run; build-test remains the merge gate.
+  build-ios:
+    name: build-ios (macOS)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.0 (pinned, ADR-0001)
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz"
+          tar -xf zig.tar.xz
+          zig_dir="$(pwd)/zig-aarch64-macos-0.17.0"
+          echo "$zig_dir" >> "$GITHUB_PATH"
+          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
+          zig version
+
+      - name: Cache deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: deps-macos-ios-${{ hashFiles('scripts/fetch-deps.sh') }}
+
+      - name: Fetch + build iOS deps (Skia + SDL3, device + simulator)
+        run: scripts/fetch-deps.sh ios
+        # NOTE: très lourd (~30-90 min au premier run: 4 builds Skia/SDL3,
+        # device + sim). Le cache deps accélère les runs suivants.
+
+      - name: Build iOS simulator binary (ReleaseSmall)
+        run: zig build -Dtarget=aarch64-ios.15.0-simulator -Doptimize=ReleaseSmall ios-gallery
+
+      - name: Smoke test (boot + install + launch on simulator — best effort)
+        continue-on-error: true
+        run: |
+          set -e
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c "import json,sys; rs=json.load(sys.stdin); print(next(r['identifier'] for r in rs if r['isAvailable'] and r['name'].startswith('iOS')))")
+          DEVICE_TYPE=$(xcrun simctl list devicetypes -j | python3 -c "import json,sys; dts=json.load(sys.stdin); print(next(d['identifier'] for d in dts if 'iPhone' in d['name']))")
+          xcrun simctl create klaxon-ci "$DEVICE_TYPE" "$RUNTIME"
+          xcrun simctl boot klaxon-ci
+          xcrun simctl bootstatus booted -b
+          # zig-out/ios/gallery is a raw Mach-O, not a bundle: wrap it in a
+          # minimal .app so simctl can install it (ad-hoc signed for the sim).
+          mkdir -p zig-out/ios/gallery.app
+          cp zig-out/ios/gallery zig-out/ios/gallery.app/gallery
+          codesign --force --sign - zig-out/ios/gallery.app/gallery
+          printf '%s' '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>gallery</string><key>CFBundleIdentifier</key><string>com.klaxon.gallery.ci</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleVersion</key><string>1</string><key>MinimumOSVersion</key><string>15.0</string></dict></plist>' > zig-out/ios/gallery.app/Info.plist
+          xcrun simctl install booted zig-out/ios/gallery.app
+          xcrun simctl launch booted com.klaxon.gallery.ci
+          sleep 5
+          xcrun simctl terminate booted com.klaxon.gallery.ci || true
+          xcrun simctl shutdown klaxon-ci || true
+          echo "Simulator smoke OK (installed + launched gallery.app)"
+
+      - name: Build iOS device binary (ReleaseSmall)
+        run: zig build -Dtarget=aarch64-ios.15.0 -Doptimize=ReleaseSmall ios-gallery
+
+      - name: Size gate (binary < 20 Mo)
+        run: |
+          SIZE=$(stat -f%z zig-out/ios/gallery)
+          echo "iOS binary size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+          # Budget: < 20 MB (placeholder — no .ipa packaging yet, the gate
+          # runs on the raw device binary). Fail si depasse.
+          if [ "$SIZE" -ge 20971520 ]; then echo "IOS BINARY TOO LARGE: $SIZE >= 20 MB"; exit 1; fi
