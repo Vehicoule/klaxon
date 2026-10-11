@@ -93,25 +93,74 @@ pub fn setColor(n: *Node, color: Color) void {
 
 // --- BoundText: a Text whose string follows a signal ---
 
+/// The signal a BoundText value rides: text rides the growable TextSignal
+/// (Signal(T) stores T by value — it could not own the string's bytes
+/// without a double-free); scalars ride Signal(T).
+fn SignalFor(comptime T: type) type {
+    return if (T == [:0]const u8) ui.state.TextSignal else ui.state.Signal(T);
+}
+
 /// Text bound to a signal: the string is `fmt(sig.peek())`, reformatted and
 /// re-measured on every change (the size may change → markLayoutDirty, not
 /// just markDirty). `fmt` writes into the provided buffer and returns the
-/// slice used (the widget appends the null sentinel).
+/// slice used — or NULL when it does not fit (the widget retries with a
+/// bigger buffer, up to ui.state.TextSignal.max_len; over the cap the node
+/// paints empty rather than truncating).
 pub fn BoundText(comptime T: type) type {
     return struct {
         const State = struct {
-            sig: *ui.state.Signal(T),
-            fmt: *const fn (T, []u8) []const u8,
+            sig: *SignalFor(T),
+            fmt: *const fn (T, []u8) ?[]const u8,
             opts: TextOptions,
-            buf: [128]u8 = undefined,
+            /// The formatted text — allocator-owned, kept null-terminated
+            /// (kx_draw_text takes a char*). sem.label borrows it: bound()
+            /// re-points the label on every format (a grow may move it).
+            buf: std.array_list.Managed(u8),
+            /// The buf is stale — the signal changed since the last format.
+            /// bound() reformats only when this is set, so measure()+paint()
+            /// in one frame don't repeat the copy (dirtyCb re-arms it).
+            dirty: bool,
         };
 
         fn bound(n: *Node) [:0]const u8 {
             const s: *State = @ptrCast(@alignCast(n.state.?));
-            const out = s.fmt(s.sig.peek(), &s.buf);
-            const len = @min(out.len, s.buf.len - 1);
-            s.buf[len] = 0;
-            return s.buf[0..len :0];
+            if (!s.dirty)
+                return s.buf.items.ptr[0..s.buf.items.len :0];
+            s.dirty = false;
+            if (s.buf.capacity == 0)
+                s.buf.ensureTotalCapacity(128) catch @panic("klaxon: out of memory");
+            while (true) {
+                const scratch = s.buf.allocatedSlice();
+                const out = s.fmt(s.sig.peek(), scratch) orelse {
+                    if (scratch.len > ui.state.TextSignal.max_len) {
+                        s.buf.items.len = 0; // over the cap: paint empty, never truncated
+                        break;
+                    }
+                    s.buf.ensureTotalCapacity(@min(scratch.len * 2, ui.state.TextSignal.max_len + 1)) catch @panic("klaxon: out of memory");
+                    continue;
+                };
+                if (out.len >= scratch.len) {
+                    // The text fits but the sentinel would not — grow + retry.
+                    s.buf.ensureTotalCapacity(out.len + 1) catch @panic("klaxon: out of memory");
+                    continue;
+                }
+                const lo = @intFromPtr(scratch.ptr);
+                const out_ptr = @intFromPtr(out.ptr);
+                if (out_ptr < lo or out_ptr + out.len > lo + scratch.len) {
+                    @memcpy(scratch[0..out.len], out); // a literal result → copy in
+                } else if (out_ptr != lo) {
+                    std.mem.copyForwards(u8, scratch[0..out.len], out); // an offset slice → move to the front
+                }
+                s.buf.items.len = out.len;
+                break;
+            }
+            // The null sentinel at items[len] (capacity > len is guaranteed).
+            s.buf.items.len += 1;
+            s.buf.items[s.buf.items.len - 1] = 0;
+            s.buf.items.len -= 1;
+            const str = s.buf.items.ptr[0..s.buf.items.len :0];
+            if (n.semantics) |sem| sem.label = str; // re-point: a grow may have moved the buffer
+            return str;
         }
 
         fn measure(n: *Node, c: Constraints) Size {
@@ -132,13 +181,16 @@ pub fn BoundText(comptime T: type) type {
         }
         fn dirtyCb(userdata: ?*anyopaque) void {
             const n: *Node = @ptrCast(@alignCast(userdata.?));
-            if (n.semantics) |sem| sem.label = bound(n); // a11y: the label follows the signal
+            const s: *State = @ptrCast(@alignCast(n.state.?));
+            s.dirty = true;
+            _ = bound(n); // refresh the text + the a11y label for the new value
             n.markLayoutDirty(); // the text (and its size) changed
             n.markDirty(); // wake the dirty-flag render path (idle repaint)
         }
         fn deinit(n: *Node) void {
             const s: *State = @ptrCast(@alignCast(n.state.?));
             s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = dirtyCb, .userdata = n } });
+            s.buf.deinit();
             n.allocator.destroy(s);
         }
         fn paintBounds(n: *Node) Rect {
@@ -148,12 +200,13 @@ pub fn BoundText(comptime T: type) type {
         }
         const vtable = ui.node.VTable{ .measure = measure, .layout = layout, .paint = paint, .deinit = deinit, .paint_bounds = paintBounds };
 
-        pub fn text(allocator: std.mem.Allocator, sig: *ui.state.Signal(T), fmt: *const fn (T, []u8) []const u8, opts: TextOptions) !*Node {
+        pub fn text(allocator: std.mem.Allocator, sig: *SignalFor(T), fmt: *const fn (T, []u8) ?[]const u8, opts: TextOptions) !*Node {
             const node = try Node.create(allocator, &vtable);
             errdefer node.allocator.destroy(node); // no state yet
             const s = try allocator.create(State);
             errdefer allocator.destroy(s);
-            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts };
+            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true };
+            errdefer s.buf.deinit();
             node.state = s;
             // Phase 2c: the label is the initial text — dynamic changes go
             // through live regions (semantics.announce).
@@ -337,8 +390,8 @@ test "golden: rich text paints both spans" {
     try std.testing.expect(frame.countColor(red) > 0);
 }
 
-fn fmtBoundCount(v: u32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Pressed {d} times", .{v}) catch "Pressed";
+fn fmtBoundCount(v: u32, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Pressed {d} times", .{v}) catch null;
 }
 
 test "boundText: follows the signal and re-layouts on change" {
@@ -362,6 +415,34 @@ test "boundText: follows the signal and re-layouts on change" {
     node.layout_dirty = false;
     sig.set(12345);
     try std.testing.expect(!node.layout_dirty);
+}
+
+fn fmtEcho(v: [:0]const u8, buf: []u8) ?[]const u8 {
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return buf[0..v.len];
+}
+
+test "boundText: text signals grow past the old 128-byte formatter cap" {
+    const sig = try ui.state.TextSignal.init(std.testing.allocator, "hi");
+    defer sig.deinit();
+    const node = try BoundText([:0]const u8).text(std.testing.allocator, sig, fmtEcho, .{ .size = 16 });
+    defer node.deinit();
+    const m1 = node.measure(.{ .max_w = 4000, .max_h = 20 });
+    const e1 = ui.paint.measureText("hi", 16, false);
+    try std.testing.expectApproxEqAbs(e1.width, m1.w, 0.01);
+    // a value far over the old fixed [128]u8 formatter buffer lands whole
+    var long_buf: [406]u8 = undefined;
+    @memcpy(long_buf[0..5], "echo ");
+    @memset(long_buf[5..405], 'z');
+    long_buf[405] = 0;
+    const long: [:0]const u8 = long_buf[0..405 :0];
+    try sig.set(long);
+    try std.testing.expect(node.layout_dirty);
+    try std.testing.expectEqualStrings(long, node.semantics.?.label);
+    const m2 = node.measure(.{ .max_w = 4000, .max_h = 20 });
+    const e2 = ui.paint.measureText(long, 16, false);
+    try std.testing.expectApproxEqAbs(e2.width, m2.w, 0.01);
 }
 
 test "golden: boundText paints the current signal value" {

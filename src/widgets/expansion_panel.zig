@@ -52,14 +52,23 @@ const chevron_size: f32 = 24;
 const EPState = struct {
     opts: ExpansionPanelOptions,
     sig: ?*ui.state.Signal(bool),
-    title_z: [128]u8 = std.mem.zeroes([128]u8),
-    title_len: usize = 0,
+    /// The header title — an owned null-terminated copy of opts.title (the
+    /// options string is borrowed; the node outlives the caller's).
+    title: [:0]const u8,
     pressed: bool = false,
     hovered: bool = false,
 };
 
 fn stateOf(n: *Node) *EPState {
     return @ptrCast(@alignCast(n.state.?));
+}
+
+/// An owned null-terminated copy of a string.
+fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
+    const buf = try allocator.alloc(u8, str.len + 1);
+    @memcpy(buf[0..str.len], str);
+    buf[str.len] = 0;
+    return buf[0..str.len :0];
 }
 
 fn isExpanded(s: *EPState) bool {
@@ -87,7 +96,7 @@ fn epMeasure(n: *Node, c: Constraints) Size {
     // Header width: title + chevron + paddings.
     const t = s.opts.theme;
     const ts = t.type_scale.title_medium;
-    const title_w = ui.paint.measureText(s.title_z[0..s.title_len :0], ts.size, ts.weight >= 500).width;
+    const title_w = ui.paint.measureText(s.title, ts.size, ts.weight >= 500).width;
     const header_w = header_pad + title_w + 8 + chevron_size + header_pad;
     var w = @max(header_w, c.min_w);
     w = @min(w, c.max_w);
@@ -150,10 +159,9 @@ fn epPaint(n: *Node, ctx: *kx.Ctx) void {
 
     // Title.
     const ts = t.type_scale.title_medium;
-    const title_z = s.title_z[0..s.title_len :0];
     const title_x = b.x + header_pad;
     const title_y = b.y + (header_h - ts.line_height) / 2 + ts.line_height * 0.8;
-    ui.paint.text(ctx, title_z, title_x, title_y, ts.size, ts.weight >= 500, t.colors.on_surface);
+    ui.paint.text(ctx, s.title, title_x, title_y, ts.size, ts.weight >= 500, t.colors.on_surface);
 
     // Chevron (▼ when collapsed, ▲ when expanded — v1: static glyph swap).
     const expanded = isExpanded(s);
@@ -244,6 +252,7 @@ fn epDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = epSyncCb, .userdata = n } });
     input.releaseNode(n);
+    n.allocator.free(s.title);
     n.allocator.destroy(s);
 }
 
@@ -276,14 +285,10 @@ pub fn expansionPanel(
     errdefer allocator.destroy(node);
     const s = try allocator.create(EPState);
     errdefer allocator.destroy(s);
+    const title = try dupeZ(allocator, opts.title); // any length — no cap
+    errdefer allocator.free(title);
 
-    s.* = .{ .opts = opts, .sig = expanded };
-
-    // Copy the title (null-terminated).
-    const copy_len = @min(opts.title.len, 127);
-    @memcpy(s.title_z[0..copy_len], opts.title[0..copy_len]);
-    s.title_z[copy_len] = 0;
-    s.title_len = copy_len;
+    s.* = .{ .opts = opts, .sig = expanded, .title = title };
 
     node.state = @ptrCast(s);
 
@@ -300,7 +305,7 @@ pub fn expansionPanel(
 
     ui.semantics.attach(node, .{
         .role = .button,
-        .label = s.title_z[0..copy_len],
+        .label = s.title,
         .value = if (isExpanded(s)) "expanded" else "collapsed",
         .focusable = true,
     });
@@ -354,6 +359,19 @@ test "expansion_panel: semantics — role button, value follows state" {
     try std.testing.expectEqual(ui.semantics.Role.button, n.semantics.?.role);
     try std.testing.expectEqualStrings("My Panel", n.semantics.?.label);
     try std.testing.expectEqualStrings("collapsed", n.semantics.?.value);
+}
+
+test "expansion_panel: a long title measures + labels whole (no truncation)" {
+    const a = std.testing.allocator;
+    const long_title = "A very long expansion panel title that exceeds the old 127-byte title buffer " ++ "by quite a margin — CJK too: 展開パネル";
+    const n = try expansionPanel(a, null, null, .{ .title = long_title });
+    defer n.deinit();
+    try std.testing.expectEqualStrings(long_title, n.semantics.?.label);
+    const ts = theme_mod.light.type_scale.title_medium;
+    const title_w = ui.paint.measureText(long_title, ts.size, ts.weight >= 500).width;
+    const m = n.measure(.{ .max_w = 4000, .max_h = 200 });
+    // the full title (not a truncated prefix) drives the measured width
+    try std.testing.expectApproxEqAbs(header_pad + title_w + 8 + chevron_size + header_pad, m.w, 0.001);
 }
 
 test "golden: the collapsed panel paints SurfaceContainer + title + chevron" {

@@ -63,8 +63,10 @@ fn decCount(userdata: ?*anyopaque) void {
     app.count_sig.set(app.count_sig.peek() - 1);
 }
 
-/// BoundText fmt for []const u8 signals: copy into the provided buffer.
-fn copyFmt(s: []const u8, buf: []u8) []const u8 {
+/// BoundText fmt for []const u8 signals: copy into the provided buffer
+/// (null = it does not fit — the widget retries with a bigger buffer).
+fn copyFmt(s: []const u8, buf: []u8) ?[]const u8 {
+    if (s.len > buf.len) return null;
     @memcpy(buf[0..s.len], s);
     return buf[0..s.len];
 }

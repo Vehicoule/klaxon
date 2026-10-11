@@ -555,11 +555,12 @@ fn buildChip(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror
 
 /// M3E text field (2d.2 PR C2): every registry field is editable, so every
 /// field gets a live binding — the serialized text is always the CURRENT
-/// buffer, read losslessly from the node (the fixed-size signal is only the
-/// two-way channel; reading it would truncate past 255 bytes). The live field
-/// is "value" when the document has one, "initial" when it only has that,
-/// else "value" (materialized on save — the checkbox convention). The widget
-/// is a leaf — document children never serialize.
+/// buffer, read from the node (the growable TextSignal is the two-way
+/// channel; text over its 1 MiB cap is REJECTED at build time, never
+/// truncated). The live field is "value" when the document has one,
+/// "initial" when it only has that, else "value" (materialized on save —
+/// the checkbox convention). The widget is a leaf — document children never
+/// serialize.
 fn buildTextField(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
     const topts = try value_mod.optionsFromValue(text_field_w.TextFieldOptions, opts, null, null);
     const value_v = opts.get("value");
@@ -579,17 +580,13 @@ fn buildTextField(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) any
         }
     else
         "";
-    const sig = try state.Signal(text_field_w.TextBuf).init(allocator, text_field_w.bufFromText(initial));
+    const sig = try state.TextSignal.init(allocator, initial); // errors on over-cap text
     try ctx.track(sig, deinitTextSignal);
     const n = try text_field_w.textField(allocator, sig, null, null, topts);
-    // The signal mirror caps at 255 bytes (TextBuf = [256]u8, the two-way
-    // channel); the buffer is lossless — re-seed it when the initial text
-    // exceeds the mirror.
-    if (initial.len >= 256) text_field_w.setText(n, initial);
     return .{ .node = n, .live = .{ .signal = @ptrCast(n), .field = field, .read = readTextFieldNode } };
 }
 
-/// The live text: the widget's CURRENT buffer (lossless), as an owned string.
+/// The live text: the widget's CURRENT buffer, as an owned string.
 fn readTextFieldNode(allocator: std.mem.Allocator, p: *anyopaque) anyerror!Value {
     const n: *Node = @ptrCast(@alignCast(p));
     return .{ .string = try allocator.dupe(u8, text_field_w.text(n)) }; // owned (Value.set takes ownership)
@@ -597,9 +594,8 @@ fn readTextFieldNode(allocator: std.mem.Allocator, p: *anyopaque) anyerror!Value
 
 /// M3E search bar (2d.3 PR D4): a leaf — the pill is internal chrome. The
 /// text is ALWAYS live (like the text field, PR #26): the "value" (or
-/// "initial") option seeds a TextBuf signal mirrored both ways; the current
-/// text round-trips. The live read is the widget's buffer (lossless — the
-/// signal mirror caps at 255 bytes, TextBuf = [256]u8).
+/// "initial") option seeds a growable TextSignal mirrored both ways; the
+/// current text round-trips. The live read is the widget's buffer.
 fn buildSearchBar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
     const sopts = try value_mod.optionsFromValue(search_bar_w.SearchBarOptions, opts, null, null);
     const value_v = opts.get("value");
@@ -619,13 +615,9 @@ fn buildSearchBar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) any
         }
     else
         "";
-    const sig = try state.Signal(search_bar_w.TextBuf).init(allocator, search_bar_w.bufFromText(initial));
+    const sig = try state.TextSignal.init(allocator, initial); // errors on over-cap text
     try ctx.track(sig, deinitTextSignal);
     const n = try search_bar_w.searchBar(allocator, sig, null, null, sopts);
-    // The signal mirror caps at 255 bytes (TextBuf = [256]u8, the two-way
-    // channel); the buffer is lossless — re-seed it when the initial text
-    // exceeds the mirror.
-    if (initial.len >= 256) search_bar_w.setText(n, initial);
     return .{ .node = n, .live = .{ .signal = @ptrCast(n), .field = field, .read = readSearchBarNode } };
 }
 
@@ -1122,8 +1114,8 @@ fn parseNavRailItems(allocator: std.mem.Allocator, v: Value) ![]navigation_rail_
 }
 
 fn deinitTextSignal(p: *anyopaque) void {
-    const s: *state.Signal(text_field_w.TextBuf) = @ptrCast(@alignCast(p));
-    s.deinit(); // Signal.deinit frees itself (state.zig)
+    const s: *state.TextSignal = @ptrCast(@alignCast(p));
+    s.deinit(); // TextSignal.deinit frees itself + its buffer (state.zig)
 }
 
 // --- batch 2d.1 PR A: navigation chrome (M3E) ---
@@ -1906,8 +1898,8 @@ test "registry: text_field (M3E) round-trips (live value, and plain initial)" {
     const bare_out = try treeToJson(&ctx, bare, std.testing.allocator);
     defer std.testing.allocator.free(bare_out);
     try std.testing.expectEqualStrings("{\"name\":\"text_field\",\"options\":{\"label\":\"Email\",\"value\":\"\"}}", bare_out);
-    // long text round-trips losslessly (the live value reads the widget's
-    // buffer, not the fixed-size signal mirror)
+    // long text round-trips losslessly (the growable TextSignal is no
+    // longer a truncation point)
     const long_text = blk: {
         var t: [300]u8 = undefined;
         @memset(&t, 'a');

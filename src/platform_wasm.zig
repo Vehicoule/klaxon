@@ -106,6 +106,9 @@ fn wasmFrameCallback(arg: ?*anyopaque) callconv(.c) void {
         emscripten_cancel_main_loop();
         return;
     };
+    // The event queue drained inside runIteration — every queued text event
+    // was polled, so its backing buffer can be freed.
+    freePendingTextBufs();
     // Quit request, or the demo's frame budget exhausted: stop the rAF loop.
     if (quit or st.host.stats.frames >= st.max_frames) emscripten_cancel_main_loop();
 }
@@ -147,33 +150,41 @@ export fn kx_a11y_key(down: c_int, key: u32, mod: u16) callconv(.c) void {
     _ = sdl.c.SDL_PushEvent(&event);
 }
 
-/// Static backing store for kx_a11y_text: SDL_TextInputEvent.text is a
-/// borrowed `const char *` — SDL keeps the pointer until the event is polled
-/// (the next rAF frame), so the text must outlive the JS caller, which frees
-/// its buffer right after the call. A fixed buffer is enough: wasm is
-/// single-threaded and the event queue is drained every frame, so text events
-/// are pushed one at a time.
-var text_input_buf: [1024]u8 = undefined;
+/// Per-event backing store for kx_a11y_text: SDL_TextInputEvent.text is a
+/// borrowed `const char *` kept until the event is polled (the next rAF
+/// frame), so the text must outlive the JS caller, which frees its buffer
+/// right after the call. Each queued event gets its OWN allocation: several
+/// beforeinput events can land between two frames, and a shared growable
+/// buffer would leave the first event's pointer dangling after a realloc.
+/// The buffers are freed after the queue drains in wasmFrameCallback.
+var pending_text_bufs: std.ArrayList([]u8) = .empty;
+
+/// Free the queued text-event buffers — call AFTER the event queue drains
+/// (every pushed TEXT_INPUT event has been polled by then).
+fn freePendingTextBufs() void {
+    for (pending_text_bufs.items) |b| std.heap.page_allocator.free(b);
+    pending_text_bufs.clearRetainingCapacity();
+}
 
 /// Export for JS (web/kx_a11y.js): push a text input event into SDL's queue —
 /// called from the hidden-DOM mirror's beforeinput/textInput handlers (mobile
-/// virtual keyboard, IME). The text is copied into a static buffer (SDL
-/// borrows the pointer until the event is polled), truncated at a UTF-8
-/// codepoint boundary if it exceeds the buffer.
+/// virtual keyboard, IME). The text is copied into its own allocation (SDL
+/// borrows the pointer until the event is polled).
 ///   text_ptr: pointer to UTF-8 text bytes (need not be null-terminated)
 ///   text_len: length in bytes
 export fn kx_a11y_text(text_ptr: [*]const u8, text_len: usize) callconv(.c) void {
     const sdl = @import("sdl.zig");
-    // Copy into the static buffer, keeping room for the null terminator.
-    var len: usize = @min(text_len, text_input_buf.len - 1);
-    // If truncation split a multi-byte UTF-8 codepoint, back off to its lead byte.
-    while (len > 0 and len < text_len and (text_ptr[len] & 0xC0) == 0x80) len -= 1;
-    @memcpy(text_input_buf[0..len], text_ptr[0..len]);
-    text_input_buf[len] = 0;
+    const buf = std.heap.page_allocator.alloc(u8, text_len + 1) catch return;
+    @memcpy(buf[0..text_len], text_ptr[0..text_len]);
+    buf[text_len] = 0;
+    pending_text_bufs.append(std.heap.page_allocator, buf) catch {
+        std.heap.page_allocator.free(buf);
+        return;
+    };
     var event: sdl.c.SDL_Event = std.mem.zeroes(sdl.c.SDL_Event);
     event.type = @intCast(sdl.c.SDL_EVENT_TEXT_INPUT);
     event.common.timestamp = sdl.c.SDL_GetTicksNS();
-    event.text.text = text_input_buf[0..len].ptr;
+    event.text.text = buf.ptr;
     event.text.windowID = 0; // 0 = virtual keyboard, no specific window
     _ = sdl.c.SDL_PushEvent(&event);
 }

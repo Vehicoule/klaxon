@@ -151,6 +151,110 @@ pub fn Signal(comptime T: type) type {
     };
 }
 
+// --- TextSignal — a reactive, growable text channel ---
+// Signal(T) stores T by value, so it cannot own a growable string (a
+// `Managed(u8)` member would be copied by value on set → double-free). Text
+// needs its own channel: an allocator-owned, null-terminated buffer with a
+// documented cap. Input over `max_len` is REJECTED (error.TextTooLong) —
+// never silently truncated. `peek`/`get` borrow the buffer; the borrow
+// stays valid until the next `set`/`deinit` (callers that must outlive a
+// set dupe it).
+
+pub const TextSignal = struct {
+    /// The documented upper bound on held text (1 MiB of UTF-8 — ~350k CJK
+    /// codepoints). Anything larger is rejected, not truncated.
+    pub const max_len: usize = 1 << 20;
+
+    base: SignalBase,
+    /// The owned text — items.len excludes the sentinel byte that is always
+    /// kept at items[items.len] (kx_draw_text takes a null-terminated char*).
+    buf: std.array_list.Managed(u8),
+
+    pub fn init(allocator: std.mem.Allocator, initial: []const u8) !*TextSignal {
+        if (initial.len > max_len) return error.TextTooLong;
+        const self = try allocator.create(TextSignal);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .base = SignalBase.init(allocator),
+            .buf = std.array_list.Managed(u8).init(allocator),
+        };
+        errdefer self.buf.deinit();
+        try self.buf.ensureTotalCapacity(initial.len + 1);
+        self.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
+        self.buf.items.len += 1;
+        self.buf.items[initial.len] = 0;
+        self.buf.items.len -= 1;
+        return self;
+    }
+
+    /// Read the text. Inside an Effect, this tracks a dependency.
+    pub fn get(self: *TextSignal) [:0]const u8 {
+        if (current_effect) |e| e.track(&self.base);
+        return self.peek();
+    }
+
+    /// Read the text WITHOUT tracking a dependency. Borrows the buffer —
+    /// valid until the next `set`/`deinit`.
+    pub fn peek(self: *TextSignal) [:0]const u8 {
+        // items[items.len] is the sentinel (written on init + every set).
+        return self.buf.items.ptr[0..self.buf.items.len :0];
+    }
+
+    /// Set the text. No-op (no notifications) when unchanged. Rejects text
+    /// over `max_len` with error.TextTooLong — the old value stands.
+    /// `new_text` may borrow this signal's own buffer (a `peek()` subslice —
+    /// e.g. set(peek()[1..]) removes the first character): the bytes are
+    /// moved in place before the length/sentinel are updated.
+    pub fn set(self: *TextSignal, new_text: []const u8) error{TextTooLong}!void {
+        if (new_text.len > max_len) return error.TextTooLong;
+        if (std.mem.eql(u8, self.buf.items, new_text)) return;
+        // Borrowed-slice update: new_text overlaps our storage — a clear or
+        // realloc would invalidate it before the copy. Move it down in place
+        // instead (dest starts at the buffer head, before src: copyForwards).
+        const buf_start = @intFromPtr(self.buf.items.ptr);
+        const buf_end = buf_start + self.buf.items.len;
+        const src_start = @intFromPtr(new_text.ptr);
+        if (new_text.len > 0 and src_start < buf_end and src_start + new_text.len > buf_start) {
+            std.mem.copyForwards(u8, self.buf.items[0..new_text.len], new_text);
+            self.buf.items.len = new_text.len;
+            // capacity already covers len+1 (it covered the longer old text).
+            self.buf.items.len += 1;
+            self.buf.items[new_text.len] = 0;
+            self.buf.items.len -= 1;
+            self.base.notify();
+            return;
+        }
+        self.buf.clearRetainingCapacity();
+        self.buf.ensureTotalCapacity(new_text.len + 1) catch @panic("klaxon: out of memory");
+        self.buf.appendSlice(new_text) catch @panic("klaxon: out of memory");
+        self.buf.items.len += 1;
+        self.buf.items[new_text.len] = 0;
+        self.buf.items.len -= 1;
+        self.base.notify();
+    }
+
+    /// Force-notify subscribers even when the text is unchanged (hot reload:
+    /// the underlying data changed, not the bytes).
+    pub fn notify(self: *TextSignal) void {
+        self.base.notify();
+    }
+
+    pub fn subscribe(self: *TextSignal, sub: Subscriber) void {
+        self.base.subscribe(sub);
+    }
+
+    pub fn unsubscribe(self: *TextSignal, sub: Subscriber) void {
+        self.base.unsubscribe(sub);
+    }
+
+    pub fn deinit(self: *TextSignal) void {
+        // Nodes unsubscribe in their own deinit, which always runs first.
+        self.buf.deinit();
+        self.base.deinit();
+        self.base.allocator.destroy(self);
+    }
+};
+
 // --- Effect — runs a fn ptr, re-runs when any dependency changes ---
 
 pub const Effect = struct {
@@ -487,4 +591,67 @@ test "memo caches the computed value until a dependency changes" {
     test_sig_a.set(4);
     try std.testing.expectEqual(@as(u32, 2), memo_calls);
     try std.testing.expectEqual(@as(u32, 8), memo.get());
+}
+
+test "text signal: growable, null-terminated, dedup on equal content" {
+    const sig = try TextSignal.init(std.testing.allocator, "hello");
+    defer sig.deinit();
+    try std.testing.expectEqualStrings("hello", sig.get());
+    // past the old 255-byte mirror cap: 300 bytes + a CJK string round-trip
+    const cjk = "こんにちは世界";
+    var long_buf: [300 + cjk.len]u8 = undefined;
+    @memset(&long_buf, 'a');
+    @memcpy(long_buf[300..], cjk);
+    const long = long_buf[0..];
+    try sig.set(long);
+    try std.testing.expectEqualStrings(long, sig.peek());
+    try std.testing.expectEqual(@as(u8, 0), sig.buf.items.ptr[sig.buf.items.len]); // sentinel
+    try std.testing.expectEqual(@as(u64, 1), sig.base.version);
+    var fired: u32 = 0;
+    sig.subscribe(.{ .callback = .{ .fn_ptr = testCallback, .userdata = &fired } });
+    try sig.set(long); // unchanged → no notify
+    try std.testing.expectEqual(@as(u64, 1), sig.base.version);
+    try sig.set("world");
+    try std.testing.expectEqual(@as(u32, 1), fired);
+    try std.testing.expectEqualStrings("world", sig.get());
+    sig.unsubscribe(.{ .callback = .{ .fn_ptr = testCallback, .userdata = &fired } });
+}
+
+test "text signal: input over max_len is rejected, not truncated" {
+    const sig = try TextSignal.init(std.testing.allocator, "keep me");
+    defer sig.deinit();
+    const huge = try std.testing.allocator.alloc(u8, TextSignal.max_len + 1);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    try std.testing.expectError(error.TextTooLong, sig.set(huge));
+    try std.testing.expectEqualStrings("keep me", sig.peek()); // the old value stands
+    try std.testing.expectError(error.TextTooLong, TextSignal.init(std.testing.allocator, huge));
+}
+
+test "text signal: set from a borrowed subslice of peek() (in-place edit)" {
+    const sig = try TextSignal.init(std.testing.allocator, "abcdef");
+    defer sig.deinit();
+    // remove the first character — the slice borrows the signal's own buffer
+    try sig.set(sig.peek()[1..]);
+    try std.testing.expectEqualStrings("bcdef", sig.peek());
+    // prefix slice: keep the first 3 chars
+    try sig.set(sig.peek()[0..3]);
+    try std.testing.expectEqualStrings("bcd", sig.peek());
+    // middle slice
+    try sig.set(sig.peek()[1..2]);
+    try std.testing.expectEqualStrings("c", sig.peek());
+    // the sentinel still terminates the buffer
+    try std.testing.expectEqual(@as(u8, 0), sig.buf.items.ptr[sig.buf.items.len]);
+}
+
+test "text signal: set from a borrowed subslice across a capacity realloc" {
+    const sig = try TextSignal.init(std.testing.allocator, "");
+    defer sig.deinit();
+    // grow the buffer past its initial capacity, then shrink via a subslice —
+    // the source must survive any realloc of the backing store
+    const big = "abcdefghijklmnopqrstuvwxyz0123456789";
+    try sig.set(big ++ big ++ big);
+    try std.testing.expectEqual(@as(usize, big.len * 3), sig.peek().len);
+    try sig.set(sig.peek()[big.len .. big.len * 2]);
+    try std.testing.expectEqualStrings(big, sig.peek());
 }

@@ -44,7 +44,6 @@ const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
-const text_field_w = @import("text_field.zig"); // TextBuf + bufFromText
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -54,10 +53,6 @@ const Size = ui.layout.Size;
 const Color = ui.paint.Color;
 const Callback = ui.state.Callback;
 const Theme = theme_mod.Theme;
-
-/// Re-exported so the registry/designer share one text-buffer type.
-pub const TextBuf = text_field_w.TextBuf;
-pub const bufFromText = text_field_w.bufFromText;
 
 pub const SearchBarOptions = struct {
     enabled: bool = true,
@@ -83,9 +78,10 @@ const SearchBarState = struct {
     buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
     placeholder: [:0]const u8, // owned
     opts: SearchBarOptions,
-    /// Live text mirror (registry/designer): the widget sets it on edit; an
-    /// external set replaces the buffer (two-way).
-    sig: ?*ui.state.Signal(TextBuf) = null,
+    /// Live text channel (registry/designer): the widget sets it on edit; an
+    /// external set replaces the buffer (two-way). Growable + owned by the
+    /// signal — never truncates, never dangles after the widget is gone.
+    sig: ?*ui.state.TextSignal = null,
     on_changed: ?Callback = null,
     on_submitted: ?Callback = null,
     hovered: bool = false,
@@ -359,7 +355,8 @@ fn applyEdit(n: *Node, s: *SearchBarState) void {
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
     ui.semantics.notifyControlChanged(n); // a11y: the control's value changed
-    if (s.sig) |sig| sig.set(bufFromText(s.buf.items)); // the live mirror
+    // The buffer is already bounded by the 1 MiB input cap → set cannot fail.
+    if (s.sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
     if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
 }
 
@@ -375,6 +372,10 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.kind) {
         .text_input => {
+            // Reject (never truncate) input that would grow the text past
+            // the documented cap — a paste/IME burst is applied whole or
+            // not at all.
+            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
             s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
             s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
             setSentinel(&s.buf);
@@ -409,21 +410,17 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
 }
 
 /// An external signal set (the designer): replace the buffer when the text
-/// differs. The comparison runs against the MIRROR of the current buffer
-/// (the signal channel caps at 255 bytes): the widget's own sets round-trip
-/// as no-ops even when the buffer exceeds the mirror (Signal.set dedups
-/// only exact values — a truncated mirror of a long buffer would otherwise
-/// feed back and truncate the buffer).
+/// differs. The signal holds the full text, so the comparison runs against
+/// the buffer itself — the widget's own sets round-trip as no-ops (the
+/// signal dedups equal content).
 fn searchBarSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
-    const inc_len = std.mem.indexOfScalar(u8, &incoming, 0) orelse incoming.len;
-    const cur_mirror = bufFromText(s.buf.items);
-    const cur_len = std.mem.indexOfScalar(u8, &cur_mirror, 0) orelse cur_mirror.len;
-    if (std.mem.eql(u8, cur_mirror[0..cur_len], incoming[0..inc_len])) return;
+    if (std.mem.eql(u8, s.text(), incoming)) return;
     s.buf.clearRetainingCapacity();
-    s.buf.appendSlice(incoming[0..inc_len]) catch @panic("klaxon: out of memory");
+    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
     n.markLayoutDirty();
     n.markDirty();
@@ -452,8 +449,14 @@ const search_bar_vtable = ui.node.VTable{
 /// `opts.initial`; non-null → the text mirrors the signal both ways.
 /// `on_changed` fires on every edit (including the clear button);
 /// `on_submitted` on Enter. The bar is a leaf: it owns its text buffer and
-/// paints all of its chrome.
-pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(TextBuf), on_changed: ?Callback, on_submitted: ?Callback, opts: SearchBarOptions) !*Node {
+/// paints all of its chrome. Text is growable up to
+/// ui.state.TextSignal.max_len (1 MiB); over-cap initial text is REJECTED
+/// (error.TextTooLong), never truncated.
+pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_changed: ?Callback, on_submitted: ?Callback, opts: SearchBarOptions) !*Node {
+    // Rejected up front: over the documented cap → error.TextTooLong (never
+    // truncated). Checked before any allocation so nothing needs freeing.
+    const initial: []const u8 = if (sig) |sg| sg.peek() else opts.initial;
+    if (initial.len > ui.state.TextSignal.max_len) return error.TextTooLong;
     const node = try Node.create(allocator, &search_bar_vtable);
     errdefer node.allocator.destroy(node); // no state yet
     const placeholder = try dupeZ(allocator, opts.placeholder);
@@ -477,10 +480,6 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(TextBuf), 
         allocator.free(s.placeholder);
         s.buf.deinit();
     }
-    const initial: []const u8 = if (sig) |sg| blk: {
-        const v = sg.peek();
-        break :blk v[0..(std.mem.indexOfScalar(u8, &v, 0) orelse v.len)];
-    } else opts.initial;
     s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
         s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
@@ -508,16 +507,19 @@ pub fn text(n: *Node) [:0]const u8 {
 }
 
 /// Replace the text (the gallery restores entries across theme rebuilds).
+/// Over-cap text is rejected: the bar keeps its current contents.
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
+    if (str.len > ui.state.TextSignal.max_len) return;
     s.buf.clearRetainingCapacity();
+    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
     ui.semantics.notifyControlChanged(n);
-    if (s.sig) |sig| sig.set(bufFromText(s.buf.items));
+    if (s.sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
 }
 
 // --- tests ---
@@ -602,7 +604,7 @@ test "search_bar: click focuses; typing appends; backspace/enter/escape; the cle
 }
 
 test "search_bar: the signal mirrors the text both ways" {
-    const sig = try ui.state.Signal(TextBuf).init(std.testing.allocator, bufFromText("Ada"));
+    const sig = try ui.state.TextSignal.init(std.testing.allocator, "Ada");
     defer sig.deinit();
     const b = try searchBar(std.testing.allocator, sig, null, null, .{});
     defer b.deinit();
@@ -613,12 +615,29 @@ test "search_bar: the signal mirrors the text both ways" {
     defer input.setCurrent(null);
     router.dispatchPointer(b, .{ .phase = .down, .x = 180, .y = 28, .raw_x = 180, .raw_y = 28 });
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "!" });
-    const v = sig.peek();
-    try std.testing.expectEqualStrings("Ada!", v[0..(std.mem.indexOfScalar(u8, &v, 0).?)]); // the widget sets the signal
+    try std.testing.expectEqualStrings("Ada!", sig.peek()); // the widget sets the signal
     // an external set replaces the buffer
-    sig.set(bufFromText("Bob"));
+    try sig.set("Bob");
     try std.testing.expectEqualStrings("Bob", text(b));
     try std.testing.expectEqualStrings("Bob", b.semantics.?.value);
+}
+
+test "search_bar: input over the 1 MiB cap is rejected, not truncated" {
+    const b = try searchBar(std.testing.allocator, null, null, null, .{});
+    defer b.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    router.focus(b);
+    const huge = try std.testing.allocator.alloc(u8, ui.state.TextSignal.max_len + 1);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = huge }); // dropped whole
+    try std.testing.expectEqual(@as(usize, 0), text(b).len);
+    setText(b, huge); // setText over the cap keeps the current text
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "ok" });
+    try std.testing.expectEqualStrings("ok", text(b));
+    try std.testing.expectError(error.TextTooLong, searchBar(std.testing.allocator, null, null, null, .{ .initial = huge }));
 }
 
 test "search_bar: RTL mirrors the chrome (the search icon moves to the end side)" {

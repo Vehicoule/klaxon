@@ -439,7 +439,8 @@ fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
 fn sliderSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(SliderState, n);
-    const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{s.sig.peek() * 100}) catch return;
+    // Clamped like the M3E slider — an out-of-range signal stays formattable.
+    const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(s.sig.peek(), 0, 1) * 100}) catch return;
     s.value_len = str.len;
     if (n.semantics) |sem| sem.value = s.value_buf[0..s.value_len];
     n.markDirty();
@@ -572,6 +573,10 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(TextFieldState, n);
     switch (ev.kind) {
         .text_input => {
+            // Reject (never truncate) input that would grow the text past
+            // the documented cap — a paste/IME burst is applied whole or
+            // not at all.
+            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
             s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
             s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
             setSentinel(&s.buf);
@@ -625,6 +630,9 @@ const text_field_vtable = ui.node.VTable{
 };
 
 pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_changed: ?Callback, on_submitted: ?Callback) !*Node {
+    // Rejected up front: over the documented cap → error.TextTooLong (never
+    // truncated). Checked before any allocation so nothing needs freeing.
+    if (opts.initial.len > ui.state.TextSignal.max_len) return error.TextTooLong;
     const node = try Node.create(allocator, &text_field_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(TextFieldState);

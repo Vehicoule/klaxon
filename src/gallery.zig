@@ -72,9 +72,8 @@ const snackbar_w = widgets.snackbar;
 pub const WINDOW_W: i32 = 960;
 pub const WINDOW_H: i32 = 640;
 
-/// Fixed-capacity status line (gestures / echo / dropdown), null-terminated.
-pub const StatusBuf = [96]u8;
-
+/// The status lines (gestures / echo / dropdown pick) ride growable
+/// TextSignals — no fixed capacity.
 const dropdown_items = [_][]const u8{ "Alpha", "Beta", "Gamma" };
 const radio_labels = [_][]const u8{ "One", "Two", "Three" };
 
@@ -167,7 +166,7 @@ pub const Gallery = struct {
     split_press: *state.Signal(u32), // the split button's leading counter
     split_trail: *state.Signal(u32), // the split button's trailing counter
     // the search bar + navigation rails' signals (M3E sections, 2d.3 PR D4)
-    sb_text: *state.Signal(search_bar_w.TextBuf), // the search bar's text
+    sb_text: *state.TextSignal, // the search bar's text (growable, owned)
     sb_change: *state.Signal(u32), // the search bar's change counter
     sb_submit: *state.Signal(u32), // the search bar's submit (Enter) counter
     nr_selected: *state.Signal(usize), // the collapsed rail's selection
@@ -205,9 +204,9 @@ pub const Gallery = struct {
     pulse_sig: *state.Signal(Color),
     offset_sig: *state.Signal(anim_w.Offset),
     scale_sig: *state.Signal(f32),
-    status_sig: *state.Signal(StatusBuf),
-    echo_sig: *state.Signal(StatusBuf),
-    pick_sig: *state.Signal(StatusBuf),
+    status_sig: *state.TextSignal,
+    echo_sig: *state.TextSignal,
+    pick_sig: *state.TextSignal,
     nav_selected: *state.Signal(usize),
     tabs_selected: *state.Signal(usize),
     drawer_open: *state.Signal(bool),
@@ -218,19 +217,16 @@ pub const Gallery = struct {
     refs: Refs,
     // Transient widget state captured before a theme rebuild and restored
     // after it (a theme switch must not lose typed text, selections or
-    // scroll positions).
-    saved_tf: [128]u8 = std.mem.zeroes([128]u8),
-    saved_tf_len: usize = 0,
+    // scroll positions). Text is saved in growable buffers — entries of any
+    // length round-trip untruncated.
+    saved_tf: std.array_list.Managed(u8),
     saved_dd: usize = 0,
     saved_scroll: f32 = 0,
     saved_list: f32 = 0,
     saved_grid: f32 = 0,
     // the M3E text fields' entries (restored across theme switches)
-    saved_tf_m3e: [5][256]u8 = std.mem.zeroes([5][256]u8),
-    saved_tf_m3e_lens: [5]usize = std.mem.zeroes([5]usize),
-    // the M3E search bar's entry (restored across theme switches at FULL
-    // length — the TextBuf signal mirror caps at 255 bytes, so the saved
-    // copy is an owned buffer, not a fixed array)
+    saved_tf_m3e: [5]std.array_list.Managed(u8),
+    // the M3E search bar's entry (restored across theme switches)
     saved_sb: std.array_list.Managed(u8),
 
     /// Heap-allocated: the tree holds pointers into the Gallery (item
@@ -242,16 +238,19 @@ pub const Gallery = struct {
         g.allocator = allocator;
         g.tree = null; // no tree yet (undefined would NOT pick up the default)
         g.on_platform_changed = null; // same: undefined would NOT pick up the default
-        g.saved_tf = std.mem.zeroes([128]u8);
-        g.saved_tf_len = 0;
+        g.saved_tf = std.array_list.Managed(u8).init(allocator);
+        errdefer g.saved_tf.deinit();
         g.saved_dd = 0;
         g.saved_scroll = 0;
         g.saved_list = 0;
         g.saved_grid = 0;
-        g.saved_tf_m3e = std.mem.zeroes([5][256]u8);
-        g.saved_tf_m3e_lens = std.mem.zeroes([5]usize);
+        g.saved_tf_m3e = undefined;
+        for (&g.saved_tf_m3e) |*b| b.* = std.array_list.Managed(u8).init(allocator);
         g.saved_sb = std.array_list.Managed(u8).init(allocator);
-        errdefer g.saved_sb.deinit();
+        errdefer {
+            for (&g.saved_tf_m3e) |*b| b.deinit();
+            g.saved_sb.deinit();
+        }
         g.dark_mode = try state.Signal(bool).init(allocator, true);
         errdefer g.dark_mode.deinit();
         // one function-scope errdefer frees the signals initialized so far
@@ -306,7 +305,7 @@ pub const Gallery = struct {
         errdefer g.split_press.deinit();
         g.split_trail = try state.Signal(u32).init(allocator, 0);
         errdefer g.split_trail.deinit();
-        g.sb_text = try state.Signal(search_bar_w.TextBuf).init(allocator, search_bar_w.bufFromText(""));
+        g.sb_text = try state.TextSignal.init(allocator, "");
         errdefer g.sb_text.deinit();
         g.sb_change = try state.Signal(u32).init(allocator, 0);
         errdefer g.sb_change.deinit();
@@ -375,11 +374,11 @@ pub const Gallery = struct {
         errdefer g.offset_sig.deinit();
         g.scale_sig = try state.Signal(f32).init(allocator, 1);
         errdefer g.scale_sig.deinit();
-        g.status_sig = try state.Signal(StatusBuf).init(allocator, std.mem.zeroes(StatusBuf));
+        g.status_sig = try state.TextSignal.init(allocator, "");
         errdefer g.status_sig.deinit();
-        g.echo_sig = try state.Signal(StatusBuf).init(allocator, std.mem.zeroes(StatusBuf));
+        g.echo_sig = try state.TextSignal.init(allocator, "");
         errdefer g.echo_sig.deinit();
-        g.pick_sig = try state.Signal(StatusBuf).init(allocator, std.mem.zeroes(StatusBuf));
+        g.pick_sig = try state.TextSignal.init(allocator, "");
         errdefer g.pick_sig.deinit();
         g.nav_selected = try state.Signal(usize).init(allocator, 0);
         errdefer g.nav_selected.deinit();
@@ -417,18 +416,17 @@ pub const Gallery = struct {
         const had_tree = g.tree != null;
         if (had_tree) {
             const tf_text = input_w.textFieldText(g.refs.text_field);
-            g.saved_tf_len = @min(tf_text.len, g.saved_tf.len - 1);
-            @memcpy(g.saved_tf[0..g.saved_tf_len], tf_text[0..g.saved_tf_len]);
+            g.saved_tf.clearRetainingCapacity();
+            g.saved_tf.appendSlice(tf_text) catch @panic("klaxon: out of memory");
             g.saved_dd = input_w.dropdownSelected(g.refs.dropdown);
             g.saved_scroll = widgets.scroll_view.scrollOffset(g.refs.scroll_view);
             g.saved_list = widgets.list_view.scrollOffset(g.refs.list_10k);
             g.saved_grid = widgets.grid_view.scrollOffset(g.refs.grid);
             for (g.refs.tf_m3e, 0..) |tf, i| {
                 const txt = text_field_w.text(tf);
-                g.saved_tf_m3e_lens[i] = @min(txt.len, g.saved_tf_m3e[i].len - 1);
-                @memcpy(g.saved_tf_m3e[i][0..g.saved_tf_m3e_lens[i]], txt[0..g.saved_tf_m3e_lens[i]]);
+                g.saved_tf_m3e[i].clearRetainingCapacity();
+                g.saved_tf_m3e[i].appendSlice(txt) catch @panic("klaxon: out of memory");
             }
-            // the search bar's full text (the signal mirror caps at 255)
             g.saved_sb.clearRetainingCapacity();
             g.saved_sb.appendSlice(search_bar_w.text(g.refs.sb_m3e)) catch @panic("klaxon: out of memory");
         }
@@ -480,6 +478,8 @@ pub const Gallery = struct {
         g.seg_change.deinit();
         g.split_press.deinit();
         g.split_trail.deinit();
+        g.saved_tf.deinit();
+        for (&g.saved_tf_m3e) |*b| b.deinit();
         g.saved_sb.deinit();
         g.sb_text.deinit();
         g.sb_change.deinit();
@@ -691,11 +691,11 @@ fn buildInputSection(g: *Gallery, theme: Theme) !*Node {
         .hint = theme.colors.on_surface_variant,
         .bg = theme.colors.surface_container_high,
         .placeholder = "Type here...",
-        .initial = g.saved_tf[0..g.saved_tf_len], // restored across theme switches
+        .initial = g.saved_tf.items, // restored across theme switches (any length)
     }, .{ .fn_ptr = echoCb, .userdata = g }, null);
     g.refs.text_field = tf;
     r5.add(tf);
-    r5.add(try text_w.BoundText(StatusBuf).text(a, g.echo_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    r5.add(try text_w.BoundText([:0]const u8).text(a, g.echo_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     col.add(r5);
     // Dropdown + picked item
     const r6 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
@@ -707,7 +707,7 @@ fn buildInputSection(g: *Gallery, theme: Theme) !*Node {
     }, .{ .fn_ptr = pickCb, .userdata = g });
     g.refs.dropdown = dd;
     r6.add(dd);
-    r6.add(try text_w.BoundText(StatusBuf).text(a, g.pick_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    r6.add(try text_w.BoundText([:0]const u8).text(a, g.pick_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     col.add(r6);
     return col;
 }
@@ -867,7 +867,7 @@ fn buildTextFieldsSection(g: *Gallery, theme: Theme) !*Node {
     for (&specs, 0..) |*spec, i| {
         // the entry is restored across theme switches (disabled fields keep
         // their fixed initial — they are never edited)
-        if (spec.enabled) spec.initial = g.saved_tf_m3e[i][0..g.saved_tf_m3e_lens[i]];
+        if (spec.enabled) spec.initial = g.saved_tf_m3e[i].items; // restored whole
         const f = try text_field_w.textField(a, null, null, null, spec.*);
         g.refs.tf_m3e[i] = f;
         col.add(f);
@@ -982,8 +982,8 @@ fn buildSearchBarSection(g: *Gallery, theme: Theme) !*Node {
     const col = try layout.column(a, .{ .gap = 8 });
     const sb = try search_bar_w.searchBar(a, g.sb_text, .{ .fn_ptr = sbChangeCb, .userdata = g }, .{ .fn_ptr = sbSubmitCb, .userdata = g }, .{ .placeholder = "Search songs, videos, books…", .theme = theme });
     g.refs.sb_m3e = sb;
-    // restore the entry captured before a theme rebuild (full length — the
-    // signal mirror caps at 255 bytes; setText also re-mirrors the signal)
+    // restore the entry captured before a theme rebuild (any length —
+    // setText re-mirrors the growable signal)
     if (g.saved_sb.items.len > 0) search_bar_w.setText(sb, g.saved_sb.items);
     col.add(sb);
     const row = try layout.row(a, .{ .gap = 8, .cross_align = .center });
@@ -1446,7 +1446,7 @@ fn buildGestureSection(g: *Gallery, theme: Theme) !*Node {
     const box = try layout.constrainedBox(a, .{ .min_h = 96 });
     box.add(det);
     col.add(box);
-    col.add(try text_w.BoundText(StatusBuf).text(a, g.status_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface }));
+    col.add(try text_w.BoundText([:0]const u8).text(a, g.status_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface }));
     return col;
 }
 
@@ -1860,55 +1860,53 @@ fn gRotate(userdata: ?*anyopaque, delta: f32) void {
     statusSet(galleryOf(userdata).status_sig, std.fmt.bufPrint(&buf, "rotate {d:.2} rad", .{delta}) catch "rotate");
 }
 
-fn statusSet(sig: *state.Signal(StatusBuf), str: []const u8) void {
-    var buf: StatusBuf = std.mem.zeroes(StatusBuf);
-    const n = @min(str.len, buf.len - 1);
-    @memcpy(buf[0..n], str[0..n]);
-    sig.set(buf);
+fn statusSet(sig: *state.TextSignal, str: []const u8) void {
+    // Any length lands whole; a status over the 1 MiB cap keeps the last one.
+    sig.set(str) catch {};
 }
 
-// --- BoundText formatters ---
+// --- BoundText formatters (null = the scratch is too small → the widget retries bigger) ---
 
-fn fmtPress(v: u32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Pressed {d} times", .{v}) catch "Pressed";
+fn fmtPress(v: u32, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Pressed {d} times", .{v}) catch null;
 }
-fn fmtRadio(v: u32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Selected: {d}", .{v + 1}) catch "Selected";
+fn fmtRadio(v: u32, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Selected: {d}", .{v + 1}) catch null;
 }
-fn fmtSlider(v: f32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{d:.2}", .{v}) catch "?";
+fn fmtSlider(v: f32, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{d:.2}", .{v}) catch null;
 }
-fn fmtMode(v: bool, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s} mode", .{if (v) "Dark" else "Light"}) catch "mode";
+fn fmtMode(v: bool, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s} mode", .{if (v) "Dark" else "Light"}) catch null;
 }
-fn fmtDensity(v: bool, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s} density", .{if (v) "Desktop" else "Mobile"}) catch "density";
+fn fmtDensity(v: bool, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s} density", .{if (v) "Desktop" else "Mobile"}) catch null;
 }
-fn fmtNavSel(v: usize, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "NavBar selected: {d}", .{v}) catch "NavBar";
+fn fmtNavSel(v: usize, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "NavBar selected: {d}", .{v}) catch null;
 }
-fn fmtTabsSel(v: usize, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Tabs selected: {d}", .{v}) catch "Tabs";
+fn fmtTabsSel(v: usize, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Tabs selected: {d}", .{v}) catch null;
 }
-fn fmtDrawerOpen(v: bool, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Drawer {s}", .{if (v) "open" else "closed"}) catch "Drawer";
-}
-
-fn fmtRefreshing(v: bool, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Refreshing {s}", .{if (v) "yes" else "no"}) catch "Refreshing";
+fn fmtDrawerOpen(v: bool, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Drawer {s}", .{if (v) "open" else "closed"}) catch null;
 }
 
-fn fmtProgress(v: f32, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Progress {d:.2}", .{v}) catch "Progress";
+fn fmtRefreshing(v: bool, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Refreshing {s}", .{if (v) "yes" else "no"}) catch null;
 }
 
-fn fmtOptDay(v: ?i64, buf: []u8) []const u8 {
+fn fmtProgress(v: f32, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "Progress {d:.2}", .{v}) catch null;
+}
+
+fn fmtOptDay(v: ?i64, buf: []u8) ?[]const u8 {
     if (v) |d| {
         var dbuf: [32]u8 = undefined;
         const s = date_picker_w.formatDay(d, &dbuf);
-        return std.fmt.bufPrint(buf, "{s}", .{s}) catch "?";
+        return std.fmt.bufPrint(buf, "{s}", .{s}) catch null;
     }
-    return std.fmt.bufPrint(buf, "none", .{}) catch "none";
+    return std.fmt.bufPrint(buf, "none", .{}) catch null;
 }
 
 fn dpOkCb(userdata: ?*anyopaque) void {
@@ -1921,11 +1919,11 @@ fn tpOkCb(userdata: ?*anyopaque) void {
     g.tp_ok.set(g.tp_ok.peek() + 1);
 }
 
-fn fmtTime(v: i32, buf: []u8) []const u8 {
+fn fmtTime(v: i32, buf: []u8) ?[]const u8 {
     var b: [24]u8 = undefined;
     // 12h + AM/PM — the same format the picker displays (and its a11y value)
     const s = time_picker_w.formatTime(v, false, &b);
-    return std.fmt.bufPrint(buf, "{s}", .{s}) catch "?";
+    return std.fmt.bufPrint(buf, "{s}", .{s}) catch null;
 }
 
 fn cpChangedCb(userdata: ?*anyopaque) void {
@@ -1933,15 +1931,15 @@ fn cpChangedCb(userdata: ?*anyopaque) void {
     g.cp_changed.set(g.cp_changed.peek() + 1);
 }
 
-fn fmtColorHex(v: u32, buf: []u8) []const u8 {
+fn fmtColorHex(v: u32, buf: []u8) ?[]const u8 {
     var hexbuf: [8]u8 = undefined;
     const s = color_picker_w.colorToHex(v, &hexbuf);
-    return std.fmt.bufPrint(buf, "{s}", .{s}) catch "?";
+    return std.fmt.bufPrint(buf, "{s}", .{s}) catch null;
 }
-fn fmtStatus(v: StatusBuf, buf: []u8) []const u8 {
-    const s = std.mem.sliceTo(&v, 0);
-    @memcpy(buf[0..s.len], s);
-    return buf[0..s.len];
+fn fmtStatus(v: [:0]const u8, buf: []u8) ?[]const u8 {
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return buf[0..v.len];
 }
 
 // --- tests ---
@@ -2302,8 +2300,7 @@ test "gallery: the M3E search bar takes focus, accepts text, submits and clears"
     // type: the text mirrors the signal, the change counter fires
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "Hi" });
     try std.testing.expectEqualStrings("Hi", search_bar_w.text(sb));
-    const v = g.sb_text.peek();
-    try std.testing.expectEqualStrings("Hi", v[0..(std.mem.indexOfScalar(u8, &v, 0).?)]); // the signal round-trips
+    try std.testing.expectEqualStrings("Hi", g.sb_text.peek()); // the signal round-trips
     try std.testing.expectEqual(@as(u32, 1), g.sb_change.peek());
     // Enter submits
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
@@ -2316,7 +2313,7 @@ test "gallery: the M3E search bar takes focus, accepts text, submits and clears"
     try std.testing.expectEqual(@as(u32, 2), g.sb_change.peek());
     try std.testing.expect(input_mod.isFocused(sb)); // the focus is kept
     // the external signal replaces the text
-    g.sb_text.set(search_bar_w.bufFromText("Ada"));
+    try g.sb_text.set("Ada");
     try std.testing.expectEqualStrings("Ada", search_bar_w.text(sb));
     try std.testing.expectEqualStrings("Ada", sb.semantics.?.value);
 }
@@ -2334,16 +2331,17 @@ test "gallery: the M3E search bar's entry survives a theme switch at full length
     const sy = widgets.scroll_view.scrollOffset(sv);
     const b = sb.bounds;
     router.dispatchPointer(g.root, .{ .phase = .down, .x = b.x + 100, .y = b.y + b.h / 2 - sy, .raw_x = b.x + 100, .raw_y = b.y + b.h / 2 - sy });
-    // type a query LONGER than the 255-byte signal mirror
+    // type a query LONGER than the old 255-byte fixed buffer cap
     var buf: [300]u8 = undefined;
     @memset(&buf, 'a');
     _ = router.dispatchKey(.{ .kind = .text_input, .text = &buf });
     try std.testing.expectEqual(@as(usize, 300), search_bar_w.text(sb).len);
+    try std.testing.expectEqual(@as(usize, 300), g.sb_text.peek().len); // the signal holds it too
     // toggle the theme (the header sits above the scroll content)
     const t = g.refs.theme_toggle.bounds;
     router.dispatchPointer(g.root, .{ .phase = .down, .x = t.x + t.w / 2, .y = t.y + t.h / 2 });
     router.dispatchPointer(g.root, .{ .phase = .up, .x = t.x + t.w / 2, .y = t.y + t.h / 2 });
-    // the full entry survived the rebuild (not truncated to the mirror's 255)
+    // the full entry survived the rebuild (untruncated)
     const txt = search_bar_w.text(g.refs.sb_m3e);
     try std.testing.expectEqual(@as(usize, 300), txt.len);
     try std.testing.expect(txt[0] == 'a' and txt[299] == 'a');
