@@ -450,7 +450,20 @@ pub const FocusManager = struct {
     /// on purpose: the deepest child (e.g. a Button's Text) would receive
     /// the event with child-local coordinates.
     fn activateNode(fm: *FocusManager, node: *Node) void {
-        _ = fm;
+        // Dispatch through the router like a real tap (kx_a11y_activate_node
+        // does the same): each phase re-hit-tests, so a .down handler that
+        // tears down its own subtree can't make the .up dereference freed
+        // nodes — the direct down+up-on-the-same-node loop did.
+        if (fm.root) |root| {
+            if (input_mod.current()) |router| {
+                const r = node.mapRectToRoot(node.bounds);
+                router.dispatchPointer(root, .{ .phase = .down, .x = r.x + r.w / 2, .y = r.y + r.h / 2 });
+                router.dispatchPointer(root, .{ .phase = .up, .x = r.x + r.w / 2, .y = r.y + r.h / 2 });
+                return;
+            }
+        }
+        // No router in context (unit tests, headless callers): synthesize
+        // down+up on the nearest pointer-handling ancestor directly.
         var n: ?*Node = node;
         while (n) |cur| {
             if (cur.vtable.on_pointer) |op| {

@@ -152,6 +152,8 @@ pub const InputRouter = struct {
     /// canceled); the notification bubbles from it, skipping `except` (the
     /// new owner — it is already driving the gesture).
     pub fn captureNode(self: *InputRouter, ev: PointerEvent, node: *Node, except: ?*Node) void {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         if (self.captureSlot(ev.pointer)) |i| {
             const prev = self.captured[i].?.node;
             self.captured[i] = .{ .pointer = ev.pointer, .node = node };
@@ -164,6 +166,8 @@ pub const InputRouter = struct {
     }
 
     pub fn dispatchPointer(self: *InputRouter, root: *Node, ev_in: PointerEvent) void {
+        node_mod.traversalBegin(); // handlers may deinit nodes — defer to sweep
+        defer node_mod.traversalEnd();
         // Events arrive in window (viewport) coordinates; keep a copy as
         // raw_* before any local-space mapping below. Drag deltas are
         // physical finger motion: a scrollable scrolling under a held
@@ -230,6 +234,8 @@ pub const InputRouter = struct {
     /// Dispatch a key event to the focused node's chain. Returns true when a
     /// node handled it (Phase 2c: the host falls back to semantic activation).
     pub fn dispatchKey(self: *InputRouter, ev: KeyEvent) bool {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         if (self.focused) |f| return sendKey(f, ev);
         return false;
     }
@@ -267,6 +273,8 @@ pub const InputRouter = struct {
     /// dismisses itself even when focus is outside it); then the registered
     /// back handler (the navigator pops). Returns true when handled.
     pub fn dispatchBack(self: *InputRouter) bool {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         if (self.focused) |f| {
             if (sendKey(f, .{ .kind = .key_down, .key = .escape })) return true;
         }
@@ -283,6 +291,8 @@ pub const InputRouter = struct {
     /// hover: nav bar / tabs track across cell gaps; a separate phase on
     /// purpose — uncaptured hover must never reach drag consumers of `.move`).
     fn updateHover(self: *InputRouter, root: *Node, x: f32, y: f32, send_move: bool) void {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         // An open popup's overflow children (a menu's item rows live outside
         // the popup's bounds) are hoverable too — without the popup-aware
         // hit-test the mouse could never hover them.
@@ -308,6 +318,8 @@ pub const InputRouter = struct {
     /// Scroll: hit-test at the pointer position, deliver to the node's
     /// chain (bubbles until a scrollable reports it handled).
     pub fn dispatchScroll(self: *InputRouter, root: *Node, ev: ScrollEvent) void {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         if (ev.pointer == 0) {
             self.last_x = ev.x;
             self.last_y = ev.y;
@@ -336,6 +348,8 @@ pub const InputRouter = struct {
     /// stays highlighted under the panel). Coordinates follow updateHover's
     /// convention: the primary pointer's last window position.
     pub fn clearHover(self: *InputRouter) void {
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         if (self.hovered) |h| {
             _ = sendPointer(h, .{ .phase = .leave, .x = self.last_x, .y = self.last_y, .raw_x = self.last_x, .raw_y = self.last_y, .pointer = 0, .time_ms = 0 });
         }
@@ -392,7 +406,7 @@ fn sendPointerExcept(node: *Node, ev: PointerEvent, except: ?*Node) bool {
     var handled = false;
     var n: ?*Node = node;
     while (n) |cur| : (n = cur.parent) {
-        if (cur == except) continue;
+        if (cur == except or cur.zombie) continue;
         if (cur.vtable.on_pointer) |h| {
             if (h(cur, ev)) {
                 handled = true;
@@ -407,6 +421,7 @@ fn sendPointerExcept(node: *Node, ev: PointerEvent, except: ?*Node) bool {
 fn sendKey(node: *Node, ev: KeyEvent) bool {
     var n: ?*Node = node;
     while (n) |cur| : (n = cur.parent) {
+        if (cur.zombie) continue;
         if (cur.vtable.on_key) |h| {
             if (h(cur, ev)) return true;
         }
@@ -418,6 +433,7 @@ fn sendKey(node: *Node, ev: KeyEvent) bool {
 fn sendScroll(node: *Node, ev: ScrollEvent) bool {
     var n: ?*Node = node;
     while (n) |cur| : (n = cur.parent) {
+        if (cur.zombie) continue;
         if (cur.vtable.on_scroll) |h| {
             if (h(cur, ev)) return true;
         }

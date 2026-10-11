@@ -108,8 +108,14 @@ pub fn syncItemWindow(
     const old_last = first.* + n.children.items.len;
     const overlaps = first.* < range.last and range.first < old_last;
     if (!overlaps) {
-        for (n.children.items) |child| child.deinit();
-        n.children.clearRetainingCapacity();
+        // Detach-then-deinit from the back — deinit() may DEFER the destroy
+        // (zombie), and the sweep's parent.detach would shift the array
+        // under a for-loop's captured slice.
+        while (n.children.items.len > 0) {
+            const child = n.children.items[n.children.items.len - 1];
+            _ = n.remove(child);
+            child.deinit();
+        }
         first.* = range.first;
     }
     // Trim items that left the window (front): destroy the child and
@@ -118,7 +124,7 @@ pub fn syncItemWindow(
     while (first.* < range.first) {
         if (n.children.items.len > 0) {
             const child = n.children.items[0];
-            _ = n.children.orderedRemove(0);
+            _ = n.remove(child); // detach then deinit — never the reverse
             child.deinit();
         }
         first.* += 1;
@@ -127,7 +133,7 @@ pub fn syncItemWindow(
     while (first.* + n.children.items.len > range.last and n.children.items.len > 0) {
         const last = n.children.items.len - 1;
         const child = n.children.items[last];
-        _ = n.children.orderedRemove(last);
+        _ = n.remove(child); // detach then deinit — never the reverse
         child.deinit();
     }
     // Items entering at the front (scrolled up): prepend.

@@ -82,10 +82,23 @@ pub const SignalBase = struct {
 
     pub fn notify(base: *SignalBase) void {
         base.version += 1;
+        // Subscribers run app/widget code that may destroy nodes — the
+        // traversal freeze defers those deinits to a safe point.
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         // Iterate a snapshot: subscribers may (un)subscribe during notify.
         const snapshot = base.allocator.dupe(Subscriber, base.subscribers.items) catch @panic("klaxon: out of memory");
         defer base.allocator.free(snapshot);
-        for (snapshot) |sub| sub.notify();
+        for (snapshot) |sub| {
+            // Revalidate: a subscriber earlier in the snapshot may have
+            // destroyed a later subscriber's node/effect — the widget
+            // deinit unsubscribes, but the STALE SNAPSHOT ENTRY still
+            // points at freed memory. Skip anything no longer subscribed.
+            const live = for (base.subscribers.items) |s| {
+                if (Subscriber.same(s, sub)) break true;
+            } else false;
+            if (live) sub.notify();
+        }
     }
 
     pub fn deinit(base: *SignalBase) void {
@@ -290,6 +303,11 @@ pub const Effect = struct {
     }
 
     fn track(effect: *Effect, base: *SignalBase) void {
+        // Reading the same signal twice in one run must not subscribe twice
+        // (a duplicate dep made the effect re-run once per duplicate entry).
+        for (effect.dependencies.items) |dep| {
+            if (dep == base) return;
+        }
         effect.dependencies.append(base) catch @panic("klaxon: out of memory");
         base.subscribe(.{ .effect = effect });
     }

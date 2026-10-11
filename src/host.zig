@@ -26,6 +26,7 @@ const anim = @import("ui/anim.zig");
 const devtools_mod = @import("devtools.zig");
 const inspector_mod = @import("inspector.zig");
 
+const node_mod = ui.node;
 const Node = ui.node.Node;
 
 /// Emscripten target (wasm32-emscripten). The rAF main loop paces the frame
@@ -579,6 +580,10 @@ pub const Host = struct {
     }
 
     fn renderFrame(host: *Host, root: *Node) void {
+        // The whole frame is a tree traversal: any widget code that deinits
+        // a node (paint hooks, layout, signal writes) defers to the sweep.
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         // Layout pass (Phase 1e): re-layout when sizes/structure changed.
         // Layout moves content, so the frame repaints fully. The pass is
         // timed separately (Phase 4a.4 frame timeline).
@@ -637,6 +642,10 @@ pub const Host = struct {
                 // Damage entirely off-surface: nothing to repaint.
                 root.clearDamage();
             } else {
+                // Clear the accumulator BEFORE painting: dirty marks raised
+                // during the paint pass (paint hooks writing signals) start
+                // next frame's damage, they aren't wiped by the tail clear.
+                root.clearDamage();
                 kx.c.kx_clip_rect(host.ctx, d.x, d.y, d.w, d.h);
                 kx.c.kx_clear(host.ctx, 0);
                 root.paint(host.ctx, d);
@@ -645,6 +654,7 @@ pub const Host = struct {
                 kx.c.kx_clip_reset(host.ctx);
             }
         } else {
+            root.clearDamage(); // same: marks during paint seed the next frame
             root.paint(host.ctx, surface);
             host.paintPopupOverlay();
             if (focus) |fm| fm.paintRing(host.ctx); // full repaint: ring included
@@ -678,7 +688,8 @@ pub const Host = struct {
         // paint_time_ms has always measured (kept for the FPS overlay and
         // the frame_overrun signal).
         host.stats.record_time_ms = @as(f32, @floatFromInt(t_paint - host.frame_start_ns)) / 1e6;
-        root.clearDamage();
+        // Damage was cleared before the paint pass — marks raised while
+        // painting are still accumulating for the next frame; do NOT wipe.
         host.present(); // fills submit_time_ms / present_time_ms (raster)
         const t1 = sdl.c.SDL_GetTicksNS();
         host.stats.frames += 1;

@@ -20,6 +20,7 @@
 //   - ADR-0009 shape: callbacks are fn ptr + userdata.
 const std = @import("std");
 const state_mod = @import("state.zig");
+const node_mod = @import("node.zig");
 
 pub const Callback = state_mod.Callback;
 
@@ -518,6 +519,10 @@ pub const Timeline = struct {
     /// tickers are compacted after the ticker pass.
     pub fn tick(tl: *Timeline, now_ms: u64) void {
         tl.last_now_ms = now_ms;
+        // Ticker/animation callbacks run widget code — a callback that
+        // destroys a node defers via the traversal freeze.
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         // Tickers (re-read the list every step: callbacks may append).
         var ti: usize = 0;
         while (ti < tl.tickers.items.len) {
