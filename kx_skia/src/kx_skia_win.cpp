@@ -471,4 +471,18 @@ const char* platform_font_family() {
 
 const char* platform_fallback_font_family() { return "Segoe UI Symbol"; }
 
+// Warmup (Phase 4e.1): stubs — per-backend offscreen surfaces (D3D12, Dawn
+// Vulkan, WGL) are future work; warmup is best-effort, so this returns
+// false until then (the host logs it and moves on).
+SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
+    (void)state;
+    (void)width;
+    (void)height;
+    return nullptr;
+}
+bool gpu_end_offscreen(GpuState* state) {
+    (void)state;
+    return false;
+}
+
 } // namespace kx
