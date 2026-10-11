@@ -1,6 +1,9 @@
 // Scenes.kt — the 9 canonical scenes (Klaxon src/bench.zig) ported to Compose,
 // the per-frame tick logic that drives them (the bench.zig SceneRunner.tick
 // analog), and the closed-form spring used by anim_100 (src/ui/anim.zig parity).
+// SceneState also carries the state for the 24 schema-v2 scenes
+// (docs/specs/bench-scenes.md) and dispatches to their ticks/composables in
+// ScenesListOps.kt / ScenesRamp.kt / ScenesStress.kt / ScenesSystem.kt.
 //
 // Scene structure, strings, sizes, colors and the tick cadence mirror bench.zig
 // as closely as Compose allows; the known non-parities are documented in
@@ -38,6 +41,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -66,6 +72,10 @@ import kotlin.math.sqrt
 
 /** Klaxon's bench background (bench.zig BG: 0x14141CFF, RRGGBBAA). */
 val BG = Color(0xFF14141C)
+
+/** The schema-v2 catalogue palette (bench-scenes.md): #7C4DFF / #03DAC6. */
+val PURPLE = Color(0xFF7C4DFF)
+val TEAL = Color(0xFF03DAC6)
 
 /** anim_100: the widget count (bench.zig ANIM_WIDGETS). */
 const val ANIM_WIDGETS = 100
@@ -126,8 +136,11 @@ private fun String.dropLastCodePoint(): String {
 /// SceneRunner analog). State is plain Compose snapshot state, so writing it in
 /// tick() invalidates the affected scopes and the next scene.render() recomposes.
 class SceneState(val scene: BenchScene) {
-    /** scroll_10k: published from composition via rememberLazyListState. */
+    /** scroll_10k / scroll_anim / backdrop_scroll: published from composition via rememberLazyListState. */
     var listState: LazyListState? = null
+
+    /** backdrop_scroll: the blurred copy of the list mirrors the scroller. */
+    var listState2: LazyListState? = null
 
     // --- anim_100: 100 widgets x (height + color) spring lanes ---
     val heights = Array(ANIM_WIDGETS) { mutableStateOf(32f) }
@@ -138,6 +151,88 @@ class SceneState(val scene: BenchScene) {
 
     // --- video_playback ---
     var videoFrame by mutableStateOf(0L)
+
+    // --- schema-v2 additions (docs/specs/bench-scenes.md) ---
+
+    /** The rendered frame index — the shared animation clock every ramp/stress
+     *  scene derives positions/phase from. Written once per tick. */
+    val animFrame = mutableLongStateOf(0L)
+
+    /** ramp: the current step's item count (set by the harness per step). */
+    val rampItemCount = mutableIntStateOf(0)
+
+    // --- list_ops (Family A) ---
+    val listRows = mutableStateListOf<ListRowModel>()
+    var listRowNextId = 0
+
+    // --- mount_churn ---
+    val churnPool = mutableStateListOf<Long>()
+    var churnNextId = 0L
+
+    /** Shared deterministic LCG for the stress family (churn victims, chart noise). */
+    var lcg = 0x2B992DD5L
+
+    // --- chart_live ---
+    val chartData = DoubleArray(CHART_POINTS)
+    var chartPhase = 0L
+
+    // --- theme_switch ---
+    var themePalette by mutableStateOf(DARK_PALETTE)
+
+    // --- input_latency ---
+    /** Set by the pointerInput handler when the injected event is delivered. */
+    var responseArrived = false
+    var responseColor by mutableStateOf(PURPLE)
+    private var requestPointerInjection = false
+
+    /** input_latency's tick arms the injection; the harness fires it once. */
+    fun requestPointerInjection() {
+        requestPointerInjection = true
+    }
+
+    fun consumePointerInjection(): Boolean {
+        val r = requestPointerInjection
+        requestPointerInjection = false
+        return r
+    }
+
+    // --- semantics_build ---
+    /** One state per node so a frame's description writes invalidate only the
+     *  rotating window's semantics (the incremental rebuild half of
+     *  "build/diff the semantics tree"). */
+    val semStates = Array(SEMANTICS_NODES) { mutableLongStateOf(0L) }
+    var semNodesSum = 0L
+    var semNodesSamples = 0L
+
+    // --- app_switch ---
+    var teardownSumMs = 0.0
+    var resumeSumMs = 0.0
+    var switchCycles = 0
+
+    fun recordSwitchCycle(teardownMs: Double, resumeMs: Double) {
+        teardownSumMs += teardownMs
+        resumeSumMs += resumeMs
+        switchCycles++
+    }
+
+    /** Scene-extras (schema v2 `extra: {}`), key -> raw JSON value fragment. */
+    val extras = LinkedHashMap<String, String>()
+
+    fun putExtra(key: String, rawJson: String) {
+        extras[key] = rawJson
+    }
+
+    init {
+        when (scene) {
+            BenchScene.LIST_CREATE_1K, BenchScene.LIST_REPLACE_1K, BenchScene.LIST_UPDATE_10TH,
+            BenchScene.LIST_SWAP_ROWS, BenchScene.LIST_REMOVE_ROW, BenchScene.LIST_CLEAR_1K,
+            -> initListOps()
+
+            BenchScene.MOUNT_CHURN -> repeat(CHURN_POOL_SIZE) { churnPool += churnNextId++ }
+            BenchScene.CHART_LIVE -> initChart()
+            else -> {}
+        }
+    }
 
     /// Per-frame scene logic, before recomposition + layout + draw.
     /// Deterministic in `frame` (bench.zig SceneRunner.tick).
@@ -200,6 +295,62 @@ class SceneState(val scene: BenchScene) {
             BenchScene.VIDEO_PLAYBACK -> {
                 videoFrame = frame // the widget regenerates its "frame" at paint
             }
+
+            // --- schema-v2 families (ScenesListOps/Ramp/Stress/System.kt) ---
+
+            BenchScene.LIST_CREATE_1K, BenchScene.LIST_REPLACE_1K, BenchScene.LIST_UPDATE_10TH,
+            BenchScene.LIST_SWAP_ROWS, BenchScene.LIST_REMOVE_ROW, BenchScene.LIST_CLEAR_1K,
+            -> tickListOps(frame, harness)
+
+            BenchScene.SHAPES_RAMP, BenchScene.PATHS_RAMP, BenchScene.TEXT_RAMP,
+            BenchScene.IMAGES_RAMP,
+            -> tickRamp(frame, harness)
+
+            BenchScene.OVERDRAW_STACK, BenchScene.ELEVATION_GRID, BenchScene.RELAYOUT_STORM,
+            BenchScene.MOUNT_CHURN, BenchScene.SCROLL_ANIM, BenchScene.TEXT_RICH,
+            BenchScene.CHART_LIVE, BenchScene.CLIP_PATH, BenchScene.THEME_SWITCH,
+            BenchScene.BACKDROP_SCROLL,
+            -> tickStress(frame, harness)
+
+            BenchScene.INPUT_LATENCY, BenchScene.POINTER_STORM, BenchScene.SEMANTICS_BUILD,
+            BenchScene.APP_SWITCH,
+            -> tickSystem(frame, harness)
+        }
+    }
+
+    /// Timed post-render work (inside the frame's timed region, after
+    /// scene.render). Only semantics_build uses it: the a11y-tree walk belongs
+    /// to the measured frame it follows.
+    fun postRender(frame: Long, harness: Harness) {
+        when (scene) {
+            BenchScene.SEMANTICS_BUILD -> postRenderSemantics(frame, harness)
+            else -> {}
+        }
+    }
+
+    /// Derive the final `extra` fields from per-frame accumulators (schema v2).
+    fun finalizeExtras() {
+        when (scene) {
+            BenchScene.SEMANTICS_BUILD -> if (semNodesSamples > 0) {
+                putExtra("nodes_per_frame", (semNodesSum / semNodesSamples).toString())
+            }
+
+            BenchScene.APP_SWITCH -> if (switchCycles > 0) {
+                putExtra("teardown_ms", fmt1(teardownSumMs / switchCycles))
+                putExtra("resume_ms", fmt1(resumeSumMs / switchCycles))
+                putExtra("switch_cycles", switchCycles.toString())
+            }
+
+            BenchScene.POINTER_STORM -> putExtra("hit_tests_per_frame", "1000")
+
+            BenchScene.INPUT_LATENCY -> {
+                // Missing optional fields serialize as null (spec: the response
+                // should always arrive, but don't drop the keys if it didn't).
+                if ("latency_frames" !in extras) putExtra("latency_frames", "null")
+                if ("latency_ms" !in extras) putExtra("latency_ms", "null")
+            }
+
+            else -> {}
         }
     }
 
@@ -215,6 +366,25 @@ class SceneState(val scene: BenchScene) {
             BenchScene.RESIZE -> ResizeScene()
             BenchScene.INPUT_IME -> InputImeScene()
             BenchScene.VIDEO_PLAYBACK -> VideoPlaybackScene()
+
+            // --- schema-v2 families ---
+            BenchScene.LIST_CREATE_1K, BenchScene.LIST_REPLACE_1K, BenchScene.LIST_UPDATE_10TH,
+            BenchScene.LIST_SWAP_ROWS, BenchScene.LIST_REMOVE_ROW, BenchScene.LIST_CLEAR_1K,
+            -> ListOpsContent()
+
+            BenchScene.SHAPES_RAMP, BenchScene.PATHS_RAMP, BenchScene.TEXT_RAMP,
+            BenchScene.IMAGES_RAMP,
+            -> RampContent()
+
+            BenchScene.OVERDRAW_STACK, BenchScene.ELEVATION_GRID, BenchScene.RELAYOUT_STORM,
+            BenchScene.MOUNT_CHURN, BenchScene.SCROLL_ANIM, BenchScene.TEXT_RICH,
+            BenchScene.CHART_LIVE, BenchScene.CLIP_PATH, BenchScene.THEME_SWITCH,
+            BenchScene.BACKDROP_SCROLL,
+            -> StressContent()
+
+            BenchScene.INPUT_LATENCY, BenchScene.POINTER_STORM, BenchScene.SEMANTICS_BUILD,
+            BenchScene.APP_SWITCH,
+            -> SystemContent()
         }
     }
 
@@ -499,7 +669,7 @@ class SceneState(val scene: BenchScene) {
 /// One list row — the bench.zig benchListItem structure: a #2A2A3E card
 /// (r6, padding 8/6) with a row (gap 8, centered) of a 14px star + "Item #N".
 @Composable
-private fun BenchListRow(index: Int, height: Dp) {
+internal fun BenchListRow(index: Int, height: Dp) {
     Card(
         modifier = Modifier.fillMaxWidth().height(height),
         shape = RoundedCornerShape(6.dp),
@@ -518,7 +688,7 @@ private fun BenchListRow(index: Int, height: Dp) {
 
 /// A 14px five-point star (Klaxon's icon.star analog) drawn as a vector path.
 @Composable
-private fun StarIcon(modifier: Modifier = Modifier) {
+internal fun StarIcon(modifier: Modifier = Modifier) {
     Canvas(modifier) {
         val path = Path()
         val cx = size.width / 2
@@ -558,7 +728,7 @@ private fun GlassCard(modifier: Modifier, tint: Color) {
 /// widgets.layout.grid is not virtualized — all children are live, and so is
 /// this port; a LazyVerticalGrid would virtualize the overflow rows away).
 @Composable
-private fun SimpleGrid(
+internal fun SimpleGrid(
     modifier: Modifier = Modifier,
     columns: Int,
     hGap: Dp,
