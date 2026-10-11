@@ -509,7 +509,9 @@ build_sdl3() {
   fi
   # Trimmed: camera/sensors are V2 platform services, SDL_GPU is unused (Skia renders).
   # Audio + haptics stay ON (v1 platform services, ADR-0005).
-  cmake -S "$src" -B "$build" "${gen_args[@]}" -DCMAKE_BUILD_TYPE=Release \
+  # gen_args[@]+... : expand only when non-empty — bash 3.2 (macOS) treats an
+  # empty "${arr[@]}" under set -u as unbound.
+  cmake -S "$src" -B "$build" ${gen_args[@]+"${gen_args[@]}"} -DCMAKE_BUILD_TYPE=Release \
     -DSDL_SHARED=OFF -DSDL_STATIC=ON \
     -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF \
     -DSDL_CAMERA=OFF -DSDL_SENSOR=OFF \
@@ -540,7 +542,7 @@ build_wamr() {
     load_msvc_env
     gen_args=(-G Ninja -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
   fi
-  cmake -S "$src/product-mini/platforms/$WAMR_PLATFORM" -B "$build" "${gen_args[@]}" \
+  cmake -S "$src/product-mini/platforms/$WAMR_PLATFORM" -B "$build" ${gen_args[@]+"${gen_args[@]}"} \
     -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_TARGET="$WAMR_TARGET" \
     -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 \
