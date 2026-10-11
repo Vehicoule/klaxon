@@ -362,11 +362,9 @@ fn addWasmWeb(
         "-DNDEBUG",
         // Disable all default include paths: zig cc adds its own musl/libc++
         // headers which conflict with the emscripten sysroot. All include paths
-        // are provided explicitly below (sysroot + c++/v1 + project headers).
+        // are provided explicitly below (compat + c++/v1 + sysroot + project
+        // headers) — the same list emcc assembles (emcc.py get_cflags).
         "-nostdinc", "-nostdinc++",
-        // Emscripten's sysroot has no xlocale.h (BSD header); tell libc++ it's
-        // absent so locale_base_api.h skips the #include <xlocale.h>.
-        "-D_LIBCPP_HAS_NO_XLOCALE",
     };
     kx_skia.root_module.addCSourceFiles(.{
         .files = &.{
@@ -380,12 +378,23 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
-    // Include path ORDER matters: emscripten's libc++ (c++/v1) must come
-    // BEFORE the sysroot C headers. libc++ wrappers (e.g. cstring) do
-    // #include <string.h> expecting to find c++/v1/string.h first (which
-    // then #include_next's the musl string.h). If sysroot/include comes
-    // first, the musl string.h is found directly and libc++ errors out
-    // ("didn't find libc++'s <string.h> header").
+    // Include path ORDER matters, and it must match what emcc itself passes
+    // to clang (emcc.py get_cflags → -iwithsysroot/include/compat, then the
+    // toolchain dirs):
+    //   1. compat/ — emscripten's BSD-compat headers musl lacks. Required:
+    //      libc++'s __locale_dir/locale_base_api.h does #include <xlocale.h>
+    //      unconditionally under __EMSCRIPTEN__, and xlocale.h only exists
+    //      in compat/ (cache/sysroot/include/compat/xlocale.h). Missing this
+    //      path is what broke the build-wasm CI job.
+    //   2. c++/v1 — emscripten's libc++ BEFORE the sysroot C headers. libc++
+    //      wrappers (e.g. cstring) do #include <string.h> expecting to find
+    //      c++/v1/string.h first (which then #include_next's the musl
+    //      string.h). If sysroot/include came first, the musl string.h would
+    //      be found directly and libc++ would error out.
+    //   3. sysroot/include — musl C headers (<emscripten.h>, <GLES3/gl32.h>).
+    // (emcc also injects include/fakesdl, but only when USE_SDL=0 — we link
+    // the real SDL3, whose headers shadow it anyway.)
+    kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/c++/v1", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(sysroot_include));
 
@@ -459,7 +468,9 @@ fn addWasmWeb(
         "-sENVIRONMENT=web",
         "-sSTACK_SIZE=1MB",
         "-sEXPORTED_FUNCTIONS=_main,_kx_a11y_dump_tree,_kx_a11y_free_string,_kx_a11y_key,_kx_a11y_root_node,_kx_a11y_text",
-        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,malloc,free",
+        // malloc/free are wasm exports the JS library calls directly (not
+        // runtime methods) — emscripten pulls them in as JS-lib deps.
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS",
         opt_flag,
     }) catch unreachable;
 

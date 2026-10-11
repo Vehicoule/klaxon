@@ -84,7 +84,9 @@ mergeInto(LibraryManager.library, {
       if (!KX_A11Y.rootNodeTried) {
         KX_A11Y.rootNodeTried = true;
         if (typeof Module !== 'undefined' && typeof Module._kx_a11y_root_node === 'function') {
-          KX_A11Y.rootNodePtr = ccall('kx_a11y_root_node', 'number', [], []);
+          // kx_a11y_root_node is u64 → arrives as BigInt; wasm32 pointers fit
+          // in a Number, and dump_tree takes i32 (BigInt args throw).
+          KX_A11Y.rootNodePtr = Number(ccall('kx_a11y_root_node', 'number', [], []));
         } else if (!KX_A11Y.warnedNoRoot) {
           KX_A11Y.warnedNoRoot = true;
           console.warn('kx_a11y: no root node export — semantic tree mirror disabled');
@@ -314,15 +316,24 @@ mergeInto(LibraryManager.library, {
   },
 
   kx_js_a11y_event__sig: 'vijiii',
-  kx_js_a11y_event__deps: ['$KX_A11Y', 'kx_a11y_event'],
-  kx_js_a11y_event: function () {
-    return kx_a11y_event.apply(null, arguments);
+  kx_js_a11y_event__deps: ['$KX_A11Y'],
+  kx_js_a11y_event: function (kind, nodeId, textPtr, textLen, region) {
+    // Standalone copy of kx_a11y_event's i64-splitting dispatch: emscripten
+    // emits the alias as _kx_js_a11y_event but does not emit a callable
+    // `kx_a11y_event` global, so delegating via apply() throws ReferenceError.
+    if (typeof nodeId !== 'bigint' && arguments.length === 6) {
+      region = arguments[5];
+      textLen = arguments[4];
+      textPtr = arguments[3];
+      nodeId = arguments[1] + arguments[2] * 4294967296;
+    }
+    KX_A11Y.dispatch(kind | 0, Number(nodeId), textPtr | 0, textLen | 0, region | 0);
   },
 
   kx_a11y_set_root__sig: 'vi',
   kx_a11y_set_root__deps: ['$KX_A11Y'],
   kx_a11y_set_root: function (ptr) {
-    KX_A11Y.rootNodePtr = ptr | 0;
+    KX_A11Y.rootNodePtr = Number(ptr) | 0; // i64 args arrive as BigInt
     KX_A11Y.rootNodeTried = true;
   },
 });

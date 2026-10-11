@@ -20,6 +20,7 @@
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSurface.h"
+#include "include/gpu/ganesh/GrBackendSurface.h"        // GrBackendRenderTarget (complete type; GrGLBackendSurface.h only fwd-declares it)
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/GrTypes.h"                 // kBottomLeft_GrSurfaceOrigin, k*_GrGLBackendState, GrSyncCpu
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"         // SkSurfaces::WrapBackendRenderTarget
