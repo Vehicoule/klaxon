@@ -398,7 +398,7 @@ const NavViewState = struct {
                     s.pages_ui.items[s.pages_ui.items.len - 1]
                 else
                     null;
-                if (top == null or pageWrapperOf(f) != top) r.focus(null);
+                if (top == null or pageWrapperOf(f) != top) input_mod.requestFocus(null);
             }
         }
     }
