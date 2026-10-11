@@ -52,7 +52,9 @@ fn optsFromArgs(args: std.process.Args) !Options {
             backend = kx.c.KX_BACKEND_GANESH_GL;
         } else if (std.mem.startsWith(u8, arg, "--ppm=")) {
             // Windows converts argv → allocated storage the iterator owns;
-            // dupe what we retain past deinit.
+            // dupe what we retain past deinit. Repeated flags: free the
+            // previous copy so each --ppm= doesn't leak one allocation.
+            if (ppm) |old| std.heap.page_allocator.free(old);
             ppm = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}", .{arg["--ppm=".len..]}, 0);
         } else if (std.mem.eql(u8, arg, "--devtools")) {
             devtools = true;
