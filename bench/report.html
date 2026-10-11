@@ -1,0 +1,250 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Klaxon benchmarks — cross-framework report</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;color:#1a1a2e;background:#fafaff}
+h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:2rem}
+table{border-collapse:collapse;margin:1rem 0} th,td{border:1px solid #d5d5e5;padding:4px 10px;text-align:right;font-size:.85rem}
+th{background:#ececf6} td:first-child,th:first-child{text-align:left}
+tr:nth-child(even){background:#f4f4fa}
+.bar{height:10px;background:#4f6ef7;border-radius:2px;display:inline-block;vertical-align:middle}
+.meta{color:#666;font-size:.8rem}
+</style></head><body>
+<h1>Klaxon benchmarks — cross-framework report</h1>
+<p class='meta'>Generated 2026-10-11T12:42:32 — 3 frameworks, 9 scenes. fps = 1000/avg frame work time (unpaced).</p>
+<h2>fps (higher is better)</h2><table><tr><th>scene</th>
+<th>flutter</th>
+<th>klaxon</th>
+<th>qt</th>
+</tr>
+<tr><td>hello</td>
+<td>2055.5 <span class='bar' style='width:12px'></span></td>
+<td>16504.6 <span class='bar' style='width:100px'></span></td>
+<td>5209.9 <span class='bar' style='width:31px'></span></td>
+</tr>
+<tr><td>scroll_10k</td>
+<td>-</td>
+<td>361.8 <span class='bar' style='width:52px'></span></td>
+<td>689.6 <span class='bar' style='width:100px'></span></td>
+</tr>
+<tr><td>text_cjk</td>
+<td>-</td>
+<td>1903.9 <span class='bar' style='width:47px'></span></td>
+<td>3985.3 <span class='bar' style='width:100px'></span></td>
+</tr>
+<tr><td>glass_blur</td>
+<td>-</td>
+<td>335.3 <span class='bar' style='width:19px'></span></td>
+<td>1752.1 <span class='bar' style='width:100px'></span></td>
+</tr>
+<tr><td>anim_100</td>
+<td>-</td>
+<td>719.1 <span class='bar' style='width:100px'></span></td>
+<td>90.4 <span class='bar' style='width:12px'></span></td>
+</tr>
+<tr><td>gallery</td>
+<td>-</td>
+<td>19.3 <span class='bar' style='width:2px'></span></td>
+<td>5433.2 <span class='bar' style='width:100px'></span></td>
+</tr>
+<tr><td>resize</td>
+<td>-</td>
+<td>428.8 <span class='bar' style='width:16px'></span></td>
+<td>2672.4 <span class='bar' style='width:100px'></span></td>
+</tr>
+<tr><td>input_ime</td>
+<td>-</td>
+<td>892.2 <span class='bar' style='width:100px'></span></td>
+<td>65.7 <span class='bar' style='width:7px'></span></td>
+</tr>
+<tr><td>video_playback</td>
+<td>-</td>
+<td>530.4 <span class='bar' style='width:23px'></span></td>
+<td>2245.6 <span class='bar' style='width:100px'></span></td>
+</tr>
+</table>
+<h2>flutter</h2>
+<p class='meta'>report: bench/results/flutter/2026-10-11T10-39-44Z.json — 2026-10-11T10:39:44Z — binary 0.13 MB</p>
+<table><tr><th>scene</th>
+<th>fps</th>
+<th>avg ms</th>
+<th>p99 ms</th>
+<th>draws</th>
+<th>rss MB</th>
+<th>ttff ms</th>
+</tr>
+<tr><td>hello</td>
+<td>2055.5</td>
+<td>0.50</td>
+<td>0.60</td>
+<td>28</td>
+<td>110.7</td>
+<td>22.8</td>
+</tr>
+</table>
+<h2>klaxon</h2>
+<p class='meta'>report: bench/results/20261011-124018.json — 2026-10-11T10:41:22Z — binary 6.58 MB</p>
+<table><tr><th>scene</th>
+<th>fps</th>
+<th>avg ms</th>
+<th>p99 ms</th>
+<th>draws</th>
+<th>rss MB</th>
+<th>ttff ms</th>
+</tr>
+<tr><td>hello</td>
+<td>16504.6</td>
+<td>0.10</td>
+<td>0.10</td>
+<td>2</td>
+<td>16.8</td>
+<td>36.3</td>
+</tr>
+<tr><td>scroll_10k</td>
+<td>361.8</td>
+<td>2.80</td>
+<td>40.10</td>
+<td>60</td>
+<td>18.0</td>
+<td>2.1</td>
+</tr>
+<tr><td>text_cjk</td>
+<td>1903.9</td>
+<td>0.50</td>
+<td>13.90</td>
+<td>6</td>
+<td>19.4</td>
+<td>2.1</td>
+</tr>
+<tr><td>glass_blur</td>
+<td>335.3</td>
+<td>3.00</td>
+<td>37.40</td>
+<td>15</td>
+<td>18.4</td>
+<td>1.2</td>
+</tr>
+<tr><td>anim_100</td>
+<td>719.1</td>
+<td>1.40</td>
+<td>24.60</td>
+<td>101</td>
+<td>18.7</td>
+<td>0.5</td>
+</tr>
+<tr><td>gallery</td>
+<td>19.3</td>
+<td>51.90</td>
+<td>114.50</td>
+<td>696</td>
+<td>36.5</td>
+<td>227.4</td>
+</tr>
+<tr><td>resize</td>
+<td>428.8</td>
+<td>2.30</td>
+<td>23.80</td>
+<td>47</td>
+<td>44.5</td>
+<td>1.5</td>
+</tr>
+<tr><td>input_ime</td>
+<td>892.2</td>
+<td>1.10</td>
+<td>21.10</td>
+<td>3</td>
+<td>45.1</td>
+<td>0.9</td>
+</tr>
+<tr><td>video_playback</td>
+<td>530.4</td>
+<td>1.90</td>
+<td>28.80</td>
+<td>3</td>
+<td>45.4</td>
+<td>1.0</td>
+</tr>
+</table>
+<h2>qt</h2>
+<p class='meta'>report: bench/results/qt/2026-10-11T10-40-43Z.json — 2026-10-11T10:40:43Z — binary 0.11 MB</p>
+<table><tr><th>scene</th>
+<th>fps</th>
+<th>avg ms</th>
+<th>p99 ms</th>
+<th>draws</th>
+<th>rss MB</th>
+<th>ttff ms</th>
+</tr>
+<tr><td>hello</td>
+<td>5209.9</td>
+<td>0.20</td>
+<td>4.40</td>
+<td>2</td>
+<td>49.4</td>
+<td>2.1</td>
+</tr>
+<tr><td>scroll_10k</td>
+<td>689.6</td>
+<td>1.50</td>
+<td>38.40</td>
+<td>50</td>
+<td>58.8</td>
+<td>3.9</td>
+</tr>
+<tr><td>text_cjk</td>
+<td>3985.3</td>
+<td>0.30</td>
+<td>0.60</td>
+<td>7</td>
+<td>68.7</td>
+<td>23.3</td>
+</tr>
+<tr><td>glass_blur</td>
+<td>1752.1</td>
+<td>0.60</td>
+<td>21.30</td>
+<td>24</td>
+<td>69.9</td>
+<td>1.1</td>
+</tr>
+<tr><td>anim_100</td>
+<td>90.4</td>
+<td>11.10</td>
+<td>53.90</td>
+<td>103</td>
+<td>72.3</td>
+<td>2.9</td>
+</tr>
+<tr><td>gallery</td>
+<td>5433.2</td>
+<td>0.20</td>
+<td>0.50</td>
+<td>316</td>
+<td>80.7</td>
+<td>53.7</td>
+</tr>
+<tr><td>resize</td>
+<td>2672.4</td>
+<td>0.40</td>
+<td>8.90</td>
+<td>42</td>
+<td>92.8</td>
+<td>2.0</td>
+</tr>
+<tr><td>input_ime</td>
+<td>65.7</td>
+<td>15.20</td>
+<td>63.50</td>
+<td>8</td>
+<td>93.3</td>
+<td>1.9</td>
+</tr>
+<tr><td>video_playback</td>
+<td>2245.6</td>
+<td>0.40</td>
+<td>2.20</td>
+<td>4</td>
+<td>93.4</td>
+<td>1.2</td>
+</tr>
+</table>
+</body></html>

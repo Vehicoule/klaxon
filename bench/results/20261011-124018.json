@@ -1,0 +1,105 @@
+{
+  "scenes": [
+    {
+      "name": "hello",
+      "fps": 16504.6,
+      "frame_time_avg_ms": 0.1,
+      "frame_time_p50_ms": 0.1,
+      "frame_time_p99_ms": 0.1,
+      "draw_calls_per_frame": 2,
+      "rss_mb": 16.8,
+      "ttff_ms": 36.3,
+      "frames_rendered": 610
+    },
+    {
+      "name": "scroll_10k",
+      "fps": 361.8,
+      "frame_time_avg_ms": 2.8,
+      "frame_time_p50_ms": 1.0,
+      "frame_time_p99_ms": 40.1,
+      "draw_calls_per_frame": 60,
+      "rss_mb": 18.0,
+      "ttff_ms": 2.1,
+      "frames_rendered": 610
+    },
+    {
+      "name": "text_cjk",
+      "fps": 1903.9,
+      "frame_time_avg_ms": 0.5,
+      "frame_time_p50_ms": 0.2,
+      "frame_time_p99_ms": 13.9,
+      "draw_calls_per_frame": 6,
+      "rss_mb": 19.4,
+      "ttff_ms": 2.1,
+      "frames_rendered": 610
+    },
+    {
+      "name": "glass_blur",
+      "fps": 335.3,
+      "frame_time_avg_ms": 3.0,
+      "frame_time_p50_ms": 1.1,
+      "frame_time_p99_ms": 37.4,
+      "draw_calls_per_frame": 15,
+      "rss_mb": 18.4,
+      "ttff_ms": 1.2,
+      "frames_rendered": 610
+    },
+    {
+      "name": "anim_100",
+      "fps": 719.1,
+      "frame_time_avg_ms": 1.4,
+      "frame_time_p50_ms": 0.5,
+      "frame_time_p99_ms": 24.6,
+      "draw_calls_per_frame": 101,
+      "rss_mb": 18.7,
+      "ttff_ms": 0.5,
+      "frames_rendered": 610
+    },
+    {
+      "name": "gallery",
+      "fps": 19.3,
+      "frame_time_avg_ms": 51.9,
+      "frame_time_p50_ms": 50.0,
+      "frame_time_p99_ms": 114.5,
+      "draw_calls_per_frame": 696,
+      "rss_mb": 36.5,
+      "ttff_ms": 227.4,
+      "frames_rendered": 610
+    },
+    {
+      "name": "resize",
+      "fps": 428.8,
+      "frame_time_avg_ms": 2.3,
+      "frame_time_p50_ms": 0.9,
+      "frame_time_p99_ms": 23.8,
+      "draw_calls_per_frame": 47,
+      "rss_mb": 44.5,
+      "ttff_ms": 1.5,
+      "frames_rendered": 610
+    },
+    {
+      "name": "input_ime",
+      "fps": 892.2,
+      "frame_time_avg_ms": 1.1,
+      "frame_time_p50_ms": 0.4,
+      "frame_time_p99_ms": 21.1,
+      "draw_calls_per_frame": 3,
+      "rss_mb": 45.1,
+      "ttff_ms": 0.9,
+      "frames_rendered": 610
+    },
+    {
+      "name": "video_playback",
+      "fps": 530.4,
+      "frame_time_avg_ms": 1.9,
+      "frame_time_p50_ms": 0.7,
+      "frame_time_p99_ms": 28.8,
+      "draw_calls_per_frame": 3,
+      "rss_mb": 45.4,
+      "ttff_ms": 1.0,
+      "frames_rendered": 610
+    }
+  ],
+  "binary_size_bytes": 6584024,
+  "timestamp": "2026-10-11T10:41:22Z"
+}
