@@ -262,6 +262,17 @@ satisfied() {
 
 # --- Skia -------------------------------------------------------------------
 
+# Vulkan Memory Allocator external — pin from Skia's DEPS at $SKIA_PIN.
+# skia_use_vma=true compiles VulkanMemoryAllocatorWrapper.cpp against
+# vk_mem_alloc.h from this repo. Vulkan headers come from Skia's bundled
+# include/third_party/vulkan (use_skia_vulkan_headers), so no vulkan-headers
+# external is needed for the graphite-vulkan backend.
+fetch_vma() {
+  git_clone_at "$SKIA/third_party/externals/vulkanmemoryallocator" \
+    "$CHROMIUM/external/github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git" \
+    eb744ea7a2b17040121b4bbb4d6f9e8a77e3cae7
+}
+
 # Dawn (Graphite Dawn) externals — pins from Skia's DEPS at $SKIA_PIN (kept in
 # sync with the Dawn DEPS at the pinned Dawn revision). Required only when
 # skia_use_dawn = true (the iOS targets in Phase 3e).
@@ -345,10 +356,12 @@ skia_enable_graphite = true
 EOF
       ;;
     linux-x64|linux-arm64)
-      # Ganesh GL on Linux: the shim resolves every GL entry point through
+      # Graphite Vulkan primary + Ganesh GL fallback on Linux. The vulkan
+      # shim loads libvulkan at runtime through SDL_Vulkan_LoadLibrary (no
+      # loader link dep); VMA backs Skia's allocations (fetch_vma provides
+      # the external). Ganesh GL resolves every entry point through
       # SDL_GL_GetProcAddress (GrGLMakeAssembledGLInterface) — no EGL/GLX/X11
       # deps in Skia, so the same lib works on Wayland/X11/headless llvmpipe.
-      # Graphite Vulkan stays Phase 3a (needs vma + vulkan-headers externals).
       cat > "$out" <<EOF
 is_debug = false
 is_official_build = true
@@ -361,13 +374,13 @@ cxx = "clang++"
 skia_use_gl = true
 skia_use_egl = false
 skia_use_x11 = false
-skia_use_vulkan = false
+skia_use_vulkan = true
 skia_use_dawn = false
 skia_use_metal = false
 skia_use_direct3d = false
-skia_use_vma = false
+skia_use_vma = true
 skia_enable_ganesh = true
-skia_enable_graphite = false
+skia_enable_graphite = true
 EOF
       ;;
     windows-x64|windows-arm64)
@@ -524,6 +537,9 @@ build_skia() {
   # Windows needs the Dawn externals (skia_use_dawn) — Dawn is built via
   # CMake inside the GN build, which hard-requires all of them.
   if [ "$SKIA_TARGET_OS" = "win" ]; then fetch_dawn; fi
+  # Linux needs the VMA external (skia_use_vma) for the graphite-vulkan
+  # backend; the Vulkan headers themselves are Skia's bundled copy.
+  if [ "$SKIA_TARGET_OS" = "linux" ]; then fetch_vma; fi
   mkdir -p "$out"
   write_skia_args "$out/args.gn"
   local gn
@@ -878,9 +894,7 @@ build_skia_android() {
   # skia_use_vma=true compiles VulkanMemoryAllocatorWrapper.cpp against
   # vk_mem_alloc.h from this external (pin from Skia's DEPS at $SKIA_PIN).
   # Vulkan headers come from Skia's bundled include/third_party/vulkan.
-  git_clone_at "$SKIA/third_party/externals/vulkanmemoryallocator" \
-    "$CHROMIUM/external/github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git" \
-    eb744ea7a2b17040121b4bbb4d6f9e8a77e3cae7
+  fetch_vma
   mkdir -p "$out"
   write_skia_args_android "$out/args.gn" "$ndk"
   if [ -n "${KLAXON_GN:-}" ]; then
