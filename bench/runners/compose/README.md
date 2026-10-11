@@ -87,7 +87,8 @@ That is the Compose analog of Klaxon's per-frame `tick + layout + paint`: the
 harness mutates scene state in `tick(frame)` (the bench.zig `SceneRunner.tick`
 port), then times one `scene.render(...)` call — recomposition picks the state
 changes up inside the timed region, exactly where Klaxon's signal sets +
-timeline tick land. The loop is unpaced: 610 iterations back-to-back.
+timeline tick land. The loop is unpaced: 130 iterations for normal scenes
+(10 warmup + 120 measured), 71 for list_ops, 270 for the 9-step ramp ladder.
 
 A windowed desktop app (`compose.desktop.application`) would have been
 vsync-paced and window-driven; it was rejected for the same reason Klaxon's

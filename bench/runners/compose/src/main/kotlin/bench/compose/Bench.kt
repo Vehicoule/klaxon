@@ -202,6 +202,10 @@ private class BenchWindowInfo(override val containerSize: IntSize) : WindowInfo 
 
 /// One scene's headless run: surface + ComposeScene + the unpaced frame loop.
 class Harness(private val scene: BenchScene) {
+    // The run clock starts BEFORE the scene's model init (field order =
+    // init order) — Klaxon's ttff covers scene build, and list_ops /
+    // mount_churn populate hundreds of rows in SceneState's init.
+    private val runStartNs = System.nanoTime()
     private var surface: Surface = Surface.makeRasterN32Premul(WIDTH, HEIGHT)
     private lateinit var composeScene: ComposeScene
     private lateinit var platformContext: PlatformContext
@@ -218,7 +222,6 @@ class Harness(private val scene: BenchScene) {
 
     /// Run the scene headlessly and collect its metrics (bench.zig runScene).
     fun run(): Metrics {
-        val runStartNs = System.nanoTime()
         val windowInfo = BenchWindowInfo(IntSize(WIDTH, HEIGHT))
         platformContext = object : PlatformContext by PlatformContext.Empty {
             override val windowInfo: WindowInfo get() = windowInfo
@@ -382,6 +385,10 @@ class Harness(private val scene: BenchScene) {
         composeScene = buildScene()
         composeScene.setContent { state.Content() }
         composeScene.render(surface.canvas.asComposeCanvas(), System.nanoTime())
+        // The resume render is a real drawn frame — count it so
+        // frames_rendered reflects actual work (130 ticks → 132 draws
+        // for app_switch, which pauses/resumes at frames 60 and 120).
+        framesRendered++
         val resumeMs = (System.nanoTime() - t1) / 1e6
 
         state.recordSwitchCycle(teardownMs, resumeMs)

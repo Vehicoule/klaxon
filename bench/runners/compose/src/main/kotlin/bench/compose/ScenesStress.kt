@@ -189,7 +189,7 @@ private fun SceneState.ElevationGridScene() {
             Box(
                 Modifier
                     .size(48.dp, 40.dp)
-                    .shadow(6.dp, RoundedCornerShape(12.dp), clip = false, ambientColor = SHADOW_COLOR, spotColor = SHADOW_COLOR)
+                    .shadow(elevationDp(i).dp, RoundedCornerShape(12.dp), clip = false, ambientColor = SHADOW_COLOR, spotColor = SHADOW_COLOR)
                     .drawBehind {
                         drawRoundRect(color = elevationFill(i), cornerRadius = CornerRadius(12.dp.toPx()))
                     },
@@ -204,6 +204,13 @@ private fun SceneState.elevationFill(i: Int): Color {
     val k = 1f + 0.04f * sin(animFrame.longValue * 0.1 + i * 0.31).toFloat()
     return Color(0x2A / 255f * k, 0x2A / 255f * k, 0x3E / 255f * k)
 }
+
+/// The shadow's raster input must change every frame too — a static 6.dp
+/// elevation would leave the shadow cached while only the fill repaints
+/// (the spec wants all 100 card shadows re-rasterized per frame).
+/// Oscillates 4..8 dp on the same per-card phase as elevationFill.
+private fun SceneState.elevationDp(i: Int): Float =
+    6f + 2f * sin(animFrame.longValue * 0.1 + i * 0.31).toFloat()
 
 // --- relayout_storm: 200 rows animating width 200<->440 dp (2 s loop) ---
 
