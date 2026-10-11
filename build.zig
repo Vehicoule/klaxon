@@ -362,8 +362,8 @@ fn addWasmWeb(
         "-DNDEBUG",
         // Disable all default include paths: zig cc adds its own musl/libc++
         // headers which conflict with the emscripten sysroot. All include paths
-        // are provided explicitly below (sysroot + c++/v1 + compat + project
-        // headers) — mirroring what emcc passes via -iwithsysroot.
+        // are provided explicitly below (compat + c++/v1 + sysroot + project
+        // headers) — the same list emcc assembles (emcc.py get_cflags).
         "-nostdinc", "-nostdinc++",
     };
     kx_skia.root_module.addCSourceFiles(.{
@@ -380,10 +380,13 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
     // Emscripten sysroot dirs, mirroring emcc's own search order (emcc -v):
     //   fakesdl → compat → c++/v1 → clang builtins → include
-    // - compat/ is REQUIRED: it holds xlocale.h and the other BSD compat
-    //   headers that libc++ pulls in under __EMSCRIPTEN__
-    //   (__locale_dir/locale_base_api.h → #include <xlocale.h>; without
-    //   compat/ on the path the C++ compile fails "'xlocale.h' not found").
+    // - compat/ is REQUIRED and must come first: it holds xlocale.h plus the
+    //   other BSD-compat headers that shadow same-named musl headers
+    //   (stdlib.h, string.h, math.h, …). libc++'s
+    //   __locale_dir/locale_base_api.h does #include <xlocale.h>
+    //   unconditionally under __EMSCRIPTEN__; without compat/ on the path the
+    //   C++ compile fails "'xlocale.h' not found" (this was the build-wasm CI
+    //   failure; _LIBCPP_HAS_NO_XLOCALE is NOT honored by this libc++).
     // - c++/v1 (emscripten's libc++) must precede include/ (musl): libc++
     //   wrapper headers like <cstddef> do #include <stddef.h> expecting
     //   c++/v1/stddef.h, which then #include_next's down to the musl header;
@@ -394,11 +397,6 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/c++/v1", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(sysroot_include));
-    // emcc appends sysroot/include/compat via -iwithsysroot: that's where the
-    // musl-compat <xlocale.h> lives, which emscripten's libc++ unconditionally
-    // includes (musl locale_base_api path — _LIBCPP_HAS_NO_XLOCALE is NOT
-    // honored by this libc++ build, so the compat dir is required).
-    kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c, with the
     // emscripten target + sysroot include.

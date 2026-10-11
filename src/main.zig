@@ -67,10 +67,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Wasm (Phase 3f): the browser owns the main thread — runWasm installs
         // the rAF loop with simulate_infinite_loop = 1, which unwinds main()'s
         // stack (defers never run). Host and Demo therefore live in stable
-        // storage (page_allocator, intentional leak: the page lives as long as
+        // storage (c_allocator, intentional leak: the page lives as long as
         // the tab) so the rAF callback never reuses a dangling stack pointer
-        // (Devin issue #2).
-        const stable = std.heap.page_allocator;
+        // (Devin issue #2). NB: NOT page_allocator — on wasm32 it grows linear
+        // memory via the memory.grow opcode, which detaches emscripten JS's
+        // cached HEAP* views so every UTF8ToString returns "" (JS interop
+        // silently breaks, e.g. SDL's canvas selector). c_allocator grows via
+        // emscripten_resize_heap, which refreshes the views.
+        const stable = std.heap.c_allocator;
         // No argv parsing on emscripten: hardcoded Ganesh WebGL2 backend.
         const host_ptr = try stable.create(host_mod.Host);
         host_ptr.* = try host_mod.Host.init(stable, width, height, kx.c.KX_BACKEND_GANESH_WEBGL2, null);

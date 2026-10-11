@@ -8,9 +8,16 @@
 // change (cold path), not per frame. A set() that changes nothing notifies
 // nobody (no spurious re-renders).
 const std = @import("std");
+const builtin = @import("builtin");
 const node_mod = @import("node.zig");
 
 const Node = node_mod.Node;
+
+// Backing allocator for Store globals. page_allocator grows linear memory via
+// the memory.grow opcode, which detaches emscripten JS's cached HEAP* views
+// (UTF8ToString returns "" → JS interop breaks) — on emscripten use
+// c_allocator so growth goes through emscripten_resize_heap (see main.zig).
+const store_allocator = if (builtin.os.tag == .emscripten) std.heap.c_allocator else std.heap.page_allocator;
 
 var current_effect: ?*Effect = null;
 
@@ -246,7 +253,7 @@ pub fn Store(comptime T: type) type {
 
         pub fn get(initial: T) *Signal(T) {
             if (signal == null) {
-                signal = Signal(T).init(std.heap.page_allocator, initial) catch @panic("klaxon: out of memory");
+                signal = Signal(T).init(store_allocator, initial) catch @panic("klaxon: out of memory");
             }
             return signal.?;
         }
