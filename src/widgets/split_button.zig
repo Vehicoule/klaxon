@@ -82,6 +82,7 @@ fn dimsFor(size: SplitButtonSize) Dims {
 }
 
 const min_w: f32 = 48; // LeadingButtonMinWidth = TrailingButtonMinWidth
+const min_target: f32 = 48; // a11y touch-target floor
 const between: f32 = 2; // BetweenSpace
 const inner_corner: f32 = 4; // ExtraSmall (static in v1)
 const lead_icon_size: f32 = 20; // ButtonSmallTokens.IconSize
@@ -368,6 +369,19 @@ fn splitDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
+/// The interactive target: ≥48dp tall centered on the button — the 40dp
+/// halves were below the a11y touch floor.
+fn splitHitBounds(n: *Node) Rect {
+    const b = n.bounds;
+    const h = @max(b.h, min_target);
+    return .{
+        .x = b.x,
+        .y = b.y + (b.h - h) / 2,
+        .w = b.w,
+        .h = h,
+    };
+}
+
 const split_vtable = ui.node.VTable{
     .measure = splitMeasure,
     .layout = splitLayout,
@@ -375,6 +389,7 @@ const split_vtable = ui.node.VTable{
     .deinit = splitDeinit,
     .on_pointer = splitOnPointer,
     .on_key = splitOnKey,
+    .hit_bounds = splitHitBounds,
 };
 
 /// An M3E split button (filled style). The two halves are internal chrome
