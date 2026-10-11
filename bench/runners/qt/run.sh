@@ -2,8 +2,15 @@
 # run.sh — build + run the Qt comparison benchmark runner (roadmap 4c.4).
 #
 # Usage: bench/runners/qt/run.sh [scene]
-#   scene   run one scene (hello, scroll_10k, text_cjk, glass_blur, anim_100,
-#           gallery, resize, input_ime, video_playback); no argument = all 9.
+#   scene   run one scene — the 9 Phase-4c.4 scenes (hello, scroll_10k,
+#           text_cjk, glass_blur, anim_100, gallery, resize, input_ime,
+#           video_playback) plus the 24 catalogue-v2 scenes (list_ops:
+#           list_create_1k list_replace_1k list_update_10th list_swap_rows
+#           list_remove_row list_clear_1k; ramp: shapes_ramp paths_ramp
+#           text_ramp images_ramp; stress: overdraw_stack elevation_grid
+#           relayout_storm mount_churn scroll_anim text_rich chart_live
+#           clip_path theme_switch backdrop_scroll; system: input_latency
+#           pointer_storm semantics_build app_switch); no argument = all 33.
 #
 # Builds the runner (Qt 6 via Homebrew), then runs it headless
 # (QT_QPA_PLATFORM=offscreen + QT_QUICK_BACKEND=software — CPU raster, no
