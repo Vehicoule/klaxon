@@ -6,11 +6,12 @@
 // + a CustomPainter drawing N drawImageRect calls — the closest analog to
 // "positioned image widgets" that keeps the draw workload scaling with N.
 //
-// Gap (documented in README): ui.Image decode is asynchronous in Dart; the
-// scene requests it at construction and draws it as soon as it arrives
-// (a 64x64 decode lands inside the first step's warmup, so no measured
-// frame draws without the image).
+// ui.Image decode is asynchronous in Dart; the harness awaits the decode
+// in prepare() BEFORE the frame clock starts, so no warmup/measured frame
+// can paint without the image (a slow decode can never inject blank draws
+// into the ramp's measured buckets).
 
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -29,6 +30,12 @@ class ImagesRampScene extends RampScene {
 
   /// The shared test image (null until the async decode lands).
   ui.Image? image;
+
+  final Completer<void> _decoded = Completer<void>();
+
+  /// The harness awaits this before the scene's frame clock starts.
+  @override
+  Future<void> prepare() => _decoded.future;
 
   /// 64x64 RGBA checkerboard, 8 px squares in the spec's accent colors.
   void _decodeImage() {
@@ -49,7 +56,10 @@ class ImagesRampScene extends RampScene {
       kImageSize,
       kImageSize,
       ui.PixelFormat.rgba8888,
-      (ui.Image img) => image = img,
+      (ui.Image img) {
+        image = img;
+        if (!_decoded.isCompleted) _decoded.complete();
+      },
     );
   }
 

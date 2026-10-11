@@ -4,10 +4,12 @@
 // embedded row icons pulse opacity — mixed scroll+anim jank.
 //
 // Same list as scroll_10k (10 000 items, 36 dp rows, ~1 row of cache).
-// 600 dp/s at the 60 Hz vsync pace = 10 px/frame; rows 0, 334, 668, ...
-// (i % 334 == 0 -> exactly 30 rows) carry a star icon whose opacity pulses
-// on a shared per-frame notifier, so the icons repaint independently of the
-// scroll position.
+// 600 dp/s at the 60 Hz vsync pace = 10 px/frame — the 130-frame run
+// sweeps ~1300 px ≈ rows 0..49 only. The spec's "30 embedded pulsing
+// icons" therefore live in the first 60 rows (every other row); spreading
+// them over all 10 000 rows would leave the measured window without any
+// animated content. Each icon's opacity pulses on a shared per-frame
+// notifier, so the icons repaint independently of the scroll position.
 
 import 'dart:math' as math;
 
@@ -28,8 +30,10 @@ class ScrollAnimScene extends BenchScene {
   final ScrollController _controller = ScrollController();
   final ValueNotifier<int> _notifier = ValueNotifier<int>(0);
 
-  /// The 30 designated pulsing rows (index 0, 334, ..., 9646).
-  static bool pulses(int index) => index % 334 == 0 && index < 10000;
+  /// The 30 designated pulsing rows: every other row in 0..59, inside the
+  /// ~50-row window the 130-frame scroll actually sweeps — a pulse at row
+  /// 334 would never enter the viewport during the measured run.
+  static bool pulses(int index) => index < 60 && index % 2 == 0;
 
   @override
   Widget build(BuildContext context) {

@@ -111,6 +111,13 @@ abstract class BenchScene {
   /// scenes that bucket timings per step (ramp) override this.
   void onMeasuredFrame(int frame, double frameMs) {}
 
+  /// Optional async setup awaited BEFORE the scene's clock starts —
+  /// counters (_tickCount, _framesCompleted, _sceneStart) only begin once
+  /// this completes, so startup work (e.g. the images_ramp image decode)
+  /// is excluded from ttff and every measured frame (spec: "decoded once
+  /// at startup, startup cost excluded").
+  Future<void> prepare() async {}
+
   /// Scene-specific metrics emitted under "extra" in the JSON report
   /// (missing values serialize as null).
   Map<String, Object?> extra() => const <String, Object?>{};
@@ -252,16 +259,27 @@ class BenchHarnessState extends State<BenchHarness>
 
   void _activateScene(int i) {
     _sceneIndex = i;
-    _tickCount = 0;
-    _framesCompleted = 0;
-    _current = SceneMetrics(widget.scenes[i].name);
-    _sceneStart = DateTime.now();
-    _collecting = true;
     _wallOps.clear();
     _drainTimer?.cancel();
     _drainTimer = null;
     stderr.writeln('klaxon bench (flutter): ${widget.scenes[i].name} '
         '(${i + 1}/${widget.scenes.length})...');
+    unawaited(_startScene(i));
+  }
+
+  /// Awaits the scene's async setup, then starts its clock. Ticks and
+  /// FrameTimings produced during prepare() are ignored (_collecting is
+  /// still false), so scene startup costs stay out of every metric.
+  Future<void> _startScene(int i) async {
+    await widget.scenes[i].prepare();
+    if (!mounted || _finished || _sceneIndex != i) return;
+    _tickCount = 0;
+    _framesCompleted = 0;
+    _current = SceneMetrics(widget.scenes[i].name);
+    _sceneStart = DateTime.now();
+    _lastProgress = DateTime.now();
+    _collecting = true;
+    setState(() {});
   }
 
   void _onTick(Duration elapsed) {
@@ -289,13 +307,23 @@ class BenchHarnessState extends State<BenchHarness>
     ro?.markNeedsPaint();
   }
 
+  /// The scene's frame plan is fulfilled when the TICKER has run the full
+  /// plan (all ticks executed) AND every produced frame has been counted.
+  /// Gating on _framesCompleted alone truncated animated scenes: the engine
+  /// produces >1 frame per tick there, so the frame counter could reach
+  /// totalFrames while half the ticks (later ramp steps, app-switch
+  /// transitions) had never run.
+  bool get _planDone =>
+      _tickCount >= _scene.totalFrames &&
+      _framesCompleted >= _scene.totalFrames;
+
   void _onTimings(List<FrameTiming> timings) {
     for (final FrameTiming t in timings) {
       if (_finished) return;
       if (!_collecting || _current == null) continue;
       _lastProgress = DateTime.now();
       _resolveWallOps(t);
-      if (_framesCompleted >= _scene.totalFrames) {
+      if (_planDone) {
         // Frame plan done. Keep draining in-flight timings while wall-ops
         // are pending: the engine may run ahead of the ticker (animated
         // scenes produce >1 frame per tick), so an op's resolving frame was
@@ -325,12 +353,17 @@ class BenchHarnessState extends State<BenchHarness>
         _current!.ttffMs =
             _lastProgress.difference(_sceneStart).inMicroseconds / 1000.0;
       }
-      if (_scene.isMeasuredFrame(completed)) {
+      // Frames past the plan (engine ran ahead of the ticker) count toward
+      // completion but are not attributed — a completed-index beyond the
+      // plan would overflow per-step buckets (ramp) or inflate the measured
+      // set beyond 120 entries.
+      if (completed < _scene.totalFrames &&
+          _scene.isMeasuredFrame(completed)) {
         _current!.frameTimesMs.add(workMs);
         _scene.onMeasuredFrame(completed, workMs);
       }
       _framesCompleted++;
-      if (_framesCompleted >= _scene.totalFrames && _wallOps.isEmpty) {
+      if (_planDone && _wallOps.isEmpty) {
         _finishScene();
         return;
       }
