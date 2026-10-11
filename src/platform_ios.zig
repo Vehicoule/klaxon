@@ -75,7 +75,8 @@ export fn SDL_AppIterate(appstate: ?*anyopaque) callconv(.c) sdl.c.SDL_AppResult
     const state: *AppState = @ptrCast(@alignCast(appstate.?));
     if (state.quit) return sdl.c.SDL_APP_SUCCESS;
     const quit = state.host.runIteration(state.root, state.on_frame, state.on_frame_ctx) catch return sdl.c.SDL_APP_FAILURE;
-    if (quit or state.host.stats.frames >= state.max_frames) return sdl.c.SDL_APP_SUCCESS;
+    // max_frames == 0 means run forever (mobile: the OS terminates the app).
+    if (quit or (state.max_frames > 0 and state.host.stats.frames >= state.max_frames)) return sdl.c.SDL_APP_SUCCESS;
     return sdl.c.SDL_APP_CONTINUE;
 }
 
