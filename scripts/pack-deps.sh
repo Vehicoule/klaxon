@@ -52,7 +52,17 @@ pack_bundle() {
   fi
   mkdir -p "$DIST"
   local out="$DIST/deps-$name.tar.gz"
-  tar -czf "$out" -C "$DEPS" "$@"
+  # Shims include Skia private headers (src/core/SkUTF.h,
+  # src/gpu/ganesh/gl/GrGLDefines.h, ...) — public include/ alone is not
+  # enough. Headers only, sources stay out of the artifact.
+  local filelist="$DIST/.filelist-$name"
+  (cd "$DEPS" && find "$@" -type f | sort; find skia/src -name '*.h' -type f | sort) > "$filelist"
+  # Embedded manifest: consumers verify every packed file exists after
+  # extract — a partial tree must never pass as complete.
+  printf '%s\n' ".deps-manifest-$name" >> "$filelist"
+  cp "$filelist" "$DEPS/.deps-manifest-$name"
+  tar -czf "$out" -C "$DEPS" -T "$filelist"
+  rm -f "$DEPS/.deps-manifest-$name" "$filelist"
   (cd "$DIST" && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256")
   log "packed $(basename "$out") ($(du -sh "$out" | cut -f1))"
 }

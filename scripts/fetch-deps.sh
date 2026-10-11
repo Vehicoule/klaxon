@@ -159,6 +159,22 @@ git_clone_at() {
 DEPS_ID="$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -c1-12)"
 DEPS_BASE_URL="${KLAXON_DEPS_BASE_URL:-https://github.com/Vehicoule/klaxon/releases/download/deps-$DEPS_ID}"
 
+# verify_bundle <bundle> — when the tarball embedded a .deps-manifest-<name>,
+# every listed file must exist under deps/. A partial tree (truncated upload,
+# stale cache) must never pass as complete: missing entries → return 1 and the
+# caller falls back to the source build.
+verify_bundle() {
+  local name="$1" m="$DEPS/.deps-manifest-$name" f missing=0
+  [ -f "$m" ] || return 0
+  while IFS= read -r f; do
+    [ -e "$DEPS/$f" ] || missing=$((missing + 1))
+  done < "$m"
+  if [ "$missing" -gt 0 ]; then
+    log "$name: $missing files missing from deps tree"
+    return 1
+  fi
+}
+
 # try_artifact <bundle> — download + verify + extract deps-<bundle>.tar.gz
 # into deps/, then stamp deps/.artifact-<bundle>. Idempotent via the stamp.
 try_artifact() {
@@ -190,6 +206,11 @@ try_artifact() {
   fi
   tar -xzf "$tmp" -C "$DEPS"
   rm -f "$tmp" "$tmp.sha256"
+  if ! verify_bundle "$name"; then
+    rm -f "$DEPS/.artifact-$name" "$DEPS/.deps-manifest-$name"
+    log "artifact $base failed completeness check — will build from source"
+    return 1
+  fi
   printf '%s\n' "$name" > "$DEPS/.artifact-$name"
   log "extracted $base"
   return 0
@@ -208,7 +229,16 @@ component_bundle() {
 satisfied() {
   local comp="$1" bundle
   bundle="$(component_bundle "$comp")"
-  [ -f "$DEPS/.artifact-$bundle" ] && return 0
+  if [ -f "$DEPS/.artifact-$bundle" ]; then
+    if verify_bundle "$bundle"; then
+      return 0
+    fi
+    # Partial tree (stale cache / truncated artifact): drop the stamp so the
+    # caller re-downloads or rebuilds — representative files like libskia.a
+    # can exist in a partial tree, so do NOT fall through to the case check.
+    rm -f "$DEPS/.artifact-$bundle" "$DEPS/.deps-manifest-$bundle"
+    return 1
+  fi
   case "$comp" in
     skia)  [ -f "$SKIA/out/$TAG/libskia.a" ] ;;
     sdl3)  [ -f "$DEPS/SDL/build-$TAG/libSDL3.a" ] ;;
