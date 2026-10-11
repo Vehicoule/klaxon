@@ -185,6 +185,15 @@ pub const Node = struct {
     /// painting outside their bounds set this so focus/state changes repaint
     /// the overflow too (2d.2 PR C2: the outlined text field's cutout label).
     damage_overflow: layout_mod.EdgeInsets = .{},
+    /// Destroyed (deinit called). During a traversal the node keeps its
+    /// memory until the outermost traversalEnd sweeps the queue — traversals
+    /// skip zombies instead of dereferencing freed memory (the UAF class: a
+    /// handler that tears down a node the dispatch loop is still walking).
+    zombie: bool = false,
+    /// The subtree teardown ran; only the struct free is pending. Guards
+    /// against a second teardown when a node is reached both through a
+    /// parent's eager recursion and through its own queue slot.
+    torn_down: bool = false,
 
     pub fn create(allocator: std.mem.Allocator, vtable: *const VTable) !*Node {
         const node = try allocator.create(Node);
@@ -198,6 +207,9 @@ pub const Node = struct {
 
     /// Append a child. OOM while building the tree is fatal (same as Flutter).
     pub fn add(node: *Node, child: *Node) void {
+        // Detach from a previous parent — otherwise the child stays in two
+        // children lists and both deinit it (double free).
+        if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
         node.children.append(child) catch @panic("klaxon: out of memory");
         node.markLayoutDirty();
@@ -208,6 +220,7 @@ pub const Node = struct {
     /// as add(): the child is parented, not owned. Re-insertion at the original
     /// index restores paint order (hero flight, Phase 2a).
     pub fn insert(node: *Node, index: usize, child: *Node) void {
+        if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
         const i = @min(index, node.children.items.len);
         node.children.insert(i, child) catch @panic("klaxon: out of memory");
@@ -332,7 +345,7 @@ pub const Node = struct {
     /// same ops after their (expensive) issue. A culled node keeps its dirty
     /// flag — like an invisible one, it repaints when it becomes visible.
     pub fn paint(node: *Node, ctx: *kx.Ctx, visible: Rect) void {
-        if (!node.visible) return;
+        if (!node.visible or node.zombie) return;
         // The region descendants can paint into: `visible`, tightened by the
         // node's children clip (viewport) when it declares one.
         var child_region = visible;
@@ -342,16 +355,19 @@ pub const Node = struct {
         const own_hit = rectOverlaps(node.mapRectToRoot(node.paintRect()), visible);
         const children_hit = child_region.w > 0 and child_region.h > 0;
         if (!own_hit and !children_hit) return; // the whole subtree is off-region
+        // Clear BEFORE painting: a markDirty raised while this subtree paints
+        // (paint hook → signal write → subscriber) must survive to schedule
+        // the next frame — a tail clear would wipe it.
+        node.dirty = false;
         if (own_hit) node.vtable.paint(node, ctx);
         if (children_hit) {
             if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
             for (node.children.items) |child| {
-                if (child.defer_paint) continue; // paints in the popup overlay pass
+                if (child.defer_paint or child.zombie) continue; // defer_paint → popup overlay; zombie → swept
                 child.paint(ctx, child_region);
             }
             if (node.vtable.post_children_paint) |post| post(node, ctx);
         }
-        node.dirty = false;
     }
 
     /// Deepest visible node containing the point (children are painted last,
@@ -359,7 +375,7 @@ pub const Node = struct {
     /// their VISUAL position: hit_bounds + pre_children_hit mirror the paint
     /// transform.
     pub fn hitTest(node: *Node, px: f32, py: f32) ?*Node {
-        if (!node.visible) return null;
+        if (!node.visible or node.zombie) return null;
         const b = if (node.vtable.hit_bounds) |hb| hb(node) else node.bounds;
         if (!b.contains(px, py)) return null;
         var cx = px;
@@ -372,7 +388,9 @@ pub const Node = struct {
         var i = node.children.items.len;
         while (i > 0) {
             i -= 1;
-            if (node.children.items[i].hitTest(cx, cy)) |hit| return hit;
+            const child = node.children.items[i];
+            if (child.zombie) continue;
+            if (child.hitTest(cx, cy)) |hit| return hit;
         }
         return node;
     }
@@ -386,7 +404,7 @@ pub const Node = struct {
     /// the router delivers pointer events with those local coordinates so
     /// scrolled/transformed controls receive events at their visual position.
     pub fn hitTestMapped(node: *Node, px: f32, py: f32) ?MappedHit {
-        if (!node.visible) return null;
+        if (!node.visible or node.zombie) return null;
         const b = if (node.vtable.hit_bounds) |hb| hb(node) else node.bounds;
         if (!b.contains(px, py)) return null;
         var cx = px;
@@ -399,7 +417,9 @@ pub const Node = struct {
         var i = node.children.items.len;
         while (i > 0) {
             i -= 1;
-            if (node.children.items[i].hitTestMapped(cx, cy)) |hit| return hit;
+            const child = node.children.items[i];
+            if (child.zombie) continue;
+            if (child.hitTestMapped(cx, cy)) |hit| return hit;
         }
         return .{ .node = node, .x = px, .y = py };
     }
@@ -444,18 +464,114 @@ pub const Node = struct {
         return r;
     }
 
+    /// Destroy the subtree. If a traversal is in flight (dispatch, paint,
+    /// hit-test, signal notify — anything that might be holding a pointer
+    /// to this node) the deinit DEFERS: the node is marked `zombie`, kept in
+    /// its parent's child list (memory stays valid, traversals skip it), and
+    /// the outermost traversalEnd sweeps the queue. Otherwise the subtree
+    /// tears down immediately.
     pub fn deinit(node: *Node) void {
+        if (node.zombie) return; // already queued or torn down
+        if (traversalActive()) {
+            node.zombie = true;
+            zombie_list.append(std.heap.c_allocator, node) catch @panic("klaxon: out of memory");
+            return;
+        }
+        // Route through the same sweep: deinit is itself a traversal — a
+        // widget deinit that destroys another node defers it.
+        traversalBegin();
+        node.zombie = true;
+        zombie_list.append(std.heap.c_allocator, node) catch @panic("klaxon: out of memory");
+        traversalEnd();
+    }
+
+    /// Teardown WITHOUT freeing the node struct — callers push the struct
+    /// onto pending_free. Children are torn down EAGERLY and recursively
+    /// (vtable order: a child's deinit runs while the parent's state is
+    /// still alive — e.g. a Hero unregisters from its Navigator's state).
+    /// A zombie child is consumed here (its queue slot turns inert) for the
+    /// same reason.
+    fn deinitBody(node: *Node) void {
         // Drop router references (capture/hover/focus/popup) BEFORE anything
         // is freed — virtualized lists destroy captured items on scroll.
         input_mod.releaseNode(node);
         semantics_mod.focusNodeDestroyed(node); // drop the a11y focus if it was focused (Phase 2c)
-        for (node.children.items) |child| child.deinit();
+        for (node.children.items) |child| {
+            child.parent = null; // detach BEFORE teardown — callbacks walking
+            // up from this child must not reach the about-to-be-freed parent
+            if (!child.torn_down) {
+                // A zombie child is consumed here (its queue slot turns inert):
+                // eager recursion keeps the children-before-parent ordering
+                // that widget deinits rely on.
+                child.torn_down = true;
+                child.deinitBody();
+                pending_free.append(std.heap.c_allocator, child) catch @panic("klaxon: out of memory");
+            }
+        }
         node.children.deinit();
         if (node.semantics) |sem| node.allocator.destroy(sem);
         if (node.vtable.deinit) |d| d(node);
-        node.allocator.destroy(node);
     }
 };
+
+// --- Deferred destruction -------------------------------------------------
+//
+// Widget callbacks run during tree traversals (dispatch bubble, paint,
+// hit-test, signal notify). A callback that deinits a node being walked
+// used to leave the loop dereferencing freed memory. Instead, deinit()
+// during a traversal marks the node `zombie` — the memory stays valid, the
+// flag tells every traversal to skip it, and the outermost traversalEnd
+// sweeps: teardown runs at depth 0 where list mutation is safe.
+//
+// Two lists: `zombie_list` queues nodes awaiting teardown; `pending_free`
+// collects structs whose teardown ran — frees happen in a batch at the end
+// so a parent's removal/teardown never leaves a queued sibling pointing at
+// freed memory.
+
+var traversal_depth: u32 = 0;
+var zombie_list: std.ArrayListUnmanaged(*Node) = .empty;
+var pending_free: std.ArrayListUnmanaged(*Node) = .empty;
+
+/// Open a mutation-freeze window: deinit() inside defers to the sweep.
+pub fn traversalBegin() void {
+    traversal_depth += 1;
+}
+
+/// Close the window; at depth 0 the queued zombies are torn down and freed.
+/// Balanced — every traversalBegin must reach its traversalEnd (defer).
+pub fn traversalEnd() void {
+    traversal_depth -= 1;
+    if (traversal_depth != 0) return;
+    // Sweeping runs callbacks (vtable deinits can touch the tree): hold a
+    // freeze so nested deinits queue onto the list we drain below.
+    traversal_depth = 1;
+    while (zombie_list.items.len > 0 or pending_free.items.len > 0) {
+        var batch = zombie_list;
+        zombie_list = .empty;
+        for (batch.items) |z| {
+            if (z.torn_down) continue; // consumed eagerly by a parent's teardown
+            z.torn_down = true;
+            // Detach from the parent first — the node stayed listed so far
+            // (detaching mid-dispatch would shift the array under an active
+            // iteration). remove() at sweep depth is safe.
+            if (z.parent) |p| {
+                z.parent = null;
+                _ = p.remove(z);
+            }
+            z.deinitBody();
+            pending_free.append(std.heap.c_allocator, z) catch @panic("klaxon: out of memory");
+        }
+        batch.deinit(std.heap.c_allocator);
+        for (pending_free.items) |z| z.allocator.destroy(z);
+        pending_free.clearRetainingCapacity();
+    }
+    traversal_depth = 0;
+}
+
+/// True while a traversal window is open (dispatch/paint/notify/deinit).
+pub fn traversalActive() bool {
+    return traversal_depth > 0;
+}
 
 // --- tests (stub leaf widget) ---
 
@@ -1007,4 +1123,160 @@ test "deinit releases the node's router references (capture/hover/focus/popup)" 
     try std.testing.expect(router.hovered == null);
     try std.testing.expect(router.focused == null);
     try std.testing.expect(router.open_popup == null);
+}
+
+// --- deferred destruction (deinit during traversal) ------------------------
+
+const KillState = struct {
+    victim: ?*Node = null, // deinit'd on .down
+    self_destruct: bool = false, // deinit self on .down
+};
+fn killMeasure(_: *Node, c: Constraints) Size {
+    return c.constrain(.{ .w = 10, .h = 10 });
+}
+fn killLayout(_: *Node, _: Rect) void {}
+fn killPaint(_: *Node, _: *kx.Ctx) void {}
+fn killPointer(n: *Node, ev: input_mod.PointerEvent) bool {
+    const s: *KillState = @ptrCast(@alignCast(n.state.?));
+    if (ev.phase != .down) return true;
+    if (s.victim) |v| v.deinit();
+    if (s.self_destruct) n.deinit();
+    return true;
+}
+fn killDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*KillState, @ptrCast(@alignCast(n.state.?))));
+}
+const kill_vtable = blk: {
+    var vt = test_vtable;
+    vt.measure = killMeasure;
+    vt.layout = killLayout;
+    vt.paint = killPaint;
+    vt.on_pointer = killPointer;
+    vt.deinit = killDeinit;
+    break :blk vt;
+};
+fn killNode(victim: ?*Node, self_destruct: bool) !*Node {
+    const node = try Node.create(std.testing.allocator, &kill_vtable);
+    errdefer node.allocator.destroy(node);
+    const s = try std.testing.allocator.create(KillState);
+    s.* = .{ .victim = victim, .self_destruct = self_destruct };
+    node.state = s;
+    return node;
+}
+
+test "deinit during a traversal marks the node zombie; the sweep frees it" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const child = try testNode(50, 50);
+    root.add(child);
+    traversalBegin();
+    child.deinit(); // defers — zombie, still listed: a captured slice stays valid
+    try std.testing.expect(child.zombie);
+    try std.testing.expectEqual(@as(usize, 1), root.children.items.len);
+    traversalEnd(); // sweep: teardown + detach + free (testing alloc reports a missed free)
+    try std.testing.expectEqual(@as(usize, 0), root.children.items.len);
+}
+
+test "a zombie child is skipped by hitTest — the sibling behind it answers" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const back = try testNode(50, 50);
+    back.bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 };
+    root.add(back);
+    const front = try testNode(50, 50);
+    front.bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 };
+    root.add(front);
+    front.zombie = true; // destroyed mid-traversal: still listed, memory valid
+    const hit = root.hitTest(10, 10);
+    try std.testing.expect(hit != null);
+    try std.testing.expect(hit.? == back); // front skipped — stays listed for the sweep
+}
+
+test "dispatch: a .down handler that destroys a sibling does not UAF" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const victim = try testNode(50, 50);
+    victim.bounds = .{ .x = 50, .y = 0, .w = 50, .h = 50 };
+    root.add(victim);
+    const btn = try killNode(victim, false);
+    btn.bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 };
+    root.add(btn);
+    // .down hits btn → kills victim mid-traversal: deferral keeps the memory
+    // valid until the sweep, which detaches + frees it (a pre-fix run read
+    // 0xAA-poisoned memory and crashed).
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 });
+    try std.testing.expectEqual(@as(usize, 1), root.children.items.len);
+}
+
+test "dispatch: a handler that destroys its OWN node survives the next phase" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    const btn = try killNode(null, true);
+    btn.bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 };
+    root.add(btn);
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 }); // captures + self-destructs
+    router.dispatchPointer(root, .{ .phase = .up, .x = 10, .y = 10 }); // captured zombie → skipped
+    try std.testing.expectEqual(@as(usize, 0), root.children.items.len);
+}
+
+const TwinKillState = struct { other: ?*Node = null };
+fn twinKillMeasure(_: *Node, c: Constraints) Size {
+    return c.constrain(.{ .w = 10, .h = 10 });
+}
+fn twinKillDeinit(n: *Node) void {
+    const s: *TwinKillState = @ptrCast(@alignCast(n.state.?));
+    if (s.other) |o| o.deinit(); // destroys a DETACHED sibling during teardown
+    n.allocator.destroy(s);
+}
+const twin_kill_vtable = blk: {
+    var vt = test_vtable;
+    vt.measure = twinKillMeasure;
+    vt.deinit = twinKillDeinit;
+    break :blk vt;
+};
+fn twinKillNode(other: ?*Node) !*Node {
+    const node = try Node.create(std.testing.allocator, &twin_kill_vtable);
+    errdefer node.allocator.destroy(node);
+    const s = try std.testing.allocator.create(TwinKillState);
+    s.* = .{ .other = other };
+    node.state = s;
+    return node;
+}
+
+test "deinit: a vtable deinit that destroys another node defers it to the sweep" {
+    const detached = try testNode(10, 10); // not parented — destroyed by the sibling's deinit
+    const killer = try twinKillNode(detached);
+    killer.deinit(); // depth-0 deinit runs the sweep; the nested deinit queues onto it
+    // both freed — the testing allocator fails the test on a leak
+}
+
+test "paint: a markDirty raised during paint survives to the next frame" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    const mark_paint_vtable = blk: {
+        var vt = test_vtable;
+        vt.deinit = null; // no TestState on this node
+        vt.paint = struct {
+            fn p(n: *Node, _: *kx.Ctx) void {
+                n.markDirty(); // a paint hook that mutates must re-dirty the node
+            }
+        }.p;
+        break :blk vt;
+    };
+    const root = try Node.create(std.testing.allocator, &mark_paint_vtable);
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
+    kx.c.kx_end_frame(ctx);
+    try std.testing.expect(root.dirty); // cleared BEFORE paint — the in-paint mark survives
 }

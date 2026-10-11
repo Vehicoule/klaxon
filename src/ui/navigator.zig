@@ -216,9 +216,13 @@ pub const Navigator = struct {
         const def = nav.findDef(pattern) orelse return error.UnknownRoute;
         const path = try buildPath(nav.allocator, pattern, params);
         defer nav.allocator.free(path);
+        // Build the replacement FIRST — on error the old page stays live.
+        // (freePage-then-build left a dangling Page whose next freePage
+        // was a double free.)
+        const new_page = try nav.buildPageFromSlice(def, path, params);
         const top = &nav.pages.items[nav.pages.items.len - 1];
         freePage(nav.allocator, top);
-        top.* = try nav.buildPageFromSlice(def, path, params);
+        top.* = new_page;
         nav.notify(.replace);
     }
 
@@ -250,13 +254,16 @@ pub const Navigator = struct {
     /// Build a page from borrowed param slices (duped into the navigator).
     fn buildPageFromSlice(nav: *Navigator, def: *const RouteDef, path: []const u8, params: []const Param) !Page {
         var owned = Params{};
+        // Free the duped pairs on ANY early return — a mid-loop OOM used
+        // to leak every pair built so far (only TooManyParams freed).
+        errdefer freeParams(nav.allocator, &owned);
         for (params) |p| {
             // Check capacity BEFORE duplicating: a rejected pair must not leak.
-            if (owned.len >= MAX_PARAMS) {
-                freeParams(nav.allocator, &owned);
-                return error.TooManyParams;
-            }
-            _ = owned.add(try nav.allocator.dupe(u8, p.key), try nav.allocator.dupe(u8, p.value));
+            if (owned.len >= MAX_PARAMS) return error.TooManyParams;
+            const key = try nav.allocator.dupe(u8, p.key);
+            errdefer nav.allocator.free(key);
+            const value = try nav.allocator.dupe(u8, p.value);
+            _ = owned.add(key, value);
         }
         return nav.buildPageOwned(def, path, owned);
     }

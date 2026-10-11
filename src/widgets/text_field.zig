@@ -114,7 +114,10 @@ fn stateOf(n: *Node) *TextFieldState {
 }
 
 /// Write the null sentinel at items[len] (the P0 TextField helper).
+/// Grows if the buffer is exactly full — the sync/setText paths reserve
+/// only len bytes, and writing the sentinel past capacity was a heap OOB.
 fn setSentinel(buf: *std.array_list.Managed(u8)) void {
+    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
     buf.items.len += 1;
     buf.items[buf.items.len - 1] = 0;
     buf.items.len -= 1;
