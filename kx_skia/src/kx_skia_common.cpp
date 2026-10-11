@@ -18,11 +18,13 @@
 #include "include/core/SkRect.h"
 #include "include/core/SkSamplingOptions.h"
 #include "include/core/SkSurface.h"
+#include "include/core/SkTextBlob.h"
 #include "include/core/SkTypeface.h"
 #include "include/effects/SkGradient.h"
 #include "src/core/SkUTF.h"
 
 #include <cstring>
+#include <string>
 #include <unordered_map>
 
 struct kx_ctx {
@@ -72,6 +74,157 @@ static SkFont kx_make_font(const char* text, float size, bool bold) {
     font.setSize(size);
     return font;
 }
+
+// --- Text shape/metrics cache ------------------------------------------
+// kx_draw_text_styled and kx_measure_text each used to pay, on EVERY call:
+// a font-mgr typeface lookup, a per-codepoint coverage scan
+// (kx_typeface_covers), a UTF-8 decode + textToGlyphs, and glyph-run
+// construction. A retained tree repaints the same strings every frame —
+// the bench's gallery scene issued ~400 such font ops per frame before
+// paint culling, and still pays it for every on-screen label.
+//
+// The shaped result depends only on (text bytes, size, bold), so it is
+// cached: the resolved SkFont, an SkTextBlob (glyph ids + positions — the
+// same conversion drawSimpleText performs, paid once), and the measured
+// metrics. A hit is hash + probe + memcmp — no allocation, no font work.
+// Direction is deliberately NOT in the key: drawSimpleText does no bidi —
+// (text,size,bold) fully determines the glyphs (alignment/RTL resolution
+// happens widget-side, in textX).
+//
+// Fixed-capacity open addressing (linear probing) with tombstones + LRU
+// eviction: bounded memory, ZERO allocations on the hit path — key copies
+// and blob construction happen only on a miss. Threading: the ABI's
+// existing contract — thread-confined (no locking), process-global like
+// the font manager (kx_measure_text takes no ctx, so the cache can't be
+// per-ctx).
+//
+// The cached font/blob bake in the resolved typeface. The font manager is
+// fixed at process start today; if a runtime font-registration API is
+// added it MUST call kx_text_cache_reset() or stale glyphs would render.
+namespace {
+
+constexpr int kTextCacheCap = 2048;     // power of two — probe mask
+constexpr int kTextCacheMaxUsed = 1536; // ~73% load keeps probes short
+
+enum class KxTextSlotState : uint8_t { kEmpty, kOccupied, kTombstone };
+
+struct KxTextSlot {
+    std::string text;       // owned key bytes — allocated on insert only
+    uint64_t hash = 0;
+    float size = 0.0f;
+    bool bold = false;
+    KxTextSlotState state = KxTextSlotState::kEmpty;
+    uint64_t last_used = 0; // LRU tick
+    SkFont font;            // resolved typeface + size (fallback applied)
+    sk_sp<SkTextBlob> blob; // null when the text can't form a blob
+    kx_text_metrics metrics = {0, 0, 0, 0};
+};
+
+KxTextSlot kx_text_cache[kTextCacheCap];
+int kx_text_cache_used = 0;
+uint64_t kx_text_cache_tick = 0;
+
+uint64_t kx_text_key_hash(const char* text, size_t len, float size, bool bold) {
+    uint64_t h = 14695981039346656037ull; // FNV-1a over the UTF-8 bytes
+    for (size_t i = 0; i < len; i++) {
+        h ^= static_cast<uint8_t>(text[i]);
+        h *= 1099511628211ull;
+    }
+    uint32_t size_bits;
+    std::memcpy(&size_bits, &size, sizeof(size_bits));
+    h ^= size_bits;
+    h *= 1099511628211ull;
+    h ^= bold ? 0xFFu : 0x33u;
+    h *= 1099511628211ull;
+    return h;
+}
+
+// Drop every entry — today only a future runtime font-registration API
+// would need this (the font manager is fixed at process start).
+[[maybe_unused]] void kx_text_cache_reset() {
+    for (auto& s : kx_text_cache) s = KxTextSlot{}; // releases key + blob + typeface
+    kx_text_cache_used = 0;
+}
+
+// Free one slot for a new key. A tombstone (not kEmpty) is left behind so
+// probe chains that pass through this slot still terminate correctly.
+void kx_text_cache_evict_lru() {
+    int oldest = -1;
+    for (int i = 0; i < kTextCacheCap; i++) {
+        if (kx_text_cache[i].state == KxTextSlotState::kOccupied &&
+            (oldest < 0 || kx_text_cache[i].last_used < kx_text_cache[oldest].last_used)) {
+            oldest = i;
+        }
+    }
+    if (oldest < 0) return;
+    kx_text_cache[oldest] = KxTextSlot{};
+    kx_text_cache[oldest].state = KxTextSlotState::kTombstone;
+    --kx_text_cache_used;
+}
+
+// First tombstone-or-empty slot on key h's probe path (the key is known to
+// be absent). Call only when such a slot is known to exist — the probe is
+// unbounded.
+int kx_text_cache_victim(uint64_t h) {
+    const size_t mask = kTextCacheCap - 1;
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
+        if (kx_text_cache[i].state != KxTextSlotState::kOccupied) return static_cast<int>(i);
+    }
+}
+
+// The slot for (text,size,bold) — the shared entry for kx_measure_text and
+// kx_draw_text_styled. On a miss the full font path runs ONCE (typeface
+// resolution + coverage fallback + shaping + metrics) and the result is
+// inserted; hits only refresh the LRU tick.
+KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
+    const uint64_t h = kx_text_key_hash(text, len, size, bold);
+    const uint64_t tick = ++kx_text_cache_tick;
+    const size_t mask = kTextCacheCap - 1;
+    size_t i = h & mask;
+    int insert_at = -1;   // first reusable tombstone on the probe path
+    bool hit_empty = false;
+    for (int scanned = 0; scanned < kTextCacheCap; ++scanned) {
+        KxTextSlot& s = kx_text_cache[i];
+        if (s.state == KxTextSlotState::kEmpty) { hit_empty = true; break; }
+        if (s.state == KxTextSlotState::kTombstone) {
+            if (insert_at < 0) insert_at = static_cast<int>(i);
+        } else if (s.hash == h && s.size == size && s.bold == bold &&
+                   s.text.size() == len && std::memcmp(s.text.data(), text, len) == 0) {
+            s.last_used = tick;
+            return &s;
+        }
+        i = (i + 1) & mask;
+    }
+    // Miss — the key is absent (the probe hit a virgin slot, or scanned the
+    // whole ring past only occupied/tombstone slots). Bound the live set:
+    // evict the LRU entry once occupancy reaches kTextCacheMaxUsed; the
+    // evicted slot becomes a tombstone, so a pathological all-non-empty ring
+    // still yields an insert slot below.
+    if (kx_text_cache_used >= kTextCacheMaxUsed) kx_text_cache_evict_lru();
+    if (insert_at < 0) {
+        insert_at = hit_empty ? static_cast<int>(i) : kx_text_cache_victim(h);
+    }
+    KxTextSlot& s = kx_text_cache[insert_at];
+    s.text.assign(text, len); // owned key copy — the only per-entry alloc
+    s.hash = h;
+    s.size = size;
+    s.bold = bold;
+    s.last_used = tick;
+    s.font = kx_make_font(text, size, bold);
+    s.blob = SkTextBlob::MakeFromText(text, len, s.font, SkTextEncoding::kUTF8);
+    SkFontMetrics fm;
+    s.font.getMetrics(&fm);
+    s.metrics.ascent = -fm.fAscent; // fAscent is negative (above the baseline)
+    s.metrics.descent = fm.fDescent;
+    s.metrics.height = s.metrics.ascent + s.metrics.descent;
+    s.metrics.width =
+        s.font.getTypeface() ? s.font.measureText(text, len, SkTextEncoding::kUTF8) : 0.0f;
+    s.state = KxTextSlotState::kOccupied;
+    ++kx_text_cache_used;
+    return &s;
+}
+
+} // namespace
 
 // kx color: 0xRRGGBBAA → SkColor: 0xAARRGGBB
 static SkColor kx_to_skcolor(uint32_t rgba) {
@@ -151,26 +304,51 @@ void kx_draw_text(kx_ctx* ctx, const char* text, float x, float y, float size, u
 
 void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float size, bool bold, uint32_t rgba) {
     if (!ctx || !ctx->canvas || !text) return;
-    SkFont font = kx_make_font(text, size, bold);
+    const size_t len = std::strlen(text);
+    // Degenerate keys bypass the cache: NaN never matches itself (it would
+    // re-insert forever), and non-positive sizes draw nothing anyway.
+    if (!(size > 0.0f)) {
+        SkFont font = kx_make_font(text, size, bold);
+        SkPaint paint;
+        paint.setColor(kx_to_skcolor(rgba));
+        paint.setAntiAlias(true);
+        ctx->canvas->drawSimpleText(text, len, SkTextEncoding::kUTF8, x, y, font, paint);
+        return;
+    }
+    const KxTextSlot* e = kx_text_entry(text, len, size, bold);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
-    ctx->canvas->drawSimpleText(text, std::strlen(text), SkTextEncoding::kUTF8, x, y, font, paint);
+    if (e->blob) {
+        // The cached glyph run replays at any origin — drawTextBlob(blob,x,y)
+        // is what drawSimpleText computes per call (UTF-8 decode → glyphs →
+        // advances from the origin) — identical output, no re-shaping.
+        ctx->canvas->drawTextBlob(e->blob.get(), x, y, paint);
+    } else {
+        // Unshapeable input (e.g. empty string or no resolvable glyphs):
+        // draw through the stored font — identical to the uncached path.
+        ctx->canvas->drawSimpleText(text, len, SkTextEncoding::kUTF8, x, y, e->font, paint);
+    }
 }
 
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
     kx_text_metrics m = {0, 0, 0, 0};
     if (!text) return m;
-    const SkFont font = kx_make_font(text, size, bold);
-    SkFontMetrics fm;
-    font.getMetrics(&fm);
-    m.ascent = -fm.fAscent; // fAscent is negative (above the baseline)
-    m.descent = fm.fDescent;
-    m.height = m.ascent + m.descent;
-    if (font.getTypeface()) {
-        m.width = font.measureText(text, std::strlen(text), SkTextEncoding::kUTF8);
+    if (!(size > 0.0f)) {
+        // Degenerate key (NaN/<=0 bypasses the cache — see kx_draw_text_styled):
+        // run the uncached path so the returned metrics are unchanged.
+        const SkFont font = kx_make_font(text, size, bold);
+        SkFontMetrics fm;
+        font.getMetrics(&fm);
+        m.ascent = -fm.fAscent;
+        m.descent = fm.fDescent;
+        m.height = m.ascent + m.descent;
+        if (font.getTypeface()) {
+            m.width = font.measureText(text, std::strlen(text), SkTextEncoding::kUTF8);
+        }
+        return m;
     }
-    return m;
+    return kx_text_entry(text, std::strlen(text), size, bold)->metrics;
 }
 
 uint64_t kx_image_create(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h) {
