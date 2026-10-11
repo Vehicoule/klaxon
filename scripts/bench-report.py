@@ -22,15 +22,47 @@ RESULTS = os.path.join(ROOT, "bench", "results")
 SCENE_ORDER = [
     "hello", "scroll_10k", "text_cjk", "glass_blur", "anim_100",
     "gallery", "resize", "input_ime", "video_playback",
+    # family A — list_ops
+    "list_create_1k", "list_replace_1k", "list_update_10th",
+    "list_swap_rows", "list_remove_row", "list_clear_1k",
+    # family B — ramp
+    "shapes_ramp", "paths_ramp", "text_ramp", "images_ramp",
+    # family C — stress
+    "overdraw_stack", "elevation_grid", "relayout_storm", "mount_churn",
+    "scroll_anim", "text_rich", "chart_live", "clip_path", "theme_switch",
+    "backdrop_scroll",
+    # family D — system
+    "input_latency", "pointer_storm", "semantics_build", "app_switch",
 ]
 METRICS = [
     ("fps", "fps", "{:.1f}"),
     ("frame_time_avg_ms", "avg ms", "{:.2f}"),
     ("frame_time_p99_ms", "p99 ms", "{:.2f}"),
+    ("frame_time_p999_ms", "p99.9 ms", "{:.2f}"),
+    ("jank_pct", "jank %", "{:.1f}"),
     ("draw_calls_per_frame", "draws", "{:.0f}"),
     ("rss_mb", "rss MB", "{:.1f}"),
     ("ttff_ms", "ttff ms", "{:.1f}"),
 ]
+
+# Scene-extra fields (schema v2) rendered as one summary column; missing
+# extra = blank cell (older results stay valid).
+EXTRA_KEYS = ["op_ms", "n_max_60fps", "latency_ms", "latency_frames",
+              "nodes_per_frame", "teardown_ms", "resume_ms"]
+
+
+def extra_summary(sc):
+    extra = sc.get("extra") or {}
+    parts = []
+    if extra.get("ramp"):
+        n_max = extra.get("n_max_60fps")
+        parts.append(f"n_max60={n_max if n_max is not None else '-'}")
+    for k in EXTRA_KEYS:
+        v = extra.get(k)
+        if v is None or k == "n_max_60fps":
+            continue
+        parts.append(f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}")
+    return ", ".join(parts)
 
 
 def load_reports():
@@ -175,7 +207,7 @@ def html_report(reports, scenes):
         parts.append("<table><tr><th>scene</th>")
         for _, label, _ in METRICS:
             parts.append(f"<th>{esc(label)}</th>")
-        parts.append("</tr>")
+        parts.append("<th>extra</th></tr>")
         for s in scenes:
             sc = r["scenes"].get(s)
             if not sc:
@@ -183,6 +215,7 @@ def html_report(reports, scenes):
             parts.append(f"<tr><td>{esc(s)}</td>")
             for key, _, spec in METRICS:
                 parts.append(f"<td>{fmt(sc.get(key), spec)}</td>")
+            parts.append(f"<td class='meta'>{esc(extra_summary(sc))}</td>")
             parts.append("</tr>")
         parts.append("</table>")
     parts.append("</body></html>")

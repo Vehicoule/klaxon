@@ -111,14 +111,14 @@ pub fn build(b: *std.Build) void {
     a11y_step.dependOn(&run_a11y.step);
 
     // --- bench runner (Phase 4c.3) ---
-    // Benchmark runner: 9 canonical scenes, metrics, JSON report to stdout.
+    // Benchmark runner: the 33-scene catalogue, metrics, JSON report to stdout.
     // Always ReleaseSmall — benchmarks must measure the shipping binary
     // (docs/PERF-BUDGETS.md), whatever -Doptimize the user passes. The bench
     // graph gets its OWN ReleaseSmall kx_skia shim: the shared shim is built
     // at the user's optimize (Debug → ubsan-instrumented), which neither links
     // into a ReleaseSmall exe nor measures realistic performance.
     const bench_frames = b.option(u32, "bench-frames", "Benchmark frames per scene (default 600)") orelse 600;
-    const bench_scene = b.option([]const u8, "bench-scene", "Run a single scene by name (default: all 9)") orelse null;
+    const bench_scene = b.option([]const u8, "bench-scene", "Run a single scene by name (default: all scenes)") orelse null;
     const bench_output = b.option([]const u8, "bench-output", "Also write the JSON report to this file") orelse null;
     const bench_options = b.addOptions();
     bench_options.addOption(u32, "bench_frames", bench_frames);
@@ -136,7 +136,7 @@ pub fn build(b: *std.Build) void {
 
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
-    const bench_step = b.step("bench", "Run benchmarks: 9 scenes, JSON metrics to stdout (-Dbench-frames=N -Dbench-scene=NAME -Dbench-output=PATH)");
+    const bench_step = b.step("bench", "Run benchmarks: 33 scenes, JSON metrics to stdout (-Dbench-frames=N -Dbench-scene=NAME -Dbench-output=PATH)");
     bench_step.dependOn(&run_bench.step);
 
     const tests = b.addTest(.{
