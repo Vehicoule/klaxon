@@ -742,8 +742,8 @@ fn addIosApp(
     });
     app.root_module.addImport("sdl_c", translate_sdl.createModule());
     app.root_module.addImport("kx_c", translate_kx.createModule());
-    // Backend selection: -Dios-backend=graphite-metal (default) | ganesh-gles | raster
-    const ios_backend = b.option([]const u8, "ios-backend", "iOS rendering backend (default: graphite-metal)") orelse "graphite-metal";
+    // Backend selection: -Dios-backend=auto (default) | graphite-metal | raster
+    const ios_backend = b.option([]const u8, "ios-backend", "iOS rendering backend (default: auto)") orelse "auto";
     // App selection: -Dios-app=gallery (default) | hello
     const ios_app = b.option([]const u8, "ios-app", "iOS app to build: gallery|hello") orelse "gallery";
     const ios_options = b.addOptions();
@@ -785,26 +785,21 @@ fn addIosApp(
             }
         else
             &[_][]const u8{
-                "xcrun",                                                         "clang++",                                             b.fmt("-x{s}", .{lang}),
-                b.fmt("-isysroot{s}", .{sdk_path}),                              std_flag,                                              "-arch",
-                "arm64",                                                         version_min_flag,                                      "-fno-exceptions",
-                "-fno-rtti",
-                // Dawn expects ARC disabled (src/dawn/common/NSRef.h #errors
-                // under ARC) — the shim's manual retain/release matches.
-                                                                    "-fno-objc-arc",                                       "-DSK_GANESH",
-                "-DSK_GRAPHITE",                                                 "-DSK_METAL",                                          "-DNDEBUG",
-                "-I",                                                            "kx_skia/include",                                     "-I",
-                "deps/skia",                                                     "-I",                                                  "deps/skia/include",
-                "-I",                                                            "deps/SDL/include",
-                // Graphite Dawn (Metal) shim (kx_skia_ios.mm): dawn headers +
-                // the cmake_dawn generated headers — the same include set the
-                // libdawn_combined.a build used (deps/skia/out/<tag>/cmake_dawn).
-                                                   "-I",
-                "deps/skia/third_party/externals/dawn/include",                  "-I",                                                  b.fmt("deps/skia/out/{s}/cmake_dawn/gen/include", .{tag}),
-                "-I",                                                            "deps/skia/third_party/externals/abseil-cpp",          "-I",
-                "deps/skia/third_party/externals/dawn/src/dawn/partition_alloc", "-I",                                                  "deps/skia/third_party/externals/dawn",
-                "-I",                                                            b.fmt("deps/skia/out/{s}/cmake_dawn/gen/src", .{tag}), "-c",
-                src,                                                             "-o",                                                  obj_path,
+                "xcrun", "clang++", b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}),
+                std_flag, "-arch", "arm64",
+                version_min_flag,
+                "-fno-exceptions", "-fno-rtti",
+                // ARC disabled — the shim does manual retain/release
+                // (sk_cfp + CFRetain). iOS ships graphite-metal only.
+                "-fno-objc-arc",
+                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
+                "-I", "kx_skia/include",
+                "-I", "deps/skia",
+                "-I", "deps/skia/include",
+                "-I", "deps/SDL/include",
+                "-c", src,
+                "-o", obj_path,
             };
         const compile = b.addSystemCommand(compile_cmd);
         compile.step.dependOn(last_compile_step);
@@ -820,12 +815,9 @@ fn addIosApp(
     // lib + shim .o + Skia .a + SDL .a + iOS frameworks. The shim and deps
     // are not yet built for iOS — this step may fail at link time; the graph
     // just needs to evaluate.
-    // libdawn_combined.a goes AFTER libskia.a: static-link order is
-    // dependents-first (libskia.a's graphite Dawn backend references dawn
-    // symbols; the kx_skia shim references them too — both resolve here).
     const skia_libs = [_][]const u8{
-        "libfreetype2.a",     "libharfbuzz.a",      "libicu.a",         "libpng.a",      "libskcms.a",
-        "libskia.a",          "libdawn_combined.a", "libskparagraph.a", "libskshaper.a", "libskunicode_core.a",
+        "libfreetype2.a", "libharfbuzz.a",    "libicu.a",      "libpng.a",            "libskcms.a",
+        "libskia.a",      "libskparagraph.a", "libskshaper.a", "libskunicode_core.a",
         "libskunicode_icu.a", "libzlib.a",
     };
     var argv: std.ArrayList([]const u8) = .empty;

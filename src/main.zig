@@ -31,13 +31,13 @@ fn optsFromArgs(args: std.process.Args) !Options {
     var it = try std.process.Args.Iterator.initAllocator(args, std.heap.page_allocator);
     defer it.deinit();
     _ = it.next(); // exe name
-    // Default backend: raster (native) / Ganesh WebGL2 (wasm, Phase 3f) —
-    // the browser has no Metal/Vulkan; WebGL2 is the GPU path, raster stays
-    // the always-available fallback.
+    // Default backend: AUTO walks the platform chain (graphite → ganesh →
+    // raster, the ARCHITECTURE.md contract). `raster`/`metal`/`gl` still
+    // force a backend explicitly (with raster as the automatic last resort).
     var backend: kx.c.kx_backend = if (builtin.os.tag == .emscripten)
         kx.c.KX_BACKEND_GANESH_WEBGL2
     else
-        kx.c.KX_BACKEND_RASTER;
+        kx.c.KX_BACKEND_AUTO;
     var ppm: ?[:0]const u8 = null;
     var devtools = false;
     var inspector = false;
@@ -50,6 +50,8 @@ fn optsFromArgs(args: std.process.Args) !Options {
             backend = kx.c.KX_BACKEND_GRAPHITE_VULKAN;
         } else if (std.mem.eql(u8, arg, "gl")) {
             backend = kx.c.KX_BACKEND_GANESH_GL;
+        } else if (std.mem.eql(u8, arg, "raster")) {
+            backend = kx.c.KX_BACKEND_RASTER;
         } else if (std.mem.startsWith(u8, arg, "--ppm=")) {
             // Windows converts argv → allocated storage the iterator owns;
             // dupe what we retain past deinit. Repeated flags: free the

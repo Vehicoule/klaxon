@@ -242,17 +242,27 @@ Layout runs only when `layout_dirty`. No relayout per frame.
 
 ## Renderer — backend selection
 
-Static map platform→backend. **Never probing** (creators crash instead of returning NULL — measured).
+**The contract: at most three tiers per platform — Graphite on the native
+API, Ganesh GL-family, raster.** `KX_BACKEND_AUTO` walks the chain inside
+`kx_create`; an explicit backend tries itself then raster. The chain is
+resolved once at context creation — zero per-frame cost, no hot switching.
+Window/GL-context setup still lives in `host.zig` (SDL owns the context);
+a failed context there downgrades to raster before `kx_create` even runs.
 
-| Platform | Primary | Fallback | Last resort |
-|---|---|---|---|
-| macOS (arm64) | graphite-metal | raster | — |
-| iOS (arm64) | graphite-metal | graphite-dawn → ganesh-metal → ganesh-gles | raster |
-| Android ≥ API 33 | graphite-vulkan | ganesh-gles | raster |
-| Android < API 33 | ganesh-gles | raster | — |
-| Linux x64/arm64 | graphite-vulkan (Phase 3a) | ganesh-gl (implemented) | raster |
-| Windows x64/arm64 | graphite-dawn-d3d12 | dawn-vulkan → ganesh-gl | raster |
-| Web (WASM) | graphite-webgpu | ganesh-webgl2 | raster |
+| Platform | Chain (primary → … → last resort) | Status |
+|---|---|---|
+| macOS (arm64) | graphite-metal → raster | ✅ complete — no GL fallback (GL frozen at 4.1 since macOS 10.14) |
+| iOS (arm64) | graphite-metal → raster | ✅ complete — ganesh-metal/ganesh-gles/graphite-dawn codepaths removed from shipping |
+| Android | graphite-vulkan → ganesh-gles → raster | 🔧 vulkan pending; gles covers Vulkan-less devices (incl. emulator) |
+| Linux x64/arm64 | graphite-vulkan → ganesh-gl → raster | 🔧 vulkan pending; ganesh-gl implemented (SDL GL context, GLX/EGL/Wayland-agnostic) |
+| Windows x64/arm64 | graphite-dawn-d3d12 → dawn-vulkan → ganesh-gl → raster | 🔧 in flight (win stack); D3D12 is guaranteed on Win10+, Vulkan optional |
+| Web (WASM) | graphite-webgpu → ganesh-webgl2 → raster | 🔧 webgpu pending; webgl2 implemented |
+
+Rationale: Ganesh GL-family is the *single* universal middle tier — one
+FBO-0-wrap pattern shared by wasm/android/linux/win. The only platform
+without a GL middle tier is Apple, where Metal covers 100% of supported
+hardware. Raster is always built, always tested (CI goldens), always
+reachable — it is what makes AUTO safe.
 
 Current truth: macOS ships graphite-metal + raster; iOS ships all five
 backends; Android ships ganesh-gles + raster; Linux ships **ganesh-gl +
