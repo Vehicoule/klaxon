@@ -12,7 +12,7 @@
 # long download instead of a 30-60 min Skia compile. Missing artifacts fall
 # back to the source build below. KLAXON_DEPS_SOURCE=1 forces source builds.
 #
-# Hosts: macOS arm64 (dev host), Linux x64/arm64 (CI). Idempotent: up-to-date steps are skipped.
+# Hosts: macOS arm64 (dev host), Linux x64/arm64 (CI), Windows x64 (Git Bash; arm64 secondary). Idempotent: up-to-date steps are skipped.
 #
 # Usage:
 #   scripts/fetch-deps.sh              # all components
@@ -52,16 +52,69 @@ die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 command -v git     >/dev/null || die "git is required"
 command -v ninja   >/dev/null || die "ninja is required (brew install ninja / apt install ninja-build)"
 command -v cmake   >/dev/null || die "cmake is required (brew install cmake)"
-command -v python3 >/dev/null || die "python3 is required (Skia's bin/gn wrapper)"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+# Git Bash / MSYS2 / Cygwin all report Windows hosts.
+case "$OS" in MINGW*|MSYS*|CYGWIN*) OS=Windows ;; esac
 case "$OS:$ARCH" in
-  Darwin:arm64)  TAG="macos-arm64"; SKIA_TARGET_CPU="arm64"; SKIA_TARGET_OS="mac";   WAMR_PLATFORM="darwin"; WAMR_TARGET="AARCH64" ;;
-  Linux:x86_64)  TAG="linux-x64";   SKIA_TARGET_CPU="x64";   SKIA_TARGET_OS="linux"; WAMR_PLATFORM="linux";  WAMR_TARGET="X86_64" ;;
-  Linux:aarch64) TAG="linux-arm64"; SKIA_TARGET_CPU="arm64"; SKIA_TARGET_OS="linux"; WAMR_PLATFORM="linux";  WAMR_TARGET="AARCH64" ;;
+  Darwin:arm64)    TAG="macos-arm64";    SKIA_TARGET_CPU="arm64"; SKIA_TARGET_OS="mac";     WAMR_PLATFORM="darwin";  WAMR_TARGET="AARCH64" ;;
+  Linux:x86_64)    TAG="linux-x64";      SKIA_TARGET_CPU="x64";   SKIA_TARGET_OS="linux";   WAMR_PLATFORM="linux";   WAMR_TARGET="X86_64" ;;
+  Linux:aarch64)   TAG="linux-arm64";    SKIA_TARGET_CPU="arm64"; SKIA_TARGET_OS="linux";   WAMR_PLATFORM="linux";   WAMR_TARGET="AARCH64" ;;
+  Windows:x86_64)  TAG="windows-x64";    SKIA_TARGET_CPU="x64";   SKIA_TARGET_OS="win";     WAMR_PLATFORM="windows"; WAMR_TARGET="X86_64" ;;
+  Windows:aarch64|Windows:ARM64) TAG="windows-arm64"; SKIA_TARGET_CPU="arm64"; SKIA_TARGET_OS="win"; WAMR_PLATFORM="windows"; WAMR_TARGET="AARCH64" ;;
   *) die "unsupported host $OS/$ARCH — add it to scripts/fetch-deps.sh" ;;
 esac
+
+# python3: Skia's bin/fetch-gn and depot_tools' python3.bat want a `python3`
+# on PATH. Stock Windows Python ships only python.exe — shim it into
+# deps/.win-tools/ (repo-local, not a system change).
+if ! command -v python3 >/dev/null; then
+  if [ "$OS" = "Windows" ] && command -v python >/dev/null; then
+    mkdir -p "$DEPS/.win-tools"
+    PY="$(command -v python)"
+    cp -f "$PY" "$DEPS/.win-tools/python3.exe" 2>/dev/null || true
+    command -v python3 >/dev/null || export PATH="$DEPS/.win-tools:$PATH"
+  fi
+fi
+command -v python3 >/dev/null || die "python3 is required (Skia's bin/gn wrapper)"
+
+# MSVC environment (Windows): locate vcvars through vswhere and import
+# INCLUDE/LIB/LIBPATH/PATH so cl.exe, cmake -G Ninja and gn resolve.
+load_msvc_env() {
+  [ -n "${KX_MSVC_LOADED:-}" ] && return 0
+  local vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  [ -x "$vswhere" ] || die "Visual Studio not found — install VS 2022 Build Tools (workload: VCTools + a Windows SDK)"
+  local vs_path
+  vs_path="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')"
+  [ -n "$vs_path" ] || die "MSVC C++ tools not found — add the VCTools workload"
+  # Pick the vcvars matching the target arch. vcvars64.bat = host arch on
+  # both x64 and ARM64 native installs; cross from an x64 host to ARM64
+  # needs vcvarsamd64_arm64.bat.
+  local vcvars_name="vcvars64.bat"
+  if [ "$SKIA_TARGET_CPU" = "arm64" ] && [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "ARM64" ]; then
+    vcvars_name="vcvarsamd64_arm64.bat"
+  fi
+  local vcvars="$(cygpath -u "$vs_path")/VC/Auxiliary/Build/$vcvars_name"
+  [ -f "$vcvars" ] || die "$vcvars_name not found under $vs_path"
+  # Direct `cmd //c "vcvars && set"` quoting is fragile under MSYS bash — a
+  # temp .bat is deterministic.
+  local tmpbat
+  tmpbat="$(mktemp --suffix=.bat)"
+  printf '@echo off\r\ncall "%s" >nul\r\nset\r\n' "$(cygpath -w "$vcvars")" > "$tmpbat"
+  local line
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in
+      INCLUDE=*|LIB=*|LIBPATH=*) export "$line" ;;
+      Path=*|PATH=*) PATH="$(cygpath -pu "${line#*=}"):$PATH" ;;
+    esac
+  done < <(cmd //c "$(cygpath -w "$tmpbat")")
+  rm -f "$tmpbat"
+  export KX_MSVC_LOADED=1
+  command -v cl >/dev/null || die "cl.exe not on PATH after vcvars — MSVC setup incomplete"
+}
+
 if [ "$OS" = "Darwin" ]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode Command Line Tools required (xcode-select --install)"
 fi
@@ -180,6 +233,10 @@ fetch_dawn() {
   git_clone_at "$ext/spirv-tools"              "$SKIA_GOOG/external/github.com/KhronosGroup/SPIRV-Tools.git"         1ba1f5b8fe921e46091d18370f91fb46450ff786
   git_clone_at "$ext/spirv-headers"            "$SKIA_GOOG/external/github.com/KhronosGroup/SPIRV-Headers.git"       86f980c731e62ae4eaf383d320449d71687936bf
   git_clone_at "$ext/vulkan-headers"           "$CHROMIUM/external/github.com/KhronosGroup/Vulkan-Headers"           c46850864f4661461b0f6cb9922c058ffea4915e
+  # Windows D3D12: Skia cross-compiles SPIRV → HLSL through spirv-cross, and
+  # its D3D12 backend allocates through D3D12MemoryAllocator.
+  git_clone_at "$ext/spirv-cross"              "$CHROMIUM/external/github.com/KhronosGroup/SPIRV-Cross"               b8fcf307f1f347089e3c46eb4451d27f32ebc8d3
+  git_clone_at "$ext/d3d12allocator"           "$SKIA_GOOG/external/github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator.git" 169895d529dfce00390a20e69c2f516066fe7a3b
   git_clone_at "$ext/vulkan-utility-libraries" "$CHROMIUM/external/github.com/KhronosGroup/Vulkan-Utility-Libraries" f91385f84e1c82d744b3050d1919edb3eaa32827
   git_clone_at "$ext/egl-registry"             "$SKIA_GOOG/external/github.com/KhronosGroup/EGL-Registry"            b055c9b483e70ecd57b3cf7204db21f5a06f9ffe
   git_clone_at "$ext/opengl-registry"          "$SKIA_GOOG/external/github.com/KhronosGroup/OpenGL-Registry"         14b80ebeab022b2c78f84a573f01028c96075553
@@ -247,7 +304,7 @@ skia_enable_ganesh = true
 skia_enable_graphite = true
 EOF
       ;;
-    linux-x64|linux-arm64|windows-x64|windows-arm64)
+    linux-x64|linux-arm64)
       # Phase 0: raster-only Skia on Linux — the Linux shim is raster-only
       # (gpu_init returns false). Phase 3a enables graphite-vulkan + ganesh-gl
       # (fetch the vma + vulkan-headers externals from DEPS, apt libgl-dev on CI).
@@ -270,6 +327,38 @@ skia_use_direct3d = false
 skia_use_vma = false
 skia_enable_ganesh = false
 skia_enable_graphite = false
+EOF
+      ;;
+    windows-x64|windows-arm64)
+      # Phase 3c: Dawn (D3D12 primary + Vulkan fallback) + Ganesh GL (WGL)
+      # + raster. MSVC toolchain (cl.exe, /MT) — Skia's msvc toolchain is the
+      # GN default on win; clang is used only when clang_win is set.
+      cat > "$out" <<EOF
+is_debug = false
+is_official_build = true
+is_component_build = false
+target_cpu = "$SKIA_TARGET_CPU"
+target_os = "win"
+
+skia_use_direct3d = true
+skia_use_dawn = true
+skia_use_vulkan = false
+skia_use_gl = true
+skia_use_angle = false
+skia_use_egl = false
+skia_use_x11 = false
+skia_use_metal = false
+skia_use_vma = false
+skia_enable_ganesh = true
+skia_enable_graphite = true
+
+# dawn_enable_vulkan defaults to false on Windows — the Vulkan fallback
+# backend (dawn-vulkan) needs it forced on. D3D11 stays off.
+dawn_enable_vulkan = true
+dawn_enable_d3d11 = false
+
+# jpeg_gainmaps would pull in the expat external — not fetched.
+skia_use_jpeg_gainmaps = false
 EOF
       ;;
   esac
@@ -313,12 +402,20 @@ skia_enable_skshaper = true
 skia_enable_skparagraph = true
 skia_enable_pdf = false
 skia_enable_tools = false
+EOF
+  if [ "$SKIA_TARGET_OS" = "win" ]; then
+    # No GCC-style flags: the MSVC toolchain (cl.exe) rejects -Wno-error and
+    # libc++ does not exist on Windows (MSVC STL + /MT runtime instead).
+    :
+  else
+    cat >> "$out" <<'EOF'
 
 extra_cflags = [ "-Wno-error" ]
 # Linux: compile Skia against libc++ to match zig's bundled libc++ at link time
 # (CI installs libc++-dev). macOS + wasm: libc++ is the default anyway.
 extra_cflags_cc = [ "-Wno-error", "-stdlib=libc++" ]
 EOF
+  fi
 }
 
 # Phase 3f wasm args (target_cpu = "wasm" implies target_os = "wasm",
@@ -354,22 +451,42 @@ EOF
 
 build_skia() {
   local out="$SKIA/out/$TAG"
-  if [ -f "$out/libskia.a" ]; then
+  if [ "$OS" = "Windows" ]; then
+    if [ -f "$out/skia.lib" ]; then
+      log "skia already built for $TAG"
+      return 0
+    fi
+  elif [ -f "$out/libskia.a" ]; then
     log "skia already built for $TAG"
     return 0
   fi
+  if [ "$OS" = "Windows" ]; then load_msvc_env; fi
   fetch_skia
+  # Windows needs the Dawn externals (skia_use_dawn) — Dawn is built via
+  # CMake inside the GN build, which hard-requires all of them.
+  if [ "$SKIA_TARGET_OS" = "win" ]; then fetch_dawn; fi
   mkdir -p "$out"
   write_skia_args "$out/args.gn"
-  if [ ! -x "$SKIA/bin/gn" ]; then
+  if [ ! -x "$SKIA/bin/gn" ] && [ ! -f "$SKIA/bin/gn.exe" ]; then
     log "fetch gn binary (bin/fetch-gn)"
     (cd "$SKIA" && python3 bin/fetch-gn)
   fi
   log "gn gen out/$TAG"
-  (cd "$SKIA" && ./bin/gn gen "out/$TAG")
-  log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
-  ls -la "$out"/*.a
+  local gn="$SKIA/bin/gn"
+  [ -f "$SKIA/bin/gn.exe" ] && gn="$SKIA/bin/gn.exe"
+  (cd "$SKIA" && "$gn" gen "out/$TAG")
+  log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run (Dawn adds ~10-20)"
+  CMAKE_BUILD_PARALLEL_LEVEL=$(( JOBS > 2 ? JOBS - 2 : 1 )) \
+    ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  if [ "$SKIA_TARGET_OS" = "win" ]; then
+    # ICU data file — must sit next to the exe at runtime (skparagraph).
+    local icudtl
+    icudtl="$(find "$out" "$SKIA/third_party/externals/icu" -name icudtl.dat 2>/dev/null | head -1)"
+    [ -n "$icudtl" ] && cp -f "$icudtl" "$out/icudtl.dat"
+    ls -la "$out"/*.lib
+  else
+    ls -la "$out"/*.a
+  fi
 }
 
 # --- SDL3 -------------------------------------------------------------------
@@ -383,15 +500,28 @@ build_sdl3() {
   fi
   git_clone_at "$src" "$SDL3_URL" "$SDL3_PIN"
   log "cmake SDL3 ($TAG, static, trimmed)"
+  local gen_args=()
+  if [ "$OS" = "Windows" ]; then
+    load_msvc_env
+    # /MT: a /MD static lib carries /DEFAULTLIB:MSVCRT, which collides with
+    # the static CRT the final exe links (build.zig win_libs).
+    gen_args=(-G Ninja -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+  fi
   # Trimmed: camera/sensors are V2 platform services, SDL_GPU is unused (Skia renders).
   # Audio + haptics stay ON (v1 platform services, ADR-0005).
-  cmake -S "$src" -B "$build" -DCMAKE_BUILD_TYPE=Release \
+  # gen_args[@]+... : expand only when non-empty — bash 3.2 (macOS) treats an
+  # empty "${arr[@]}" under set -u as unbound.
+  cmake -S "$src" -B "$build" ${gen_args[@]+"${gen_args[@]}"} -DCMAKE_BUILD_TYPE=Release \
     -DSDL_SHARED=OFF -DSDL_STATIC=ON \
     -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF \
     -DSDL_CAMERA=OFF -DSDL_SENSOR=OFF \
     -DSDL_GPU=OFF -DSDL_RENDER_GPU=OFF -DSDL_RENDER_VULKAN=OFF
   cmake --build "$build" --parallel "$JOBS"
-  ls -la "$build"/libSDL3.a
+  if [ "$OS" = "Windows" ]; then
+    ls -la "$build"/SDL3-static.lib
+  else
+    ls -la "$build"/libSDL3.a
+  fi
 }
 
 # --- WAMR -------------------------------------------------------------------
@@ -407,7 +537,12 @@ build_wamr() {
   fi
   git_clone_at "$src" "$WAMR_URL" "$WAMR_PIN"
   log "cmake WAMR ($TAG, fast-interp)"
-  cmake -S "$src/product-mini/platforms/$WAMR_PLATFORM" -B "$build" \
+  local gen_args=()
+  if [ "$OS" = "Windows" ]; then
+    load_msvc_env
+    gen_args=(-G Ninja -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded)
+  fi
+  cmake -S "$src/product-mini/platforms/$WAMR_PLATFORM" -B "$build" ${gen_args[@]+"${gen_args[@]}"} \
     -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_TARGET="$WAMR_TARGET" \
     -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 \
@@ -543,9 +678,9 @@ src, dst = sys.argv[1], sys.argv[2]
 with open(src, "rb") as f:
     data = f.read()
 with open(dst, "w") as f:
-    f.write("// kx_font_wasm.h — generated by scripts/fetch-deps.sh (web-wasm)\n")
-    f.write("// Embedded default font (DejaVu Sans 2.37) for the WASM Skia backend.\n")
-    f.write("// Regenerate: rm kx_skia/src/kx_font_wasm.h && scripts/fetch-deps.sh web-wasm\n")
+    f.write("// kx_font_wasm.h — generated by scripts/fetch-deps.sh\n")
+    f.write("// Embedded default font (DejaVu Sans 2.37) for the WASM and Windows Skia backends.\n")
+    f.write("// Regenerate: rm kx_skia/src/kx_font_wasm.h && scripts/fetch-deps.sh\n")
     f.write("#pragma once\n")
     f.write("#include <cstddef>\n")
     f.write("#include <cstdint>\n\n")
@@ -877,6 +1012,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       *) die "unknown component '$component' (expected: skia | sdl3 | wamr | web-wasm | android-arm64 | ios)" ;;
     esac
   done
+
+  # Windows embeds the same DejaVu default font as web-wasm (icon/symbol
+  # coverage + deterministic metrics across platforms).
+  case "$TAG" in
+    windows-*) generate_font_header ;;
+  esac
 
   log "done — artifacts in $DEPS ($TAG)"
   du -sh "$DEPS" 2>/dev/null || true
