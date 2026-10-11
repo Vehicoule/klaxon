@@ -192,27 +192,23 @@ quint64 countVisibleItems(const QQuickItem *item) {
     return n;
 }
 
-// Nearest-rank percentile of an ascending-sorted sample: the value at rank
-// ceil(p·n/100) — e.g. the p50 of 20 samples is the 10th value (index 9).
-// This is the strict nearest-rank convention; note bench.zig uses the
-// floor-rank index min(n*p/100, n-1), which lands one rank higher on small
-// samples — at 20 frames per ramp step the floor variant would pick the
-// 11th value and misclassify n_max_60fps. p is in percent (50/99); the
-// p99.9 tail uses the per-mille overload below.
+// Nearest-rank percentile of an ascending-sorted sample — the shared
+// bench.zig convention (spec bench-scenes.md): index min(n*p/100, n-1)
+// over the ascending sort. All four runners implement this identical
+// floor-rank formula so cross-framework percentiles are computed the same
+// way; p is in percent (50/99), the p99.9 tail uses the per-mille overload.
 double percentile(const std::vector<double> &sorted, int p) {
     if (sorted.empty())
         return 0;
     const size_t n = sorted.size();
-    const size_t rank = (n * size_t(p) + 99) / 100; // ceil(n*p/100)
-    return sorted[std::min(rank, n) - 1];
+    return sorted[std::min(n * size_t(p) / 100, n - 1)];
 }
 
 double percentilePerMille(const std::vector<double> &sorted, int pMille) {
     if (sorted.empty())
         return 0;
     const size_t n = sorted.size();
-    const size_t rank = (n * size_t(pMille) + 999) / 1000; // ceil
-    return sorted[std::min(rank, n) - 1];
+    return sorted[std::min(n * size_t(pMille) / 1000, n - 1)];
 }
 
 quint64 imageHash(const QImage &img) {
