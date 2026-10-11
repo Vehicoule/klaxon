@@ -168,4 +168,8 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_CoreText(nullptr);
 }
 
+const char* platform_font_family() { return nullptr; }
+
+const char* platform_fallback_font_family() { return nullptr; }
+
 } // namespace kx

@@ -20,6 +20,7 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkTypeface.h"
 #include "include/effects/SkGradient.h"
+#include "src/core/SkUTF.h"
 
 #include <cstring>
 #include <unordered_map>
@@ -43,10 +44,30 @@ static sk_sp<SkFontMgr>& kx_fonts() {
     return mgr;
 }
 
-static SkFont kx_make_font(float size, bool bold) {
+static bool kx_typeface_covers(SkTypeface* tf, const char* utf8) {
+    if (!tf) return false;
+    const char* p = utf8;
+    const char* const end = utf8 + std::strlen(utf8);
+    while (p < end) {
+        const SkUnichar u = SkUTF::NextUTF8(&p, end);
+        if (u < 0) break;
+        if (tf->unicharToGlyph(u) == 0) return false;
+    }
+    return true;
+}
+
+static SkFont kx_make_font(const char* text, float size, bool bold) {
     SkFont font;
     if (kx_fonts()) {
-        font.setTypeface(kx_fonts()->legacyMakeTypeface(nullptr, bold ? SkFontStyle::Bold() : SkFontStyle::Normal()));
+        const SkFontStyle style = bold ? SkFontStyle::Bold() : SkFontStyle::Normal();
+        sk_sp<SkTypeface> tf = kx_fonts()->legacyMakeTypeface(kx::platform_font_family(), style);
+        const char* fallback = kx::platform_fallback_font_family();
+        if (tf && fallback && text && !kx_typeface_covers(tf.get(), text)) {
+            if (sk_sp<SkTypeface> fbtf = kx_fonts()->legacyMakeTypeface(fallback, style)) {
+                if (kx_typeface_covers(fbtf.get(), text)) tf = std::move(fbtf);
+            }
+        }
+        font.setTypeface(std::move(tf));
     }
     font.setSize(size);
     return font;
@@ -130,7 +151,7 @@ void kx_draw_text(kx_ctx* ctx, const char* text, float x, float y, float size, u
 
 void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float size, bool bold, uint32_t rgba) {
     if (!ctx || !ctx->canvas || !text) return;
-    SkFont font = kx_make_font(size, bold);
+    SkFont font = kx_make_font(text, size, bold);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -140,7 +161,7 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
     kx_text_metrics m = {0, 0, 0, 0};
     if (!text) return m;
-    const SkFont font = kx_make_font(size, bold);
+    const SkFont font = kx_make_font(text, size, bold);
     SkFontMetrics fm;
     font.getMetrics(&fm);
     m.ascent = -fm.fAscent; // fAscent is negative (above the baseline)

@@ -36,4 +36,14 @@ bool gpu_end_offscreen(GpuState* state);
 // Platform font manager (macOS: CoreText, Linux: custom directory, ...).
 sk_sp<SkFontMgr> platform_font_mgr();
 
+// Default family name passed to legacyMakeTypeface, or nullptr to let the
+// manager pick its built-in default (Arial/DejaVu/...).
+const char* platform_font_family();
+
+// Fallback family consulted when the default typeface lacks a codepoint in
+// the drawn string, or nullptr for no fallback. Windows returns Segoe UI
+// Symbol — Segoe UI and Arial lack the Geometric Shapes/Arrows/Dingbats
+// codepoints the icon widget paints.
+const char* platform_fallback_font_family();
+
 } // namespace kx
