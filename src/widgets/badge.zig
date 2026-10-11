@@ -244,3 +244,24 @@ test "golden: badge paints the error pill with the on_error label" {
     defer f2.deinit();
     try std.testing.expectEqual(t.colors.@"error", f2.pixelAt(13, 13));
 }
+
+test "golden: badged_box paints the badge over the content's top-trailing corner" {
+    const t = theme_mod.light;
+    const content = try golden.solidBox(std.testing.allocator, 24, 24, 0x112233FF);
+    const dot = try badge(std.testing.allocator, .{ .theme = t });
+    const box = try badgedBox(std.testing.allocator, content, dot, .{});
+    defer box.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 40, 40);
+    defer r.deinit();
+    box.layout(.{ .x = 8, .y = 8, .w = 24, .h = 24 });
+    r.paint(box, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // the small badge: a 6x6 error circle anchored at the content's
+    // top-trailing corner (26, 8) — its center is error fill
+    try std.testing.expectEqual(t.colors.@"error", f.pixelAt(29, 11));
+    // the content's body, away from the badge: the content color
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f.pixelAt(12, 28));
+    // outside both: background
+    try std.testing.expectEqual(@as(Color, 0x000000FF), f.pixelAt(2, 2));
+}

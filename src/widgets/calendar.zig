@@ -323,3 +323,37 @@ test "golden: the calendar paints SurfaceContainer + a day grid" {
     // Outside the panel corner: background.
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(10, 10));
 }
+
+test "golden: the selected day paints a primary-filled cell with on_primary ink" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    // A fixed "today" keeps the displayed month deterministic (Oct 2026).
+    const fixed_today = date_picker_w.daysFromCivil(2026, 10, 15);
+    const sel = try ui.state.Signal(?i64).init(a, null);
+    defer sel.deinit();
+    const n = try calendar(a, sel, null, .{ .theme = t, .today = fixed_today });
+    defer n.deinit();
+    var r = try golden.Renderer.init(a, 300, 340);
+    defer r.deinit();
+    n.layout(.{ .x = 10, .y = 10, .w = 280, .h = total_h });
+    // counts are scoped to the panel INSET by the corner radius: the light
+    // theme's on_primary is white (0xFFFFFFFF), and the rounded corners show
+    // the white background — indistinguishable without the inset
+    const panel: ui.node.Rect = .{ .x = 10 + panel_corner, .y = 10 + panel_corner, .w = 280 - 2 * panel_corner, .h = total_h - 2 * panel_corner };
+    // unselected: no filled primary cell (today is only stroked) and no
+    // on_primary ink anywhere in the panel
+    r.paint(n, 0xFFFFFFFF);
+    var f1 = try r.readback(a);
+    const base_primary = f1.countColorIn(panel, t.colors.primary);
+    try std.testing.expectEqual(@as(u64, 0), f1.countColorIn(panel, t.colors.on_primary));
+    f1.deinit();
+    // select Oct 10 (in the displayed month): a filled primary cell
+    sel.set(date_picker_w.daysFromCivil(2026, 10, 10));
+    n.layout(.{ .x = 10, .y = 10, .w = 280, .h = total_h });
+    r.paint(n, 0xFFFFFFFF);
+    var f2 = try r.readback(a);
+    defer f2.deinit();
+    // the filled circle (r = 18 → ~1017px, minus the day-number ink) dominates
+    // the today stroke (~100px) — font-independent (the fill needs no glyphs)
+    try std.testing.expect(f2.countColorIn(panel, t.colors.primary) > base_primary + 400);
+}

@@ -146,3 +146,195 @@ pub fn syncItemWindow(
         layout_item(n, node, index);
     }
 }
+
+// --- tests ---
+
+const kx = @import("../kx.zig");
+const golden = @import("../golden.zig");
+
+// --- syncItemWindow (a counting item factory + a solid-box parent) ---
+
+const ItemRec = struct { created: *u32, last_index: *usize };
+
+fn countItem(userdata: ?*anyopaque, index: usize) *Node {
+    const rec: *ItemRec = @ptrCast(@alignCast(userdata.?));
+    rec.created.* += 1;
+    rec.last_index.* = index;
+    // Deliberately no error path: OOM is fatal (Node.add convention).
+    return golden.solidBox(std.testing.allocator, 10, 10, 0xFF0000FF) catch @panic("klaxon: out of memory");
+}
+
+fn noopLayoutItem(_: *Node, _: *Node, _: usize) void {}
+
+test "syncItemWindow: fills, trims front/back, prepends and appends" {
+    const parent = try golden.solidBox(std.testing.allocator, 100, 100, 0xFFFFFFFF);
+    defer parent.deinit();
+    var created: u32 = 0;
+    var last_index: usize = 0;
+    var rec = ItemRec{ .created = &created, .last_index = &last_index };
+    const factory = ItemFactory{ .fn_ptr = countItem, .userdata = &rec };
+    var first: usize = 0;
+    // initial fill [0, 5)
+    syncItemWindow(parent, &first, factory, .{ .first = 0, .last = 5 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(usize, 5), parent.children.items.len);
+    try std.testing.expectEqual(@as(u32, 5), created);
+    // scroll down: [2, 7) → trim 2 at the front, append 2 at the back
+    syncItemWindow(parent, &first, factory, .{ .first = 2, .last = 7 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(usize, 2), first);
+    try std.testing.expectEqual(@as(usize, 5), parent.children.items.len);
+    try std.testing.expectEqual(@as(u32, 7), created); // only the 2 new items
+    try std.testing.expectEqual(@as(usize, 6), last_index); // the last appended index
+    // scroll up: [0, 3) → prepend 2 at the front, trim 4 at the back
+    syncItemWindow(parent, &first, factory, .{ .first = 0, .last = 3 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(usize, 0), first);
+    try std.testing.expectEqual(@as(usize, 3), parent.children.items.len);
+    try std.testing.expectEqual(@as(u32, 9), created);
+}
+
+test "syncItemWindow: a non-overlapping jump re-anchors without materializing the gap" {
+    const parent = try golden.solidBox(std.testing.allocator, 100, 100, 0xFFFFFFFF);
+    defer parent.deinit();
+    var created: u32 = 0;
+    var last_index: usize = 0;
+    var rec = ItemRec{ .created = &created, .last_index = &last_index };
+    const factory = ItemFactory{ .fn_ptr = countItem, .userdata = &rec };
+    var first: usize = 0;
+    syncItemWindow(parent, &first, factory, .{ .first = 0, .last = 5 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(u32, 5), created);
+    // jump far ahead: [1000, 1005) — drop everything, re-anchor (NOT 1000 items)
+    syncItemWindow(parent, &first, factory, .{ .first = 1000, .last = 1005 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(usize, 1000), first);
+    try std.testing.expectEqual(@as(usize, 5), parent.children.items.len);
+    try std.testing.expectEqual(@as(u32, 10), created); // only the 5 new ones
+    // an empty window drops everything
+    syncItemWindow(parent, &first, factory, .{ .first = 0, .last = 0 }, noopLayoutItem);
+    try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+    try std.testing.expectEqual(@as(u32, 10), created); // nothing re-created
+}
+
+// --- ScrollInput (a stub scrollable widget wired like ListView) ---
+
+const ScrollWidget = struct {
+    input: ScrollInput = .{},
+    scroll: scroll_mod.ScrollState = .{},
+    set_calls: u32 = 0,
+    last_value: f32 = 0,
+};
+
+fn swSetOffset(n: *Node, value: f32) bool {
+    const s: *ScrollWidget = @ptrCast(@alignCast(n.state.?));
+    s.set_calls += 1;
+    s.last_value = value;
+    return s.scroll.setOffset(value);
+}
+fn swMeasure(_: *Node, c: ui.layout.Constraints) ui.layout.Size {
+    return c.constrain(.{ .w = 100, .h = 100 });
+}
+fn swLayout(_: *Node, _: ui.node.Rect) void {}
+fn swPaint(_: *Node, _: *kx.Ctx) void {}
+fn swOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const s: *ScrollWidget = @ptrCast(@alignCast(n.state.?));
+    return s.input.onPointer(ev, &s.scroll, swSetOffset, n);
+}
+fn swOnScroll(n: *Node, ev: input.ScrollEvent) bool {
+    const s: *ScrollWidget = @ptrCast(@alignCast(n.state.?));
+    return s.input.onScroll(ev, &s.scroll, 48, swSetOffset, n);
+}
+fn swDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*ScrollWidget, @ptrCast(@alignCast(n.state.?))));
+}
+const sw_vtable = ui.node.VTable{
+    .measure = swMeasure,
+    .layout = swLayout,
+    .paint = swPaint,
+    .deinit = swDeinit,
+    .on_pointer = swOnPointer,
+    .on_scroll = swOnScroll,
+};
+
+fn scrollWidget() !*Node {
+    const n = try Node.create(std.testing.allocator, &sw_vtable);
+    errdefer n.allocator.destroy(n);
+    const s = try std.testing.allocator.create(ScrollWidget);
+    errdefer std.testing.allocator.destroy(s);
+    s.* = .{ .scroll = .{ .content = 1000, .viewport = 200 } };
+    n.state = s;
+    n.layout(.{ .x = 0, .y = 0, .w = 100, .h = 200 });
+    return n;
+}
+
+fn swState(n: *Node) *ScrollWidget {
+    return @ptrCast(@alignCast(n.state.?));
+}
+
+test "ScrollInput: a drag scrolls (finger up = offset up); a hover move does not" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const n = try scrollWidget();
+    defer n.deinit();
+    const s = swState(n);
+    // a hover move (no capture) never scrolls
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 100 });
+    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 0), s.set_calls);
+    // press (capture + track), then drag DOWN 30px: the content follows → offset -30 → clamped 0
+    router.dispatchPointer(n, .{ .phase = .down, .x = 50, .y = 100 });
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 130 });
+    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset); // clamped at 0
+    try std.testing.expectEqual(@as(u32, 1), s.set_calls);
+    try std.testing.expectEqual(@as(f32, -30), s.last_value); // the requested (unclamped) value
+    // drag UP 50px from there: offset +50
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 80 });
+    try std.testing.expectEqual(@as(f32, 50), s.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 2), s.set_calls);
+    try std.testing.expectEqual(@as(f32, 50), s.last_value);
+    // release: the track ends; a later hover move does not scroll
+    router.dispatchPointer(n, .{ .phase = .up, .x = 50, .y = 80 });
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 10 });
+    try std.testing.expectEqual(@as(f32, 50), s.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 2), s.set_calls);
+}
+
+test "ScrollInput: the wheel scrolls by delta * speed; an unscrollable ignores it" {
+    var router = input.InputRouter{};
+    const n = try scrollWidget();
+    defer n.deinit();
+    const s = swState(n);
+    // wheel down (delta_y = -1) at speed 48 → offset += 48
+    router.dispatchScroll(n, .{ .x = 50, .y = 50, .delta_y = -1 });
+    try std.testing.expectEqual(@as(f32, 48), s.scroll.offset);
+    // wheel up (delta_y = +1) → offset -= 48
+    router.dispatchScroll(n, .{ .x = 50, .y = 50, .delta_y = 1 });
+    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset);
+    // content smaller than the viewport: canScroll is false → ignored
+    s.scroll = .{ .content = 100, .viewport = 200 };
+    router.dispatchScroll(n, .{ .x = 50, .y = 50, .delta_y = -1 });
+    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset);
+    try std.testing.expectEqual(@as(u32, 2), s.set_calls); // no extra set_offset call
+}
+
+test "ScrollInput: tracks are per-pointer; up releases the track" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const n = try scrollWidget();
+    defer n.deinit();
+    const s = swState(n);
+    // two fingers down at the same spot
+    router.dispatchPointer(n, .{ .phase = .down, .x = 50, .y = 100, .pointer = 1 });
+    router.dispatchPointer(n, .{ .phase = .down, .x = 50, .y = 100, .pointer = 2 });
+    // finger 1 moves up 40 → offset 40
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 60, .pointer = 1 });
+    try std.testing.expectEqual(@as(f32, 40), s.scroll.offset);
+    // finger 2 moves down 10 from ITS OWN start (raw_y 100 → 110) → offset 30
+    // (a shared track would compute the delta against finger 1's last y=60
+    // and clamp to 0 instead)
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 110, .pointer = 2 });
+    try std.testing.expectEqual(@as(f32, 30), s.scroll.offset);
+    // release finger 1 (router + track); a fresh drag starts without a jump
+    router.dispatchPointer(n, .{ .phase = .up, .x = 50, .y = 60, .pointer = 1 });
+    router.dispatchPointer(n, .{ .phase = .down, .x = 50, .y = 150, .pointer = 1 });
+    router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 140, .pointer = 1 });
+    try std.testing.expectEqual(@as(f32, 40), s.scroll.offset); // 30 + 10
+}

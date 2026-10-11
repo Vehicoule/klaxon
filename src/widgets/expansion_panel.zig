@@ -374,3 +374,30 @@ test "golden: the collapsed panel paints SurfaceContainer + title + chevron" {
     // Title ink (OnSurface) in the header area.
     try std.testing.expect(f.countColorIn(.{ .x = 36, .y = 30, .w = 100, .h = 20 }, t.colors.on_surface) > 0);
 }
+
+test "golden: the expanded panel paints the child body; the collapsed panel does not" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(bool).init(a, false);
+    defer sig.deinit();
+    const body = try golden.solidBox(a, 100, 20, 0x336699FF);
+    const n = try expansionPanel(a, sig, body, .{ .title = "Panel", .theme = t });
+    defer n.deinit();
+    var r = try golden.Renderer.init(a, 340, 140);
+    defer r.deinit();
+    // collapsed: the body is invisible → not a single body pixel
+    n.layout(.{ .x = 20, .y = 20, .w = 300, .h = 120 });
+    r.paint(n, 0xFFFFFFFF);
+    var f1 = try r.readback(a);
+    try std.testing.expectEqual(@as(u64, 0), f1.countColor(0x336699FF));
+    f1.deinit();
+    // expanded: the body paints below the header — child_y = 20 + 48 + 1 + 16
+    // = 85, x = 36, w = 300 - 2*16 = 268, h = 20 (the solid box's size)
+    sig.set(true);
+    n.layout(.{ .x = 20, .y = 20, .w = 300, .h = 120 });
+    r.paint(n, 0xFFFFFFFF);
+    var f2 = try r.readback(a);
+    defer f2.deinit();
+    try std.testing.expectEqual(@as(u64, 268 * 20), f2.countColor(0x336699FF));
+    try std.testing.expectEqual(@as(Color, 0x336699FF), f2.pixelAt(100, 95));
+}

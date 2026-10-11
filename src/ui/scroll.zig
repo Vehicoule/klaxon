@@ -123,3 +123,47 @@ test "visibleRange: viewport ± margin, clamped to the item count" {
     const r3 = visibleRange(10_000, 48, 200, 0, 2);
     try std.testing.expect(r3.last - r3.first <= 10);
 }
+
+test "scroll state: info() maps offset, max, viewport and content" {
+    var s = ScrollState{ .content = 1000, .viewport = 200, .offset = 250 };
+    const info = s.info();
+    try std.testing.expectEqual(@as(f32, 250), info.offset);
+    try std.testing.expectEqual(@as(f32, 800), info.max_offset);
+    try std.testing.expectEqual(@as(f32, 200), info.viewport);
+    try std.testing.expectEqual(@as(f32, 1000), info.content);
+    try std.testing.expect(info.canScroll());
+    // a fresh state (nothing scrolled): max_offset is the full slack
+    const fresh = ScrollState{ .content = 300, .viewport = 100 };
+    try std.testing.expectEqual(@as(f32, 200), fresh.info().max_offset);
+}
+
+test "scroll info: thumb fraction clamps to [0.05, 1]" {
+    // viewport larger than the content → the thumb fills the track
+    const big = ScrollInfo{ .viewport = 500, .content = 100 };
+    try std.testing.expectEqual(@as(f32, 1), big.thumbFraction());
+    // a tiny viewport → the 0.05 floor (a hairline thumb stays grabbable)
+    const tiny = ScrollInfo{ .viewport = 1, .content = 10_000 };
+    try std.testing.expectEqual(@as(f32, 0.05), tiny.thumbFraction());
+    // zero content → 1 (the guard, no division by zero)
+    const zero = ScrollInfo{ .viewport = 100, .content = 0 };
+    try std.testing.expectEqual(@as(f32, 1), zero.thumbFraction());
+}
+
+test "visibleRange: degenerate inputs and partial items" {
+    // a non-positive stride → empty (the caller never scrolls without one)
+    try std.testing.expectEqual(Range{ .first = 0, .last = 0 }, visibleRange(10, 0, 25, 0, 1));
+    try std.testing.expectEqual(Range{ .first = 0, .last = 0 }, visibleRange(10, -5, 25, 0, 1));
+    // margin 0: exactly the intersecting items (ceil(25/10) = 3)
+    const r = visibleRange(10, 10, 25, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), r.first);
+    try std.testing.expectEqual(@as(usize, 3), r.last);
+    // a fractional stride counts partial items at the edges
+    const rf = visibleRange(100, 2.5, 10, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), rf.first);
+    try std.testing.expectEqual(@as(usize, 4), rf.last); // ceil(10/2.5) = 4
+    // a negative offset → empty (the offset is clamped before this runs)
+    try std.testing.expectEqual(Range{ .first = 0, .last = 0 }, visibleRange(10, 10, 25, -50, 1));
+    // the window never inverts: last is at least first
+    const inv = visibleRange(10, 10, 25, 95, 0);
+    try std.testing.expect(inv.last >= inv.first);
+}

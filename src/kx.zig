@@ -22,3 +22,10 @@ pub fn a11yShutdown() void {
 pub fn create(window: ?*anyopaque, width: c_int, height: c_int, backend: c.kx_backend) ?*Ctx {
     return c.kx_create(window, width, height, backend);
 }
+
+// --- tests ---
+
+test "raster backend creates a headless ctx and destroys it" {
+    const ctx = create(null, 64, 48, c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    c.kx_destroy(ctx);
+}

@@ -937,3 +937,309 @@ test "invisible nodes are neither painted nor hit-tested" {
     child.visible = false;
     try std.testing.expectEqual(root, root.hitTest(10, 10).?);
 }
+
+// --- scroll dispatch (recording scroll stub) ---
+
+const RecScrollState = struct { events: u32 = 0, last_dy: f32 = 0, handled: bool = true };
+
+fn recOnScroll(n: *Node, ev: ScrollEvent) bool {
+    const s: *RecScrollState = @ptrCast(@alignCast(n.state.?));
+    s.events += 1;
+    s.last_dy = ev.delta_y;
+    return s.handled;
+}
+fn recScrollDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*RecScrollState, @ptrCast(@alignCast(n.state.?))));
+}
+const scroll_rec_vtable = blk: {
+    var vt = rec_vtable;
+    vt.on_scroll = recOnScroll;
+    vt.deinit = recScrollDeinit;
+    break :blk vt;
+};
+
+fn scrollRecNode(allocator: std.mem.Allocator, handled: bool) !*Node {
+    const node = try Node.create(allocator, &scroll_rec_vtable);
+    errdefer node.allocator.destroy(node);
+    const s = try allocator.create(RecScrollState);
+    errdefer allocator.destroy(s);
+    s.* = .{ .handled = handled };
+    node.state = s;
+    return node;
+}
+
+fn scrollRecState(n: *Node) *RecScrollState {
+    return @ptrCast(@alignCast(n.state.?));
+}
+
+test "scroll delivers to the hit chain and bubbles until handled; a miss delivers nothing" {
+    const root = try recNode(std.testing.allocator, false);
+    defer root.deinit();
+    const parent = try scrollRecNode(std.testing.allocator, false);
+    const child = try scrollRecNode(std.testing.allocator, true); // claims scroll
+    root.add(parent);
+    parent.add(child);
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    parent.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    child.layout(.{ .x = 0, .y = 0, .w = 50, .h = 50 });
+    var router = InputRouter{};
+    router.dispatchScroll(root, .{ .x = 10, .y = 10, .delta_y = -3 });
+    try std.testing.expectEqual(@as(u32, 1), scrollRecState(child).events);
+    try std.testing.expectEqual(@as(f32, -3), scrollRecState(child).last_dy);
+    try std.testing.expectEqual(@as(u32, 0), scrollRecState(parent).events); // claimed by the child
+    // a miss: nothing delivered
+    router.dispatchScroll(root, .{ .x = 500, .y = 500, .delta_y = 1 });
+    try std.testing.expectEqual(@as(u32, 1), scrollRecState(child).events);
+    // an unhandled child: the event bubbles to the parent
+    scrollRecState(child).handled = false;
+    router.dispatchScroll(root, .{ .x = 10, .y = 10, .delta_y = 2 });
+    try std.testing.expectEqual(@as(u32, 2), scrollRecState(child).events);
+    try std.testing.expectEqual(@as(u32, 1), scrollRecState(parent).events);
+    try std.testing.expectEqual(@as(f32, 2), scrollRecState(parent).last_dy);
+}
+
+// --- modal back stack ---
+
+var back_log: [8]u8 = undefined;
+var back_log_len: usize = 0;
+
+fn logBack(userdata: ?*anyopaque) bool {
+    const id: *u8 = @ptrCast(@alignCast(userdata.?));
+    back_log[back_log_len] = id.*;
+    back_log_len += 1;
+    return true;
+}
+
+test "back stack: LIFO dispatch, pop by userdata (topmost match), a full stack rejects" {
+    var router = InputRouter{};
+    var a: u8 = 'a';
+    var b: u8 = 'b';
+    var c: u8 = 'c';
+    try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &a }));
+    try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &b }));
+    try std.testing.expectEqual(@as(usize, 2), router.back_stack_len);
+    // dispatchBack runs the topmost handler first
+    back_log_len = 0;
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expectEqual(@as(usize, 1), back_log_len);
+    try std.testing.expectEqual(@as(u8, 'b'), back_log[0]);
+    // pop by userdata removes the match even when it is not on top
+    router.popBackHandler(&a);
+    try std.testing.expectEqual(@as(usize, 1), router.back_stack_len);
+    back_log_len = 0;
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expectEqual(@as(u8, 'b'), back_log[0]); // b is now the top
+    // popping an unknown userdata is a no-op
+    router.popBackHandler(&c);
+    try std.testing.expectEqual(@as(usize, 1), router.back_stack_len);
+    // duplicate userdata: the pop removes the TOPMOST match (LIFO)
+    var router2 = InputRouter{};
+    try std.testing.expect(router2.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &a }));
+    try std.testing.expect(router2.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &a }));
+    router2.popBackHandler(&a);
+    try std.testing.expectEqual(@as(usize, 1), router2.back_stack_len);
+    back_log_len = 0;
+    try std.testing.expect(router2.dispatchBack());
+    try std.testing.expectEqual(@as(u8, 'a'), back_log[0]); // the remaining (bottom) one
+    // fill the stack (one slot taken by 'b'): the 9th push fails
+    var ids: [8]u8 = .{ 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k' };
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &ids[i] }));
+    }
+    try std.testing.expect(!router.pushBackHandler(.{ .fn_ptr = logBack, .userdata = &ids[7] }));
+    try std.testing.expectEqual(@as(usize, 8), router.back_stack_len);
+}
+
+test "back: the modal stack is consulted before the navigator's back handler" {
+    var router = InputRouter{};
+    var modal: u32 = 0;
+    var nav: u32 = 0;
+    router.setBackHandler(.{ .fn_ptr = countBack, .userdata = &nav });
+    try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = countBack, .userdata = &modal }));
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expectEqual(@as(u32, 1), modal);
+    try std.testing.expectEqual(@as(u32, 0), nav); // the modal swallowed the back
+    router.popBackHandler(&modal);
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expectEqual(@as(u32, 1), nav);
+}
+
+test "refreshHover: no-op without a last position; refreshes without a hover_move" {
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    var router = InputRouter{};
+    router.refreshHover(root); // no last position → no-op
+    try std.testing.expect(router.hoveredNode() == null);
+    try std.testing.expectEqual(@as(usize, 0), recState(root).log.items.len);
+    // hover once (records the last position), then move away (leave)
+    router.dispatchPointer(root, .{ .phase = .move, .x = 50, .y = 50 }); // enter
+    router.dispatchPointer(root, .{ .phase = .move, .x = 500, .y = 500 }); // leave
+    try std.testing.expect(router.hoveredNode() == null);
+    // the pointer "comes back" without a move event (a layout change): the
+    // refresh re-hovers — with an .enter, never a .hover_move
+    router.last_x = 50;
+    router.last_y = 50;
+    router.refreshHover(root);
+    try std.testing.expect(router.hoveredNode() == root);
+    const log = recState(root).log.items;
+    try std.testing.expectEqual(@as(usize, 3), log.len);
+    try std.testing.expectEqual(PointerPhase.enter, log[0]);
+    try std.testing.expectEqual(PointerPhase.leave, log[1]);
+    try std.testing.expectEqual(PointerPhase.enter, log[2]);
+}
+
+test "capture slots: the 9th simultaneous pointer is dropped" {
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    var router = InputRouter{};
+    var p: u64 = 1;
+    while (p <= MAX_POINTERS) : (p += 1) {
+        router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10, .pointer = p });
+    }
+    p = 1;
+    while (p <= MAX_POINTERS) : (p += 1) {
+        try std.testing.expect(router.capturedNode(p) == root);
+    }
+    // no free slot: the extra pointer's capture is dropped
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10, .pointer = MAX_POINTERS + 1 });
+    try std.testing.expect(router.capturedNode(MAX_POINTERS + 1) == null);
+}
+
+test "focus marks the previously focused node dirty" {
+    const a = try recNode(std.testing.allocator, false);
+    defer a.deinit();
+    const b = try recNode(std.testing.allocator, false);
+    defer b.deinit();
+    a.layout(.{ .x = 0, .y = 0, .w = 10, .h = 10 });
+    b.layout(.{ .x = 0, .y = 0, .w = 10, .h = 10 });
+    var router = InputRouter{};
+    a.dirty = false;
+    b.dirty = false;
+    router.focus(a);
+    try std.testing.expect(!a.dirty); // focusing does not dirty the new node
+    router.focus(b);
+    try std.testing.expect(a.dirty); // the old one repaints (its caret/focus border is gone)
+    try std.testing.expect(!b.dirty);
+    router.focus(b); // same node: nothing
+    try std.testing.expect(!b.dirty);
+}
+
+test "process-global wrappers: requestFocus/isFocused/setOpenPopup/releaseNode" {
+    var router = InputRouter{};
+    setCurrent(&router);
+    defer setCurrent(null);
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    try std.testing.expect(current() == &router);
+    try std.testing.expect(!isFocused(root));
+    requestFocus(root);
+    try std.testing.expect(router.focused == root);
+    try std.testing.expect(isFocused(root));
+    requestFocus(null);
+    try std.testing.expect(router.focused == null);
+    setOpenPopup(root);
+    try std.testing.expect(router.open_popup == root);
+    setOpenPopup(null);
+    try std.testing.expect(router.open_popup == null);
+    // releaseNode through the global clears capture/hover/focus
+    router.dispatchPointer(root, .{ .phase = .move, .x = 10, .y = 10 }); // hover
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 }); // capture
+    router.focus(root);
+    releaseNode(root);
+    try std.testing.expect(router.capturedNode(0) == null);
+    try std.testing.expect(router.hovered == null);
+    try std.testing.expect(router.focused == null);
+}
+
+// --- coordinate mapping through a transformed ancestor ---
+
+const RecPointState = struct { x: f32 = 0, y: f32 = 0, raw_x: f32 = 0, raw_y: f32 = 0, got: bool = false };
+
+fn recPointPointer(n: *Node, ev: PointerEvent) bool {
+    const s: *RecPointState = @ptrCast(@alignCast(n.state.?));
+    s.x = ev.x;
+    s.y = ev.y;
+    s.raw_x = ev.raw_x;
+    s.raw_y = ev.raw_y;
+    s.got = true;
+    return true;
+}
+fn recPointDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*RecPointState, @ptrCast(@alignCast(n.state.?))));
+}
+const point_rec_vtable = blk: {
+    var vt = rec_vtable;
+    vt.on_pointer = recPointPointer;
+    vt.deinit = recPointDeinit;
+    break :blk vt;
+};
+
+const offset_hit_vtable = blk: {
+    var vt = rec_vtable;
+    vt.pre_children_hit = struct {
+        fn pre(_: *Node, px: f32, py: f32) ui_node.HitPoint {
+            return .{ .x = px - 100, .y = py - 50 }; // content translated by (+100, +50)
+        }
+    }.pre;
+    break :blk vt;
+};
+
+test "dispatch maps x/y to the hit node's parent space but keeps raw window coordinates" {
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    root.vtable = &offset_hit_vtable;
+    root.layout(.{ .x = 0, .y = 0, .w = 200, .h = 200 });
+    const child = try Node.create(std.testing.allocator, &point_rec_vtable);
+    errdefer child.allocator.destroy(child);
+    const ps = try std.testing.allocator.create(RecPointState);
+    errdefer std.testing.allocator.destroy(ps);
+    ps.* = .{};
+    child.state = ps;
+    root.add(child);
+    child.layout(.{ .x = 10, .y = 10, .w = 50, .h = 50 }); // content space
+    var router = InputRouter{};
+    // window (120, 70) → child space (20, 20): inside the child
+    router.dispatchPointer(root, .{ .phase = .down, .x = 120, .y = 70 });
+    try std.testing.expect(ps.got);
+    try std.testing.expectEqual(@as(f32, 20), ps.x); // local (the hit node's parent space)
+    try std.testing.expectEqual(@as(f32, 20), ps.y);
+    try std.testing.expectEqual(@as(f32, 120), ps.raw_x); // the raw window coords survive
+    try std.testing.expectEqual(@as(f32, 70), ps.raw_y);
+}
+
+test "dispatchKey bubbles up the focused chain and reports handled" {
+    const root = try recNode(std.testing.allocator, false);
+    defer root.deinit();
+    const child = try recNode(std.testing.allocator, true); // claims keys
+    root.add(child);
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    child.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    var router = InputRouter{};
+    router.focus(child);
+    try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .tab }));
+    try std.testing.expectEqual(@as(usize, 1), recState(child).keys.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recState(root).keys.items.len); // claimed
+    // an unhandled key bubbles to the root; dispatchKey reports false
+    recState(child).handled = false;
+    try std.testing.expect(!router.dispatchKey(.{ .kind = .key_down, .key = .enter }));
+    try std.testing.expectEqual(@as(usize, 2), recState(child).keys.items.len);
+    try std.testing.expectEqual(@as(usize, 1), recState(root).keys.items.len); // bubbled
+    try std.testing.expectEqual(Key.enter, recState(root).last_key);
+}
+
+test "up with no capture and no hit delivers nothing" {
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    var router = InputRouter{};
+    router.dispatchPointer(root, .{ .phase = .up, .x = 500, .y = 500 }); // miss, no capture
+    try std.testing.expectEqual(@as(usize, 0), recState(root).log.items.len);
+    // an uncaptured up ON a node is still delivered (a release over the tree)
+    router.dispatchPointer(root, .{ .phase = .up, .x = 10, .y = 10 });
+    try std.testing.expectEqual(@as(usize, 1), recState(root).log.items.len);
+    try std.testing.expectEqual(PointerPhase.up, recState(root).log.items[0]);
+}

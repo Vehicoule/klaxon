@@ -322,3 +322,32 @@ test "golden: the stepper paints Primary circles for completed+active, SurfaceCo
     // Sample slightly off-center to avoid the number ink.
     try std.testing.expectEqual(t.colors.surface_container_highest, f.pixelAt(@intFromFloat(cx2 - 8), @intFromFloat(cy)));
 }
+
+test "golden: the connector after a completed step is primary; before an upcoming step it is outline_variant" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(usize).init(a, 1);
+    defer sig.deinit();
+    const n = try stepper(a, sig, &.{ .{ .label = "A" }, .{ .label = "B" }, .{ .label = "C" } }, .{ .theme = t });
+    defer n.deinit();
+    var r = try golden.Renderer.init(a, 300, 60);
+    defer r.deinit();
+    // half-pixel y: the 1dp connector (cy - 0.5) lands pixel-aligned on row 22
+    n.layout(.{ .x = 10.5, .y = 10.5, .w = 280, .h = 44 });
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    const col_w = min_step_w;
+    const cy = 10.5 + circle_d / 2;
+    // connector 0 (after the completed step 0): circle 0's right edge → circle 1's left edge
+    const conn0_x0 = 10.5 + col_w / 2 + circle_d / 2;
+    const conn0_x1 = 10.5 + col_w + col_w / 2 - circle_d / 2;
+    const conn0: ui.node.Rect = .{ .x = conn0_x0 + 2, .y = cy - 0.5, .w = conn0_x1 - conn0_x0 - 4, .h = 1 };
+    try std.testing.expect(f.countColorIn(conn0, t.colors.primary) > 0);
+    // connector 1 (after the active step 1, toward the upcoming step 2): outline_variant
+    const conn1_x0 = 10.5 + col_w + col_w / 2 + circle_d / 2;
+    const conn1_x1 = 10.5 + col_w * 2 + col_w / 2 - circle_d / 2;
+    const conn1: ui.node.Rect = .{ .x = conn1_x0 + 2, .y = cy - 0.5, .w = conn1_x1 - conn1_x0 - 4, .h = 1 };
+    try std.testing.expect(f.countColorIn(conn1, t.colors.outline_variant) > 0);
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(conn1, t.colors.primary));
+}

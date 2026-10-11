@@ -325,3 +325,31 @@ test "golden: the tree paints the root label" {
     // Root label ink (OnSurface) in the row.
     try std.testing.expect(f.countColorIn(.{ .x = 10, .y = 20, .w = 180, .h = 20 }, t.colors.on_surface) > 0);
 }
+
+test "golden: a collapsed root hides the child rows; expanding shows them" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const root_def = TreeNode{
+        .label = "Root",
+        .children = &.{.{ .label = "Child" }},
+    };
+    const n = try tree(a, &root_def, null, .{ .theme = t });
+    defer n.deinit();
+    var r = try golden.Renderer.init(a, 300, 120);
+    defer r.deinit();
+    n.layout(.{ .x = 10, .y = 10, .w = 280, .h = 120 });
+    // the child's row region (the second row)
+    const child_row: Rect = .{ .x = 10, .y = 10 + row_h, .w = 280, .h = row_h };
+    // expanded by default: the child's label ink is present
+    r.paint(n, 0xFFFFFFFF);
+    var f1 = try r.readback(a);
+    try std.testing.expect(f1.countColorIn(child_row, t.colors.on_surface) > 0);
+    f1.deinit();
+    // collapse the root: the child row paints nothing
+    stateOf(n).root.expanded = false;
+    r.paint(n, 0xFFFFFFFF);
+    var f2 = try r.readback(a);
+    defer f2.deinit();
+    try std.testing.expectEqual(@as(u64, 0), f2.countColorIn(child_row, t.colors.on_surface));
+    try std.testing.expectEqual(@as(u64, 0), f2.countColor(t.colors.secondary_container));
+}

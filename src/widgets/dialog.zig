@@ -544,3 +544,46 @@ test "golden: dialog paints the scrim and the centered panel (open)" {
     try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(2, 2));
     try std.testing.expect(f2.countColorIn(.{ .x = pb.x, .y = pb.y, .w = pb.w, .h = pb.h }, t.colors.surface_container_high) == 0);
 }
+
+test "golden: dialog with actions paints the primary action labels in the panel" {
+    const t = theme_mod.light;
+    const layout_w = @import("layout.zig");
+    const input_w = @import("input.zig");
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    // the M3E actions row: Cancel / Delete text buttons (primary label_large)
+    const actions = try layout_w.row(std.testing.allocator, .{ .gap = 8 });
+    const cancel = try input_w.button(std.testing.allocator, null, .{
+        .bg = 0x00000000,
+        .bg_hover = theme_mod.stateLayer(t.colors.surface_container_high, t.colors.primary, t.state.hover),
+        .bg_pressed = theme_mod.stateLayer(t.colors.surface_container_high, t.colors.primary, t.state.pressed),
+        .padding = ui.layout.EdgeInsets.symmetric(8, 4),
+    });
+    cancel.add(try text_w.text(std.testing.allocator, "Cancel", .{ .size = t.type_scale.label_large.size, .color = t.colors.primary }));
+    actions.add(cancel);
+    const del = try input_w.button(std.testing.allocator, null, .{
+        .bg = 0x00000000,
+        .bg_hover = theme_mod.stateLayer(t.colors.surface_container_high, t.colors.primary, t.state.hover),
+        .bg_pressed = theme_mod.stateLayer(t.colors.surface_container_high, t.colors.primary, t.state.pressed),
+        .padding = ui.layout.EdgeInsets.symmetric(8, 4),
+    });
+    del.add(try text_w.text(std.testing.allocator, "Delete", .{ .size = t.type_scale.label_large.size, .color = t.colors.primary }));
+    actions.add(del);
+    const d = try dialog(std.testing.allocator, open, null, .{
+        .theme = t,
+        .title = try text_w.text(std.testing.allocator, "Delete?", .{ .size = t.type_scale.headline_small.size, .color = t.colors.on_surface }),
+        .actions = actions,
+    });
+    defer d.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 480, 320);
+    defer r.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 480, .h = 320 });
+    r.paint(d, 0x112233FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // the action labels' ink (primary) is present inside the panel (the title
+    // is on_surface — a different color; the scrim lies outside the panel)
+    const pb = stateOf(d).panel.bounds;
+    const panel_rect: ui.node.Rect = .{ .x = pb.x, .y = pb.y, .w = pb.w, .h = pb.h };
+    try std.testing.expect(f.countColorIn(panel_rect, t.colors.primary) > 0);
+}

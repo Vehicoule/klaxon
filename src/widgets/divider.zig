@@ -95,3 +95,20 @@ test "golden: horizontal divider paints an exact line with indents" {
     try std.testing.expectEqual(bg, frame.pixelAt(50, 2)); // above the line
     try std.testing.expectEqual(bg, frame.pixelAt(50, 11)); // below the line
 }
+
+test "golden: vertical divider paints an exact line with indents" {
+    const bg = 0x101010FF;
+    const gray = 0xAAAAAAFF;
+    const root = try divider(std.testing.allocator, .{ .horizontal = false, .thickness = 2, .color = gray, .indent = 10, .end_indent = 20 });
+    var frame = try golden.render(std.testing.allocator, root, 20, 100, bg);
+    defer frame.deinit();
+    // Line: y in [10, 80), thickness 2, horizontally centered in the 20px
+    // bounds → x in [9, 11).
+    try std.testing.expectEqual(@as(u64, 70 * 2), frame.countColor(gray));
+    try std.testing.expectEqual(gray, frame.pixelAt(9, 10));
+    try std.testing.expectEqual(gray, frame.pixelAt(10, 79));
+    try std.testing.expectEqual(bg, frame.pixelAt(9, 9)); // indent
+    try std.testing.expectEqual(bg, frame.pixelAt(9, 80)); // end indent
+    try std.testing.expectEqual(bg, frame.pixelAt(2, 50)); // left of the line
+    try std.testing.expectEqual(bg, frame.pixelAt(11, 50)); // right of the line
+}

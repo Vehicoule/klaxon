@@ -341,3 +341,25 @@ test "golden: the tooltip bubble paints the inverse surface over the anchor" {
     // the anchor still paints at its own position
     try std.testing.expectEqual(@as(Color, 0x112233FF), f.pixelAt(100, 112));
 }
+
+test "golden: an unhovered tooltip paints nothing above the anchor" {
+    const t = theme_mod.light;
+    const anchor = try golden.solidBox(std.testing.allocator, 80, 24, 0x112233FF);
+    const tip = try tooltip(std.testing.allocator, anchor, .{ .text = "Save", .theme = t });
+    defer tip.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 200, 200);
+    defer r.deinit();
+    tip.layout(.{ .x = 60, .y = 100, .w = 80, .h = 24 });
+    const s = stateOf(tip);
+    const bb = s.bubble.bounds;
+    // no hover: the bubble is invisible → its whole rect stays background
+    try std.testing.expect(!s.bubble.visible);
+    r.paint(tip, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const br: ui.node.Rect = .{ .x = bb.x, .y = bb.y, .w = bb.w, .h = bb.h };
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(br, t.colors.inverse_surface));
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(br, t.colors.inverse_on_surface));
+    // the anchor still paints at its own position
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f.pixelAt(100, 112));
+}

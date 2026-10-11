@@ -647,3 +647,25 @@ test "golden: snackbar paints the inverse_surface container with the text" {
     defer f2.deinit();
     try std.testing.expectEqual(@as(Color, 0x000000FF), f2.pixelAt(@intFromFloat(c.x + 4), @intFromFloat(c.y + c.h - 4)));
 }
+
+test "golden: snackbar with an action paints the inverse_primary action label" {
+    const t = theme_mod.light;
+    const visible = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer visible.deinit();
+    const sb = try snackBar(std.testing.allocator, visible, null, null, .{ .text = "Saved", .action_label = "Undo", .theme = t });
+    defer sb.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 300, 80);
+    defer r.deinit();
+    sb.layout(.{ .x = 20, .y = 20, .w = 260, .h = 48 });
+    const c = stateOf(sb).content;
+    r.paint(sb, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // the container rect: the action's label ink (inverse_primary) is present
+    // inside it (the body text is inverse_on_surface — a different color)
+    const cr: ui.node.Rect = .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h };
+    try std.testing.expect(f.countColorIn(cr, t.colors.inverse_primary) > 0);
+    // the container itself still fills most of its rect (the inverse_surface
+    // background, minus the text/action ink and the AA edge)
+    try std.testing.expect(@as(f32, @floatFromInt(f.countColorIn(cr, t.colors.inverse_surface))) > c.w * c.h / 2);
+}

@@ -496,3 +496,269 @@ test "markDirty accumulates the damage region at the root" {
     child.markDirtyRect(.{});
     try std.testing.expect(!root.damage_valid);
 }
+
+test "rect: contains is half-open; main/cross pick the axis; rectUnion sweeps both" {
+    const r = Rect{ .x = 10, .y = 20, .w = 30, .h = 40 };
+    try std.testing.expect(r.contains(10, 20)); // the top-left corner is inside
+    try std.testing.expect(r.contains(39.9, 59.9));
+    try std.testing.expect(!r.contains(40, 30)); // the right edge is exclusive
+    try std.testing.expect(!r.contains(20, 60)); // the bottom edge is exclusive
+    try std.testing.expect(!r.contains(9.9, 20));
+    try std.testing.expectEqual(@as(f32, 30), r.main(.horizontal));
+    try std.testing.expectEqual(@as(f32, 40), r.main(.vertical));
+    try std.testing.expectEqual(@as(f32, 40), r.cross(.horizontal));
+    try std.testing.expectEqual(@as(f32, 30), r.cross(.vertical));
+    const u = rectUnion(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, .{ .x = 5, .y = 20, .w = 10, .h = 5 });
+    try std.testing.expectEqual(@as(f32, 0), u.x);
+    try std.testing.expectEqual(@as(f32, 0), u.y);
+    try std.testing.expectEqual(@as(f32, 15), u.w); // spans 0..15
+    try std.testing.expectEqual(@as(f32, 25), u.h); // spans 0..25
+    // a rect unioned with itself is itself
+    try std.testing.expectEqual(r, rectUnion(r, r));
+}
+
+test "add parents the child and marks the tree dirty + layout-dirty" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    root.dirty = false;
+    root.layout_dirty = false;
+    const child = try testNode(10, 10);
+    root.add(child);
+    try std.testing.expectEqual(root, child.parent.?);
+    try std.testing.expect(root.dirty);
+    try std.testing.expect(root.layout_dirty);
+}
+
+test "markLayoutDirty propagates up to the root" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const mid = try testNode(50, 50);
+    const leaf = try testNode(10, 10);
+    root.add(mid);
+    mid.add(leaf);
+    root.layout_dirty = false;
+    mid.layout_dirty = false;
+    leaf.markLayoutDirty();
+    try std.testing.expect(leaf.layout_dirty);
+    try std.testing.expect(mid.layout_dirty);
+    try std.testing.expect(root.layout_dirty);
+}
+
+// --- paint-pass recording stub (order + visibility assertions) ---
+
+const PaintRec = struct {
+    log: *std.array_list.Managed([]const u8),
+    name: []const u8, // static literal — safe to store in the log
+    pre_name: []u8, // owned ("pre:" ++ name) — the log stores slice pointers
+    post_name: []u8, // owned ("post:" ++ name)
+};
+
+fn recPaintMeasure(_: *Node, c: Constraints) Size {
+    return c.constrain(.{ .w = 10, .h = 10 });
+}
+fn recPaintPaint(n: *Node, ctx: *kx.Ctx) void {
+    _ = ctx;
+    const s: *PaintRec = @ptrCast(@alignCast(n.state.?));
+    s.log.append(s.name) catch @panic("klaxon: out of memory");
+}
+fn recPaintPre(n: *Node, ctx: *kx.Ctx) void {
+    _ = ctx;
+    const s: *PaintRec = @ptrCast(@alignCast(n.state.?));
+    s.log.append(s.pre_name) catch @panic("klaxon: out of memory");
+}
+fn recPaintPost(n: *Node, ctx: *kx.Ctx) void {
+    _ = ctx;
+    const s: *PaintRec = @ptrCast(@alignCast(n.state.?));
+    s.log.append(s.post_name) catch @panic("klaxon: out of memory");
+}
+fn recPaintDeinit(n: *Node) void {
+    const s: *PaintRec = @ptrCast(@alignCast(n.state.?));
+    n.allocator.free(s.pre_name);
+    n.allocator.free(s.post_name);
+    n.allocator.destroy(s);
+}
+const paint_rec_vtable = VTable{
+    .measure = recPaintMeasure,
+    .layout = testLayout,
+    .paint = recPaintPaint,
+    .deinit = recPaintDeinit,
+    .pre_children_paint = recPaintPre,
+    .post_children_paint = recPaintPost,
+};
+
+fn recPaintNode(log: *std.array_list.Managed([]const u8), name: []const u8) !*Node {
+    const node = try Node.create(std.testing.allocator, &paint_rec_vtable);
+    errdefer node.allocator.destroy(node);
+    const s = try std.testing.allocator.create(PaintRec);
+    errdefer std.testing.allocator.destroy(s);
+    s.* = .{
+        .log = log,
+        .name = name,
+        .pre_name = try std.fmt.allocPrint(std.testing.allocator, "pre:{s}", .{name}),
+        .post_name = try std.fmt.allocPrint(std.testing.allocator, "post:{s}", .{name}),
+    };
+    node.state = s;
+    return node;
+}
+
+test "paint: hooks wrap the children pass; invisible + defer_paint subtrees are skipped" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    const child = try recPaintNode(&log, "child");
+    const hidden = try recPaintNode(&log, "hidden");
+    const deferred = try recPaintNode(&log, "deferred");
+    root.add(child);
+    root.add(hidden);
+    root.add(deferred);
+    hidden.visible = false;
+    deferred.defer_paint = true;
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx);
+    kx.c.kx_end_frame(ctx);
+    // own paint → pre → children (defer_paint skipped) → post
+    const expected = [_][]const u8{ "root", "pre:root", "child", "pre:child", "post:child", "post:root" };
+    try std.testing.expectEqual(expected.len, log.items.len);
+    for (expected, log.items) |exp, act| {
+        try std.testing.expectEqualStrings(exp, act);
+    }
+    // the painted nodes clear their dirty flag; the skipped ones keep it
+    try std.testing.expect(!root.dirty);
+    try std.testing.expect(!child.dirty);
+    try std.testing.expect(hidden.dirty);
+    try std.testing.expect(deferred.dirty);
+}
+
+const hit_bounds_vtable = blk: {
+    var vt = test_vtable;
+    vt.hit_bounds = struct {
+        fn hb(_: *Node) Rect {
+            return .{ .x = 50, .y = 50, .w = 20, .h = 20 };
+        }
+    }.hb;
+    break :blk vt;
+};
+
+test "hitTest honors the hit_bounds hook over the raw bounds" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    const shifted = try testNode(10, 10);
+    shifted.vtable = &hit_bounds_vtable; // bounds at (0,0,10,10), hit rect at (50,50,20,20)
+    root.add(shifted);
+    shifted.layout(.{ .x = 0, .y = 0, .w = 10, .h = 10 });
+    try std.testing.expectEqual(shifted, root.hitTest(55, 55).?); // inside the hit rect
+    try std.testing.expectEqual(root, root.hitTest(5, 5).?); // bounds say child, hit rect says no
+}
+
+const pre_hit_shift_vtable = blk: {
+    var vt = test_vtable;
+    vt.pre_children_hit = struct {
+        fn pre(_: *Node, px: f32, py: f32) HitPoint {
+            return .{ .x = px - 100, .y = py - 50 }; // content translated by (+100, +50)
+        }
+    }.pre;
+    break :blk vt;
+};
+
+const pre_hit_shift2_vtable = blk: {
+    var vt = test_vtable;
+    vt.pre_children_hit = struct {
+        fn pre(_: *Node, px: f32, py: f32) HitPoint {
+            return .{ .x = px - 10, .y = py }; // content translated by (+10, 0)
+        }
+    }.pre;
+    break :blk vt;
+};
+
+test "hitTestMapped maps through pre_children_hit and reports parent-space coords" {
+    const root = try testNode(200, 200);
+    defer root.deinit();
+    root.vtable = &pre_hit_shift_vtable;
+    root.layout(.{ .x = 0, .y = 0, .w = 200, .h = 200 });
+    const child = try testNode(50, 50);
+    root.add(child);
+    child.layout(.{ .x = 10, .y = 10, .w = 50, .h = 50 }); // content space
+    // window (120, 70) → child space (20, 20): inside the child
+    const hit = root.hitTestMapped(120, 70).?;
+    try std.testing.expectEqual(child, hit.node);
+    try std.testing.expectEqual(@as(f32, 20), hit.x); // the hit node's parent space
+    try std.testing.expectEqual(@as(f32, 20), hit.y);
+    // a point outside the mapped child hits the root
+    try std.testing.expectEqual(root, root.hitTestMapped(50, 20).?.node);
+}
+
+test "mapPointToParentSpace applies every ancestor's pre_children_hit, root-first" {
+    const root = try testNode(300, 300);
+    defer root.deinit();
+    root.vtable = &pre_hit_shift_vtable; // window → root's child space: (-100, -50)
+    const mid = try testNode(100, 100);
+    mid.vtable = &pre_hit_shift2_vtable; // root's child space → mid's child space: (-10, 0)
+    root.add(mid);
+    const leaf = try testNode(10, 10);
+    mid.add(leaf);
+    // window (115, 55) → mid space (15, 5) → leaf's parent space (5, 5)
+    const p = Node.mapPointToParentSpace(leaf, 115, 55);
+    try std.testing.expectEqual(@as(f32, 5), p.x);
+    try std.testing.expectEqual(@as(f32, 5), p.y);
+    // a node without a parent maps 1:1 (identity)
+    const free_leaf = try testNode(10, 10);
+    defer free_leaf.deinit();
+    const p2 = Node.mapPointToParentSpace(free_leaf, 115, 55);
+    try std.testing.expectEqual(@as(f32, 115), p2.x);
+    try std.testing.expectEqual(@as(f32, 55), p2.y);
+}
+
+const map_paint_vtable = blk: {
+    var vt = test_vtable;
+    vt.map_paint_rect = struct {
+        fn m(_: *Node, rect: Rect) Rect {
+            return .{ .x = rect.x + 100, .y = rect.y + 50, .w = rect.w, .h = rect.h };
+        }
+    }.m;
+    break :blk vt;
+};
+
+test "mapRectToRoot applies every transformed ancestor's map_paint_rect" {
+    const root = try testNode(300, 300);
+    defer root.deinit();
+    root.vtable = &map_paint_vtable; // translates child rects by (+100, +50)
+    const leaf = try testNode(10, 10);
+    root.add(leaf);
+    const r = leaf.mapRectToRoot(.{ .x = 0, .y = 0, .w = 10, .h = 10 });
+    try std.testing.expectEqual(@as(f32, 100), r.x);
+    try std.testing.expectEqual(@as(f32, 50), r.y);
+    try std.testing.expectEqual(@as(f32, 10), r.w);
+    try std.testing.expectEqual(@as(f32, 10), r.h);
+    // without a transform hook the rect passes through unchanged
+    const free_leaf = try testNode(10, 10);
+    defer free_leaf.deinit();
+    const r2 = free_leaf.mapRectToRoot(.{ .x = 1, .y = 2, .w = 3, .h = 4 });
+    try std.testing.expectEqual(Rect{ .x = 1, .y = 2, .w = 3, .h = 4 }, r2);
+}
+
+test "deinit releases the node's router references (capture/hover/focus/popup)" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const child = try testNode(50, 50);
+    root.add(child);
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    child.layout(.{ .x = 0, .y = 0, .w = 50, .h = 50 });
+    router.dispatchPointer(root, .{ .phase = .move, .x = 10, .y = 10 }); // hover the child
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 }); // capture it
+    router.focus(child);
+    router.open_popup = child;
+    try std.testing.expect(router.capturedNode(0) == child);
+    try std.testing.expect(root.remove(child)); // detach first: the root must not double-free
+    child.deinit();
+    try std.testing.expect(router.capturedNode(0) == null);
+    try std.testing.expect(router.hovered == null);
+    try std.testing.expect(router.focused == null);
+    try std.testing.expect(router.open_popup == null);
+}

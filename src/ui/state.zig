@@ -338,3 +338,146 @@ test "store: global signal shared per type" {
     try std.testing.expect(s1 == s2);
     try std.testing.expectEqual(@as(u32, 7), s1.get());
 }
+
+test "signal peek reads the value without tracking a dependency" {
+    const sig = try Signal(u32).init(std.testing.allocator, 5);
+    defer sig.deinit();
+    var ctx = EffectCtx{ .sig = sig };
+    // an effect reading via peek records no dependency → never re-runs
+    const peek_effect = try Effect.init(std.testing.allocator, struct {
+        fn cb(userdata: ?*anyopaque) void {
+            const c: *EffectCtx = @ptrCast(@alignCast(userdata.?));
+            c.runs += 1;
+            c.last = c.sig.peek();
+        }
+    }.cb, &ctx);
+    defer peek_effect.deinit();
+    peek_effect.run();
+    try std.testing.expectEqual(@as(u32, 1), ctx.runs);
+    try std.testing.expectEqual(@as(u32, 5), ctx.last);
+    sig.set(9);
+    try std.testing.expectEqual(@as(u32, 1), ctx.runs); // no re-run
+    try std.testing.expectEqual(@as(u32, 9), sig.peek());
+}
+
+test "signal notify force-notifies subscribers on an unchanged value" {
+    const sig = try Signal(u32).init(std.testing.allocator, 3);
+    defer sig.deinit();
+    var fired: u32 = 0;
+    sig.subscribe(.{ .callback = .{ .fn_ptr = testCallback, .userdata = &fired } });
+    sig.set(3); // unchanged → no notify
+    try std.testing.expectEqual(@as(u32, 0), fired);
+    try std.testing.expectEqual(@as(u64, 0), sig.base.version);
+    sig.notify(); // forced (hot reload: the data changed, not the tag)
+    try std.testing.expectEqual(@as(u32, 1), fired);
+    try std.testing.expectEqual(@as(u64, 1), sig.base.version);
+    try std.testing.expectEqual(@as(u32, 3), sig.get()); // the value itself is unchanged
+}
+
+test "unsubscribe removes the subscriber; an unknown one is a no-op" {
+    const sig = try Signal(u32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    var a: u32 = 0;
+    var b: u32 = 0;
+    const sub_a = Subscriber{ .callback = .{ .fn_ptr = testCallback, .userdata = &a } };
+    const sub_b = Subscriber{ .callback = .{ .fn_ptr = testCallback, .userdata = &b } };
+    sig.subscribe(sub_a);
+    sig.subscribe(sub_b);
+    sig.unsubscribe(sub_a);
+    sig.set(1);
+    try std.testing.expectEqual(@as(u32, 0), a);
+    try std.testing.expectEqual(@as(u32, 1), b);
+    // unsubscribing a missing subscriber changes nothing (same fn + userdata
+    // matches by value, so a re-created equal subscriber is also "missing")
+    sig.unsubscribe(sub_a);
+    sig.unsubscribe(.{ .callback = .{ .fn_ptr = testCallback, .userdata = &a } });
+    sig.set(2);
+    try std.testing.expectEqual(@as(u32, 0), a);
+    try std.testing.expectEqual(@as(u32, 2), b);
+}
+
+const kx_mod = @import("../kx.zig");
+
+fn stubMeasure(_: *Node, c: node_mod.Constraints) node_mod.Size {
+    return c.constrain(.{ .w = 10, .h = 10 });
+}
+fn stubLayout(_: *Node, _: node_mod.Rect) void {}
+fn stubPaint(_: *Node, _: *kx_mod.Ctx) void {}
+const stub_vtable = node_mod.VTable{ .measure = stubMeasure, .layout = stubLayout, .paint = stubPaint };
+
+test "bindNode: a signal change marks the bound node dirty" {
+    const node = try Node.create(std.testing.allocator, &stub_vtable);
+    defer node.deinit();
+    node.dirty = false;
+    const sig = try Signal(u32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    bindNode(node, sig);
+    try std.testing.expect(!node.dirty);
+    sig.set(1);
+    try std.testing.expect(node.dirty);
+    // an unchanged set does not re-dirty (a clean node stays clean)
+    node.dirty = false;
+    sig.set(1);
+    try std.testing.expect(!node.dirty);
+}
+
+var flag_sig: *Signal(bool) = undefined;
+var dep_a: *Signal(u32) = undefined;
+var dep_b: *Signal(u32) = undefined;
+
+fn conditionalCb(userdata: ?*anyopaque) void {
+    const ctx: *EffectCtx = @ptrCast(@alignCast(userdata.?));
+    ctx.runs += 1;
+    if (flag_sig.get()) {
+        ctx.last = dep_a.get();
+    } else {
+        ctx.last = dep_b.get();
+    }
+}
+
+test "effect drops stale dependencies between runs" {
+    flag_sig = try Signal(bool).init(std.testing.allocator, true);
+    defer flag_sig.deinit();
+    dep_a = try Signal(u32).init(std.testing.allocator, 1);
+    defer dep_a.deinit();
+    dep_b = try Signal(u32).init(std.testing.allocator, 2);
+    defer dep_b.deinit();
+    var ctx = EffectCtx{ .sig = dep_a };
+    const effect = try Effect.init(std.testing.allocator, conditionalCb, &ctx);
+    defer effect.deinit();
+    effect.run(); // tracks flag + a
+    try std.testing.expectEqual(@as(u32, 1), ctx.runs);
+    try std.testing.expectEqual(@as(u32, 1), ctx.last);
+    dep_b.set(20); // not a dependency yet → no re-run
+    try std.testing.expectEqual(@as(u32, 1), ctx.runs);
+    flag_sig.set(false); // re-run: tracks flag + b; a is now stale
+    try std.testing.expectEqual(@as(u32, 2), ctx.runs);
+    try std.testing.expectEqual(@as(u32, 20), ctx.last); // b's value set above
+    dep_a.set(100); // stale dependency → no re-run
+    try std.testing.expectEqual(@as(u32, 2), ctx.runs);
+    dep_b.set(21); // live dependency → re-runs
+    try std.testing.expectEqual(@as(u32, 3), ctx.runs);
+    try std.testing.expectEqual(@as(u32, 21), ctx.last);
+}
+
+var memo_calls: u32 = 0;
+
+fn computeDoubled() u32 {
+    memo_calls += 1;
+    return test_sig_a.get() * 2;
+}
+
+test "memo caches the computed value until a dependency changes" {
+    memo_calls = 0;
+    test_sig_a = try Signal(u32).init(std.testing.allocator, 3);
+    defer test_sig_a.deinit();
+    const memo = try Memo(u32, computeDoubled).init(std.testing.allocator);
+    defer memo.deinit();
+    try std.testing.expectEqual(@as(u32, 1), memo_calls); // the initial compute
+    try std.testing.expectEqual(@as(u32, 6), memo.get());
+    try std.testing.expectEqual(@as(u32, 6), memo.get()); // a cached read: no recompute
+    try std.testing.expectEqual(@as(u32, 1), memo_calls);
+    test_sig_a.set(4);
+    try std.testing.expectEqual(@as(u32, 2), memo_calls);
+    try std.testing.expectEqual(@as(u32, 8), memo.get());
+}

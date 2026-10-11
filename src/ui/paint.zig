@@ -149,3 +149,27 @@ pub fn imageDraw(ctx: *kx.Ctx, id: u64, x: f32, y: f32, w: f32, h: f32) void {
 test "kx ABI version reports 0.10.0 (the fill_rrect_gradient entry)" {
     try std.testing.expectEqualStrings("0.10.0", std.mem.span(kx.c.kx_abi_version()));
 }
+
+test "paint constructors: fill keeps the defaults, stroke carries color + width" {
+    const f = Paint.fill(0x11223344);
+    try std.testing.expectEqual(@as(Color, 0x11223344), f.color);
+    try std.testing.expectEqual(Style.fill, f.style);
+    try std.testing.expectEqual(@as(f32, 1.0), f.stroke_width); // the default
+    const s = Paint.stroke(0xFF0000FF, 2.5);
+    try std.testing.expectEqual(@as(Color, 0xFF0000FF), s.color);
+    try std.testing.expectEqual(Style.stroke, s.style);
+    try std.testing.expectEqual(@as(f32, 2.5), s.stroke_width);
+}
+
+test "withAlphaScaled scales only the alpha channel and clamps k to [0, 1]" {
+    const c: Color = 0x11223480; // alpha 128
+    // k = 1 → unchanged; k = 0 → fully transparent; RGB preserved throughout
+    try std.testing.expectEqual(@as(Color, 0x11223480), withAlphaScaled(c, 1));
+    try std.testing.expectEqual(@as(Color, 0x11223400), withAlphaScaled(c, 0));
+    try std.testing.expectEqual(@as(Color, 0x11223440), withAlphaScaled(c, 0.5)); // 128 * 0.5 = 64
+    // k outside [0, 1] clamps (a fade factor is never negative or > 1)
+    try std.testing.expectEqual(@as(Color, 0x11223480), withAlphaScaled(c, 2));
+    try std.testing.expectEqual(@as(Color, 0x11223400), withAlphaScaled(c, -1));
+    // an opaque color scaled to 0.5 truncates (255 * 0.5 = 127.5 → 127)
+    try std.testing.expectEqual(@as(Color, 0xA0B0C07F), withAlphaScaled(0xA0B0C0FF, 0.5));
+}

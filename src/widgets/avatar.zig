@@ -376,6 +376,25 @@ test "golden: the avatar paints PrimaryContainer circle + OnPrimaryContainer ini
     try std.testing.expect(f.countColorIn(.{ .x = 12, .y = 30, .w = 56, .h = 20 }, t.colors.on_primary_container) > 0);
 }
 
+test "golden: the image avatar draws the exact pixels stretched into the bounds" {
+    const a = std.testing.allocator;
+    // 2x2 source: red green / blue white, drawn into 4x4 → each source pixel
+    // is a 2x2 block (nearest sampling — the same draw path as the image widget).
+    const src = [_]u8{
+        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, // red, green
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // blue, white
+    };
+    const n = try avatar(a, null, .{ .size = .xs, .image_rgba = &src, .image_w = 2, .image_h = 2 });
+    var frame = try golden.render(a, n, 4, 4, 0x101010FF);
+    defer frame.deinit();
+    // the image covers the whole bounds (v1: stretched, no circular clip)
+    try std.testing.expectEqual(@as(u64, 4), frame.countColor(0xFF0000FF));
+    try std.testing.expectEqual(@as(u64, 4), frame.countColor(0x00FF00FF));
+    try std.testing.expectEqual(@as(u64, 4), frame.countColor(0x0000FFFF));
+    try std.testing.expectEqual(@as(u64, 4), frame.countColor(0xFFFFFFFF));
+    try std.testing.expectEqual(@as(u64, 0), frame.countColor(0x101010FF)); // no bg shows
+}
+
 // --- Test helpers ---
 
 fn tapCounterCb(userdata: ?*anyopaque) void {

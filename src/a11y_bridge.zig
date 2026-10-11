@@ -312,3 +312,139 @@ test "kx_a11y_activate_node: double-tap synthesizes down+up at the node's center
     kx_a11y_activate_node(null, @intFromPtr(btn));
     try std.testing.expectEqual(@as(u32, 1), clicks.*);
 }
+
+test "dump_tree(null) returns null; free_string(null) is a no-op" {
+    try std.testing.expect(kx_a11y_dump_tree(null) == null);
+    kx_a11y_free_string(null); // must not crash
+}
+
+test "dump tree: checked=false serializes as 1 and the value lands at field 3" {
+    const a = std.testing.allocator;
+    const root = try tNode(a);
+    defer root.deinit();
+    const sw = try tNode(a);
+    sem.attach(sw, .{ .role = .toggle, .label = "Wi-Fi", .value = "off", .focusable = true, .checked = false });
+    root.add(sw);
+    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    sw.layout(.{ .x = 5, .y = 6, .w = 100, .h = 40 });
+
+    const dump_ptr = kx_a11y_dump_tree(@ptrCast(root)) orelse return error.TestUnexpectedResult;
+    defer kx_a11y_free_string(dump_ptr);
+    const dump: [:0]const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(dump_ptr)));
+
+    // a single semantic node is the root itself — no synthetic wrapper group
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    const line = it.next().?;
+    try std.testing.expectEqual(@as(usize, 11), countFields(line));
+    try std.testing.expectEqualStrings("0", fieldAt(line, 0).?); // depth
+    try std.testing.expectEqualStrings("toggle", fieldAt(line, 1).?);
+    try std.testing.expectEqualStrings("Wi-Fi", fieldAt(line, 2).?); // label
+    try std.testing.expectEqualStrings("off", fieldAt(line, 3).?); // value
+    try std.testing.expectEqualStrings("1", fieldAt(line, 4).?); // focusable
+    try std.testing.expectEqualStrings("1", fieldAt(line, 6).?); // checked = false → 1
+    try std.testing.expectEqualStrings("5", fieldAt(line, 7).?); // the real rect
+    try std.testing.expectEqualStrings("6", fieldAt(line, 8).?);
+    try std.testing.expectEqualStrings("100", fieldAt(line, 9).?);
+    try std.testing.expectEqualStrings("40", fieldAt(line, 10).?);
+    // only the trailing newline remains
+    const rest = it.next();
+    try std.testing.expect(rest != null);
+    try std.testing.expectEqual(@as(usize, 0), rest.?.len);
+    try std.testing.expect(it.next() == null);
+}
+
+test "dump tree: grandchildren are depth-first at depth 2" {
+    const a = std.testing.allocator;
+    const root = try tNode(a);
+    defer root.deinit();
+    const first = try tNode(a);
+    sem.attach(first, .{ .role = .button, .label = "A", .focusable = true });
+    const parent = try tNode(a);
+    sem.attach(parent, .{ .role = .group, .label = "P" });
+    const child = try tNode(a);
+    sem.attach(child, .{ .role = .button, .label = "C", .focusable = true });
+    root.add(first);
+    root.add(parent);
+    parent.add(child);
+    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    first.layout(.{ .x = 1, .y = 2, .w = 100, .h = 40 });
+    parent.layout(.{ .x = 5, .y = 6, .w = 100, .h = 100 });
+    child.layout(.{ .x = 3, .y = 4, .w = 50, .h = 20 });
+
+    const dump_ptr = kx_a11y_dump_tree(@ptrCast(root)) orelse return error.TestUnexpectedResult;
+    defer kx_a11y_free_string(dump_ptr);
+    const dump: [:0]const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(dump_ptr)));
+
+    // two top-level semantic nodes → a synthetic wrapper group; depth-first:
+    // wrapper(0) → A(1) → P(1) → C(2)
+    var depths: [4][]const u8 = undefined;
+    var labels: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(n < depths.len);
+        depths[n] = fieldAt(line, 0).?;
+        labels[n] = fieldAt(line, 2).?;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings("0", depths[0]);
+    try std.testing.expectEqualStrings("1", depths[1]);
+    try std.testing.expectEqualStrings("1", depths[2]);
+    try std.testing.expectEqualStrings("2", depths[3]);
+    try std.testing.expectEqualStrings("A", labels[1]);
+    try std.testing.expectEqualStrings("P", labels[2]);
+    try std.testing.expectEqualStrings("C", labels[3]);
+
+    // the grandchild's own rect (the t_vtable has no paint transform: 1:1)
+    var it2 = std.mem.splitScalar(u8, dump, '\n');
+    var line: []const u8 = undefined;
+    var i: usize = 0;
+    while (it2.next()) |l| {
+        if (l.len == 0) continue;
+        if (i == 3) {
+            line = l;
+            break;
+        }
+        i += 1;
+    }
+    try std.testing.expectEqualStrings("C", fieldAt(line, 2).?);
+    try std.testing.expectEqualStrings("3", fieldAt(line, 7).?);
+    try std.testing.expectEqualStrings("4", fieldAt(line, 8).?);
+}
+
+var bridge_events: u32 = 0;
+var bridge_last_kind: u32 = 0;
+
+fn testBridgeC(userdata: ?*anyopaque, event: sem.BridgeEventC) callconv(.c) void {
+    _ = userdata;
+    bridge_events += 1;
+    bridge_last_kind = event.kind;
+}
+
+test "set_bridge registers the C bridge callback; clearing stops the events" {
+    bridge_events = 0;
+    kx_a11y_set_bridge(testBridgeC, null);
+    sem.notifyTreeDirty();
+    try std.testing.expectEqual(@as(u32, 1), bridge_events);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(sem.BridgeEvent.Kind.tree_dirty)), bridge_last_kind);
+    kx_a11y_set_bridge(null, null); // clear
+    sem.notifyTreeDirty();
+    try std.testing.expectEqual(@as(u32, 1), bridge_events); // no more events
+}
+
+test "activate_node without a router is a no-op" {
+    const a = std.testing.allocator;
+    ui.input.setCurrent(null); // defensive: the tests share the process-global router
+    const root = try tNode(a);
+    defer root.deinit();
+    const btn = try tNode(a);
+    root.add(btn);
+    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    btn.layout(.{ .x = 10, .y = 20, .w = 100, .h = 40 });
+    const clicks = &@as(*ClickState, @ptrCast(@alignCast(btn.state.?))).clicks;
+    // no router installed: the activation returns before dispatching
+    kx_a11y_activate_node(@ptrCast(root), @intFromPtr(btn));
+    try std.testing.expectEqual(@as(u32, 0), clicks.*);
+}
