@@ -280,6 +280,10 @@ fn addKxSkia(
             kx_skia.root_module.linkSystemLibrary("atk-bridge-2.0", .{});
             kx_skia.root_module.linkSystemLibrary("gobject-2.0", .{});
             kx_skia.root_module.linkSystemLibrary("glib-2.0", .{});
+            // <vulkan/vulkan.h> comes from Skia's vendored copy — the shim
+            // loads libvulkan at runtime via SDL_Vulkan_LoadLibrary, so no
+            // SDK or loader link is needed to build it.
+            kx_skia.root_module.addIncludePath(b.path("deps/skia/include/third_party/vulkan"));
         },
         .windows => {
             // Compiled with MSVC cl.exe (not zig's clang): Skia/Dawn are
@@ -372,10 +376,10 @@ fn linkRuntime(
     const skia_libs_win = [_][]const u8{
         // Order: dependents first (skia's graphite Dawn backend references
         // dawn symbols; spirv_cross is referenced by the D3D12 backend).
-        "skia.lib",      "skparagraph.lib", "skshaper.lib",    "skunicode_core.lib",
+        "skia.lib",          "skparagraph.lib",   "skshaper.lib",    "skunicode_core.lib",
         "skunicode_icu.lib", "dawn_combined.lib", "spirv_cross.lib", "d3d12allocator.lib",
-        "harfbuzz.lib",  "icu.lib",         "freetype2.lib",   "libpng.lib",
-        "skcms.lib",     "zlib.lib",
+        "harfbuzz.lib",      "icu.lib",           "freetype2.lib",   "libpng.lib",
+        "skcms.lib",         "zlib.lib",
     };
     if (is_windows) {
         for (skia_libs_win) |lib| {
@@ -402,7 +406,7 @@ fn linkRuntime(
         for ([_][]const u8{ "libcmt.lib", "libvcruntime.lib", "libcpmt.lib", "delayimp.lib", "oldnames.lib" }) |lib| {
             module.addObjectFile(.{ .cwd_relative = b.fmt("{s}\\{s}", .{ dirs.vc, lib }) });
         }
-        for ([_][]const u8{ "libucrt.lib" }) |lib| {
+        for ([_][]const u8{"libucrt.lib"}) |lib| {
             module.addObjectFile(.{ .cwd_relative = b.fmt("{s}\\{s}", .{ dirs.ucrt, lib }) });
         }
         const win_libs = [_][]const u8{
@@ -410,13 +414,12 @@ fn linkRuntime(
             // for mingw targets — linkSystemLibrary would silently set
             // link_libc, dragging libmingw32 in. They are linked positionally
             // above alongside the CRT libs.
-            "d3d12",    "dxgi",       "d3dcompiler", "dxva2",
-            "opengl32", "gdi32",      "user32",      "kernel32",  "advapi32",
-            "ole32",    "oleaut32",   "dwmapi",      "ws2_32",
-            "imm32",    "version",     "setupapi",  "winmm",
-            "shell32",  "hid",        "cfgmgr32",    "uiautomationcore",
-            "dbghelp",
-            "onecore",
+            "d3d12",            "dxgi",    "d3dcompiler", "dxva2",
+            "opengl32",         "gdi32",   "user32",      "kernel32",
+            "advapi32",         "ole32",   "oleaut32",    "dwmapi",
+            "ws2_32",           "imm32",   "version",     "setupapi",
+            "winmm",            "shell32", "hid",         "cfgmgr32",
+            "uiautomationcore", "dbghelp", "onecore",
         };
         inline for (win_libs) |lib| {
             // .use_pkg_config = .no: these resolve through the MSVC/Windows
@@ -785,21 +788,18 @@ fn addIosApp(
             }
         else
             &[_][]const u8{
-                "xcrun", "clang++", b.fmt("-x{s}", .{lang}),
-                b.fmt("-isysroot{s}", .{sdk_path}),
-                std_flag, "-arch", "arm64",
-                version_min_flag,
-                "-fno-exceptions", "-fno-rtti",
+                "xcrun",                            "clang++",          b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}), std_flag,           "-arch",
+                "arm64",                            version_min_flag,   "-fno-exceptions",
+                "-fno-rtti",
                 // ARC disabled — the shim does manual retain/release
                 // (sk_cfp + CFRetain). iOS ships graphite-metal only.
-                "-fno-objc-arc",
-                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
-                "-I", "kx_skia/include",
-                "-I", "deps/skia",
-                "-I", "deps/skia/include",
-                "-I", "deps/SDL/include",
-                "-c", src,
-                "-o", obj_path,
+                                       "-fno-objc-arc",    "-DSK_GANESH",
+                "-DSK_GRAPHITE",                    "-DSK_METAL",       "-DNDEBUG",
+                "-I",                               "kx_skia/include",  "-I",
+                "deps/skia",                        "-I",               "deps/skia/include",
+                "-I",                               "deps/SDL/include", "-c",
+                src,                                "-o",               obj_path,
             };
         const compile = b.addSystemCommand(compile_cmd);
         compile.step.dependOn(last_compile_step);
@@ -817,8 +817,8 @@ fn addIosApp(
     // just needs to evaluate.
     const skia_libs = [_][]const u8{
         "libfreetype2.a", "libharfbuzz.a",    "libicu.a",      "libpng.a",            "libskcms.a",
-        "libskia.a",      "libskparagraph.a", "libskshaper.a", "libskunicode_core.a",
-        "libskunicode_icu.a", "libzlib.a",
+        "libskia.a",      "libskparagraph.a", "libskshaper.a", "libskunicode_core.a", "libskunicode_icu.a",
+        "libzlib.a",
     };
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(b.allocator, "xcrun") catch unreachable;
