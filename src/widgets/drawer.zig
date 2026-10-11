@@ -166,12 +166,13 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
     // Corner radius on the END side only: clip to the panel rect, then draw
     // a full pill shifted towards the start side — the start-side corners
-    // land outside the clip and stay square.
-    ui.paint.save(ctx);
+    // land outside the clip and stay square. clipRect pushes its own save
+    // (clipReset pops it) — an extra save/restore pair would leak one save
+    // per frame and strand the host's enclosing clip (damage rect) forever.
     ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
     const shift = hideSign() * panel_radius;
     ui.paint.fillRRect(ctx, b.x + shift, b.y, b.w + panel_radius, b.h, panel_radius, t.colors.surface_container_low);
-    ui.paint.restore(ctx);
+    ui.paint.clipReset(ctx);
 }
 fn panelBgDeinit(n: *Node) void {
     n.allocator.destroy(panelBgStateOf(n));

@@ -189,16 +189,15 @@ fn ptrPaint(n: *Node, ctx: *kx.Ctx) void {
 
 fn ptrPreChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
-    // own save: the restore in post_children_paint must not pop a caller's
-    // canvas state (enclosing clips survive). The content is clipped to the
-    // container and translated down by the adjusted offset.
-    ui.paint.save(ctx);
+    // clipRect pushes its own save — clipReset pops it, restoring the
+    // enclosing clip (scroll view, damage rect) intact. The content is
+    // clipped to the container and translated down by the adjusted offset.
     ui.paint.clipRect(ctx, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
     ui.paint.translate(ctx, 0, s.adjusted);
 }
 
 fn ptrPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
-    ui.paint.restore(ctx); // the content's clip + translate
+    ui.paint.clipReset(ctx); // the content's clip + translate
     const s = stateOf(n);
     const t = s.opts.theme;
     const b = n.bounds;
