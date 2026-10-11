@@ -17,14 +17,19 @@ jobs:
   build-test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
+    defaults:
+      run:
+        # bash everywhere: smoke steps use env-prefix + POSIX paths
+        # (Git Bash on windows-latest, login shell elsewhere).
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         # ubuntu-24.04-arm covers the linux-arm64 target (fetch-deps
-        # linux-arm64 tag); x64 stays on ubuntu-latest. Windows joins the
-        # matrix once the win backend stack lands.
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        # linux-arm64 tag); x64 stays on ubuntu-latest. windows-latest
+        # covers windows-x64 (Git Bash + MSVC + Dawn stack, Phase 3c).
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -36,7 +41,7 @@ jobs:
           fi
 
       - name: arm64 toolchain fixes (gn x64-only; clang outline-atomics)
-        if: runner.arch == 'ARM64'
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
         run: |
           sudo apt-get update
           sudo apt-get install -y generate-ninja
@@ -85,7 +90,8 @@ jobs:
       - name: ReleaseSmall build + size gate (< 6,8 Mo)
         run: |
           zig build -Doptimize=ReleaseSmall
-          size=$(wc -c < zig-out/bin/hello)
+          bin=zig-out/bin/hello; [ -f "$bin" ] || bin="$bin.exe"
+          size=$(wc -c < "$bin")
           echo "hello (ReleaseSmall): $size bytes"
           if [ "$size" -ge 7127245 ]; then
             echo "SIZE GATE FAILED: $size >= 6,8 Mo"; exit 1

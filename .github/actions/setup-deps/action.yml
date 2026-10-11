@@ -42,14 +42,18 @@ runs:
     - name: Install Zig ${{ inputs.zig-version }} (pinned, ADR-0001)
       shell: bash
       run: |
+        ext=tar.xz
         case "$(uname -s)-$(uname -m)" in
           Darwin-arm64)   zig_target=aarch64-macos ;;
           Linux-x86_64)   zig_target=x86_64-linux ;;
           Linux-aarch64)  zig_target=aarch64-linux ;;
+          MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64)
+            zig_target=x86_64-windows; ext=zip ;;
           *) echo "unsupported CI host: $(uname -s)-$(uname -m)"; exit 1 ;;
         esac
-        curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${{ inputs.zig-version }}/zig-${zig_target}-${{ inputs.zig-version }}.tar.xz"
-        tar -xf zig.tar.xz
+        curl -fsSL -o "zig.$ext" "https://ziglang.org/download/${{ inputs.zig-version }}/zig-${zig_target}-${{ inputs.zig-version }}.$ext"
+        # bsdtar (what `tar` resolves to on Windows runners) also reads .zip.
+        tar -xf "zig.$ext"
         zig_dir="$(pwd)/zig-${zig_target}-${{ inputs.zig-version }}"
         echo "$zig_dir" >> "$GITHUB_PATH"
         export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
