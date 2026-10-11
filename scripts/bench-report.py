@@ -34,8 +34,13 @@ METRICS = [
 
 
 def load_reports():
-    """Return {framework: {scene: metrics-dict, ...}, ...} plus metadata."""
-    reports = {}  # framework -> (timestamp, path, data)
+    """Return {framework: {scene: metrics-dict, ...}, ...} plus metadata.
+
+    All JSON files of a framework are MERGED (union of scenes; a later file
+    overrides an earlier one for the same scene) — some runners write one
+    report per scene, others a single all-scenes report.
+    """
+    raw = {}  # framework -> list of (timestamp, path, data)
     # Flat files = Klaxon's own runner.
     for path in glob.glob(os.path.join(RESULTS, "*.json")):
         try:
@@ -43,9 +48,7 @@ def load_reports():
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        ts = data.get("timestamp", "")
-        if "klaxon" not in reports or ts > reports["klaxon"][0]:
-            reports["klaxon"] = (ts, path, data)
+        raw.setdefault("klaxon", []).append((data.get("timestamp", ""), path, data))
     # Per-framework directories.
     for fw_dir in sorted(glob.glob(os.path.join(RESULTS, "*"))):
         if not os.path.isdir(fw_dir):
@@ -57,19 +60,26 @@ def load_reports():
                     data = json.load(f)
             except (OSError, json.JSONDecodeError):
                 continue
-            ts = data.get("timestamp", "")
-            if fw not in reports or ts > reports[fw][0]:
-                reports[fw] = (ts, path, data)
+            raw.setdefault(fw, []).append((data.get("timestamp", ""), path, data))
     out = {}
-    for fw, (ts, path, data) in reports.items():
+    for fw, entries in raw.items():
+        entries.sort(key=lambda e: e[0])  # oldest first — later overrides
         scenes = {}
-        for s in data.get("scenes", []):
-            scenes[s["name"]] = s
+        binary = 0
+        paths = []
+        last_ts = ""
+        for ts, path, data in entries:
+            for s in data.get("scenes", []):
+                scenes[s["name"]] = s
+            if data.get("binary_size_bytes"):
+                binary = data["binary_size_bytes"]
+            paths.append(os.path.relpath(path, ROOT))
+            last_ts = ts or last_ts
         out[fw] = {
             "scenes": scenes,
-            "binary_size_bytes": data.get("binary_size_bytes", 0),
-            "timestamp": ts,
-            "path": os.path.relpath(path, ROOT),
+            "binary_size_bytes": binary,
+            "timestamp": last_ts,
+            "path": ", ".join(paths) if len(paths) <= 3 else f"{len(paths)} reports ({paths[0]} … {paths[-1]})",
         }
     return out
 
