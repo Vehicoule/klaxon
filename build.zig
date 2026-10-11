@@ -457,7 +457,7 @@ fn addWasmWeb(
         // headers which conflict with the emscripten sysroot. All include paths
         // are provided explicitly below (compat + c++/v1 + sysroot + project
         // headers) — the same list emcc assembles (emcc.py get_cflags).
-        "-nostdinc", "-nostdinc++",
+           "-nostdinc",       "-nostdinc++",
     };
     kx_skia.root_module.addCSourceFiles(.{
         .files = &.{
@@ -716,8 +716,11 @@ fn addIosApp(
     app.root_module.addImport("kx_c", translate_kx.createModule());
     // Backend selection: -Dios-backend=graphite-metal (default) | ganesh-gles | raster
     const ios_backend = b.option([]const u8, "ios-backend", "iOS rendering backend (default: graphite-metal)") orelse "graphite-metal";
+    // App selection: -Dios-app=gallery (default) | hello
+    const ios_app = b.option([]const u8, "ios-app", "iOS app to build: gallery|hello") orelse "gallery";
     const ios_options = b.addOptions();
     ios_options.addOption([]const u8, "ios_backend", ios_backend);
+    ios_options.addOption([]const u8, "ios_app", ios_app);
     app.root_module.addOptions("build_options", ios_options);
     b.installArtifact(app);
 
@@ -743,51 +746,44 @@ fn addIosApp(
         const std_flag = if (is_c) "-std=c11" else "-std=c++20";
         const compile_cmd = if (is_c)
             &[_][]const u8{
-                "xcrun", "clang", b.fmt("-x{s}", .{lang}),
-                b.fmt("-isysroot{s}", .{sdk_path}),
-                std_flag, "-arch", "arm64",
-                version_min_flag,
-                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
-                "-I", "kx_skia/include",
-                "-I", "deps/skia",
-                "-I", "deps/skia/include",
-                "-I", "deps/SDL/include",
-                "-c", src,
-                "-o", obj_path,
+                "xcrun",                            "clang",            b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}), std_flag,           "-arch",
+                "arm64",                            version_min_flag,   "-DSK_GANESH",
+                "-DSK_GRAPHITE",                    "-DSK_METAL",       "-DNDEBUG",
+                "-I",                               "kx_skia/include",  "-I",
+                "deps/skia",                        "-I",               "deps/skia/include",
+                "-I",                               "deps/SDL/include", "-c",
+                src,                                "-o",               obj_path,
             }
         else
             &[_][]const u8{
-                "xcrun", "clang++", b.fmt("-x{s}", .{lang}),
-                b.fmt("-isysroot{s}", .{sdk_path}),
-                std_flag, "-arch", "arm64",
-                version_min_flag,
-                "-fno-exceptions", "-fno-rtti",
+                "xcrun",                                                         "clang++",                                             b.fmt("-x{s}", .{lang}),
+                b.fmt("-isysroot{s}", .{sdk_path}),                              std_flag,                                              "-arch",
+                "arm64",                                                         version_min_flag,                                      "-fno-exceptions",
+                "-fno-rtti",
                 // Dawn expects ARC disabled (src/dawn/common/NSRef.h #errors
                 // under ARC) — the shim's manual retain/release matches.
-                "-fno-objc-arc",
-                "-DSK_GANESH", "-DSK_GRAPHITE", "-DSK_METAL", "-DNDEBUG",
-                "-I", "kx_skia/include",
-                "-I", "deps/skia",
-                "-I", "deps/skia/include",
-                "-I", "deps/SDL/include",
+                                                                    "-fno-objc-arc",                                       "-DSK_GANESH",
+                "-DSK_GRAPHITE",                                                 "-DSK_METAL",                                          "-DNDEBUG",
+                "-I",                                                            "kx_skia/include",                                     "-I",
+                "deps/skia",                                                     "-I",                                                  "deps/skia/include",
+                "-I",                                                            "deps/SDL/include",
                 // Graphite Dawn (Metal) shim (kx_skia_ios.mm): dawn headers +
                 // the cmake_dawn generated headers — the same include set the
                 // libdawn_combined.a build used (deps/skia/out/<tag>/cmake_dawn).
-                "-I", "deps/skia/third_party/externals/dawn/include",
-                "-I", b.fmt("deps/skia/out/{s}/cmake_dawn/gen/include", .{tag}),
-                "-I", "deps/skia/third_party/externals/abseil-cpp",
-                "-I", "deps/skia/third_party/externals/dawn/src/dawn/partition_alloc",
-                "-I", "deps/skia/third_party/externals/dawn",
-                "-I", b.fmt("deps/skia/out/{s}/cmake_dawn/gen/src", .{tag}),
-                "-c", src,
-                "-o", obj_path,
+                                                   "-I",
+                "deps/skia/third_party/externals/dawn/include",                  "-I",                                                  b.fmt("deps/skia/out/{s}/cmake_dawn/gen/include", .{tag}),
+                "-I",                                                            "deps/skia/third_party/externals/abseil-cpp",          "-I",
+                "deps/skia/third_party/externals/dawn/src/dawn/partition_alloc", "-I",                                                  "deps/skia/third_party/externals/dawn",
+                "-I",                                                            b.fmt("deps/skia/out/{s}/cmake_dawn/gen/src", .{tag}), "-c",
+                src,                                                             "-o",                                                  obj_path,
             };
         const compile = b.addSystemCommand(compile_cmd);
         compile.step.dependOn(last_compile_step);
         last_compile_step = &compile.step;
     }
     const archive = b.addSystemCommand(&.{
-        "xcrun", "ar", "rcs", "zig-out/lib/libkx_skia_ios.a",
+        "xcrun",      "ar",         "rcs",        "zig-out/lib/libkx_skia_ios.a",
         shim_objs[0], shim_objs[1], shim_objs[2], shim_objs[3],
     });
     archive.step.dependOn(last_compile_step);
@@ -800,8 +796,8 @@ fn addIosApp(
     // dependents-first (libskia.a's graphite Dawn backend references dawn
     // symbols; the kx_skia shim references them too — both resolve here).
     const skia_libs = [_][]const u8{
-        "libfreetype2.a", "libharfbuzz.a",    "libicu.a",      "libpng.a",            "libskcms.a",
-        "libskia.a",      "libdawn_combined.a", "libskparagraph.a", "libskshaper.a",    "libskunicode_core.a",
+        "libfreetype2.a",     "libharfbuzz.a",      "libicu.a",         "libpng.a",      "libskcms.a",
+        "libskia.a",          "libdawn_combined.a", "libskparagraph.a", "libskshaper.a", "libskunicode_core.a",
         "libskunicode_icu.a", "libzlib.a",
     };
     var argv: std.ArrayList([]const u8) = .empty;
@@ -855,9 +851,9 @@ fn addIosApp(
     // The link references libkx_skia_ios.a — built by the shim archive step.
     link.step.dependOn(&archive.step);
 
-    // Steps: "ios" (hello placeholder) and "ios-gallery" (default).
-    const ios_step = b.step("ios", "Build the iOS app (hello placeholder)");
-    ios_step.dependOn(&link.step);
+    // Single step: "ios-gallery" (the only iOS app for now — a previous
+    // "ios" step depended on the same link.step and produced the identical
+    // binary, which was misleading).
     const ios_gallery_step = b.step("ios-gallery", "Build the iOS gallery app");
     ios_gallery_step.dependOn(&link.step);
 }
