@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const opts = try optsFromArgs(init.args, allocator);
 
     var results = std.array_list.Managed(conformance.TestResult).init(allocator);
-    var by_domain = std.StringArrayHashMap(DomainScore).init(allocator);
+    var by_domain = std.StringArrayHashMapUnmanaged(DomainScore){};
     var skipped_files = std.array_list.Managed([]const u8).init(allocator);
 
     if (opts.file) |path| {
@@ -133,14 +133,19 @@ fn optsFromArgs(args: std.process.Args, allocator: Allocator) !Options {
     return opts;
 }
 
+// std.c has no fseek/ftell — declare the libc externs (same pattern as
+// bench_main.zig; the conformance runner is native-only).
+extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
+extern "c" fn ftell(stream: *std.c.FILE) c_long;
+
 fn readFile(allocator: Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeSentinel(u8, path, 0);
     const f = std.c.fopen(path_z, "rb") orelse return error.CannotOpenFile;
     defer _ = std.c.fclose(f);
-    if (std.c.fseek(f, 0, std.c.SEEK.END) != 0) return error.CannotReadFile;
-    const size = std.c.ftell(f);
+    if (fseek(f, 0, std.c.SEEK.END) != 0) return error.CannotReadFile;
+    const size = ftell(f);
     if (size <= 0) return error.CannotReadFile;
-    _ = std.c.fseek(f, 0, std.c.SEEK_SET);
+    _ = fseek(f, 0, std.c.SEEK.SET);
     const buf = try allocator.alloc(u8, @intCast(size));
     const n = std.c.fread(buf.ptr, 1, buf.len, f);
     if (n != buf.len) return error.CannotReadFile;
@@ -152,7 +157,7 @@ fn runFile(
     path: []const u8,
     opts: Options,
     results: *std.array_list.Managed(conformance.TestResult),
-    by_domain: *std.StringArrayHashMap(DomainScore),
+    by_domain: *std.StringArrayHashMapUnmanaged(DomainScore),
 ) !void {
     const text = try readFile(allocator, path);
     const doc = try value_mod.parseJson(allocator, text);
@@ -165,7 +170,7 @@ fn runFile(
         }
         const res = conformance.runTest(allocator, tv);
         try results.append(res);
-        const gop = try by_domain.getOrPut(res.domain);
+        const gop = try by_domain.getOrPut(allocator, res.domain);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         if (res.passed) gop.value_ptr.pass += 1 else gop.value_ptr.fail += 1;
     }
@@ -181,7 +186,7 @@ fn valueToStr(v: ?value_mod.Value) []const u8 {
 fn formatReport(
     allocator: Allocator,
     results: []const conformance.TestResult,
-    by_domain: *std.StringArrayHashMap(DomainScore),
+    by_domain: *std.StringArrayHashMapUnmanaged(DomainScore),
     score: f64,
     ts: []const u8,
 ) ![]const u8 {

@@ -172,8 +172,9 @@ fn parseTextAlign(s: []const u8) ui.layout.TextAlign {
 }
 
 fn parseRole(s: []const u8) ?sem.Role {
-    inline for (@typeInfo(sem.Role).@"enum".fields) |f| {
-        if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+    const info = @typeInfo(sem.Role).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (std.mem.eql(u8, s, name)) return @enumFromInt(value);
     }
     return null;
 }
@@ -190,7 +191,9 @@ fn parseKey(s: []const u8) input_mod.Key {
     if (std.mem.eql(u8, s, "up")) return .up;
     if (std.mem.eql(u8, s, "down")) return .down;
     if (std.mem.eql(u8, s, "back")) return .back;
-    if (std.mem.eql(u8, s, "a")) return .a;
+    // Single chars map to their codepoint (Key is a non-exhaustive enum(u32);
+    // e.g. "a" → @enumFromInt('a') like the host's keymap path).
+    if (s.len == 1) return @enumFromInt(s[0]);
     return .unknown;
 }
 
@@ -540,8 +543,9 @@ fn attachPropSemantics(node: *Node, props: Value) void {
         if (a == .array) {
             for (a.array) |av| {
                 const name = str(av) orelse continue;
-                inline for (@typeInfo(sem.Action).@"enum".fields) |f| {
-                    if (std.mem.eql(u8, name, f.name)) s.actions.insert(@enumFromInt(f.value));
+                const info = @typeInfo(sem.Action).@"enum";
+                inline for (info.field_names, info.field_values) |fname, fval| {
+                    if (std.mem.eql(u8, name, fname)) s.actions.insert(@enumFromInt(fval));
                 }
             }
         }
@@ -568,7 +572,9 @@ fn applyNodeProps(h: *Harness, node: *Node, tv: Value, id: []const u8) !void {
     }
 }
 
-fn buildChildren(h: *Harness, parent: *Node, tv: Value) !void {
+// Explicit error set: buildChildren ↔ buildNode are mutually recursive, so
+// inferred error sets create a dependency loop (Zig 0.17).
+fn buildChildren(h: *Harness, parent: *Node, tv: Value) anyerror!void {
     if (getProp(tv, "children")) |kids| {
         if (kids == .array) {
             for (kids.array) |kv| {
@@ -926,8 +932,10 @@ fn runAction(h: *Harness, av: Value) void {
 }
 
 fn runActionInner(h: *Harness, op: []const u8, av: Value) !void {
-    const root = h.root orelse error.NoTree;
+    // The tree is required only by ops that dispatch into it — signal/memo/
+    // nav/focus ops run on tree-less state tests.
     if (std.mem.eql(u8, op, "pointer")) {
+        const root = h.root orelse return error.NoTree;
         h.router.dispatchPointer(root, .{
             .phase = parsePhase(strOr(getProp(av, "phase"), "move")) orelse .move,
             .x = num(getProp(av, "x"), 0),
@@ -936,6 +944,7 @@ fn runActionInner(h: *Harness, op: []const u8, av: Value) !void {
             .time_ms = @intCast(@max(0, intOf(getProp(av, "t"), 0))),
         });
     } else if (std.mem.eql(u8, op, "scroll")) {
+        const root = h.root orelse return error.NoTree;
         h.router.dispatchScroll(root, .{
             .x = num(getProp(av, "x"), 0),
             .y = num(getProp(av, "y"), 0),
@@ -985,6 +994,7 @@ fn runActionInner(h: *Harness, op: []const u8, av: Value) !void {
     } else if (std.mem.eql(u8, op, "relayout")) {
         h.viewport.w = num(getProp(av, "w"), h.viewport.w);
         h.viewport.h = num(getProp(av, "h"), h.viewport.h);
+        const root = h.root orelse return error.NoTree;
         root.layout(h.viewport);
         if (h.renderer) |*r| r.resize(@intFromFloat(h.viewport.w), @intFromFloat(h.viewport.h));
     } else if (std.mem.eql(u8, op, "paint")) {
@@ -1078,6 +1088,10 @@ const Check = struct {
 
 fn nearEq(a: f32, b: f32, tol: f32) bool {
     return @abs(a - b) <= tol;
+}
+
+fn boolStr(b: bool) []const u8 {
+    return if (b) "true" else "false";
 }
 
 fn rectEq(a: Rect, b: Rect, tol: f32) bool {
@@ -1196,7 +1210,7 @@ fn expectSignals(h: *Harness, c: *Check, v: Value) void {
             if (s.peek() != want) c.fail("signals.{s}: expected {d}, got {d}", .{ f.name, want, s.peek() });
         } else if (h.sig_bool.get(f.name)) |s| {
             const want = boolean(f.value, false);
-            if (s.peek() != want) c.fail("signals.{s}: expected {s}, got {s}", .{ f.name, @tagName(want), @tagName(s.peek()) });
+            if (s.peek() != want) c.fail("signals.{s}: expected {s}, got {s}", .{ f.name, boolStr(want), boolStr(s.peek()) });
         } else if (h.sig_f32.get(f.name)) |s| {
             const want = num(f.value, 0);
             if (!nearEq(s.peek(), want, c.tol)) c.fail("signals.{s}: expected {d}, got {d}", .{ f.name, want, s.peek() });
@@ -1252,13 +1266,13 @@ fn checkSemNode(h: *Harness, c: *Check, ev: Value, got: sem.SemanticNode) void {
     if (getProp(ev, "checked")) |cv| {
         const want = boolean(cv, false);
         const g = got.checked orelse false;
-        if (g != want) c.fail("a11y checked: expected {s}, got {s}", .{ @tagName(want), @tagName(g) });
+        if (g != want) c.fail("a11y checked: expected {s}, got {s}", .{ boolStr(want), boolStr(g) });
     }
     if (getProp(ev, "focusable")) |fv| {
-        if (got.focusable != boolean(fv, false)) c.fail("a11y focusable: expected {s}, got {s}", .{ @tagName(boolean(fv, false)), @tagName(got.focusable) });
+        if (got.focusable != boolean(fv, false)) c.fail("a11y focusable: expected {s}, got {s}", .{ boolStr(boolean(fv, false)), boolStr(got.focusable) });
     }
     if (getProp(ev, "disabled")) |dv| {
-        if (got.disabled != boolean(dv, false)) c.fail("a11y disabled: expected {s}, got {s}", .{ @tagName(boolean(dv, false)), @tagName(got.disabled) });
+        if (got.disabled != boolean(dv, false)) c.fail("a11y disabled: expected {s}, got {s}", .{ boolStr(boolean(dv, false)), boolStr(got.disabled) });
     }
     _ = h;
 }
@@ -1335,7 +1349,7 @@ fn expectI18n(h: *Harness, c: *Check, v: Value) void {
                 while (it.next()) |tok| {
                     if (std.mem.eql(u8, tok, "pct")) opts.percent = true;
                     if (std.mem.eql(u8, tok, "nogroup")) opts.grouping = false;
-                    if (std.mem.startsWith(u8, tok, "dec=")) opts.decimals = std.fmt.parseInt(usize, tok[4..], 10) catch null;
+                    if (std.mem.startsWith(u8, tok, "dec=")) opts.decimals = std.fmt.parseInt(u8, tok[4..], 10) catch null;
                 }
             }
             const loc = i18n.locale() orelse continue;
@@ -1545,7 +1559,7 @@ fn runTestInner(alloc: Allocator, tv: Value, c: *Check) !void {
 
     if (getProp(setup, "tree")) |tree| {
         h.root = try buildNode(h, tree);
-        h.fm.?.setRoot(h.root);
+        h.fm.?.setRoot(h.root.?);
         h.root.?.layout(h.viewport);
         h.root.?.clearDamage(); // frame-0 boundary: actions observe a clean damage accumulator
     }
