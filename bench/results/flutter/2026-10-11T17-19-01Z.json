@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "semantics_build",
+      "frame_time_avg_ms": 11.9,
+      "frame_time_p50_ms": 11.9,
+      "frame_time_p99_ms": 14.1,
+      "frame_time_p999_ms": 15.2,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 84.3,
+      "draw_calls_per_frame": 3001,
+      "rss_mb": 130.4,
+      "ttff_ms": 47.6,
+      "frames_rendered": 130,
+      "extra": {"nodes_per_frame":1002}
+    }
+  ],
+  "binary_size_bytes": 132880,
+  "timestamp": "2026-10-11T17:19:01Z"
+}

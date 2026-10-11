@@ -13,6 +13,7 @@
 // override the directory with KLAXON_BENCH_OUT_DIR). Progress goes to stderr.
 // See README.md for the methodology and the known non-parities.
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -87,10 +88,12 @@ void writeStdout(String json) {
   }
 }
 
-/// JSON report — the 4c.3 output contract, same shape as src/bench_main.zig:
-/// { "scenes": [ { "name", "fps", "frame_time_avg_ms", "frame_time_p50_ms",
-///                 "frame_time_p99_ms", "draw_calls_per_frame", "rss_mb",
-///                 "ttff_ms", "frames_rendered" } ],
+/// JSON report — the 4c.3 output contract + the bench-scenes.md schema v2
+/// additions (frame_time_p999_ms, jank_frames, jank_pct, extra):
+/// { "scenes": [ { "name", "frame_time_avg_ms", "frame_time_p50_ms",
+///                 "frame_time_p99_ms", "frame_time_p999_ms", "jank_frames",
+///                 "jank_pct", "fps", "draw_calls_per_frame", "rss_mb",
+///                 "ttff_ms", "frames_rendered", "extra" } ],
 ///   "binary_size_bytes": N, "timestamp": "YYYY-MM-DDTHH:MM:SSZ" }
 String formatReport(List<SceneMetrics> results) {
   final StringBuffer buf = StringBuffer();
@@ -100,14 +103,18 @@ String formatReport(List<SceneMetrics> results) {
     final SceneMetrics m = results[i];
     buf.write('    {\n');
     buf.write('      "name": "${m.name}",\n');
-    buf.write('      "fps": ${m.fps.toStringAsFixed(1)},\n');
     buf.write('      "frame_time_avg_ms": ${m.frameTimeAvgMs.toStringAsFixed(1)},\n');
     buf.write('      "frame_time_p50_ms": ${m.percentile(50).toStringAsFixed(1)},\n');
     buf.write('      "frame_time_p99_ms": ${m.percentile(99).toStringAsFixed(1)},\n');
+    buf.write('      "frame_time_p999_ms": ${m.percentile(99.9).toStringAsFixed(1)},\n');
+    buf.write('      "jank_frames": ${m.jankFrames},\n');
+    buf.write('      "jank_pct": ${m.jankPct.toStringAsFixed(1)},\n');
+    buf.write('      "fps": ${m.fps.toStringAsFixed(1)},\n');
     buf.write('      "draw_calls_per_frame": ${m.drawCallsPerFrame},\n');
     buf.write('      "rss_mb": ${m.rssMb.toStringAsFixed(1)},\n');
     buf.write('      "ttff_ms": ${m.ttffMs.toStringAsFixed(1)},\n');
-    buf.write('      "frames_rendered": ${m.framesRendered}\n');
+    buf.write('      "frames_rendered": ${m.framesRendered},\n');
+    buf.write('      "extra": ${jsonEncode(m.extra)}\n');
     buf.write('    }');
   }
   buf.write('\n  ],\n');
