@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  klaxon.wxs — WiX source for the "Klaxon <App>" .msi installer (Windows x64).
+
+  Authored in WiX v3-compatible syntax so it builds with the widest set of
+  toolchains:
+    - WiX v3:    candle.exe + light.exe  (compiled directly)
+    - WiX v4/v5: `wix build` — the v4 CLI cannot read the v3 namespace, so
+      scripts/package-windows-msi.sh runs this file through `wix convert`
+      into a temp copy first. All constructs below (Product/Package split,
+      MajorUpgrade, Media, <?define?>/<?if?>) convert cleanly.
+
+  Multi-app: everything app-specific arrives via <?define?> preprocessor
+  variables, each guarded by <?ifndef?> so the file also compiles standalone
+  (defaults to the gallery app). The packaging script passes:
+      -dAppName -dAppTitle -dAppExe -dProductVersion -dUpgradeCode
+      -dStageDir -dRepoRoot -dHasIcu -dHasDxc
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <!-- ---- preprocessor knobs (overridden by -d flags) ---- -->
+  <?ifndef AppName        ?><?define AppName="gallery"    ?><?endif?>
+  <?ifndef AppTitle       ?><?define AppTitle="Gallery"   ?><?endif?>
+  <?ifndef AppExe         ?><?define AppExe="gallery.exe" ?><?endif?>
+  <?ifndef ProductVersion ?><?define ProductVersion="0.1.0" ?><?endif?>
+  <?ifndef Manufacturer   ?><?define Manufacturer="Vehicoule" ?><?endif?>
+  <?ifndef StageDir       ?><?define StageDir="."         ?><?endif?>
+  <?ifndef RepoRoot       ?><?define RepoRoot="."         ?><?endif?>
+  <?ifndef HasIcu         ?><?define HasIcu="no"          ?><?endif?>
+  <?ifndef HasDxc         ?><?define HasDxc="no"          ?><?endif?>
+
+  <!-- Base UpgradeCode: fixed, generated once — do NOT regenerate. The script
+       normally overrides this with a deterministic per-app code derived from
+       it, so "Klaxon Hello" and "Klaxon Gallery" can coexist; a shared code
+       would make each install "upgrade" (i.e. remove) its siblings. -->
+  <?ifndef UpgradeCode ?><?define UpgradeCode="EE54060F-0A3A-4A97-96A0-ACD2235BC6D4" ?><?endif?>
+
+  <Product Id="*"
+           Name="Klaxon $(var.AppTitle)"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="$(var.Manufacturer)"
+           UpgradeCode="$(var.UpgradeCode)">
+
+    <!-- InstallScope="perUser": the .msi never requests elevation. The app
+         lands under %LOCALAPPDATA%\Programs and the user's own Start Menu;
+         InstallPrivileges="limited" keeps Windows Installer from even
+         offering a UAC prompt. (perMachine would target Program Files and
+         demand admin — pointless for a portable-adjacent demo app.)
+         InstallerVersion="500" is the floor for MSIINSTALLPERUSER — Windows
+         Installer 5.0 shipped with Windows 7, and Klaxon's D3D12 backend
+         needs Windows 10 anyway. SummaryCodepage silences light's LGHT1076. -->
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perUser"
+             InstallPrivileges="limited"
+             SummaryCodepage="1252"
+             Description="Klaxon $(var.AppTitle)"
+             Comments="Klaxon $(var.AppTitle) $(var.ProductVersion)"/>
+
+    <!-- Same UpgradeCode + higher Version → old installs upgrade in place. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Klaxon $(var.AppTitle) is already installed."/>
+
+    <Media Id="1" Cabinet="klaxon.cab" EmbedCab="yes"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <!-- Per-user install root: %LOCALAPPDATA%\Programs\Klaxon <App> -->
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="Klaxon $(var.AppTitle)"/>
+      </Directory>
+      <!-- Per-user Start Menu (ProgramMenuFolder resolves per-install-context). -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="AppMenuFolder" Name="Klaxon"/>
+      </Directory>
+    </Directory>
+
+    <Feature Id="ProductFeature" Title="Klaxon $(var.AppTitle)" Level="1">
+      <ComponentRef Id="AppExecutable"/>
+      <ComponentRef Id="LicenseDocs"/>
+      <ComponentRef Id="StartMenuShortcut"/>
+      <?if $(var.HasIcu)=yes ?>
+      <ComponentRef Id="IcuRuntime"/>
+      <?endif?>
+      <?if $(var.HasDxc)=yes ?>
+      <ComponentRef Id="DxcRuntime"/>
+      <?endif?>
+    </Feature>
+  </Product>
+
+  <!-- No Icon element: assets/ ships no .ico today. When one exists, add
+       <Icon Id="AppIcon" SourceFile="..."/> + Shortcut/@Icon="AppIcon". -->
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <!-- Guid="*": stable auto-generated GUIDs seeded by component id, so
+           rebuilds produce upgrade-compatible components. -->
+      <Component Id="AppExecutable" Guid="*">
+        <File Id="AppExeFile" Source="$(var.StageDir)/$(var.AppExe)" KeyPath="yes"/>
+      </Component>
+
+      <!-- Legal docs from the repo root — part of the installed payload. -->
+      <Component Id="LicenseDocs" Guid="*">
+        <File Id="LicenseFile" Source="$(var.RepoRoot)/LICENSE" KeyPath="yes"/>
+        <File Id="NoticeFile"  Source="$(var.RepoRoot)/NOTICE"/>
+      </Component>
+
+      <!-- Optional runtime payload for the Dawn/D3D12 + ICU stack; matches
+           what package-windows.sh puts in the portable .zip. -->
+      <?if $(var.HasIcu)=yes ?>
+      <Component Id="IcuRuntime" Guid="*">
+        <File Id="IcuDatFile" Source="$(var.StageDir)/icudtl.dat" KeyPath="yes"/>
+      </Component>
+      <?endif?>
+      <?if $(var.HasDxc)=yes ?>
+      <Component Id="DxcRuntime" Guid="*">
+        <File Id="DxCompilerFile" Source="$(var.StageDir)/dxcompiler.dll" KeyPath="yes"/>
+        <File Id="DxilFile"       Source="$(var.StageDir)/dxil.dll"/>
+      </Component>
+      <?endif?>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <!-- Non-advertised shortcut pointing at the installed exe. -->
+        <Shortcut Id="AppStartMenuShortcut"
+                  Name="Klaxon $(var.AppTitle)"
+                  Description="Klaxon $(var.AppTitle)"
+                  Target="[#AppExeFile]"
+                  WorkingDirectory="INSTALLFOLDER"/>
+        <!-- The shortcut lives outside INSTALLFOLDER, so the component needs
+             its own keypath: an HKCU value keeps it per-user (no elevation). -->
+        <RegistryValue Root="HKCU"
+                       Key="Software\Klaxon\$(var.AppName)"
+                       Name="installed" Type="integer" Value="1" KeyPath="yes"/>
+        <RemoveFolder Id="AppMenuFolder" On="uninstall"/>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>
