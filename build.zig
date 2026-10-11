@@ -394,6 +394,10 @@ fn addWasmWeb(
     //   3. sysroot/include — musl C headers (<emscripten.h>, <GLES3/gl32.h>).
     // (emcc also injects include/fakesdl, but only when USE_SDL=0 — we link
     // the real SDL3, whose headers shadow it anyway.)
+    // NB: compat/ must come FIRST (emcc prepends it): its headers shadow
+    // sysroot ones of the same name (stdlib.h, string.h, math.h, time.h, …)
+    // adding BSD-compat declarations musl lacks — _LIBCPP_HAS_NO_XLOCALE is
+    // NOT honored by this libc++ build, so the compat dir is required.
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/c++/v1", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(sysroot_include));
