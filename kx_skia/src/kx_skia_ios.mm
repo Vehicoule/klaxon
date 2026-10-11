@@ -542,6 +542,10 @@ bool gpu_end_offscreen(GpuState* state) {
     return false;
 }
 
+const char* platform_font_family() { return nullptr; }
+
+const char* platform_fallback_font_family() { return nullptr; }
+
 // iOS: check if the UIWindow's root view is attached — presents before the
 // view is mapped to the window are silently lost (black screen).
 extern "C" bool kx_ios_window_mapped(void* uiwindow) {
