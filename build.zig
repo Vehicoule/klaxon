@@ -77,6 +77,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Windows: skparagraph's ICU needs icudtl.dat next to the exe at runtime
+    // (staged by fetch-deps into the Skia out dir).
+    if (target.result.os.tag == .windows) {
+        const dat = b.fmt("deps/skia/out/{s}/icudtl.dat", .{tag});
+        b.getInstallStep().dependOn(&b.addInstallFile(b.path(dat), "bin/icudtl.dat").step);
+    }
+
     // --- hello app ---
     const exe = addApp(b, target, optimize, "hello", "src/main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
     b.installArtifact(exe);
@@ -868,7 +875,7 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         // UIAutomationCore.h needs the ole2 types — no WIN32_LEAN_AND_MEAN.
         .{ .src = "kx_skia/src/kx_a11y_win.cpp", .lean = false },
     };
-    const vcvars = msvcVcvarsPath(b);
+    const vcvars = msvcVcvarsPath(b, target);
     // Wrapper .bat: `cmd /c wrapper.bat <args>` forwards args via %* —
     // args appended after a quoted `cmd /c "..."` string are ignored by cmd.
     const wf = b.addWriteFiles();
@@ -983,10 +990,17 @@ fn newestSubdir(b: *std.Build, dir_path: []const u8) ?[]const u8 {
 }
 
 /// Path to vcvars64.bat ("" when INCLUDE is already set — a vcvars shell).
-fn msvcVcvarsPath(b: *std.Build) []const u8 {
+fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     if (b.graph.environ_map.get("INCLUDE")) |v| {
         if (v.len > 0) return "";
     }
+    // vcvars64 = host arch on both x64 and ARM64 native installs; crossing
+    // from an x64 host to aarch64 needs the amd64_arm64 variant instead.
+    const vcvars_name: []const u8 = if (target.result.cpu.arch == .aarch64 and
+        builtin.cpu.arch == .x86_64)
+        "vcvarsamd64_arm64.bat"
+    else
+        "vcvars64.bat";
     // Probe the usual VS 2022 install layout (no vswhere subprocess).
     const prefixes = [_][]const u8{
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
@@ -994,11 +1008,11 @@ fn msvcVcvarsPath(b: *std.Build) []const u8 {
     };
     const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
     for (prefixes) |p| for (editions) |e| {
-        const cand = b.fmt("{s}\\{s}\\VC\\Auxiliary\\Build\\vcvars64.bat", .{ p, e });
+        const cand = b.fmt("{s}\\{s}\\VC\\Auxiliary\\Build\\{s}", .{ p, e, vcvars_name });
         std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
         return cand;
     };
-    @panic("MSVC not found: install VS 2022 Build Tools (VCTools + a Windows SDK), or run `zig build` inside a vcvars64 shell");
+    @panic("MSVC not found: install VS 2022 Build Tools (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
 }
 
 fn is_windows_local(target: std.Build.ResolvedTarget) bool {

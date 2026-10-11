@@ -197,7 +197,8 @@ fn optsFromArgs(args: std.process.Args) !Options {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
         } else if (std.mem.startsWith(u8, arg, "klaxon://")) {
-            uri = arg;
+            // Iterator-owned arg storage: dupe what we retain past deinit.
+            uri = try std.heap.page_allocator.dupe(u8, arg);
         }
     }
     return .{ .backend = backend, .uri = uri };
