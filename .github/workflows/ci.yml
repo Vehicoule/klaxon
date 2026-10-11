@@ -96,13 +96,12 @@ jobs:
           deps-args: web-wasm
           apt-packages: python3 ninja-build cmake clang libc++-dev libc++abi-dev
 
-      # Eager cache save for the wasm deps. actions/cache's post-job save is
-      # skipped when the job fails (post-if: success()), and this job fails
-      # every run while the emscripten toolchain is broken — without this
-      # step deps-wasm-* never persists and each run pays the ~15 min cold
-      # build. Once a run has saved the key, later saves no-op; the
-      # continue-on-error covers a concurrent-save key conflict.
-      - name: Save deps cache now (job always fails before post-save)
+      # Eager cache save for the wasm deps: actions/cache's post-job save is
+      # skipped when a later step fails (post-if: success()), which would
+      # make every failed run pay the ~15 min cold build again. Once a run
+      # has saved the key, later saves no-op; continue-on-error covers a
+      # concurrent-save key conflict.
+      - name: Save deps cache now (failure-proof post-save)
         continue-on-error: true
         uses: actions/cache/save@v6
         with:
