@@ -762,9 +762,9 @@ fn addIosApp(
     // The link references libkx_skia_ios.a — built by the shim archive step.
     link.step.dependOn(&archive.step);
 
-    // Steps: "ios" (hello placeholder) and "ios-gallery" (default).
-    const ios_step = b.step("ios", "Build the iOS app (hello placeholder)");
-    ios_step.dependOn(&link.step);
+    // Single step: "ios-gallery" (the only iOS app for now — a previous
+    // "ios" step depended on the same link.step and produced the identical
+    // binary, which was misleading).
     const ios_gallery_step = b.step("ios-gallery", "Build the iOS gallery app");
     ios_gallery_step.dependOn(&link.step);
 }

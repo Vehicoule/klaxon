@@ -7,11 +7,11 @@
 // construit le Host + l'arbre dans du stockage stable (page_allocator — les
 // callbacks reviennent plus tard, la pile de SDL_AppInit ne doit pas fuiter).
 //
-// SQUELETTE : la taille de fenêtre est un placeholder (0x0) — le vrai code
-// lira SDL_GetWindowSize après la création de la fenêtre (l'événement
-// SDL_EVENT_WINDOW_RESIZED re-layout l'arbre via host.handleEvent). Le
-// backend demandé est Graphite-Metal, avec un fallback raster si kx_create
-// échoue (simulateur sans Metal, etc.).
+// La taille réelle est lue par Host.init (SDL_GetWindowSize) — le 0x0 passé
+// à init n'est qu'un placeholder avant la création de la fenêtre ; l'événement
+// SDL_EVENT_WINDOW_RESIZED re-layout l'arbre via host.handleEvent. Le backend
+// demandé est Graphite-Metal, avec un fallback raster si kx_create échoue
+// (simulateur sans Metal, etc.).
 //
 // Guard: racine du graphe ios uniquement (build.zig) — le @compileError rend
 // la contrainte explicite si un build natif la compilait par erreur.
@@ -66,9 +66,8 @@ comptime {
 
 pub const AppKind = enum { hello, gallery };
 
-// Option de build -Dios-app=hello|gallery (défaut: gallery).
-// TODO(build.zig): remplacer par b.addOption quand le step ios sera câblé sur
-// ce fichier (le root du graphe ios est encore gallery_main.zig, placeholder).
+// Sélection d'app iOS : `gallery` pour l'instant (le switch `.hello` reste
+// pour un futur toggle de dev ; câbler -Dios-app dans build.zig si besoin).
 const ios_app: AppKind = .gallery;
 
 const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
