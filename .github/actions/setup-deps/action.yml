@@ -1,0 +1,69 @@
+name: setup-deps
+description: >-
+  Install the pinned Zig toolchain (ADR-0001), restore the deps/ cache and
+  run scripts/fetch-deps.sh. Shared by every job so the Zig install and the
+  deps cache key live in exactly one place.
+inputs:
+  cache-key:
+    description: >-
+      Full actions/cache key for deps/. deps/ is a pure function of
+      fetch-deps.sh plus the Skia patches it applies, so callers build the
+      key as deps-<target>-<hashFiles over scripts/fetch-deps.sh and
+      scripts/patches/**>. Each target needs its own deps build, so every
+      job passes a distinct prefix (deps-Linux, deps-macOS, deps-wasm,
+      deps-android, deps-macos-ios).
+    required: true
+  deps-args:
+    description: >-
+      Arguments forwarded to scripts/fetch-deps.sh ('web-wasm',
+      'android-arm64', 'ios', ...). Empty = the native deps for this OS.
+    required: false
+    default: ''
+  apt-packages:
+    description: >-
+      Space-separated apt packages to install first. Linux only — the input
+      is ignored on macOS. Empty = skip.
+    required: false
+    default: ''
+  zig-version:
+    description: Zig version to install (pinned by ADR-0001).
+    required: false
+    default: '0.17.0'
+runs:
+  using: composite
+  steps:
+    - name: Install apt packages (Linux)
+      if: runner.os == 'Linux' && inputs.apt-packages != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.apt-packages }}
+
+    - name: Install Zig ${{ inputs.zig-version }} (pinned, ADR-0001)
+      shell: bash
+      run: |
+        case "$(uname -s)-$(uname -m)" in
+          Darwin-arm64)  zig_target=aarch64-macos ;;
+          Linux-x86_64)  zig_target=x86_64-linux ;;
+          *) echo "unsupported CI host: $(uname -s)-$(uname -m)"; exit 1 ;;
+        esac
+        curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${{ inputs.zig-version }}/zig-${zig_target}-${{ inputs.zig-version }}.tar.xz"
+        tar -xf zig.tar.xz
+        zig_dir="$(pwd)/zig-${zig_target}-${{ inputs.zig-version }}"
+        echo "$zig_dir" >> "$GITHUB_PATH"
+        export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
+        zig version
+
+    - name: Cache deps
+      uses: actions/cache@v6
+      with:
+        path: deps
+        # Exact key only — no restore-keys. A stale deps/ from a different
+        # fetch-deps.sh or patch set is not safe to reuse: fetch-deps.sh
+        # stamps dirs (.pin) and skips existing build outputs, so restored
+        # leftovers could silently mask a needed rebuild.
+        key: ${{ inputs.cache-key }}
+
+    - name: Fetch + build deps (Skia, SDL3, WAMR)
+      shell: bash
+      run: scripts/fetch-deps.sh ${{ inputs.deps-args }}
