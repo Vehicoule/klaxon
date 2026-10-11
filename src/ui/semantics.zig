@@ -836,7 +836,7 @@ test "golden: focus ring paints around the focused node (exact pixels)" {
     fm.focusNode(root);
     kx.c.kx_begin_frame(r.ctx);
     kx.c.kx_clear(r.ctx, bg);
-    root.paint(r.ctx);
+    root.paint(r.ctx, .{ .x = 0, .y = 0, .w = 128, .h = 64 });
     fm.paintRing(r.ctx);
     kx.c.kx_end_frame(r.ctx);
     var f2 = try r.readback(a);

@@ -48,6 +48,22 @@ pub fn rectUnion(a: Rect, b: Rect) Rect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
+/// Intersection of two rects (empty when they don't overlap — w/h clamp to 0).
+pub fn rectIntersect(a: Rect, b: Rect) Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(a.x + a.w, b.x + b.w);
+    const y1 = @min(a.y + a.h, b.y + b.h);
+    return .{ .x = x0, .y = y0, .w = @max(0, x1 - x0), .h = @max(0, y1 - y0) };
+}
+
+/// Whether two rects share any area (an empty rect overlaps nothing).
+pub fn rectOverlaps(a: Rect, b: Rect) bool {
+    return a.w > 0 and a.h > 0 and b.w > 0 and b.h > 0 and
+        a.x < b.x + b.w and b.x < a.x + a.w and
+        a.y < b.y + b.h and b.y < a.y + a.h;
+}
+
 /// Pointer cursor shapes (Phase 2d-0.5): the host maps the hovered node to
 /// a system cursor on desktop (SDL). A widget overrides via VTable.cursor;
 /// otherwise the semantic role decides (.button/.link → hand, .text_field →
@@ -89,6 +105,20 @@ pub const VTable = struct {
     /// inverse of the paint transform (pre_children_paint). Dirty marks
     /// under a transformed ancestor land at the child's VISIBLE position.
     map_paint_rect: ?*const fn (node: *Node, rect: Rect) Rect = null,
+    /// The rect the children are clipped to (in this node's parent space) —
+    /// matching the clipRect pre_children_paint pushes, e.g. a scroll view's
+    /// viewport. The paint traversal intersects the visible region with it:
+    /// descendants cull against the tighter rect, and an empty intersection
+    /// skips the whole children pass. Null = children aren't clipped — their
+    /// paint may overflow the bounds (a tooltip's bubble, a menu's panel), so
+    /// each child must be visited and culled on its own.
+    child_clip: ?*const fn (node: *Node) Rect = null,
+    /// The region own-paint can touch, in the node's bounds space (defaults
+    /// to bounds + damage_overflow). Set when own paint lands SOMEWHERE ELSE
+    /// than an expansion of the bounds — the overlay scrollbar floats over
+    /// its parent's edge and takes no layout space (its bounds are ~empty).
+    /// Paint culling and markDirty consult it.
+    paint_bounds: ?*const fn (node: *Node) Rect = null,
     /// Effective hit-test rect (defaults to bounds). Transformed widgets
     /// return where their children actually paint.
     hit_bounds: ?*const fn (node: *Node) Rect = null,
@@ -218,18 +248,13 @@ pub const Node = struct {
         unionDamage(n, r);
     }
 
-    /// Mark this node (and its ancestors) dirty. The node's own bounds
-    /// (expanded by damage_overflow) — mapped to its visible position through
-    /// any transformed ancestors — are unioned into the root's damage region.
+    /// Mark this node (and its ancestors) dirty. The node's paint rect
+    /// (paint_bounds, or the bounds expanded by damage_overflow) — mapped
+    /// to its visible position through any transformed ancestors — is
+    /// unioned into the root's damage region.
     pub fn markDirty(node: *Node) void {
         markDirtyUp(node);
-        const o = node.damage_overflow;
-        damageRectUp(node, .{
-            .x = node.bounds.x - o.left,
-            .y = node.bounds.y - o.top,
-            .w = node.bounds.w + o.left + o.right,
-            .h = node.bounds.h + o.top + o.bottom,
-        });
+        damageRectUp(node, node.paintRect());
     }
 
     /// Mark dirty + record an explicit damaged rect (given in the node's
@@ -261,19 +286,59 @@ pub const Node = struct {
         node.vtable.layout(node, bounds);
     }
 
-    /// Paint the subtree and clear dirty flags. The whole tree paints every
-    /// frame; the host clips to the damage region (dirty-rect, Phase 1e) and
-    /// the vtable's pre/post_children_paint hooks wrap the children's paint
-    /// in a canvas transform (animated offsets/scales).
-    pub fn paint(node: *Node, ctx: *kx.Ctx) void {
+    /// The region a node's own paint can touch, in its bounds space: the
+    /// vtable's paint_bounds when declared, else the bounds expanded by
+    /// damage_overflow — the same rect markDirty damages. Paint outside it
+    /// is a contract violation (damage tracking already misses it), so the
+    /// cull test below can trust it.
+    pub fn paintRect(node: *Node) Rect {
+        if (node.vtable.paint_bounds) |pb| return pb(node);
+        const o = node.damage_overflow;
+        return .{
+            .x = node.bounds.x - o.left,
+            .y = node.bounds.y - o.top,
+            .w = node.bounds.w + o.left + o.right,
+            .h = node.bounds.h + o.top + o.bottom,
+        };
+    }
+
+    /// Paint the subtree and clear dirty flags. `visible` is the region the
+    /// frame can reach, in ROOT space (the space the root's bounds and the
+    /// damage accumulator live in): the damage rect for a clipped repaint,
+    /// the surface rect for a full one. Off-region work is culled before any
+    /// draw op is issued:
+    ///
+    /// - own paint is skipped when the node's paintRect — mapped to the root
+    ///   through the transformed ancestors' map_paint_rect — misses `visible`;
+    /// - the children pass (pre/loop/post hooks) is skipped wholesale when the
+    ///   node's child_clip ∩ visible is empty (the canvas clip makes any
+    ///   descendant output unreachable);
+    /// - otherwise each child is visited and culled on its own mapped rect —
+    ///   a child CAN paint outside its parent's bounds (a tooltip bubble).
+    ///
+    /// Culling changes no visible output: Skia's rasterizer already drops the
+    /// same ops after their (expensive) issue. A culled node keeps its dirty
+    /// flag — like an invisible one, it repaints when it becomes visible.
+    pub fn paint(node: *Node, ctx: *kx.Ctx, visible: Rect) void {
         if (!node.visible) return;
-        node.vtable.paint(node, ctx);
-        if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
-        for (node.children.items) |child| {
-            if (child.defer_paint) continue; // paints in the popup overlay pass
-            child.paint(ctx);
+        // The region descendants can paint into: `visible`, tightened by the
+        // node's children clip (viewport) when it declares one.
+        var child_region = visible;
+        if (node.vtable.child_clip) |cc| {
+            child_region = rectIntersect(visible, node.mapRectToRoot(cc(node)));
         }
-        if (node.vtable.post_children_paint) |post| post(node, ctx);
+        const own_hit = rectOverlaps(node.mapRectToRoot(node.paintRect()), visible);
+        const children_hit = child_region.w > 0 and child_region.h > 0;
+        if (!own_hit and !children_hit) return; // the whole subtree is off-region
+        if (own_hit) node.vtable.paint(node, ctx);
+        if (children_hit) {
+            if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
+            for (node.children.items) |child| {
+                if (child.defer_paint) continue; // paints in the popup overlay pass
+                child.paint(ctx, child_region);
+            }
+            if (node.vtable.post_children_paint) |post| post(node, ctx);
+        }
         node.dirty = false;
     }
 
@@ -551,6 +616,7 @@ const PaintRec = struct {
     name: []const u8, // static literal — safe to store in the log
     pre_name: []u8, // owned ("pre:" ++ name) — the log stores slice pointers
     post_name: []u8, // owned ("post:" ++ name)
+    clip: Rect = .{}, // read by rec_clip_vtable's child_clip
 };
 
 fn recPaintMeasure(_: *Node, c: Constraints) Size {
@@ -586,8 +652,33 @@ const paint_rec_vtable = VTable{
     .post_children_paint = recPaintPost,
 };
 
-fn recPaintNode(log: *std.array_list.Managed([]const u8), name: []const u8) !*Node {
-    const node = try Node.create(std.testing.allocator, &paint_rec_vtable);
+/// Recording vtable + a child clip (scroll-view-style: the children pass
+/// paints inside a canvas clip the hook pushes).
+const paint_rec_clip_vtable = blk: {
+    var vt = paint_rec_vtable;
+    vt.child_clip = struct {
+        fn cc(n: *Node) Rect {
+            const s: *PaintRec = @ptrCast(@alignCast(n.state.?));
+            return s.clip;
+        }
+    }.cc;
+    break :blk vt;
+};
+
+/// Recording vtable + a paint transform: children paint translated by
+/// (+100, +50) — map_paint_rect mirrors it (like scroll_view's offset).
+const paint_rec_shift_vtable = blk: {
+    var vt = paint_rec_vtable;
+    vt.map_paint_rect = struct {
+        fn m(_: *Node, rect: Rect) Rect {
+            return .{ .x = rect.x + 100, .y = rect.y + 50, .w = rect.w, .h = rect.h };
+        }
+    }.m;
+    break :blk vt;
+};
+
+fn recPaintNodeVtable(log: *std.array_list.Managed([]const u8), name: []const u8, vt: *const VTable) !*Node {
+    const node = try Node.create(std.testing.allocator, vt);
     errdefer node.allocator.destroy(node);
     const s = try std.testing.allocator.create(PaintRec);
     errdefer std.testing.allocator.destroy(s);
@@ -599,6 +690,10 @@ fn recPaintNode(log: *std.array_list.Managed([]const u8), name: []const u8) !*No
     };
     node.state = s;
     return node;
+}
+
+fn recPaintNode(log: *std.array_list.Managed([]const u8), name: []const u8) !*Node {
+    return recPaintNodeVtable(log, name, &paint_rec_vtable);
 }
 
 test "paint: hooks wrap the children pass; invisible + defer_paint subtrees are skipped" {
@@ -614,10 +709,15 @@ test "paint: hooks wrap the children pass; invisible + defer_paint subtrees are 
     root.add(child);
     root.add(hidden);
     root.add(deferred);
+    // Paint culling needs real bounds: an empty rect misses every region.
+    root.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    child.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    hidden.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    deferred.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
     hidden.visible = false;
     deferred.defer_paint = true;
     kx.c.kx_begin_frame(ctx);
-    root.paint(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
     kx.c.kx_end_frame(ctx);
     // own paint → pre → children (defer_paint skipped) → post
     const expected = [_][]const u8{ "root", "pre:root", "child", "pre:child", "post:child", "post:root" };
@@ -630,6 +730,118 @@ test "paint: hooks wrap the children pass; invisible + defer_paint subtrees are 
     try std.testing.expect(!child.dirty);
     try std.testing.expect(hidden.dirty);
     try std.testing.expect(deferred.dirty);
+}
+
+fn expectLog(log: *std.array_list.Managed([]const u8), expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, log.items.len);
+    for (expected, log.items) |exp, act| {
+        try std.testing.expectEqualStrings(exp, act);
+    }
+}
+
+test "paint culling: off-region own paint is skipped but children are still visited" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    // "wrapper" is entirely off-region: its own paint is culled — but the
+    // traversal still visits its children (a child can paint outside the
+    // parent's bounds — the tooltip bubble does).
+    const wrapper = try recPaintNode(&log, "wrapper");
+    wrapper.bounds = .{ .x = 200, .y = 200, .w = 10, .h = 10 };
+    const bubble = try recPaintNode(&log, "bubble");
+    bubble.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 }; // back inside the region
+    wrapper.add(bubble);
+    root.add(wrapper);
+    const inside = try recPaintNode(&log, "inside");
+    inside.bounds = .{ .x = 0, .y = 0, .w = 5, .h = 5 };
+    root.add(inside);
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
+    kx.c.kx_end_frame(ctx);
+    try expectLog(&log, &.{ "root", "pre:root", "pre:wrapper", "bubble", "pre:bubble", "post:bubble", "post:wrapper", "inside", "pre:inside", "post:inside", "post:root" });
+}
+
+test "paint culling: child_clip tightens the region and can skip the whole pass" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    // A clipper whose clip rect misses the visible region entirely: the
+    // children pass (pre/children/post) is skipped wholesale.
+    const away = try recPaintNodeVtable(&log, "away", &paint_rec_clip_vtable);
+    away.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    (@as(*PaintRec, @ptrCast(@alignCast(away.state.?)))).clip = .{ .x = 200, .y = 200, .w = 10, .h = 10 };
+    const hidden_child = try recPaintNode(&log, "hidden_child");
+    hidden_child.bounds = .{ .x = 0, .y = 0, .w = 5, .h = 5 };
+    away.add(hidden_child);
+    root.add(away);
+    // A clipper whose clip keeps only the top-left corner: a child outside it
+    // is culled against the TIGHTER region even though it hits the surface.
+    const corner = try recPaintNodeVtable(&log, "corner", &paint_rec_clip_vtable);
+    corner.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    (@as(*PaintRec, @ptrCast(@alignCast(corner.state.?)))).clip = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    const clipped_child = try recPaintNode(&log, "clipped_child");
+    clipped_child.bounds = .{ .x = 50, .y = 50, .w = 5, .h = 5 }; // on-surface, off-clip
+    corner.add(clipped_child);
+    root.add(corner);
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
+    kx.c.kx_end_frame(ctx);
+    try expectLog(&log, &.{ "root", "pre:root", "away", "corner", "pre:corner", "pre:clipped_child", "post:clipped_child", "post:corner", "post:root" });
+}
+
+test "paint culling follows map_paint_rect transforms (visual position, not layout)" {
+    const ctx = kx.create(null, 200, 200, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 200, .h = 200 };
+    const shifted = try recPaintNodeVtable(&log, "shifted", &paint_rec_shift_vtable);
+    shifted.bounds = .{ .x = 0, .y = 0, .w = 200, .h = 200 };
+    root.add(shifted);
+    // Layout-space (0,0,10,10) paints at (100,50,10,10) — inside the region.
+    const on = try recPaintNode(&log, "on");
+    on.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    shifted.add(on);
+    // Layout-space (-300,-200,10,10) paints at (-200,-150,10,10) — off-region.
+    const off = try recPaintNode(&log, "off");
+    off.bounds = .{ .x = -300, .y = -200, .w = 10, .h = 10 };
+    shifted.add(off);
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 200, .h = 200 });
+    kx.c.kx_end_frame(ctx);
+    try expectLog(&log, &.{ "root", "pre:root", "shifted", "pre:shifted", "on", "pre:on", "post:on", "pre:off", "post:off", "post:shifted", "post:root" });
+}
+
+test "paint culling honors damage_overflow (paint legitimately outside bounds)" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    root.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    // Same off-region bounds; only the overflow-expanded rect reaches back in.
+    const shadow = try recPaintNode(&log, "shadow");
+    shadow.bounds = .{ .x = 70, .y = 0, .w = 10, .h = 10 };
+    shadow.damage_overflow.left = 10; // paints from x=60 → inside the region
+    root.add(shadow);
+    const plain = try recPaintNode(&log, "plain");
+    plain.bounds = .{ .x = 70, .y = 0, .w = 10, .h = 10 };
+    root.add(plain);
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
+    kx.c.kx_end_frame(ctx);
+    try expectLog(&log, &.{ "root", "pre:root", "shadow", "pre:shadow", "post:shadow", "pre:plain", "post:plain", "post:root" });
 }
 
 const hit_bounds_vtable = blk: {

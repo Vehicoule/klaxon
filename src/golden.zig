@@ -129,11 +129,20 @@ pub const Renderer = struct {
         kx.c.kx_destroy(r.ctx);
     }
 
+    /// Resize the surface (and the tracked size — paint culls against it).
+    pub fn resize(r: *Renderer, w: i32, h: i32) void {
+        kx.c.kx_resize(r.ctx, w, h);
+        r.w = w;
+        r.h = h;
+    }
+
     /// Paint one frame of `root` on a cleared `bg`.
     pub fn paint(r: *Renderer, root: *Node, bg: Color) void {
         kx.c.kx_begin_frame(r.ctx);
         kx.c.kx_clear(r.ctx, bg);
-        root.paint(r.ctx);
+        // Full repaint: the visible region is the whole surface.
+        const surface = Rect{ .x = 0, .y = 0, .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
+        root.paint(r.ctx, surface);
         paintOverlayPass(root, r.ctx); // the popup overlay, above the tree (like the host)
         kx.c.kx_end_frame(r.ctx);
     }

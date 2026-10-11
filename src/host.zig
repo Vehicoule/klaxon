@@ -596,6 +596,14 @@ pub const Host = struct {
         // retained pixels) → full repaint until retained composition lands.
         const raster = kx.c.kx_backend_of(host.ctx) == kx.c.KX_BACKEND_RASTER;
         const focus = semantics_mod.currentFocus();
+        // The repaint region (root space = points): the traversal culls any
+        // subtree that can't reach it — off-surface content costs nothing.
+        const surface = ui.node.Rect{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(host.width),
+            .h = @floatFromInt(host.height),
+        };
         // The DevTools overlay paints translucent pixels over the whole panel
         // area; a dirty-rect partial repaint would blend the new overlay over
         // retained old overlay pixels (ghosting). Force a full repaint when
@@ -607,15 +615,20 @@ pub const Host = struct {
             // (moving widgets) are erased, not trailed. The focus ring paints
             // INSIDE the clip (a focus change damages its ring regions), so
             // unrelated repaints never redraw it.
-            const d = root.damage;
-            kx.c.kx_clip_rect(host.ctx, d.x, d.y, d.w, d.h);
-            kx.c.kx_clear(host.ctx, 0);
-            root.paint(host.ctx);
-            host.paintPopupOverlay(); // above the tree (a popup overflows its anchor), below the ring
-            if (focus) |fm| fm.paintRing(host.ctx);
-            kx.c.kx_clip_reset(host.ctx);
+            const d = ui.node.rectIntersect(root.damage, surface);
+            if (d.w <= 0 or d.h <= 0) {
+                // Damage entirely off-surface: nothing to repaint.
+                root.clearDamage();
+            } else {
+                kx.c.kx_clip_rect(host.ctx, d.x, d.y, d.w, d.h);
+                kx.c.kx_clear(host.ctx, 0);
+                root.paint(host.ctx, d);
+                host.paintPopupOverlay(); // above the tree (a popup overflows its anchor), below the ring
+                if (focus) |fm| fm.paintRing(host.ctx);
+                kx.c.kx_clip_reset(host.ctx);
+            }
         } else {
-            root.paint(host.ctx);
+            root.paint(host.ctx, surface);
             host.paintPopupOverlay();
             if (focus) |fm| fm.paintRing(host.ctx); // full repaint: ring included
         }

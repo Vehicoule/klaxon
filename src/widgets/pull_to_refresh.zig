@@ -234,6 +234,10 @@ fn ptrMapPaintRect(n: *Node, r: Rect) Rect {
     return .{ .x = r.x, .y = r.y + dy, .w = r.w, .h = r.h };
 }
 
+fn ptrChildClip(n: *Node) Rect {
+    return n.bounds; // the container clip pushed in pre_children_paint
+}
+
 fn ptrPreChildrenHit(n: *Node, px: f32, py: f32) node_mod.HitPoint {
     const dy = stateOf(n).adjusted;
     return .{ .x = px, .y = py - dy };
@@ -314,6 +318,7 @@ const ptr_vtable = ui.node.VTable{
     .pre_children_paint = ptrPreChildrenPaint,
     .post_children_paint = ptrPostChildrenPaint,
     .map_paint_rect = ptrMapPaintRect,
+    .child_clip = ptrChildClip,
     .pre_children_hit = ptrPreChildrenHit,
 };
 

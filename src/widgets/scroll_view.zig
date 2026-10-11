@@ -87,6 +87,9 @@ fn scrollViewMapPaintRect(n: *Node, rect: Rect) Rect {
     const s = stateOf(ScrollViewState, n);
     return .{ .x = rect.x, .y = rect.y - s.scroll.offset, .w = rect.w, .h = rect.h };
 }
+fn scrollViewChildClip(n: *Node) Rect {
+    return n.bounds; // the viewport clip pushed in pre_children_paint
+}
 fn scrollViewPreChildrenHit(n: *Node, px: f32, py: f32) ui.node.HitPoint {
     const s = stateOf(ScrollViewState, n);
     return .{ .x = px, .y = py + s.scroll.offset };
@@ -121,6 +124,7 @@ const scroll_view_vtable = ui.node.VTable{
     .pre_children_paint = scrollViewPreChildrenPaint,
     .post_children_paint = scrollViewPostChildrenPaint,
     .map_paint_rect = scrollViewMapPaintRect,
+    .child_clip = scrollViewChildClip,
     .pre_children_hit = scrollViewPreChildrenHit,
 };
 
