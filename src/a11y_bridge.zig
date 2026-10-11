@@ -104,7 +104,12 @@ fn findNodeByPtr(node: *Node, ptr: u64) ?*Node {
 /// positionally, so a literal '|' or '\n' in a label/value would scramble
 /// fields (or split the node across lines); NUL would truncate the dump.
 fn sanitizeA11yField(in: []const u8, out: []u8) []const u8 {
-    const n = @min(in.len, out.len);
+    var n = @min(in.len, out.len);
+    // A mid-codepoint cut produces invalid UTF-8 — the native bridges then
+    // drop the WHOLE string (stringWithUTF8String → nil). Back off to the
+    // last complete character: a boundary is any byte that is not a UTF-8
+    // continuation (10xxxxxx).
+    while (n > 0 and n < in.len and (in[n] & 0xC0) == 0x80) n -= 1;
     for (in[0..n], 0..) |ch, i| {
         out[i] = switch (ch) {
             '|', '\n', '\r', 0 => ' ',
@@ -448,7 +453,7 @@ test "set_bridge registers the C bridge callback; clearing stops the events" {
     kx_a11y_set_bridge(testBridgeC, null);
     sem.notifyTreeDirty();
     try std.testing.expectEqual(@as(u32, 1), bridge_events);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(sem.BridgeEvent.Kind.tree_dirty)), bridge_last_kind);
+    try std.testing.expectEqual(@as(u32, @backingInt(sem.BridgeEvent.Kind.tree_dirty)), bridge_last_kind);
     kx_a11y_set_bridge(null, null); // clear
     sem.notifyTreeDirty();
     try std.testing.expectEqual(@as(u32, 1), bridge_events); // no more events

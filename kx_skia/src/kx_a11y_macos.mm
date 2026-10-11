@@ -71,14 +71,24 @@ extern "C" {
                    focusable:(BOOL)focusable frame:(NSRect)frame {
     self = [super init];
     if (self) {
-        _role = role;
-        _label = label;
-        _value = value;
+        // MRC (-fno-objc-arc): copy the strings + alloc the array — the
+        // autoreleased arguments would dangle after the pool drains.
+        _role = [role copy];
+        _label = [label copy];
+        _value = [value copy];
         _focusable = focusable;
         _frame = frame;
-        _children = [NSMutableArray array];
+        _children = [[NSMutableArray alloc] init];
     }
     return self;
+}
+
+- (void)dealloc {
+    [_role release];
+    [_label release];
+    [_value release];
+    [_children release]; // releases the child elements it retained
+    [super dealloc];
 }
 
 - (BOOL)isAccessibilityElement { return YES; }
@@ -132,46 +142,49 @@ static KXA11yElement* buildHierarchy(const char* dump) {
                                                         value:nil
                                                     focusable:NO
                                                         frame:NSMakeRect(0, 0, 800, 600)];
-    // Count lines for a basic child list.
+    // v1: add one child per line (flat list under the root). Manual
+    // split — sscanf's [^|] scansets reject EMPTY fields, so a control
+    // with no label used to vanish from VoiceOver entirely.
     const char* p = dump;
-    int line_count = 0;
     while (*p) {
-        if (*p == '\n') line_count++;
-        p++;
-    }
-    // v1: add one child per line (flat list under the root).
-    p = dump;
-    int idx = 0;
-    while (*p && idx < line_count) {
-        // Parse: depth|role|label|value|focusable|ptr|checked|x|y|w|h
-        int depth = 0;
-        char role[64] = {0};
-        char label[256] = {0};
-        char value[256] = {0};
-        int focusable = 0;
-        unsigned long long ptr = 0; // node pointer — ignored (v1 keys off rects)
-        int checked = 0;            // 0=null 1=false 2=true — ignored
-        float x = 0, y = 0, w = 0, h = 0;
-        int consumed = 0;
-        // Simple sscanf-like parse (depth is the leading integer before '|').
-        if (sscanf(p, "%d|%63[^|]|%255[^|]|%255[^|]|%d|%llu|%d|%f|%f|%f|%f%n",
-                   &depth, role, label, value, &focusable, &ptr, &checked,
-                   &x, &y, &w, &h, &consumed) >= 5) {
-            KXA11yElement* child = [[KXA11yElement alloc] initWithRole:
-                [NSString stringWithUTF8String:role]
-                label:[NSString stringWithUTF8String:label]
-                value:[NSString stringWithUTF8String:value]
-                focusable:(BOOL)focusable
-                frame:NSMakeRect(x, y, w, h)];
+        const char* eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        // Fields are sanitized ≤512B each; 2K covers an 11-field line.
+        char line[2048];
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = 0;
+        // Split on '|': depth|role|label|value|focusable|ptr|checked|x|y|w|h
+        char* fields[11] = {0};
+        int nf = 0;
+        fields[nf++] = line;
+        for (char* q = line; *q && nf < 11; q++) {
+            if (*q == '|') {
+                *q = 0;
+                fields[nf++] = q + 1;
+            }
+        }
+        if (nf >= 11) {
+            (void)atoi(fields[0]); // depth — v1 is flat
+            NSString* role = fields[1][0] ? [NSString stringWithUTF8String:fields[1]] : @"group";
+            NSString* label = fields[2][0] ? [NSString stringWithUTF8String:fields[2]] : nil;
+            NSString* value = fields[3][0] ? [NSString stringWithUTF8String:fields[3]] : nil;
+            const int focusable = atoi(fields[4]);
+            const float x = strtof(fields[7], NULL);
+            const float y = strtof(fields[8], NULL);
+            const float w = strtof(fields[9], NULL);
+            const float h = strtof(fields[10], NULL);
+            KXA11yElement* child = [[KXA11yElement alloc] initWithRole:role
+                                                               label:label
+                                                               value:value
+                                                          focusable:(BOOL)focusable
+                                                              frame:NSMakeRect(x, y, w, h)];
             child->_parent = root;
             [root->_children addObject:child];
-            p += consumed;
-            idx++;
-        } else {
-            // Skip to next line.
-            while (*p && *p != '\n') p++;
+            [child release]; // the array owns it now
         }
-        if (*p == '\n') p++;
+        if (!eol) break;
+        p = eol + 1;
     }
     return root;
 }
@@ -189,6 +202,7 @@ static void a11y_bridge_callback(void* userdata, KxBridgeEventC event) {
                     @autoreleasepool {
                         KXA11yElement* new_root = buildHierarchy(dump);
                         if (new_root) {
+                            [g_root release]; // MRC: drop the old hierarchy
                             g_root = new_root;
                         }
                     }
@@ -235,6 +249,7 @@ void kx_a11y_init(void* root_node) {
 
 /// Shut down the bridge.
 void kx_a11y_shutdown(void) {
+    [g_root release];
     g_root = nil;
     g_zig_root_node = NULL;
     kx_a11y_set_bridge(NULL, NULL);

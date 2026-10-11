@@ -85,10 +85,13 @@ void kx_destroy(kx_ctx* ctx) {
 
 void kx_resize(kx_ctx* ctx, int width, int height) {
     if (!ctx || width <= 0 || height <= 0) return;
-    // Any canvas set by kx_begin_frame points into the surface being
-    // replaced — clear it so a caller that resizes mid-frame can't draw
-    // into a freed SkCanvas (resize is only legal between frames).
-    ctx->canvas = nullptr;
+    // A frame in flight holds the surface being replaced. Closing it out
+    // at the old size lets gpu_end_frame present valid pixels AND release
+    // its drawable/recorder — just clearing ctx->canvas left that frame
+    // active, so the next kx_end_frame would present stale pixels. Resize
+    // is still meant to happen between frames; this keeps a stray
+    // mid-frame call well-defined.
+    if (ctx->canvas) kx_end_frame(ctx);
     ctx->width = width;
     ctx->height = height;
     if (ctx->raster) {
