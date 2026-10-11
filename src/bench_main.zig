@@ -39,13 +39,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
+    // Diagnostics (investigation tooling; not part of the JSON report):
+    //   KLAXON_BENCH_TRACE_DIR=<dir>  per-frame CSV → <dir>/<scene>.csv
+    //   KLAXON_BENCH_PHASES=1         stderr tick/layout/paint breakdown
+    //   KLAXON_BENCH_PROFILE=1        per-node own-paint profile (extra frames)
+    var opts: bench.RunOptions = .{ .frames = build_options.bench_frames };
+    if (std.c.getenv("KLAXON_BENCH_TRACE_DIR")) |dir| opts.trace_dir = std.mem.span(dir);
+    if (std.c.getenv("KLAXON_BENCH_PHASES") != null) opts.phase_breakdown = true;
+    if (std.c.getenv("KLAXON_BENCH_PROFILE") != null) opts.paint_profile = true;
+    if (std.c.getenv("KLAXON_BENCH_HIDE_SCROLL_CONTENT") != null) opts.hide_scroll_content = true;
+
     // Run each scene headlessly (bench.zig renders through golden.Renderer on
     // the raster backend — no window) and collect its metrics. Progress goes
     // to stderr so the JSON stream on stdout stays clean.
     var metrics: [scene_names.len]bench.Metrics = undefined;
     for (scenes[0..count], 0..) |scene, i| {
         std.debug.print("klaxon bench: {s} ({d}/{d})...\n", .{ scene.name(), i + 1, count });
-        metrics[i] = try bench.runSceneWithOpts(scene, allocator, .{ .frames = build_options.bench_frames });
+        metrics[i] = try bench.runSceneWithOpts(scene, allocator, opts);
     }
 
     const json = try formatReport(allocator, scenes[0..count], metrics[0..count]);
