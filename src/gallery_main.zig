@@ -43,7 +43,9 @@ fn optsFromArgs(args: std.process.Args) !Options {
     var it = try std.process.Args.Iterator.initAllocator(args, std.heap.page_allocator);
     defer it.deinit();
     _ = it.next(); // exe name
-    var backend: kx.c.kx_backend = kx.c.KX_BACKEND_RASTER;
+    // AUTO walks the platform chain (graphite → ganesh → raster); explicit
+    // backend keywords force a backend (kx_create still falls back to raster).
+    var backend: kx.c.kx_backend = kx.c.KX_BACKEND_AUTO;
     var ppm: ?[:0]const u8 = null;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
@@ -54,6 +56,8 @@ fn optsFromArgs(args: std.process.Args) !Options {
             backend = kx.c.KX_BACKEND_GRAPHITE_VULKAN;
         } else if (std.mem.eql(u8, arg, "gl")) {
             backend = kx.c.KX_BACKEND_GANESH_GL;
+        } else if (std.mem.eql(u8, arg, "raster")) {
+            backend = kx.c.KX_BACKEND_RASTER;
         } else if (std.mem.startsWith(u8, arg, "--ppm=")) {
             // On Windows the iterator owns the converted arg storage — dupe
             // the retained path so it survives `it.deinit()` (process-lifetime).
