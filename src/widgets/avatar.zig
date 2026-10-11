@@ -79,11 +79,13 @@ const AvatarState = struct {
     opts: AvatarOptions,
     on_tap: ?Callback = null,
     variant: AvatarVariant = .initials,
-    /// Owned copy of the initials (uppercased, max 2 chars).
-    initials_z: [3]u8 = .{' ', ' ', 0},
-    /// Owned copy of the a11y label (null-terminated).
-    label_z: [64]u8 = std.mem.zeroes([64]u8),
-    has_label: bool = false,
+    /// Owned initials — uppercased ASCII, at most 2 UTF-8 codepoints (8
+    /// bytes; a multibyte glyph is no longer mangled by a byte-wise cap),
+    /// null-terminated at initials[len].
+    initials: [9]u8 = std.mem.zeroes([9]u8),
+    initials_len: usize = 0,
+    /// Owned a11y label (null-terminated; "" = fall back to "Avatar").
+    label: [:0]const u8,
     pressed: bool = false,
     hovered: bool = false,
     /// Owned image pixels (for deinit).
@@ -92,6 +94,14 @@ const AvatarState = struct {
 
 fn stateOf(n: *Node) *AvatarState {
     return @ptrCast(@alignCast(n.state.?));
+}
+
+/// An owned null-terminated copy of a string.
+fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
+    const buf = try allocator.alloc(u8, str.len + 1);
+    @memcpy(buf[0..str.len], str);
+    buf[str.len] = 0;
+    return buf[0..str.len :0];
 }
 
 // --- Measure ---
@@ -131,12 +141,8 @@ fn avPaint(n: *Node, ctx: *kx.Ctx) void {
         .initials => {
             // Centered initials text.
             const font_size = initialsFontSize(s.opts.size);
-            const label = s.initials_z[0..2];
-            // Find the actual length (up to the null terminator).
-            var len: usize = 0;
-            while (len < 2 and label[len] != 0) : (len += 1) {}
-            if (len > 0) {
-                const text_z: [:0]const u8 = s.initials_z[0..len :0];
+            if (s.initials_len > 0) {
+                const text_z: [:0]const u8 = s.initials[0..s.initials_len :0];
                 const metrics = ui.paint.measureText(text_z, font_size, true);
                 const tx = b.x + (b.w - metrics.width) / 2;
                 const ty = b.y + (b.h - metrics.height) / 2 + metrics.height * 0.8;
@@ -213,6 +219,7 @@ fn avPointer(n: *Node, ev: input.PointerEvent) bool {
 
 fn avDeinit(n: *Node) void {
     const s = stateOf(n);
+    n.allocator.free(s.label);
     if (s.image_owned) |pixels| n.allocator.free(pixels);
     n.allocator.destroy(s);
 }
@@ -254,32 +261,35 @@ pub fn avatar(
         variant = .icon;
     }
 
+    // A11y label — owned, any length ("" = the "Avatar" default).
+    const label = try dupeZ(allocator, opts.a11y_label orelse opts.initials);
+    errdefer allocator.free(label);
+
     s.* = .{
         .opts = opts,
         .on_tap = on_tap,
         .variant = variant,
+        .label = label,
     };
 
-    // Uppercase the initials (max 2 chars).
+    // Uppercase the initials (max 2 UTF-8 codepoints — a multibyte glyph
+    // keeps its bytes; only ASCII letters are upcased).
     var idx: usize = 0;
-    for (opts.initials) |ch| {
-        if (idx >= 2) break;
-        s.initials_z[idx] = switch (ch) {
-            'a'...'z' => ch - 'a' + 'A',
-            else => ch,
-        };
-        idx += 1;
+    var count: usize = 0;
+    while (idx < opts.initials.len and count < 2) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(opts.initials[idx]) catch 1;
+        const end = @min(idx + cp_len, opts.initials.len);
+        for (opts.initials[idx..end]) |ch| {
+            s.initials[s.initials_len] = switch (ch) {
+                'a'...'z' => ch - 'a' + 'A',
+                else => ch,
+            };
+            s.initials_len += 1;
+        }
+        idx += cp_len; // a truncated tail codepoint exits the loop anyway
+        count += 1;
     }
-    s.initials_z[idx] = 0;
-
-    // A11y label.
-    const label_src = opts.a11y_label orelse opts.initials;
-    if (label_src.len > 0) {
-        const copy_len = @min(label_src.len, 63);
-        @memcpy(s.label_z[0..copy_len], label_src[0..copy_len]);
-        s.label_z[copy_len] = 0;
-        s.has_label = true;
-    }
+    s.initials[s.initials_len] = 0;
 
     // Copy image pixels (owned).
     if (opts.image_rgba) |pixels| {
@@ -292,7 +302,7 @@ pub fn avatar(
 
     ui.semantics.attach(node, .{
         .role = .image,
-        .label = if (s.has_label) s.label_z[0..std.mem.indexOfScalar(u8, &s.label_z, 0).?] else "Avatar",
+        .label = if (s.label.len > 0) s.label else "Avatar",
         .focusable = opts.tappable,
     });
 
@@ -326,9 +336,25 @@ test "avatar: initials are uppercased (max 2 chars)" {
     const n = try avatar(a, null, .{ .initials = "john" });
     defer n.deinit();
     const s = stateOf(n);
-    try std.testing.expectEqual(@as(u8, 'J'), s.initials_z[0]);
-    try std.testing.expectEqual(@as(u8, 'O'), s.initials_z[1]);
-    try std.testing.expectEqual(@as(u8, 0), s.initials_z[2]);
+    try std.testing.expectEqual(@as(u8, 'J'), s.initials[0]);
+    try std.testing.expectEqual(@as(u8, 'O'), s.initials[1]);
+    try std.testing.expectEqual(@as(u8, 0), s.initials[2]);
+}
+
+test "avatar: initials cap at 2 UTF-8 codepoints, not 2 bytes" {
+    const a = std.testing.allocator;
+    // "世" is 3 bytes: the old [3]u8 buffer held exactly one byte-capped char
+    // (a 2-codepoint CJK string would have split the second glyph's bytes)
+    const n = try avatar(a, null, .{ .initials = "世界" });
+    defer n.deinit();
+    const s = stateOf(n);
+    try std.testing.expectEqual(@as(usize, 6), s.initials_len);
+    try std.testing.expectEqualStrings("世界", s.initials[0..s.initials_len]);
+    // a long a11y label is owned — no 63-byte cap anymore
+    const long_label = "A very long avatar accessibility label that exceeds the old 63 byte fixed buffer easily";
+    const n2 = try avatar(a, null, .{ .a11y_label = long_label });
+    defer n2.deinit();
+    try std.testing.expectEqualStrings(long_label, n2.semantics.?.label);
 }
 
 test "avatar: tappable fires on_tap" {

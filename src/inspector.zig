@@ -51,6 +51,10 @@ pub const Inspector = struct {
     rows: std.array_list.Managed(Row),
     /// Expand overrides (default = expanded). Keyed by node pointer.
     expanded: std.AutoHashMap(*Node, bool),
+    /// Reusable growable scratch for null-terminated display strings —
+    /// sem.label/value can be any length (a node's label is user text).
+    /// Valid until the next fmtZ call on it.
+    scratch: std.array_list.Managed(u8),
     scroll_y: f32 = 0,
     /// The tree panel has keyboard focus (arrows navigate, Escape releases).
     tree_focus: bool = false,
@@ -64,12 +68,14 @@ pub const Inspector = struct {
             .allocator = allocator,
             .rows = std.array_list.Managed(Row).init(allocator),
             .expanded = std.AutoHashMap(*Node, bool).init(allocator),
+            .scratch = std.array_list.Managed(u8).init(allocator),
         };
     }
 
     pub fn deinit(insp: *Inspector) void {
         insp.rows.deinit();
         insp.expanded.deinit();
+        insp.scratch.deinit();
     }
 
     pub fn toggle(insp: *Inspector) void {
@@ -340,10 +346,10 @@ pub const Inspector = struct {
                     kx.c.kx_draw_text(ctx, ">", chevron_x, row_y + 12, 10, TEXT_DIM);
                 }
             }
-            // Node name (copied into a sentinel-terminated buffer for kx).
+            // Node name (copied into the growable scratch, null-terminated
+            // for kx_draw_text).
             const label_x = chevron_x + CHEVRON_W;
-            var name_buf: [128]u8 = undefined;
-            const name = nodeName(row.node, &name_buf);
+            const name = nodeName(row.node, &insp.scratch);
             kx.c.kx_draw_text(ctx, name, label_x, row_y + 12, 10, TEXT);
             // " (internal)" suffix (dim).
             if (row.node.internal) {
@@ -359,20 +365,32 @@ pub const Inspector = struct {
 
         // Property view.
         if (insp.selected) |sel| {
-            paintProps(ctx, sel, px, props_y);
+            paintProps(ctx, &insp.scratch, sel, px, props_y);
         } else {
             kx.c.kx_draw_text(ctx, "no selection", px + PAD, props_y + 16, 10, TEXT_DIM);
         }
     }
 };
 
+/// Copy `s` into the growable scratch + a null sentinel (kx_draw_text takes
+/// a char*); the borrow is valid until the next fmtZ call on the same
+/// scratch. OOM → "".
+fn fmtZ(scratch: *std.array_list.Managed(u8), s: []const u8) [:0]const u8 {
+    scratch.clearRetainingCapacity();
+    scratch.ensureTotalCapacity(s.len + 1) catch return "";
+    scratch.appendSlice(s) catch return "";
+    scratch.items.len += 1;
+    scratch.items[scratch.items.len - 1] = 0;
+    scratch.items.len -= 1;
+    return scratch.items.ptr[0..scratch.items.len :0];
+}
+
 /// Display name for a node: semantics label, else role tag, else "node".
-/// The label is copied into `buf` (a fixed 128-byte sentinel-terminated
-/// buffer) so the result is always a [:0]const u8 for kx_draw_text.
-fn nodeName(node: *Node, buf: *[128]u8) [:0]const u8 {
+/// The label is copied into the scratch (null-terminated for kx_draw_text).
+fn nodeName(node: *Node, scratch: *std.array_list.Managed(u8)) [:0]const u8 {
     if (node.semantics) |sem| {
         if (sem.label.len > 0) {
-            return std.fmt.bufPrintSentinel(buf, "{s}", .{sem.label}, 0) catch "?";
+            return fmtZ(scratch, sem.label);
         }
         if (sem.role != .none) return @tagName(sem.role);
     }
@@ -386,8 +404,8 @@ fn drawProp(ctx: *kx.Ctx, key: [:0]const u8, value: [:0]const u8, px: f32, y: f3
 }
 
 /// Paint the property view lines for the selected node.
-fn paintProps(ctx: *kx.Ctx, node: *Node, px: f32, props_y: f32) void {
-    var buf: [128]u8 = undefined;
+fn paintProps(ctx: *kx.Ctx, scratch: *std.array_list.Managed(u8), node: *Node, px: f32, props_y: f32) void {
+    var buf: [128]u8 = undefined; // numeric formats only (bounded)
     var y = props_y + 14;
     const line_h: f32 = 14;
 
@@ -395,13 +413,11 @@ fn paintProps(ctx: *kx.Ctx, node: *Node, px: f32, props_y: f32) void {
         drawProp(ctx, "name", @tagName(sem.role), px, y);
         y += line_h;
         if (sem.label.len > 0) {
-            const label_val = std.fmt.bufPrintSentinel(&buf, "{s}", .{sem.label}, 0) catch "?";
-            drawProp(ctx, "label", label_val, px, y);
+            drawProp(ctx, "label", fmtZ(scratch, sem.label), px, y);
             y += line_h;
         }
         if (sem.value.len > 0) {
-            const value_val = std.fmt.bufPrintSentinel(&buf, "{s}", .{sem.value}, 0) catch "?";
-            drawProp(ctx, "value", value_val, px, y);
+            drawProp(ctx, "value", fmtZ(scratch, sem.value), px, y);
             y += line_h;
         }
         if (sem.checked) |c| {
@@ -820,15 +836,22 @@ test "selected node destroyed → rebuild drops the selection" {
 test "nodeName fallback chain (label > role > \"node\")" {
     const n = try testNode(10, 10);
     defer n.deinit();
-    var buf: [128]u8 = undefined;
+    var scratch = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer scratch.deinit();
     // No semantics → "node".
-    try std.testing.expectEqualStrings("node", nodeName(n, &buf));
+    try std.testing.expectEqualStrings("node", nodeName(n, &scratch));
     // Role only → tag name.
     semantics_mod.attach(n, .{ .role = .button });
-    try std.testing.expectEqualStrings("button", nodeName(n, &buf));
-    // Label wins over role.
+    try std.testing.expectEqualStrings("button", nodeName(n, &scratch));
+    // Label wins over role — and a label past the old 128-byte cap is whole.
     semantics_mod.attach(n, .{ .role = .button, .label = "OK" });
-    try std.testing.expectEqualStrings("OK", nodeName(n, &buf));
+    try std.testing.expectEqualStrings("OK", nodeName(n, &scratch));
+    var long_buf: [305]u8 = undefined;
+    @memset(long_buf[0..300], 'L');
+    @memcpy(long_buf[300..], " tail");
+    const long = long_buf[0..];
+    semantics_mod.attach(n, .{ .role = .button, .label = long });
+    try std.testing.expectEqualStrings(long, nodeName(n, &scratch));
 }
 
 test "golden: inspector paints panel + bounds highlight (exact pixels)" {

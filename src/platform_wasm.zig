@@ -150,30 +150,31 @@ export fn kx_a11y_key(down: c_int, key: u32, mod: u16) callconv(.c) void {
 /// Static backing store for kx_a11y_text: SDL_TextInputEvent.text is a
 /// borrowed `const char *` — SDL keeps the pointer until the event is polled
 /// (the next rAF frame), so the text must outlive the JS caller, which frees
-/// its buffer right after the call. A fixed buffer is enough: wasm is
-/// single-threaded and the event queue is drained every frame, so text events
-/// are pushed one at a time.
-var text_input_buf: [1024]u8 = undefined;
+/// its buffer right after the call. The buffer GROWS on demand (a paste/IME
+/// commit of any size lands whole — no truncation): wasm is single-threaded
+/// and the event queue is drained every frame, so text events are pushed one
+/// at a time.
+var text_input_buf: std.ArrayList(u8) = .empty;
 
 /// Export for JS (web/kx_a11y.js): push a text input event into SDL's queue —
 /// called from the hidden-DOM mirror's beforeinput/textInput handlers (mobile
-/// virtual keyboard, IME). The text is copied into a static buffer (SDL
-/// borrows the pointer until the event is polled), truncated at a UTF-8
-/// codepoint boundary if it exceeds the buffer.
+/// virtual keyboard, IME). The text is copied into a growable backing
+/// store (SDL borrows the pointer until the event is polled).
 ///   text_ptr: pointer to UTF-8 text bytes (need not be null-terminated)
 ///   text_len: length in bytes
 export fn kx_a11y_text(text_ptr: [*]const u8, text_len: usize) callconv(.c) void {
     const sdl = @import("sdl.zig");
-    // Copy into the static buffer, keeping room for the null terminator.
-    var len: usize = @min(text_len, text_input_buf.len - 1);
-    // If truncation split a multi-byte UTF-8 codepoint, back off to its lead byte.
-    while (len > 0 and len < text_len and (text_ptr[len] & 0xC0) == 0x80) len -= 1;
-    @memcpy(text_input_buf[0..len], text_ptr[0..len]);
-    text_input_buf[len] = 0;
+    // Grow the static buffer to fit the text + the null terminator.
+    text_input_buf.ensureTotalCapacity(std.heap.page_allocator, text_len + 1) catch return;
+    text_input_buf.clearRetainingCapacity();
+    text_input_buf.appendSlice(std.heap.page_allocator, text_ptr[0..text_len]) catch return;
+    text_input_buf.items.len += 1;
+    text_input_buf.items[text_input_buf.items.len - 1] = 0;
+    text_input_buf.items.len -= 1;
     var event: sdl.c.SDL_Event = std.mem.zeroes(sdl.c.SDL_Event);
     event.type = @intCast(sdl.c.SDL_EVENT_TEXT_INPUT);
     event.common.timestamp = sdl.c.SDL_GetTicksNS();
-    event.text.text = text_input_buf[0..len].ptr;
+    event.text.text = text_input_buf.items.ptr;
     event.text.windowID = 0; // 0 = virtual keyboard, no specific window
     _ = sdl.c.SDL_PushEvent(&event);
 }

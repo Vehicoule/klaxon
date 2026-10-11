@@ -59,10 +59,6 @@ const Theme = theme_mod.Theme;
 
 pub const TextFieldVariant = enum { filled, outlined };
 
-/// The registry's live text buffer (null-terminated invariant: the sentinel
-/// sits at items[len] / buf[len] in the spare capacity).
-pub const TextBuf = [256]u8;
-
 pub const TextFieldOptions = struct {
     variant: TextFieldVariant = .outlined,
     enabled: bool = true,
@@ -99,9 +95,10 @@ const TextFieldState = struct {
     placeholder: [:0]const u8, // owned
     supporting: [:0]const u8, // owned
     opts: TextFieldOptions,
-    /// Live text mirror (registry/designer): the widget sets it on edit; an
-    /// external set replaces the buffer (two-way).
-    sig: ?*ui.state.Signal(TextBuf) = null,
+    /// Live text channel (registry/designer): the widget sets it on edit; an
+    /// external set replaces the buffer (two-way). Growable + owned by the
+    /// signal — never truncates, never dangles after the widget is gone.
+    sig: ?*ui.state.TextSignal = null,
     on_changed: ?Callback = null,
     on_submitted: ?Callback = null,
     hovered: bool = false,
@@ -121,14 +118,6 @@ fn setSentinel(buf: *std.array_list.Managed(u8)) void {
     buf.items.len += 1;
     buf.items[buf.items.len - 1] = 0;
     buf.items.len -= 1;
-}
-
-/// A TextBuf from a string (truncated to capacity - 1, null-terminated).
-pub fn bufFromText(str: []const u8) TextBuf {
-    var buf = std.mem.zeroes(TextBuf);
-    const n = @min(str.len, buf.len - 1);
-    @memcpy(buf[0..n], str[0..n]);
-    return buf;
 }
 
 /// An owned null-terminated copy of a string.
@@ -440,7 +429,8 @@ fn applyEdit(n: *Node, s: *TextFieldState) void {
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
     ui.semantics.notifyControlChanged(n); // a11y: the control's value changed
-    if (s.sig) |sig| sig.set(bufFromText(s.buf.items)); // the live mirror
+    // The buffer is already bounded by the 1 MiB input cap → set cannot fail.
+    if (s.sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
     if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
 }
 
@@ -449,6 +439,10 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.kind) {
         .text_input => {
+            // Reject (never truncate) input that would grow the text past
+            // the documented cap — a paste/IME burst is applied whole or
+            // not at all.
+            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
             s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
             s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
             setSentinel(&s.buf);
@@ -483,22 +477,19 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
 }
 
 /// An external signal set (the designer): replace the buffer when the text
-/// differs. The comparison runs against the MIRROR of the current buffer
-/// (the signal channel caps at 255 bytes): the widget's own sets round-trip
-/// as no-ops even when the buffer exceeds the mirror (Signal.set dedups
-/// only exact values — a truncated mirror of a long buffer would otherwise
-/// feed back and truncate the buffer).
+/// differs. The signal holds the full text, so the comparison runs against
+/// the buffer itself — the widget's own sets round-trip as no-ops (the
+/// signal dedups equal content).
 fn textFieldSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
-    const inc_len = std.mem.indexOfScalar(u8, &incoming, 0) orelse incoming.len;
-    const cur_mirror = bufFromText(s.buf.items);
-    const cur_len = std.mem.indexOfScalar(u8, &cur_mirror, 0) orelse cur_mirror.len;
-    if (std.mem.eql(u8, cur_mirror[0..cur_len], incoming[0..inc_len])) return;
+    if (std.mem.eql(u8, s.text(), incoming)) return;
     s.buf.clearRetainingCapacity();
-    s.buf.appendSlice(incoming[0..inc_len]) catch @panic("klaxon: out of memory");
+    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
+    n.markLayoutDirty(); // the measured width is content-driven
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
 }
@@ -526,8 +517,14 @@ const text_field_vtable = ui.node.VTable{
 /// An M3E text field. `sig` = null → the text starts at `opts.initial`;
 /// non-null → the text mirrors the signal both ways. `on_changed` fires on
 /// every edit; `on_submitted` on Enter. The field is a leaf: it owns its text
-/// buffer and paints all of its chrome.
-pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(TextBuf), on_changed: ?Callback, on_submitted: ?Callback, opts: TextFieldOptions) !*Node {
+/// buffer and paints all of its chrome. Text is growable up to
+/// ui.state.TextSignal.max_len (1 MiB); over-cap initial text is REJECTED
+/// (error.TextTooLong), never truncated.
+pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_changed: ?Callback, on_submitted: ?Callback, opts: TextFieldOptions) !*Node {
+    // Rejected up front: over the documented cap → error.TextTooLong (never
+    // truncated). Checked before any allocation so nothing needs freeing.
+    const initial: []const u8 = if (sig) |sg| sg.peek() else opts.initial;
+    if (initial.len > ui.state.TextSignal.max_len) return error.TextTooLong;
     const node = try Node.create(allocator, &text_field_vtable);
     errdefer node.allocator.destroy(node); // no state yet
     const s = try allocator.create(TextFieldState);
@@ -554,10 +551,6 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(TextBuf), 
         allocator.free(s.supporting);
         s.buf.deinit();
     }
-    const initial: []const u8 = if (sig) |sg| blk: {
-        const v = sg.peek();
-        break :blk v[0..(std.mem.indexOfScalar(u8, &v, 0) orelse v.len)];
-    } else opts.initial;
     s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
         s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
@@ -590,16 +583,19 @@ pub fn text(n: *Node) [:0]const u8 {
 }
 
 /// Replace the text (the gallery restores entries across theme rebuilds).
+/// Over-cap text is rejected: the field keeps its current contents.
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
+    if (str.len > ui.state.TextSignal.max_len) return;
     s.buf.clearRetainingCapacity();
+    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
     ui.semantics.notifyControlChanged(n);
-    if (s.sig) |sig| sig.set(bufFromText(s.buf.items));
+    if (s.sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
 }
 
 // --- tests ---
@@ -714,7 +710,7 @@ test "text_field: click focuses; typing appends; backspace/enter/escape; disable
 }
 
 test "text_field: the signal mirrors the text both ways" {
-    const sig = try ui.state.Signal(TextBuf).init(std.testing.allocator, bufFromText("Ada"));
+    const sig = try ui.state.TextSignal.init(std.testing.allocator, "Ada");
     defer sig.deinit();
     const b = try textField(std.testing.allocator, sig, null, null, .{});
     defer b.deinit();
@@ -725,12 +721,63 @@ test "text_field: the signal mirrors the text both ways" {
     defer input.setCurrent(null);
     router.dispatchPointer(b, .{ .phase = .down, .x = 130, .y = 28 });
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "!" });
-    const v = sig.peek();
-    try std.testing.expectEqualStrings("Ada!", v[0..(std.mem.indexOfScalar(u8, &v, 0).?)]); // the widget sets the signal
+    try std.testing.expectEqualStrings("Ada!", sig.peek()); // the widget sets the signal
     // an external set replaces the buffer
-    sig.set(bufFromText("Bob"));
+    try sig.set("Bob");
     try std.testing.expectEqualStrings("Bob", text(b));
     try std.testing.expectEqualStrings("Bob", b.semantics.?.value);
+}
+
+test "text_field: text past the old 255-byte cap round-trips (CJK included)" {
+    const sig = try ui.state.TextSignal.init(std.testing.allocator, "");
+    defer sig.deinit();
+    const b = try textField(std.testing.allocator, sig, null, null, .{});
+    defer b.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    router.focus(b);
+    // 120 CJK chars = 360 bytes — over the old fixed TextBuf cap
+    var long_buf: [360]u8 = undefined;
+    var long_len: usize = 0;
+    for (0..120) |i| {
+        const s = std.fmt.bufPrint(long_buf[long_len..], "{s}", .{switch (i % 3) {
+            0 => "こ",
+            1 => "ん",
+            else => "世",
+        }}) catch unreachable;
+        long_len += s.len;
+    }
+    const long = long_buf[0..long_len];
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = long });
+    try std.testing.expectEqualStrings(long, text(b)); // the widget buffer holds all of it
+    try std.testing.expectEqualStrings(long, sig.peek()); // and so does the signal
+    // an external over-the-old-cap set lands whole too
+    var other_buf: [300]u8 = undefined;
+    @memset(&other_buf, 'x');
+    const other = other_buf[0..];
+    try sig.set(other);
+    try std.testing.expectEqualStrings(other, text(b));
+}
+
+test "text_field: input over the 1 MiB cap is rejected, not truncated" {
+    const b = try textField(std.testing.allocator, null, null, null, .{});
+    defer b.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    router.focus(b);
+    const huge = try std.testing.allocator.alloc(u8, ui.state.TextSignal.max_len + 1);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'x');
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = huge }); // over the cap → dropped whole
+    try std.testing.expectEqual(@as(usize, 0), text(b).len);
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "ok" });
+    try std.testing.expectEqualStrings("ok", text(b));
+    // setText over the cap keeps the current text; an over-cap initial fails
+    setText(b, huge);
+    try std.testing.expectEqualStrings("ok", text(b));
+    try std.testing.expectError(error.TextTooLong, textField(std.testing.allocator, null, null, null, .{ .initial = huge }));
 }
 
 test "text_field: RTL mirrors the chrome (the label moves to the end side)" {
