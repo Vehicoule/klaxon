@@ -58,7 +58,15 @@ fn textDeinit(n: *Node) void {
     n.allocator.free(s.text);
     n.allocator.destroy(s);
 }
-const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit };
+/// The glyphs' actual rect: the alignment may place them outside the bounds
+/// (a constrained right-aligned text paints left of its box). Culling and
+/// damage consult it.
+fn textPaintBounds(n: *Node) Rect {
+    const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    const m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
+    return .{ .x = textX(n, m, s.opts.text_align), .y = n.bounds.y, .w = m.width, .h = m.height };
+}
+const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds };
 
 pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*Node {
     const node = try Node.create(allocator, &text_vtable);
@@ -133,7 +141,12 @@ pub fn BoundText(comptime T: type) type {
             s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = dirtyCb, .userdata = n } });
             n.allocator.destroy(s);
         }
-        const vtable = ui.node.VTable{ .measure = measure, .layout = layout, .paint = paint, .deinit = deinit };
+        fn paintBounds(n: *Node) Rect {
+            const s: *State = @ptrCast(@alignCast(n.state.?));
+            const m = ui.paint.measureText(bound(n), s.opts.size, s.opts.bold);
+            return .{ .x = textX(n, m, s.opts.text_align), .y = n.bounds.y, .w = m.width, .h = m.height };
+        }
+        const vtable = ui.node.VTable{ .measure = measure, .layout = layout, .paint = paint, .deinit = deinit, .paint_bounds = paintBounds };
 
         pub fn text(allocator: std.mem.Allocator, sig: *ui.state.Signal(T), fmt: *const fn (T, []u8) []const u8, opts: TextOptions) !*Node {
             const node = try Node.create(allocator, &vtable);
@@ -208,7 +221,21 @@ fn richTextDeinit(n: *Node) void {
     s.spans.deinit();
     n.allocator.destroy(s);
 }
-const rich_text_vtable = ui.node.VTable{ .measure = richTextMeasure, .layout = richTextLayout, .paint = richTextPaint, .deinit = richTextDeinit };
+/// The spans' actual extent: they flow from bounds.x without wrapping, so
+/// the glyph run may exceed the bounds' width (and its height when the
+/// bounds are shorter than the tallest span).
+fn richTextPaintBounds(n: *Node) Rect {
+    const s: *RichTextState = @ptrCast(@alignCast(n.state.?));
+    var w: f32 = 0;
+    var h: f32 = 0;
+    for (s.spans.items) |span| {
+        const m = ui.paint.measureText(span.text, span.size, span.bold);
+        w += m.width;
+        h = @max(h, m.height);
+    }
+    return .{ .x = n.bounds.x, .y = n.bounds.y, .w = w, .h = h };
+}
+const rich_text_vtable = ui.node.VTable{ .measure = richTextMeasure, .layout = richTextLayout, .paint = richTextPaint, .deinit = richTextDeinit, .paint_bounds = richTextPaintBounds };
 
 /// RichText — a single line of styled spans. Copies the span strings.
 /// Error-safe: spans are copied first; on failure everything is freed.

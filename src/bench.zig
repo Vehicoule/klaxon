@@ -18,10 +18,10 @@
 //     included) → the END of the first completed frame.
 //   - draw_calls_per_frame: the kx_skia ABI has no draw-call counter (the C++
 //     shim is frozen); estimated as the number of visible nodes painted per
-//     frame — the raster backend paints the whole tree every frame and every
-//     node's paint callback issues >= 0 kx draw calls. For the virtualized
-//     scenes this is the LIVE window (~10 nodes for scroll_10k), matching what
-//     a real frame issues.
+//     frame — mirrors Node.paint's off-surface culling (a node's paint
+//     callback issues >= 0 kx draw calls). For the virtualized scenes this
+//     is the LIVE window (~10 nodes for scroll_10k); for retained scenes it
+//     is the on-surface fraction, matching what a real frame issues.
 //   - rss_mb: devtools.readRssMb (Linux /proc/self/status VmRSS, macOS
 //     mach_task_basic_info — cross-platform, no new dependency).
 const std = @import("std");
@@ -227,7 +227,7 @@ const SceneRunner = struct {
             .resize => {
                 // Cycle the viewport: resize the surface + relayout the tree.
                 const s = RESIZE_SIZES[@as(usize, @intCast(frame % RESIZE_SIZES.len))];
-                kx.c.kx_resize(renderer.ctx, s[0], s[1]);
+                renderer.resize(s[0], s[1]); // keeps the paint-visible rect in sync
                 r.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(s[0]), .h = @floatFromInt(s[1]) });
             },
             .input_ime => {
@@ -334,7 +334,14 @@ const SceneRunner = struct {
         // Capture the measured-run metrics BEFORE the optional profile: its
         // extra ticks allocate (scroll rows land in the arena) and would
         // inflate rss_mb for this scene and the shared baseline of later ones.
-        const draw_calls = countPaintNodes(r.root);
+        // The current surface (resize may have changed it) — the same region
+        // the paint pass culls against.
+        const draw_calls = countPaintNodes(r.root, .{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(renderer.w),
+            .h = @floatFromInt(renderer.h),
+        });
         const rss_mb = devtools.readRssMb();
         if (opts.paint_profile) try r.profilePaint(renderer, opts);
         return .{
@@ -718,11 +725,29 @@ fn percentile(sorted: []const f64, p: u64) f64 {
     return sorted[idx];
 }
 
-/// Draw-call estimate: the visible nodes painted per frame (see the header).
-fn countPaintNodes(n: *Node) u64 {
+/// Draw-call estimate: the nodes painted per frame (see the header) —
+/// mirrors Node.paint's culling: off-region own paint and clip-empty
+/// children passes issue no ops.
+fn countPaintNodes(n: *Node, visible: Rect) u64 {
     if (!n.visible) return 0;
-    var count: u64 = 1;
-    for (n.children.items) |child| count += countPaintNodes(child);
+    var child_region = visible;
+    if (n.vtable.child_clip) |cc| {
+        child_region = ui.node.rectIntersect(visible, n.mapRectToRoot(cc(n)));
+    }
+    var count: u64 = 0;
+    if (ui.node.rectOverlaps(n.mapRectToRoot(n.paintRect()), visible)) count = 1;
+    if (child_region.w > 0 and child_region.h > 0) {
+        for (n.children.items) |child| {
+            if (child.defer_paint) {
+                // Deferred children paint in the parent's overlay pass when
+                // visible (menuPaintOverlay's `if (child.visible)` — the
+                // overlay pass issues their draws unculled).
+                if (child.visible and n.vtable.paint_overlay != null) count += 1;
+                continue;
+            }
+            count += countPaintNodes(child, child_region);
+        }
+    }
     return count;
 }
 
@@ -1081,9 +1106,12 @@ test "bench: scroll_10k keeps the virtualization window small" {
 }
 
 test "bench: anim_100 runs 100 concurrent animations" {
-    const m = try runSceneWithOpts(.anim_100, std.testing.allocator, test_opts);
+    // At the 640x480 bench contract size the whole 10x10 grid lands
+    // on-surface — the (now cull-aware) draw-call count sees all 100.
+    const opts: RunOptions = .{ .frames = test_opts.frames, .warmup_frames = test_opts.warmup_frames, .width = 640, .height = 480 };
+    const m = try runSceneWithOpts(.anim_100, std.testing.allocator, opts);
     try std.testing.expect(m.draw_calls_per_frame >= ANIM_WIDGETS); // grid + 100 containers
-    try std.testing.expectEqual(@as(u64, test_opts.warmup_frames + test_opts.frames), m.frames_rendered);
+    try std.testing.expectEqual(@as(u64, opts.warmup_frames + opts.frames), m.frames_rendered);
 }
 
 test "bench: resize cycles the viewport without crashing" {

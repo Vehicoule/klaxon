@@ -106,6 +106,9 @@ fn listMapPaintRect(n: *Node, rect: Rect) Rect {
     const s = stateOf(ListState, n);
     return .{ .x = rect.x, .y = rect.y - s.scroll.offset, .w = rect.w, .h = rect.h };
 }
+fn listChildClip(n: *Node) Rect {
+    return n.bounds; // the viewport clip pushed in pre_children_paint
+}
 fn listPreChildrenHit(n: *Node, px: f32, py: f32) ui.node.HitPoint {
     const s = stateOf(ListState, n);
     return .{ .x = px, .y = py + s.scroll.offset };
@@ -141,6 +144,7 @@ const list_vtable = ui.node.VTable{
     .pre_children_paint = listPreChildrenPaint,
     .post_children_paint = listPostChildrenPaint,
     .map_paint_rect = listMapPaintRect,
+    .child_clip = listChildClip,
     .pre_children_hit = listPreChildrenHit,
 };
 

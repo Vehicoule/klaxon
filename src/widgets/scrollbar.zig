@@ -308,6 +308,12 @@ fn scrollbarDeinit(n: *Node) void {
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
+/// Where the scrollbar's paint lands (parent space): the overlay style
+/// draws at the parent's right edge — nowhere near its own (empty) bounds.
+/// Paint culling + markDirty consult this instead of the bounds.
+fn scrollbarPaintBounds(n: *Node) Rect {
+    return trackRect(stateOf(ScrollbarState, n), n);
+}
 const scrollbar_vtable = ui.node.VTable{
     .measure = scrollbarMeasure,
     .layout = scrollbarLayout,
@@ -316,6 +322,7 @@ const scrollbar_vtable = ui.node.VTable{
     .on_pointer = scrollbarOnPointer,
     .on_scroll = scrollbarOnScroll,
     .hit_bounds = scrollbarHitBounds,
+    .paint_bounds = scrollbarPaintBounds,
 };
 
 pub fn scrollbar(allocator: std.mem.Allocator, opts: ScrollbarOptions) !*Node {

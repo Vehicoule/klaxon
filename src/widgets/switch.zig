@@ -250,6 +250,22 @@ fn switchDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
+/// The region own-paint can touch. handleRect works in a fixed 52x32 track
+/// space anchored at b.x — when bounds are narrower than 52 the checked
+/// handle (and its 40dp state layer) still paint past b's right edge, so a
+/// constant damage_overflow under-reports. Cover the union of both handle
+/// extremes plus the layer: track space [-4, 56] x [-4, 36], plus the bounds
+/// themselves when wider/taller.
+fn switchPaintBounds(n: *Node) Rect {
+    const b = n.bounds;
+    return .{
+        .x = b.x - 4,
+        .y = b.y - 4,
+        .w = @max(b.w, track_w + 8), // layer reaches 56 in track space
+        .h = @max(b.h, track_h + 8), // layer reaches 36
+    };
+}
+
 const switch_vtable = ui.node.VTable{
     .measure = switchMeasure,
     .layout = null_layout,
@@ -258,6 +274,7 @@ const switch_vtable = ui.node.VTable{
     .on_pointer = switchOnPointer,
     .on_key = switchOnKey,
     .hit_bounds = switchHitBounds,
+    .paint_bounds = switchPaintBounds,
 };
 
 fn null_layout(n: *Node, bounds: Rect) void {
@@ -427,4 +444,18 @@ test "golden: disabled checked switch paints the OnSurface@0.12 track" {
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     try golden.expectPixelApprox(f, 10, 32, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF));
+}
+
+test "switch: paintRect covers the handle state layer extremes (culling/damage contract)" {
+    const sig = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer sig.deinit();
+    const b = try @"switch"(std.testing.allocator, sig, null, .{});
+    defer b.deinit();
+    b.layout(.{ .x = 100, .y = 100, .w = 52, .h = 32 });
+    // 4dp overflow each side (handle cx ∈ [16, 36] → layer -4..56)
+    try std.testing.expectEqual(ui.node.Rect{ .x = 96, .y = 96, .w = 60, .h = 40 }, b.paintRect());
+    // constrained width: the handle still paints in track space 0..52 anchored
+    // at b.x — the checked handle + layer must NOT be clipped by narrow bounds
+    b.layout(.{ .x = 100, .y = 100, .w = 20, .h = 32 });
+    try std.testing.expectEqual(ui.node.Rect{ .x = 96, .y = 96, .w = 60, .h = 40 }, b.paintRect());
 }

@@ -856,7 +856,7 @@ test "golden: inspector paints panel + bounds highlight (exact pixels)" {
     // Enabled: panel + highlight painted.
     kx.c.kx_begin_frame(r.ctx);
     kx.c.kx_clear(r.ctx, bg);
-    root.paint(r.ctx);
+    root.paint(r.ctx, .{ .x = 0, .y = 0, .w = 640, .h = 480 });
     insp.paintHighlight(r.ctx);
     insp.paint(r.ctx, root, 640, 480);
     kx.c.kx_end_frame(r.ctx);
@@ -870,7 +870,7 @@ test "golden: inspector paints panel + bounds highlight (exact pixels)" {
     insp.enabled = false;
     kx.c.kx_begin_frame(r.ctx);
     kx.c.kx_clear(r.ctx, bg);
-    root.paint(r.ctx);
+    root.paint(r.ctx, .{ .x = 0, .y = 0, .w = 640, .h = 480 });
     if (insp.enabled) {
         insp.paintHighlight(r.ctx);
         insp.paint(r.ctx, root, 640, 480);

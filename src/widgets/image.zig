@@ -112,7 +112,7 @@ test "image re-uploads when the painting context changes" {
     for ([_]*kx.Ctx{ ctx1, ctx2 }) |ctx| {
         kx.c.kx_begin_frame(ctx);
         kx.c.kx_clear(ctx, bg);
-        root.paint(ctx);
+        root.paint(ctx, .{ .x = 0, .y = 0, .w = 4, .h = 4 });
         kx.c.kx_end_frame(ctx);
         const pixels = try std.testing.allocator.alloc(u8, 4 * 4 * 4);
         defer std.testing.allocator.free(pixels);

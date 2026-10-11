@@ -281,6 +281,10 @@ fn buttonPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.clipReset(ctx); // restores
 }
 
+fn buttonChildClip(n: *Node) Rect {
+    return n.bounds; // the bounds clip pushed in pre_children_paint
+}
+
 fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
@@ -414,6 +418,7 @@ const button_vtable = ui.node.VTable{
     .on_key = buttonOnKey,
     .pre_children_paint = buttonPreChildrenPaint,
     .post_children_paint = buttonPostChildrenPaint,
+    .child_clip = buttonChildClip,
 };
 
 /// An M3E button. `on_pressed` fires on click (pointer up inside after a

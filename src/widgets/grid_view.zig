@@ -117,6 +117,9 @@ fn gridMapPaintRect(n: *Node, rect: Rect) Rect {
     const s = stateOf(GridState, n);
     return .{ .x = rect.x, .y = rect.y - s.scroll.offset, .w = rect.w, .h = rect.h };
 }
+fn gridChildClip(n: *Node) Rect {
+    return n.bounds; // the viewport clip pushed in pre_children_paint
+}
 fn gridPreChildrenHit(n: *Node, px: f32, py: f32) ui.node.HitPoint {
     const s = stateOf(GridState, n);
     return .{ .x = px, .y = py + s.scroll.offset };
@@ -151,6 +154,7 @@ const grid_vtable = ui.node.VTable{
     .pre_children_paint = gridPreChildrenPaint,
     .post_children_paint = gridPostChildrenPaint,
     .map_paint_rect = gridMapPaintRect,
+    .child_clip = gridChildClip,
     .pre_children_hit = gridPreChildrenHit,
 };
 

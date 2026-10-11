@@ -262,6 +262,25 @@ fn sliderDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
+/// The region own-paint can touch: the bounds plus the 40dp state layer,
+/// centered on the thumb — its cx runs [b.x + inset, b.x + inset + tw] with
+/// tw = max(0, b.w - 2*inset) like the paint path, so the layer reaches
+/// (state_layer_size/2 - inset) past the horizontal edges, and past the
+/// vertical edges whenever the bounds are shorter than the layer (a
+/// constrained slider). Culling and damage both consult it.
+fn sliderPaintBounds(n: *Node) Rect {
+    const b = n.bounds;
+    const cy = b.y + b.h / 2;
+    const top = @min(b.y, cy - state_layer_size / 2);
+    const bottom = @max(b.y + b.h, cy + state_layer_size / 2);
+    return .{
+        .x = b.x + inset - state_layer_size / 2,
+        .y = top,
+        .w = @max(0, b.w - inset * 2) + state_layer_size,
+        .h = bottom - top,
+    };
+}
+
 const slider_vtable = ui.node.VTable{
     .measure = sliderMeasure,
     .layout = null_layout,
@@ -270,6 +289,7 @@ const slider_vtable = ui.node.VTable{
     .on_pointer = sliderOnPointer,
     .on_key = sliderOnKey,
     .hit_bounds = sliderHitBounds,
+    .paint_bounds = sliderPaintBounds,
 };
 
 fn null_layout(n: *Node, bounds: Rect) void {
@@ -464,4 +484,17 @@ test "golden: disabled slider paints the OnSurface@0.38 active track" {
     // (OnSurface@0.12 over white) — blend both layers
     const inactive_over_white = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF);
     try golden.expectPixelApprox(f, 40, 24, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), inactive_over_white));
+}
+
+test "slider: paintBounds covers the thumb state layer at the track ends" {
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{});
+    defer b.deinit();
+    b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 44 });
+    // layer 40 on cx ∈ [102, 298] → x = 82, w = 236; vertically inside
+    try std.testing.expectEqual(ui.node.Rect{ .x = 82, .y = 50, .w = 236, .h = 44 }, b.paintRect());
+    // a constrained height still covers the layer (cy ± 20)
+    b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 16 });
+    try std.testing.expectEqual(ui.node.Rect{ .x = 82, .y = 38, .w = 236, .h = 40 }, b.paintRect());
 }

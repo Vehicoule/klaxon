@@ -237,6 +237,10 @@ pub fn radio(allocator: std.mem.Allocator, sig: *ui.state.Signal(usize), index: 
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .index = index };
     node.state = s;
+    // the 40dp state layer is centered on the 20dp circle — paint (and
+    // damage) reaches (state_layer_size - circle_size)/2 past each edge
+    const layer_overflow = (state_layer_size - circle_size) / 2;
+    node.damage_overflow = .{ .left = layer_overflow, .right = layer_overflow, .top = layer_overflow, .bottom = layer_overflow };
     ui.semantics.attach(node, .{
         .role = .radio,
         .label = opts.a11y_label,
@@ -343,4 +347,13 @@ test "golden: unselected radio strokes the OnSurfaceVariant circle, no dot" {
     try std.testing.expect(f.countColorIn(.{ .x = 14, .y = 14, .w = 20, .h = 20 }, t.colors.on_surface_variant) > 0);
     // the center: no dot → transparent → bg
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(24, 24));
+}
+
+test "radio: paintRect covers the 40dp state layer (culling/damage contract)" {
+    const sig = try ui.state.Signal(usize).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    const b = try radio(std.testing.allocator, sig, 0, .{});
+    defer b.deinit();
+    b.layout(.{ .x = 100, .y = 100, .w = 20, .h = 20 });
+    try std.testing.expectEqual(ui.node.Rect{ .x = 90, .y = 90, .w = 40, .h = 40 }, b.paintRect());
 }

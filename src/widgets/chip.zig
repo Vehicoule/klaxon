@@ -222,6 +222,10 @@ fn chipPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.clipReset(ctx); // restores
 }
 
+fn chipChildClip(n: *Node) Rect {
+    return n.bounds; // the bounds clip pushed in pre_children_paint
+}
+
 fn chipPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
@@ -379,6 +383,7 @@ const chip_vtable = ui.node.VTable{
     .hit_bounds = chipHitBounds,
     .pre_children_paint = chipPreChildrenPaint,
     .post_children_paint = chipPostChildrenPaint,
+    .child_clip = chipChildClip,
 };
 
 /// An M3E chip. `sig` = null → an action chip (or a fixed selected state);

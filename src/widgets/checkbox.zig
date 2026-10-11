@@ -270,6 +270,10 @@ pub fn checkbox(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_ch
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_changed = on_changed };
     node.state = s;
+    // the 40dp state layer is centered on the 18dp box — paint (and damage)
+    // reaches (state_layer_size - box_size)/2 past each edge
+    const layer_overflow = (state_layer_size - box_size) / 2;
+    node.damage_overflow = .{ .left = layer_overflow, .right = layer_overflow, .top = layer_overflow, .bottom = layer_overflow };
     ui.semantics.attach(node, .{
         .role = .checkbox,
         .label = opts.a11y_label,
@@ -410,4 +414,14 @@ test "golden: disabled checked checkbox paints the OnSurface@0.38 box" {
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     try golden.expectPixelApprox(f, 17, 17, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), 0xFFFFFFFF));
+}
+
+test "checkbox: paintRect covers the 40dp state layer (culling/damage contract)" {
+    const sig = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer sig.deinit();
+    const b = try checkbox(std.testing.allocator, sig, null, .{});
+    defer b.deinit();
+    b.layout(.{ .x = 100, .y = 100, .w = 18, .h = 18 });
+    // the layer is centered on the box: 40dp → 109±20 = 89..129
+    try std.testing.expectEqual(ui.node.Rect{ .x = 89, .y = 89, .w = 40, .h = 40 }, b.paintRect());
 }
