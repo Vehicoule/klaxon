@@ -7,6 +7,11 @@
 #   WAMR  @ WAMR-2.4.4   (fast-interp; plugin runtime for klaxon-plugin-sdk — the framework does not link it)
 #   emsdk @ 4.0.7        (web-wasm only — pinned by Skia's bin/activate-emsdk)
 #
+# Fast path: every component first tries a prebuilt tarball from the
+# `deps-<script-hash>` GitHub release (see the artifacts section) — a seconds-
+# long download instead of a 30-60 min Skia compile. Missing artifacts fall
+# back to the source build below. KLAXON_DEPS_SOURCE=1 forces source builds.
+#
 # Hosts: macOS arm64 (dev host), Linux x64/arm64 (CI). Idempotent: up-to-date steps are skipped.
 #
 # Usage:
@@ -87,6 +92,79 @@ git_clone_at() {
   fi
   git -C "$dir" checkout -q FETCH_HEAD
   printf '%s\n' "$pin" > "$dir/.pin"
+}
+
+# --- prebuilt artifacts (fast path) ------------------------------------------
+# Building Skia takes ~30-60 min; a published tarball takes seconds. Every
+# component below first tries to download deps-<bundle>.tar.gz from the
+# `deps-<DEPS_ID>` GitHub release — DEPS_ID is the script's own hash, so any
+# pin/args change produces a new key (stale artifacts are unreachable).
+# Fallbacks: missing artifact → source build (unchanged path below).
+#   KLAXON_DEPS_SOURCE=1   force source builds, never download
+#   KLAXON_DEPS_BASE_URL   override the release base (testing/mirrors)
+
+DEPS_ID="$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -c1-12)"
+DEPS_BASE_URL="${KLAXON_DEPS_BASE_URL:-https://github.com/Vehicoule/klaxon/releases/download/deps-$DEPS_ID}"
+
+# try_artifact <bundle> — download + verify + extract deps-<bundle>.tar.gz
+# into deps/, then stamp deps/.artifact-<bundle>. Idempotent via the stamp.
+try_artifact() {
+  local name="$1"
+  [ "${KLAXON_DEPS_SOURCE:-0}" = "1" ] && return 1
+  [ -f "$DEPS/.artifact-$name" ] && { log "$name: artifact already extracted"; return 0; }
+  command -v curl >/dev/null || return 1
+  local base="deps-$name.tar.gz"
+  local url="$DEPS_BASE_URL/$base"
+  local tmp="$DEPS/.dl-$base"
+  mkdir -p "$DEPS"
+  log "try artifact $base"
+  if ! curl -fsSL --retry 2 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    log "no artifact for $name — will build from source"
+    return 1
+  fi
+  if ! curl -fsSL -o "$tmp.sha256" "$url.sha256"; then
+    rm -f "$tmp" "$tmp.sha256"
+    log "artifact without checksum for $name — will build from source"
+    return 1
+  fi
+  local want got
+  want="$(cut -d' ' -f1 < "$tmp.sha256")"
+  got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  if [ "$want" != "$got" ]; then
+    rm -f "$tmp" "$tmp.sha256"
+    die "checksum mismatch on $base — refusing to extract (want $want, got $got)"
+  fi
+  tar -xzf "$tmp" -C "$DEPS"
+  rm -f "$tmp" "$tmp.sha256"
+  printf '%s\n' "$name" > "$DEPS/.artifact-$name"
+  log "extracted $base"
+  return 0
+}
+
+# component_bundle <component> — which artifact covers this component.
+component_bundle() {
+  case "$1" in
+    skia|sdl3|wamr) echo "native-$TAG" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# satisfied <component> — component outputs present (artifact stamp or
+# source-built marker). Checked cheaply via representative output files.
+satisfied() {
+  local comp="$1" bundle
+  bundle="$(component_bundle "$comp")"
+  [ -f "$DEPS/.artifact-$bundle" ] && return 0
+  case "$comp" in
+    skia)  [ -f "$SKIA/out/$TAG/libskia.a" ] ;;
+    sdl3)  [ -f "$DEPS/SDL/build-$TAG/libSDL3.a" ] ;;
+    wamr)  [ -d "$DEPS/wamr/build-$TAG" ] ;;
+    web-wasm)   [ -f "$SKIA/out/web-wasm/libskia.wasm.a" ] ;;
+    android-arm64) [ -f "$SKIA/out/android-arm64/libskia.a" ] ;;
+    ios)   [ -f "$SKIA/out/ios-arm64/libskia.a" ] ;;
+    *) return 1 ;;
+  esac
 }
 
 # --- Skia -------------------------------------------------------------------
@@ -299,6 +377,10 @@ build_skia() {
 build_sdl3() {
   local src="$DEPS/SDL"
   local build="$src/build-$TAG"
+  if [ -f "$build/libSDL3.a" ]; then
+    log "SDL3 already built (build-$TAG)"
+    return 0
+  fi
   git_clone_at "$src" "$SDL3_URL" "$SDL3_PIN"
   log "cmake SDL3 ($TAG, static, trimmed)"
   # Trimmed: camera/sensors are V2 platform services, SDL_GPU is unused (Skia renders).
@@ -319,6 +401,10 @@ build_sdl3() {
 build_wamr() {
   local src="$DEPS/wamr"
   local build="$src/build-$TAG"
+  if [ -f "$build/libiwasm.a" ]; then
+    log "wamr already built (build-$TAG)"
+    return 0
+  fi
   git_clone_at "$src" "$WAMR_URL" "$WAMR_PIN"
   log "cmake WAMR ($TAG, fast-interp)"
   cmake -S "$src/product-mini/platforms/$WAMR_PLATFORM" -B "$build" \
@@ -764,6 +850,21 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fi
 
   mkdir -p "$DEPS"
+
+  # Fast path: prebuilt artifacts — each component maps to a bundle; the
+  # first component of a bundle downloads it (idempotent: stamped + the
+  # per-component builders below skip whatever already exists).
+  bundles_done=" "
+  for component in "${COMPONENTS[@]}"; do
+    bundle="$(component_bundle "$component")"
+    case "$bundles_done" in
+      *" $bundle "*) ;;
+      *)
+        bundles_done="$bundles_done$bundle "
+        satisfied "$component" || try_artifact "$bundle" || true
+        ;;
+    esac
+  done
 
   for component in "${COMPONENTS[@]}"; do
     case "$component" in

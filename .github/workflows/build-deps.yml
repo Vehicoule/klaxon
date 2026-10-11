@@ -1,0 +1,111 @@
+# build-deps.yml — build + publish prebuilt dependency artifacts.
+#
+# fetch-deps.sh downloads deps-<bundle>.tar.gz from the `deps-<DEPS_ID>`
+# release (DEPS_ID = first 12 chars of the fetch-deps.sh sha256 — any pin or
+# args change produces a new release key, stale artifacts are unreachable).
+# This workflow builds those artifacts so `scripts/fetch-deps.sh` is a
+# seconds-long download instead of a 30-60 min Skia compile.
+#
+# Runs on pushes that touch the dep scripts, and on manual dispatch (e.g.
+# first bootstrap after a pin bump — the release only appears once this has
+# run; until then consumers transparently fall back to source builds).
+name: build-deps
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [scripts/fetch-deps.sh, scripts/pack-deps.sh]
+
+permissions:
+  contents: write # gh release create/upload
+
+concurrency:
+  group: build-deps-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deps-id:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.id.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: id
+        run: echo "id=$(shasum -a 256 scripts/fetch-deps.sh | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+  native:
+    needs: deps-id
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, tag: linux-x64 }
+          - { os: ubuntu-24.04-arm, tag: linux-arm64 }
+          - { os: macos-15, tag: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang libc++-dev
+      - name: Build native deps
+        run: scripts/fetch-deps.sh
+      - name: Pack native bundle
+        run: scripts/pack-deps.sh native
+      - name: Publish artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPS_ID: ${{ needs.deps-id.outputs.id }}
+        run: |
+          gh release create "deps-$DEPS_ID" --title "deps-$DEPS_ID" --notes "Prebuilt Klaxon deps (fetch-deps.sh $DEPS_ID)" || true
+          gh release upload "deps-$DEPS_ID" dist/*.tar.gz dist/*.sha256 --clobber
+
+  wasm:
+    needs: deps-id
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang libc++-dev
+      - run: scripts/fetch-deps.sh web-wasm
+      - run: scripts/pack-deps.sh web-wasm
+      - name: Publish artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPS_ID: ${{ needs.deps-id.outputs.id }}
+        run: |
+          gh release create "deps-$DEPS_ID" --title "deps-$DEPS_ID" --notes "Prebuilt Klaxon deps (fetch-deps.sh $DEPS_ID)" || true
+          gh release upload "deps-$DEPS_ID" dist/*.tar.gz dist/*.sha256 --clobber
+
+  android:
+    needs: deps-id
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+      - run: scripts/fetch-deps.sh android-arm64
+      - run: scripts/pack-deps.sh android-arm64
+      - name: Publish artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPS_ID: ${{ needs.deps-id.outputs.id }}
+        run: |
+          gh release create "deps-$DEPS_ID" --title "deps-$DEPS_ID" --notes "Prebuilt Klaxon deps (fetch-deps.sh $DEPS_ID)" || true
+          gh release upload "deps-$DEPS_ID" dist/*.tar.gz dist/*.sha256 --clobber
+
+  ios:
+    needs: deps-id
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/fetch-deps.sh ios
+      - run: scripts/pack-deps.sh ios
+      - name: Publish artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPS_ID: ${{ needs.deps-id.outputs.id }}
+        run: |
+          gh release create "deps-$DEPS_ID" --title "deps-$DEPS_ID" --notes "Prebuilt Klaxon deps (fetch-deps.sh $DEPS_ID)" || true
+          gh release upload "deps-$DEPS_ID" dist/*.tar.gz dist/*.sha256 --clobber
