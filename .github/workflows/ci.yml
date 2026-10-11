@@ -96,9 +96,6 @@ jobs:
   build-wasm:
     name: build-wasm (Linux)
     runs-on: ubuntu-latest
-    # Required gate: the wasm toolchain is fixed (zig cc shim compiles with
-    # the emscripten sysroot include order — compat + c++/v1 + sysroot — see
-    # build.zig addWasmWeb).
     steps:
       - uses: actions/checkout@v4
 

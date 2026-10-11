@@ -378,26 +378,22 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
-    // Include path ORDER matters, and it must match what emcc itself passes
-    // to clang (emcc.py get_cflags → -iwithsysroot/include/compat, then the
-    // toolchain dirs):
-    //   1. compat/ — emscripten's BSD-compat headers musl lacks. Required:
-    //      libc++'s __locale_dir/locale_base_api.h does #include <xlocale.h>
-    //      unconditionally under __EMSCRIPTEN__, and xlocale.h only exists
-    //      in compat/ (cache/sysroot/include/compat/xlocale.h). Missing this
-    //      path is what broke the build-wasm CI job.
-    //   2. c++/v1 — emscripten's libc++ BEFORE the sysroot C headers. libc++
-    //      wrappers (e.g. cstring) do #include <string.h> expecting to find
-    //      c++/v1/string.h first (which then #include_next's the musl
-    //      string.h). If sysroot/include came first, the musl string.h would
-    //      be found directly and libc++ would error out.
-    //   3. sysroot/include — musl C headers (<emscripten.h>, <GLES3/gl32.h>).
-    // (emcc also injects include/fakesdl, but only when USE_SDL=0 — we link
-    // the real SDL3, whose headers shadow it anyway.)
-    // NB: compat/ must come FIRST (emcc prepends it): its headers shadow
-    // sysroot ones of the same name (stdlib.h, string.h, math.h, time.h, …)
-    // adding BSD-compat declarations musl lacks — _LIBCPP_HAS_NO_XLOCALE is
-    // NOT honored by this libc++ build, so the compat dir is required.
+    // Emscripten sysroot dirs, mirroring emcc's own search order (emcc -v):
+    //   fakesdl → compat → c++/v1 → clang builtins → include
+    // - compat/ is REQUIRED and must come first: it holds xlocale.h plus the
+    //   other BSD-compat headers that shadow same-named musl headers
+    //   (stdlib.h, string.h, math.h, …). libc++'s
+    //   __locale_dir/locale_base_api.h does #include <xlocale.h>
+    //   unconditionally under __EMSCRIPTEN__; without compat/ on the path the
+    //   C++ compile fails "'xlocale.h' not found" (this was the build-wasm CI
+    //   failure; _LIBCPP_HAS_NO_XLOCALE is NOT honored by this libc++).
+    // - c++/v1 (emscripten's libc++) must precede include/ (musl): libc++
+    //   wrapper headers like <cstddef> do #include <stddef.h> expecting
+    //   c++/v1/stddef.h, which then #include_next's down to the musl header;
+    //   if musl's is found first libc++ #errors out ("didn't find libc++'s
+    //   <stddef.h> header").
+    // - fakesdl is skipped (real SDL3 headers above); zig's own lib/include
+    //   (-isystem, searched after all -I dirs) covers the clang builtins.
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(b.fmt("{s}/c++/v1", .{sysroot_include})));
     kx_skia.root_module.addIncludePath(b.path(sysroot_include));
@@ -410,6 +406,9 @@ fn addWasmWeb(
         .optimize = optimize,
     });
     translate_sdl.addIncludePath(b.path("deps/SDL/include"));
+    // compat before include — same emcc order as the shim (compat holds the
+    // BSD/GNU headers emscripten code expects to shadow the musl ones).
+    translate_sdl.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     translate_sdl.addIncludePath(b.path(sysroot_include));
 
     const translate_kx = b.addTranslateC(.{
@@ -417,6 +416,7 @@ fn addWasmWeb(
         .target = target,
         .optimize = optimize,
     });
+    translate_kx.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     translate_kx.addIncludePath(b.path(sysroot_include));
 
     // --- hello app as a static library (Zig cannot link an exe for emscripten) ---
@@ -471,9 +471,10 @@ fn addWasmWeb(
         "-sMAXIMUM_MEMORY=2GB",
         "-sENVIRONMENT=web",
         "-sSTACK_SIZE=1MB",
-        "-sEXPORTED_FUNCTIONS=_main,_kx_a11y_dump_tree,_kx_a11y_free_string,_kx_a11y_key,_kx_a11y_root_node,_kx_a11y_text",
-        // malloc/free are wasm exports the JS library calls directly (not
-        // runtime methods) — emscripten pulls them in as JS-lib deps.
+        // _malloc/_free are wasm exports callable as JS globals
+        // (kx_a11y.js uses _malloc/_free for the scratch buffer); they are
+        // not runtime methods — listing them there just warns.
+        "-sEXPORTED_FUNCTIONS=_main,_kx_a11y_dump_tree,_kx_a11y_free_string,_kx_a11y_key,_kx_a11y_root_node,_kx_a11y_text,_malloc,_free",
         "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS",
         opt_flag,
     }) catch unreachable;

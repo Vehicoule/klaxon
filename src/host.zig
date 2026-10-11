@@ -193,6 +193,17 @@ pub const Host = struct {
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DEPTH_SIZE), 0);
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_STENCIL_SIZE), 8);
         }
+        // Emscripten: pin the canvas selector before SDL creates the window —
+        // on the pinned SDL/emsdk combo SDL_GetHint() returns "" rather than
+        // NULL for this unset hint, and Emscripten_CreateWindow then calls
+        // querySelector("") which throws mid-creation.
+        if (is_emscripten) {
+            _ = sdl.c.SDL_SetHintWithPriority(
+                sdl.c.SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR,
+                "#canvas",
+                sdl.c.SDL_HINT_OVERRIDE,
+            );
+        }
         const window_flags: u64 = if (is_emscripten)
             sdl.c.SDL_WINDOW_OPENGL
         else if (is_android)
