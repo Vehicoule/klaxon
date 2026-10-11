@@ -120,9 +120,11 @@ fn navBarLayout(n: *Node, bounds: Rect) void {
         }
     }
     const loose: Constraints = .{ .max_w = item_w, .max_h = bounds.h };
+    const rtl = ui.i18n.direction() == .rtl;
     for (n.children.items, 0..) |child, i| {
         const cs = child.measure(loose);
-        const x = bounds.x + @as(f32, @floatFromInt(i)) * item_w;
+        // RTL: cell 0 is the rightmost — index order mirrors visually.
+        const x = if (rtl) bounds.x + bounds.w - @as(f32, @floatFromInt(i + 1)) * item_w else bounds.x + @as(f32, @floatFromInt(i)) * item_w;
         s.cells.items[i] = .{ .x = x, .y = bounds.y, .w = item_w, .h = bounds.h };
         s.content_sizes.items[i] = cs;
         child.layout(.{
@@ -232,20 +234,16 @@ fn navBarOnKey(n: *Node, ev: input.KeyEvent) bool {
             }
             return false;
         },
-        .left => {
+        .left, .right => {
             const sel = s.sig.peek();
-            if (sel > 0) {
-                s.sig.set(sel - 1);
-                input.requestFocus(n.children.items[sel - 1]); // selection-follows-focus, both ways
-                return true;
-            }
-            return false;
-        },
-        .right => {
-            const sel = s.sig.peek();
-            if (sel + 1 < n.children.items.len) {
-                s.sig.set(sel + 1);
-                input.requestFocus(n.children.items[sel + 1]);
+            // Arrow direction mirrors in RTL (cells are laid out mirrored).
+            const fwd: i32 = if (ev.key == .right) 1 else -1;
+            const step: i32 = if (ui.i18n.direction() == .rtl) -fwd else fwd;
+            const next_i = @as(i32, @intCast(sel)) + step;
+            if (next_i >= 0 and next_i < @as(i32, @intCast(n.children.items.len))) {
+                const next: usize = @intCast(next_i);
+                s.sig.set(next);
+                input.requestFocus(n.children.items[next]); // selection-follows-focus, both ways
                 return true;
             }
             return false;
