@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/fetch-deps.sh — fetch + build Klaxon's third-party dependencies into deps/.
 #
-#   Skia  @ 8643b1d64cff21b5e6f8d65ca98204c6eecb0098   (Graphite + Ganesh + raster)
+#   Skia  @ 8643b1d64cff21b5e6f8d65ca98204c6eecb0098   (Graphite + Ganesh + raster;
+#                                                        Graphite Dawn/Metal on iOS)
 #   SDL3  @ release-3.2.16
 #   WAMR  @ WAMR-2.4.4   (fast-interp; plugin runtime for klaxon-plugin-sdk — the framework does not link it)
 #   emsdk @ 4.0.7        (web-wasm only — pinned by Skia's bin/activate-emsdk)
@@ -18,7 +19,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPS="$ROOT/deps"
-JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)"
+# NINJA_JOBS overrides parallelism for the Skia ninja steps and the CMake
+# builds. The iOS Skia steps also cap Dawn's inner ninja (CMAKE_BUILD_PARALLEL_LEVEL)
+# so outer + inner clang processes stay within a 16 GB host's memory budget.
+JOBS="${NINJA_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)}"
 
 SKIA_PIN="8643b1d64cff21b5e6f8d65ca98204c6eecb0098"
 SDL3_PIN="release-3.2.16"
@@ -32,6 +36,8 @@ EMSDK_URL="https://github.com/emscripten-core/emsdk.git"
 
 CHROMIUM="https://chromium.googlesource.com"
 SKIA_GOOG="https://skia.googlesource.com"
+DAWN_URL="https://dawn.googlesource.com/dawn.git"
+SWIFTSHADER_URL="https://swiftshader.googlesource.com/SwiftShader"
 
 log() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -85,11 +91,49 @@ git_clone_at() {
 
 # --- Skia -------------------------------------------------------------------
 
+# Dawn (Graphite Dawn) externals — pins from Skia's DEPS at $SKIA_PIN (kept in
+# sync with the Dawn DEPS at the pinned Dawn revision). Required only when
+# skia_use_dawn = true (the iOS targets in Phase 3e).
+fetch_dawn() {
+  local ext="$SKIA/third_party/externals"
+  git_clone_at "$ext/dawn"                     "$DAWN_URL"                                                           2c217c7f8c9fe26f5622aae94ced28e9ae8d27b6
+  git_clone_at "$ext/abseil-cpp"               "$CHROMIUM/chromium/src/third_party/abseil-cpp"                       af5aede14a0b4013be6890148d34e0fd7b1fac69
+  git_clone_at "$ext/glslang"                  "$CHROMIUM/external/github.com/KhronosGroup/glslang"                  1d47ffa8ac4374a19b302021e216a20f22a3de92
+  git_clone_at "$ext/spirv-tools"              "$SKIA_GOOG/external/github.com/KhronosGroup/SPIRV-Tools.git"         1ba1f5b8fe921e46091d18370f91fb46450ff786
+  git_clone_at "$ext/spirv-headers"            "$SKIA_GOOG/external/github.com/KhronosGroup/SPIRV-Headers.git"       86f980c731e62ae4eaf383d320449d71687936bf
+  git_clone_at "$ext/vulkan-headers"           "$CHROMIUM/external/github.com/KhronosGroup/Vulkan-Headers"           c46850864f4661461b0f6cb9922c058ffea4915e
+  git_clone_at "$ext/vulkan-utility-libraries" "$CHROMIUM/external/github.com/KhronosGroup/Vulkan-Utility-Libraries" f91385f84e1c82d744b3050d1919edb3eaa32827
+  git_clone_at "$ext/egl-registry"             "$SKIA_GOOG/external/github.com/KhronosGroup/EGL-Registry"            b055c9b483e70ecd57b3cf7204db21f5a06f9ffe
+  git_clone_at "$ext/opengl-registry"          "$SKIA_GOOG/external/github.com/KhronosGroup/OpenGL-Registry"         14b80ebeab022b2c78f84a573f01028c96075553
+  git_clone_at "$ext/webgpu-headers"           "$CHROMIUM/external/github.com/webgpu-native/webgpu-headers"          706853a9da45b8e89b7ea005aa267294d115f8ce
+  git_clone_at "$ext/swiftshader"              "$SWIFTSHADER_URL"                                                    1e80438d2b93ef36a7c05f8d2b81233bac0e3d16
+}
+
+# Apply scripts/patches/*.patch to the Skia checkout — local fixes on top of
+# the pinned Skia (currently: Dawn-on-iOS support in third_party/dawn).
+# Idempotent: a patch whose reverse applies cleanly is already applied.
+apply_skia_patches() {
+  local patch_dir="$ROOT/scripts/patches"
+  [ -d "$patch_dir" ] || return 0
+  local patch
+  for patch in "$patch_dir"/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$SKIA" apply --check "$patch" 2>/dev/null; then
+      log "apply skia patch $(basename "$patch")"
+      git -C "$SKIA" apply "$patch"
+    elif git -C "$SKIA" apply --reverse --check "$patch" 2>/dev/null; then
+      log "skia patch $(basename "$patch") already applied"
+    else
+      die "scripts/patches/$(basename "$patch") does not apply to $SKIA @ $SKIA_PIN"
+    fi
+  done
+}
+
 fetch_skia() {
   git_clone_at "$SKIA" "$SKIA_URL" "$SKIA_PIN"
 
   # Minimal third_party/externals — pins from Skia's DEPS at $SKIA_PIN.
-  # Enough for graphite+ganesh+raster; no Dawn (Windows adds its own externals later).
+  # Enough for graphite+ganesh+raster; Dawn externals come from fetch_dawn.
   local ext="$SKIA/third_party/externals"
   git_clone_at "$ext/freetype"        "$CHROMIUM/chromium/src/third_party/freetype2.git"               264b5fbf5b912b39f98d038bf75d39be0a73f21b
   git_clone_at "$ext/harfbuzz"        "$CHROMIUM/external/github.com/harfbuzz/harfbuzz.git"           9cb1fee51069b206effb4736e443b038d230789d
@@ -99,6 +143,7 @@ fetch_skia() {
   git_clone_at "$ext/jinja2"          "$CHROMIUM/chromium/src/third_party/jinja2"                     c3027d884967773057bf74b957e3fea87e5df4d7
   git_clone_at "$ext/markupsafe"      "$CHROMIUM/chromium/src/third_party/markupsafe"                 4256084ae14175d38a3ff7d739dca83ae49ccec6
   git_clone_at "$ext/partition_alloc" "$CHROMIUM/chromium/src/base/allocator/partition_allocator.git" 03cc513177b4340bee3dbfd46f6dd5fdded43b79
+  apply_skia_patches
 }
 
 write_skia_args() {
@@ -245,7 +290,7 @@ build_skia() {
   log "gn gen out/$TAG"
   (cd "$SKIA" && ./bin/gn gen "out/$TAG")
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.a
 }
 
@@ -334,7 +379,7 @@ build_skia_wasm() {
   log "gn gen out/web-wasm"
   (cd "$SKIA" && ./bin/gn gen out/web-wasm)
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.wasm.a
 }
 
@@ -503,7 +548,7 @@ build_skia_android() {
   log "gn gen out/android-arm64"
   (cd "$SKIA" && ./bin/gn gen "out/android-arm64")
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.a
 }
 
@@ -545,10 +590,11 @@ build_android_arm64() {
 write_skia_args_ios() {
   local out="$1" sysroot="$2" sim="$3"
   if [ "$sim" = "1" ]; then
-    # Simulator: explicit sysroot (xcrun --sdk iphonesimulator). ios_min_target
-    # stays empty — Skia would otherwise add -miphoneos-version-min; the
-    # deployment target goes through the extra_* flags appended below.
-    # ios_use_simulator is not Skia's default for target_cpu = "arm64".
+    # Simulator: explicit sysroot (xcrun --sdk iphonesimulator).
+    # ios_min_target feeds Skia's -miphonesimulator-version-min and is forwarded
+    # to the Dawn CMake build (see scripts/patches/); the extra_* flags appended
+    # below repeat the deployment target in the -mios-simulator-version-min
+    # spelling. ios_use_simulator is not Skia's default for target_cpu="arm64".
     cat > "$out" <<EOF
 is_debug = false
 is_official_build = true
@@ -557,12 +603,12 @@ target_cpu = "arm64"
 target_os = "ios"
 ios_use_simulator = true
 xcode_sysroot = "$sysroot"
-ios_min_target = ""
+ios_min_target = "15.0"
 
 skia_use_metal = true
 skia_use_gl = true
 skia_use_vulkan = false
-skia_use_dawn = false
+skia_use_dawn = true
 skia_use_direct3d = false
 skia_use_x11 = false
 skia_use_egl = false
@@ -584,7 +630,7 @@ ios_min_target = "15.0"
 skia_use_metal = true
 skia_use_gl = true
 skia_use_vulkan = false
-skia_use_dawn = false
+skia_use_dawn = true
 skia_use_direct3d = false
 skia_use_x11 = false
 skia_use_egl = false
@@ -614,6 +660,7 @@ build_skia_ios() {
     return 0
   fi
   fetch_skia
+  fetch_dawn
   mkdir -p "$out"
   write_skia_args_ios "$out/args.gn" "" 0
   if [ ! -x "$SKIA/bin/gn" ]; then
@@ -622,8 +669,11 @@ build_skia_ios() {
   fi
   log "gn gen out/ios-arm64"
   (cd "$SKIA" && ./bin/gn gen "out/ios-arm64")
-  log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  log "ninja ($JOBS jobs) — the long step; Dawn's CMake build adds ~10-20 min on first run"
+  # build_dawn.py runs an inner ninja for Dawn; cap it (CMAKE_BUILD_PARALLEL_LEVEL)
+  # so outer + inner clang processes stay within a 16 GB host's memory budget.
+  CMAKE_BUILD_PARALLEL_LEVEL=$(( JOBS > 2 ? JOBS - 2 : 1 )) \
+    ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.a
 }
 
@@ -636,6 +686,7 @@ build_skia_ios_sim() {
   local sysroot
   sysroot="$(xcrun --sdk iphonesimulator --show-sdk-path)"
   fetch_skia
+  fetch_dawn
   mkdir -p "$out"
   write_skia_args_ios "$out/args.gn" "$sysroot" 1
   if [ ! -x "$SKIA/bin/gn" ]; then
@@ -644,8 +695,11 @@ build_skia_ios_sim() {
   fi
   log "gn gen out/ios-sim-arm64"
   (cd "$SKIA" && ./bin/gn gen "out/ios-sim-arm64")
-  log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
-  ninja -C "$out" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
+  log "ninja ($JOBS jobs) — the long step; Dawn's CMake build adds ~10-20 min on first run"
+  # build_dawn.py runs an inner ninja for Dawn; cap it (CMAKE_BUILD_PARALLEL_LEVEL)
+  # so outer + inner clang processes stay within a 16 GB host's memory budget.
+  CMAKE_BUILD_PARALLEL_LEVEL=$(( JOBS > 2 ? JOBS - 2 : 1 )) \
+    ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.a
 }
 

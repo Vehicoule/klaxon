@@ -1,0 +1,35 @@
+diff --git a/third_party/dawn/BUILD.gn b/third_party/dawn/BUILD.gn
+index 187722e..954b482 100644
+--- a/third_party/dawn/BUILD.gn
++++ b/third_party/dawn/BUILD.gn
+@@ -264,6 +264,30 @@ action("dawn_cmake") {
+       "--android_platform=android-" + ndk_api,
+     ]
+   }
++  if (is_ios) {
++    # Forward the SDK selection to build_dawn.py — CMake would otherwise
++    # default to the iphoneos SDK even for simulator builds. The sysroot is
++    # resolved the same way gn/skia/BUILD.gn does it (xcode_sysroot itself
++    # is not visible from this file).
++    if (ios_use_simulator) {
++      _dawn_ios_sysroot = exec_script("//gn/find_xcode_sysroot.py",
++                                      [ "iphonesimulator" ],
++                                      "trim string")
++    } else {
++      _dawn_ios_sysroot = exec_script("//gn/find_xcode_sysroot.py",
++                                      [ "iphoneos" ],
++                                      "trim string")
++    }
++    args += [
++      "--ios_sysroot=" + _dawn_ios_sysroot,
++      "--ios_min_target=" + ios_min_target,
++    ]
++    if (ios_use_simulator) {
++      args += [ "--ios_simulator=true" ]
++    } else {
++      args += [ "--ios_simulator=false" ]
++    }
++  }
+ 
+   if (dawn_enable_d3d11) {
+     args += [ "--dawn_enable_d3d11=true" ]

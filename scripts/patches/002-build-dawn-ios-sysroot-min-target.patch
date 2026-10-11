@@ -1,0 +1,45 @@
+diff --git a/third_party/dawn/build_dawn.py b/third_party/dawn/build_dawn.py
+index 414c95b..f673317 100644
+--- a/third_party/dawn/build_dawn.py
++++ b/third_party/dawn/build_dawn.py
+@@ -56,6 +56,16 @@ def main():
+       "--dawn_enable_metal", default="false", help="Enable Metal backend.")
+   parser.add_argument(
+       "--dawn_enable_vulkan", default="false", help="Enable Vulkan backend.")
++  parser.add_argument(
++      "--ios_sysroot",
++      default="",
++      help="Path to the iOS SDK (iphoneos or iphonesimulator).")
++  parser.add_argument(
++      "--ios_simulator",
++      default="false",
++      help="Build for the iOS simulator instead of the device.")
++  parser.add_argument(
++      "--ios_min_target", default="", help="iOS deployment target (e.g. 15.0).")
+   args = parser.parse_args()
+ 
+   cmake_exe = shutil.which("cmake")
+@@ -152,6 +162,23 @@ def main():
+     configure_cmd.append("-DTINT_BUILD_HLSL_WRITER=OFF")
+     cxx_flags.append("-w") # Silence warnings
+ 
++  if target_os == "iOS":
++    # CMake would otherwise default to the iphoneos (device) SDK even for
++    # simulator builds — pass the SDK explicitly, plus the deployment target
++    # (it sets __IPHONE_OS_VERSION_MIN_REQUIRED, which the Metal backend
++    # checks when picking GPU family APIs).
++    if args.ios_sysroot:
++      configure_cmd.append(f"-DCMAKE_OSX_SYSROOT={args.ios_sysroot}")
++    if args.ios_min_target:
++      configure_cmd.append(
++          f"-DCMAKE_OSX_DEPLOYMENT_TARGET={args.ios_min_target}")
++      if args.ios_simulator.lower() == "true":
++        version_min_flag = "-mios-simulator-version-min=" + args.ios_min_target
++      else:
++        version_min_flag = "-mios-version-min=" + args.ios_min_target
++      cxx_flags.append(version_min_flag)
++      ld_flags.append(version_min_flag)
++
+   if cxx_flags:
+     c_cxx_flags_str = " ".join(cxx_flags)
+     # -fno-rtti is not a valid C flag.

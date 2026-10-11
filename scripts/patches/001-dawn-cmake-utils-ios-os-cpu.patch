@@ -1,0 +1,18 @@
+diff --git a/third_party/dawn/cmake_utils.py b/third_party/dawn/cmake_utils.py
+index bc52645..eee3f5b 100644
+--- a/third_party/dawn/cmake_utils.py
++++ b/third_party/dawn/cmake_utils.py
+@@ -244,6 +244,13 @@ def get_cmake_os_cpu(os, cpu):
+   if os == "wasm":
+     return "wasm", "wasm"
+ 
++  if os == "ios":
++    target_cpu_map = {
++      "arm64": "arm64",
++      "x64": "x86_64",
++    }
++    return "iOS", target_cpu_map[cpu]
++
+   print("Unsupported OS")
+   sys.exit(1)
+ 
