@@ -430,7 +430,6 @@ const SceneRunner = struct {
                 _ = widgets.list_view.setScrollOffset(list, off);
             },
             .input_latency => {
-                const s: *LatState = @ptrCast(@alignCast(r.lat_node.?.state.?));
                 if (frame == r.lat_ev) {
                     // Synthetic pointer event (a tap on the responder box).
                     const b = r.lat_node.?.bounds;
@@ -438,10 +437,7 @@ const SceneRunner = struct {
                     r.router.?.dispatchPointer(r.root, .{ .phase = .down, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
                     r.router.?.dispatchPointer(r.root, .{ .phase = .up, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
                 }
-                if (r.lat_event_ns != 0 and s.painted_ns != 0 and r.extra.latency_ms == null) {
-                    r.extra.latency_ms = @as(f64, @floatFromInt(s.painted_ns - r.lat_event_ns)) / 1e6;
-                    r.extra.latency_frames = s.painted_frame - r.lat_ev + 1;
-                }
+                // Latency closes post-paint — see closeLatency (runFrames).
             },
             .pointer_storm => {
                 // 1000 hit-test queries over the tree — pure hit-test cost.
@@ -542,6 +538,7 @@ const SceneRunner = struct {
                 r.switch_resumes += 1;
                 r.resume_t0 = 0;
             }
+            r.closeLatency(); // input_latency: same-frame close-out
             if (i == 0) ttff_ms = @as(f64, @floatFromInt(t3 - start_ns)) / 1e6;
             if (i >= opts.warmup_frames) {
                 try frame_times.append(@as(f64, @floatFromInt(t3 - t0)) / 1e6);
@@ -672,6 +669,18 @@ const SceneRunner = struct {
         r.extra.n_max_60fps = n_max;
         // draw_calls_per_frame = last_n: one node paints N items (see header).
         return r.finishMetrics(frame_times.items, ttff_ms, total, last_n, devtools.readRssMb());
+    }
+
+    /// input_latency: close the event→paint window once the lit response has
+    /// painted. Runs after the frame's paint (not in tick — the responder
+    /// stamps painted_ns inside paint), so a run ending on the injected frame
+    /// still reports latency_frames/latency_ms. No-op for other scenes.
+    fn closeLatency(r: *SceneRunner) void {
+        if (r.scene != .input_latency or r.lat_event_ns == 0 or r.extra.latency_ms != null) return;
+        const s: *LatState = @ptrCast(@alignCast(r.lat_node.?.state.?));
+        if (s.painted_ns == 0) return;
+        r.extra.latency_ms = @as(f64, @floatFromInt(s.painted_ns - r.lat_event_ns)) / 1e6;
+        r.extra.latency_frames = s.painted_frame - r.lat_ev + 1;
     }
 
     /// Stats over the measured frames → Metrics (extras merged from r.extra).
@@ -2148,7 +2157,9 @@ fn buildBackdropScroll(r: *SceneRunner) !*Node {
 // --- scene: input_latency — synthetic event → frames to the visual response ---
 // A tap on the responder box lights it; latency_frames = painted_frame -
 // event_frame + 1 (the response paints inside the frame it was dispatched on
-// → 1), latency_ms = wall time dispatch → end of that paint.
+// → 1), latency_ms = wall time dispatch → end of that paint. The close-out
+// runs after the frame's paint (SceneRunner.closeLatency) — a run ending on
+// the injected frame still reports both fields.
 
 const LatState = struct {
     drive: *Drive,
@@ -2394,6 +2405,12 @@ test "bench: input_latency records the event→paint latency" {
     try std.testing.expect(m.extra.latency_ms != null);
     try std.testing.expectEqual(@as(u64, 1), m.extra.latency_frames.?); // paints the dispatch frame
     try std.testing.expect(m.extra.latency_ms.? >= 0);
+    // A run ending on the injected frame still reports latency — the close-out
+    // is post-paint, not next-frame tick (Devin review: frames=1 regression).
+    const one = try runSceneWithOpts(.input_latency, std.testing.allocator, .{ .frames = 1, .warmup_frames = 2, .width = 320, .height = 240 });
+    try std.testing.expect(one.extra.latency_ms != null);
+    try std.testing.expectEqual(@as(u64, 1), one.extra.latency_frames.?);
+    try std.testing.expect(one.extra.latency_ms.? >= 0);
 }
 
 test "bench: semantics_build reports nodes per frame" {
