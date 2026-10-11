@@ -515,8 +515,13 @@ pub const Host = struct {
         // macOS: the NSAccessibility bridge; Android: the TalkBack bridge
         // (kx_a11y_android.cpp attaches the delegate over JNI); Windows:
         // the UIA bridge (kx_a11y_win.cpp — a stub until the UIA provider
-        // lands; init/shutdown are still wired so the ABI is exercised).
-        if (builtin.os.tag == .macos or builtin.os.tag == .windows or is_android) {
+        // lands; init/shutdown are still wired so the ABI is exercised);
+        // Linux: the AT-SPI2 bridge (kx_a11y_linux.cpp — an AtkObject tree
+        // bridged onto the a11y bus by the stock at-spi2-atk adaptor; when no
+        // a11y bus is up — headless CI, no AT running — init is a no-op).
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows or
+            builtin.os.tag == .linux) // .linux covers android (is_android ⊆ .linux)
+        {
             kx.a11yInit(@ptrCast(root));
             defer kx.a11yShutdown();
         }

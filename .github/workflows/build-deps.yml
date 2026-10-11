@@ -62,13 +62,17 @@ jobs:
           echo "CXXFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
       - name: Linux prerequisites
         if: runner.os == 'Linux'
+        # atk/atspi dev packages aren't needed to BUILD Skia/SDL, but keep the
+        # runner able to compile the app too (kx_a11y_linux.cpp) — parity with
+        # ci.yml's apt-packages list.
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build clang libc++-dev libc++abi-dev \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev libxtst-dev \
             libwayland-dev wayland-protocols libxkbcommon-dev \
             libegl1-mesa-dev libgles2-mesa-dev \
-            libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
+            libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev \
+            libatk1.0-dev libatk-bridge2.0-dev libatspi2.0-dev
       - name: Windows prerequisites
         if: runner.os == 'Windows'
         run: command -v ninja >/dev/null || choco install -y ninja

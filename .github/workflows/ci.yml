@@ -56,12 +56,16 @@ jobs:
         with:
           cache-key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
           # Linux build deps: libc++ + X11/Wayland dev — SDL3 cmake requires them.
+          # libatk/libatk-bridge/libatspi dev: the Phase 3a a11y bridge
+          # (kx_a11y_linux.cpp) compiles against ATK/AT-SPI headers and links
+          # libatk + libatk-bridge via pkg-config.
           apt-packages: >-
             libc++-dev libc++abi-dev
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev libxtst-dev
             libwayland-dev wayland-protocols libxkbcommon-dev
             libegl1-mesa-dev libgles2-mesa-dev
             libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
+            libatk1.0-dev libatk-bridge2.0-dev libatspi2.0-dev
 
       - name: Build
         run: zig build
