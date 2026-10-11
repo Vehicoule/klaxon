@@ -619,7 +619,13 @@ const SceneRunner = struct {
             const t1 = sdl.c.SDL_GetTicksNS();
             try frame_times.append(@as(f64, @floatFromInt(t1 - t0)) / 1e6);
         }
-        return r.finishMetrics(frame_times.items, ttff_ms, opts.warmup_frames + 1 + measured, countPaintNodes(r.root), devtools.readRssMb());
+        const draw_calls = countPaintNodes(r.root, .{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(renderer.w),
+            .h = @floatFromInt(renderer.h),
+        });
+        return r.finishMetrics(frame_times.items, ttff_ms, opts.warmup_frames + 1 + measured, draw_calls, devtools.readRssMb());
     }
 
     /// Family B (ramp): stepped ladder — `warmup + min(frames, 20)` frames per
