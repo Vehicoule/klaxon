@@ -66,9 +66,10 @@ comptime {
 
 pub const AppKind = enum { hello, gallery };
 
-// Sélection d'app iOS : `gallery` pour l'instant (le switch `.hello` reste
-// pour un futur toggle de dev ; câbler -Dios-app dans build.zig si besoin).
-const ios_app: AppKind = .gallery;
+// Sélection d'app iOS : -Dios-app=gallery (défaut) | hello (build.zig
+// injecte la valeur via le module build_options — même pattern que
+// -Dios-backend).
+const ios_app: AppKind = if (std.mem.eql(u8, build_options.ios_app, "hello")) .hello else .gallery;
 
 const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
 
