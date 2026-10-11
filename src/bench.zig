@@ -258,8 +258,10 @@ const SceneRunner = struct {
         const bounds = Rect{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) };
         r.root.layout(bounds);
         if (opts.hide_scroll_content and r.scene == .gallery) {
-            // Counterfactual: painting only what the viewport would show
-            // (approximates a paint-time cull of the off-screen content).
+            // Counterfactual UPPER BOUND: hiding the whole scroll content
+            // column removes visible sections too — the resulting frame time
+            // is the ceiling of the savings an off-screen paint cull would
+            // realize, not an exact isolation (see PERF-INVESTIGATION.md).
             const sv = r.gallery.?.refs.scroll_view;
             if (sv.children.items.len > 0) sv.children.items[0].visible = false;
         }
@@ -329,14 +331,19 @@ const SceneRunner = struct {
         if (opts.phase_breakdown) {
             printPhaseBreakdown(r.scene, frame_times.items, tick_times.items, layout_times.items, paint_times.items, layout_passes, opts.warmup_frames);
         }
+        // Capture the measured-run metrics BEFORE the optional profile: its
+        // extra ticks allocate (scroll rows land in the arena) and would
+        // inflate rss_mb for this scene and the shared baseline of later ones.
+        const draw_calls = countPaintNodes(r.root);
+        const rss_mb = devtools.readRssMb();
         if (opts.paint_profile) try r.profilePaint(renderer, opts);
         return .{
             .fps = if (avg > 0) 1000.0 / avg else 0,
             .frame_time_avg_ms = avg,
             .frame_time_p50_ms = percentile(sorted, 50),
             .frame_time_p99_ms = percentile(sorted, 99),
-            .draw_calls_per_frame = countPaintNodes(r.root),
-            .rss_mb = @as(f64, devtools.readRssMb()),
+            .draw_calls_per_frame = draw_calls,
+            .rss_mb = @as(f64, rss_mb),
             .ttff_ms = ttff_ms,
             .frames_rendered = total,
         };
@@ -435,6 +442,7 @@ fn recordPaint(n: *Node, own_ns: u64, p: *ProfileCtx) void {
     const offscreen = !rectsIntersect(mapped, p.surf);
     const key = @intFromPtr(n.vtable);
     const gop = p.stats.getOrPut(key) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{};
     const st = gop.value_ptr;
     st.calls += 1;
     st.own_ns += own_ns;
@@ -621,15 +629,28 @@ fn printPaintProfile(scene: BenchScene, stats: *std.AutoHashMap(usize, VtStat), 
 /// C stdio + POSIX mkdir, same pattern as bench_main's writeFile/makePath.
 fn writeFrameTrace(dir: []const u8, scene: BenchScene, csv: []const u8) void {
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.csv", .{ dir, scene.name() }) catch return;
-    makePath(std.heap.page_allocator, dir) catch {};
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.csv", .{ dir, scene.name() }) catch {
+        std.debug.print("klaxon bench: frame trace skipped — path too long: {s}/{s}.csv\n", .{ dir, scene.name() });
+        return;
+    };
+    makePath(std.heap.page_allocator, dir) catch {
+        std.debug.print("klaxon bench: frame trace skipped — cannot create {s}\n", .{dir});
+        return;
+    };
     const path_z = std.heap.page_allocator.dupeSentinel(u8, path, 0) catch return;
     defer std.heap.page_allocator.free(path_z);
-    const f = std.c.fopen(path_z, "wb") orelse return;
+    const f = std.c.fopen(path_z, "wb") orelse {
+        std.debug.print("klaxon bench: frame trace failed — cannot open {s}\n", .{path});
+        return;
+    };
     defer _ = std.c.fclose(f);
     const header = "frame,tick_ms,layout_ms,paint_ms,total_ms,relayout,had_damage\n";
-    _ = std.c.fwrite(header.ptr, 1, header.len, f);
-    _ = std.c.fwrite(csv.ptr, 1, csv.len, f);
+    if (std.c.fwrite(header.ptr, 1, header.len, f) != header.len or
+        std.c.fwrite(csv.ptr, 1, csv.len, f) != csv.len)
+    {
+        std.debug.print("klaxon bench: frame trace truncated — write failed for {s}\n", .{path});
+        return;
+    }
     std.debug.print("klaxon bench: frame trace → {s}\n", .{path});
 }
 

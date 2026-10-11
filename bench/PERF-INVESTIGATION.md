@@ -116,6 +116,11 @@ Pull to refresh 0.28 · Input 0.27 · … (spread across all 33 sections)
 hidden): **0.11 ms/frame, 15 draw calls** vs 6.7 ms / 696. The ScrollView
 clips children to the viewport at the canvas level but still *walks and
 paints every node*; nearly all of the cost is below the fold.
+*Caveat:* hiding the whole content column also removes the sections that
+ARE inside the viewport — 0.11 ms is a lower bound on the remaining cost
+(i.e. an upper bound on the savings), not an exact isolation of
+off-screen paint. The real culling measurement is the before/after on the
+fixed engine.
 
 ### Root causes (engine — documented, not fixed)
 
