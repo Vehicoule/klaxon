@@ -1,0 +1,25 @@
+name: klaxon_bench
+description: "Klaxon bench — Flutter comparison runner (roadmap 4c.4): renders the 9 canonical Klaxon bench scenes and emits the Klaxon-compatible JSON report."
+# The following line prevents the package from being accidentally published
+# to pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+# The following section is specific to Flutter packages.
+flutter:
+  # The Material Icons font (Icons.star etc. in the scenes).
+  uses-material-design: true
