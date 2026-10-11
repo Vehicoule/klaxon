@@ -263,10 +263,11 @@ fn sliderDeinit(n: *Node) void {
 }
 
 /// The region own-paint can touch: the bounds plus the 40dp state layer,
-/// centered on the thumb — its cx runs [b.x + inset, b.x + b.w - inset], so
-/// the layer reaches (state_layer_size/2 - inset) past the horizontal edges,
-/// and past the vertical edges whenever the bounds are shorter than the
-/// layer (a constrained slider). Culling and damage both consult it.
+/// centered on the thumb — its cx runs [b.x + inset, b.x + inset + tw] with
+/// tw = max(0, b.w - 2*inset) like the paint path, so the layer reaches
+/// (state_layer_size/2 - inset) past the horizontal edges, and past the
+/// vertical edges whenever the bounds are shorter than the layer (a
+/// constrained slider). Culling and damage both consult it.
 fn sliderPaintBounds(n: *Node) Rect {
     const b = n.bounds;
     const cy = b.y + b.h / 2;
@@ -275,7 +276,7 @@ fn sliderPaintBounds(n: *Node) Rect {
     return .{
         .x = b.x + inset - state_layer_size / 2,
         .y = top,
-        .w = b.w - inset * 2 + state_layer_size,
+        .w = @max(0, b.w - inset * 2) + state_layer_size,
         .h = bottom - top,
     };
 }
