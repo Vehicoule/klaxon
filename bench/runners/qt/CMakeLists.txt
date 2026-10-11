@@ -13,6 +13,8 @@ find_package(Qt6 REQUIRED COMPONENTS Quick)
 qt_add_executable(klaxon_bench_qt
     src/main.cpp
     src/BenchDriver.h
+    src/BenchImageProvider.h
+    src/StarClipItem.h
     src/VideoItem.h
 )
 
