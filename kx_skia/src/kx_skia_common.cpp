@@ -340,7 +340,7 @@ const char* kx_backend_name(kx_backend backend) {
         case KX_BACKEND_GRAPHITE_VULKAN: return "graphite-vulkan";
         case KX_BACKEND_GANESH_GLES: return "ganesh-gles";
         case KX_BACKEND_GANESH_GL: return "ganesh-gl";
-        case KX_BACKEND_GRAPHITE_DAWN: return "graphite-dawn-d3d12";
+        case KX_BACKEND_GRAPHITE_DAWN: return "graphite-dawn";
         case KX_BACKEND_GRAPHITE_WEBGPU: return "graphite-webgpu";
         case KX_BACKEND_GANESH_WEBGL2: return "ganesh-webgl2";
         case KX_BACKEND_GANESH_METAL: return "ganesh-metal";

@@ -43,9 +43,28 @@
 #include "include/gpu/ganesh/mtl/GrMtlBackendSurface.h"
 #include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
 
+// Graphite Dawn (Metal) — Skia Graphite on Dawn's Metal backend (Phase 3e).
+// Same shape as the Graphite Metal path, but the device/queue/texture wrapping
+// go through Dawn (libdawn_combined.a): the recipe is skia's
+// tools/graphite/dawn/GraphiteDawnTestContext.cpp + dawn's SwapChainMTL.mm.
+#include "dawn/dawn_proc.h"
+#include "dawn/native/DawnNative.h"
+#include "dawn/native/MetalBackend.h"
+#include "webgpu/webgpu_cpp.h"
+#include "src/dawn/native/metal/TextureMTL.h"
+#include "src/dawn/native/metal/QueueMTL.h"
+#include "src/dawn/native/metal/CommandRecordingContext.h"
+#include "src/dawn/native/metal/Forward.h"
+#include "src/dawn/native/ObjectBase.h"
+#include "src/dawn/native/ChainUtils.h"
+#include "src/dawn/native/ToBackend.h"
+#include "include/gpu/graphite/dawn/DawnBackendContext.h"
+#include "include/gpu/graphite/dawn/DawnGraphiteTypes.h"
+
 #include <OpenGLES/ES3/gl.h>
 
 #include <memory>
+#include <vector>
 
 namespace kx {
 
@@ -58,6 +77,19 @@ struct GpuState {
     id<CAMetalDrawable> drawable = nil;
     id<MTLTexture> drawable_texture = nil;
     id<MTLCommandQueue> command_queue = nil;
+    // Graphite Dawn path (Dawn Metal backend): the graphite Context is the
+    // shared `context` field above; Dawn owns the device/queue/instance.
+    std::unique_ptr<dawn::native::Instance> dawn_instance;
+    wgpu::Instance dawn_wgpu_instance;
+    wgpu::Device dawn_device;
+    wgpu::Queue dawn_queue;
+    // Current frame's wrapped drawable: internal ref (dawn_tex) + wgpu-side
+    // ref (dawn_wgpu_tex). BackendTextures::MakeDawn does NOT retain the
+    // WGPUTexture — the frame surface retains its own; these two keep the
+    // wrapped texture alive until after submit (like the Metal path's
+    // drawable_texture).
+    dawn::Ref<dawn::native::metal::Texture> dawn_tex;
+    wgpu::Texture dawn_wgpu_tex;
     // Ganesh paths (GLES + Metal)
     sk_sp<GrDirectContext> dctx;
     SDL_Window* sdl_window = nullptr;
@@ -153,6 +185,63 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
         return true;
     }
 
+    if (backend == KX_BACKEND_GRAPHITE_DAWN) {
+        // Graphite Dawn: Skia Graphite on Dawn's Metal backend. The Metal
+        // view/layer/device setup above is shared; Dawn gets its own device
+        // (adapter picked by wgpu::BackendType::Metal) on the same MTLDevice
+        // and presents through its own queue (gpu_end_frame). Recipe:
+        // skia tools/graphite/dawn/GraphiteDawnTestContext.cpp.
+        DawnProcTable procs = dawn::native::GetProcs();
+        dawnProcSetProcs(&procs);
+        // TimedWaitAny: skia's Dawn backend waits on futures with a timeout
+        // (DawnGraphicsPipeline/DawnErrorChecker/DawnGraphiteUtils call
+        // instance.WaitAny with timeout > 0); without the feature every such
+        // wait errors out ("Timeout waits are either not enabled...") and
+        // async pipeline creation fails. Same requirement as skia's
+        // GraphiteDawnTestContext.
+        wgpu::InstanceDescriptor inst_desc{};
+        static const wgpu::InstanceFeatureName kTimedWaitAny = wgpu::InstanceFeatureName::TimedWaitAny;
+        inst_desc.requiredFeatureCount = 1;
+        inst_desc.requiredFeatures = &kTimedWaitAny;
+        state->dawn_instance = std::make_unique<dawn::native::Instance>(&inst_desc);
+        std::vector<dawn::native::Adapter> adapters = state->dawn_instance->EnumerateAdapters();
+        wgpu::Adapter matched;
+        for (const auto& adapter : adapters) {
+            wgpu::AdapterInfo props;
+            wgpu::Adapter(adapter.Get()).GetInfo(&props);
+            if (props.backendType == wgpu::BackendType::Metal) {
+                matched = wgpu::Adapter(adapter.Get());
+                break;
+            }
+        }
+        if (!matched) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
+        wgpu::DeviceDescriptor dev_desc;
+        dev_desc.SetDeviceLostCallback(
+            wgpu::CallbackMode::AllowSpontaneous,
+            [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+                SDL_Log("klaxon dawn: device lost (reason %d): %.*s",
+                        static_cast<int>(reason), static_cast<int>(message.length), message.data);
+            });
+        dev_desc.SetUncapturedErrorCallback(
+            [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView message) {
+                SDL_Log("klaxon dawn: device error (type %d): %.*s",
+                        static_cast<int>(type), static_cast<int>(message.length), message.data);
+            });
+        state->dawn_device = matched.CreateDevice(&dev_desc);
+        if (!state->dawn_device) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
+        state->dawn_queue = state->dawn_device.GetQueue();
+        state->dawn_wgpu_instance = wgpu::Instance(state->dawn_instance->Get());
+
+        skgpu::graphite::DawnBackendContext dawn_ctx;
+        dawn_ctx.fInstance = state->dawn_wgpu_instance;
+        dawn_ctx.fDevice = state->dawn_device;
+        dawn_ctx.fQueue = state->dawn_queue;
+        state->context = skgpu::graphite::ContextFactory::MakeDawn(dawn_ctx, skgpu::graphite::ContextOptions{});
+        if (!state->context) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
+        *out = state;
+        return true;
+    }
+
     // Graphite Metal path (default).
     id<MTLCommandQueue> queue = [device newCommandQueue];
 
@@ -177,12 +266,20 @@ void gpu_shutdown(GpuState* state) {
         state->dctx->flushAndSubmit(GrSyncCpu::kYes);
         state->dctx = nullptr;
     }
-    // Graphite Metal: submit + release the context.
+    // Graphite Metal / Dawn: submit + release the context.
     state->recorder.reset();
     if (state->context) {
         state->context->submit(skgpu::graphite::SyncToCpu::kYes);
         state->context.reset();
     }
+    // Graphite Dawn: release the wgpu device/queue + instance (after the
+    // graphite context — it holds refs to them).
+    state->dawn_wgpu_tex = nullptr;
+    state->dawn_tex = nullptr;
+    state->dawn_queue = nullptr;
+    state->dawn_device = nullptr;
+    state->dawn_wgpu_instance = nullptr;
+    state->dawn_instance.reset();
     if (state->metal_view) SDL_Metal_DestroyView(state->metal_view);
     delete state;
 }
@@ -251,6 +348,44 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
         return canvas;
     }
 
+    // Graphite Dawn path: wrap the layer's drawable texture as a wgpu texture
+    // through Dawn's Metal backend (dawn::native::metal::Texture::CreateWrapping
+    // — the SwapChainMTL pattern), then WrapBackendTexture like the Metal path.
+    if (state->backend == KX_BACKEND_GRAPHITE_DAWN) {
+        if (!state->context || !state->layer || !state->dawn_device) return nullptr;
+        state->drawable = [state->layer nextDrawable];
+        if (!state->drawable) return nullptr;
+        state->drawable_texture = state->drawable.texture;
+        dawn::native::metal::Device* dawn_dev =
+            dawn::native::metal::ToBackend(dawn::native::FromAPI(state->dawn_device.Get()));
+        dawn::native::TextureDescriptor tex_desc;
+        tex_desc.usage = wgpu::TextureUsage::RenderAttachment;
+        tex_desc.dimension = wgpu::TextureDimension::e2D;
+        tex_desc.size = {(uint32_t)state->width, (uint32_t)state->height, 1u};
+        tex_desc.format = wgpu::TextureFormat::BGRA8Unorm;
+        tex_desc.mipLevelCount = 1;
+        tex_desc.sampleCount = 1;
+        state->dawn_tex = dawn::native::metal::Texture::CreateWrapping(
+            dawn_dev, dawn::native::Unpack(&tex_desc),
+            dawn::NSPRef<id<MTLTexture>>(state->drawable_texture));
+        if (!state->dawn_tex) return nullptr;
+        state->dawn_wgpu_tex = wgpu::Texture(dawn::native::ToAPI(state->dawn_tex.Get()));
+        state->recorder = state->context->makeRecorder();
+        if (!state->recorder) return nullptr;
+        const skgpu::graphite::BackendTexture backend_tex =
+            skgpu::graphite::BackendTextures::MakeDawn(state->dawn_wgpu_tex.Get());
+        state->frame_surface = SkSurfaces::WrapBackendTexture(
+            state->recorder.get(), backend_tex, kBGRA_8888_SkColorType,
+            SkColorSpace::MakeSRGB(), nullptr);
+        if (!state->frame_surface) return nullptr;
+        // Same DPR model as the Graphite Metal path: point-space layout,
+        // pixel drawable — scale the canvas.
+        state->scale = layer_scale(state);
+        SkCanvas* canvas = state->frame_surface->getCanvas();
+        canvas->scale(state->scale, state->scale);
+        return canvas;
+    }
+
     // Graphite Metal path.
     if (!state->context || !state->layer) return nullptr;
     state->drawable = [state->layer nextDrawable];
@@ -307,6 +442,45 @@ void gpu_end_frame(GpuState* state) {
                 [cb presentDrawable:state->drawable];
                 [cb commit];
             }
+            state->drawable = nil;
+        }
+        return;
+    }
+
+    // Graphite Dawn path: snap + insert + submit like Graphite Metal, then
+    // present through DAWN's queue (presenting on Klaxon's own command_queue
+    // risks presenting before Dawn's GPU work lands).
+    if (state->backend == KX_BACKEND_GRAPHITE_DAWN) {
+        if (!state->context) return;
+        if (state->recorder) {
+            std::unique_ptr<skgpu::graphite::Recording> recording = state->recorder->snap();
+            if (recording) {
+                skgpu::graphite::InsertRecordingInfo info;
+                info.fRecording = recording.get();
+                info.fTargetSurface = state->frame_surface.get();
+                state->context->insertRecording(info);
+            }
+            state->recorder.reset();
+        }
+        // Synchronous submit (same as Graphite Metal): GPU work completes
+        // before we release the wrapped drawable texture.
+        state->context->submit(skgpu::graphite::SyncToCpu::kYes);
+        // Release the frame surface BEFORE presenting (same as Graphite
+        // Metal): the surface holds a BackendTexture referencing the wrapped
+        // drawable texture.
+        state->frame_surface = nullptr;
+        state->dawn_wgpu_tex = nullptr;
+        state->dawn_tex = nullptr;
+        state->drawable_texture = nil;
+        if (state->drawable) {
+            // Present through Dawn's queue (SwapChainMTL::PresentImpl): append
+            // presentDrawable to Dawn's pending command buffer and submit it.
+            dawn::native::metal::Queue* dawn_queue =
+                dawn::native::metal::ToBackend(dawn::native::FromAPI(state->dawn_queue.Get()));
+            dawn::native::metal::CommandRecordingContext* command_context =
+                dawn_queue->GetPendingCommandContext();
+            [command_context->GetCommands() presentDrawable:state->drawable];
+            (void)dawn_queue->SubmitPendingCommandBuffer();
             state->drawable = nil;
         }
         return;

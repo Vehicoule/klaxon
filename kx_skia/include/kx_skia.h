@@ -50,7 +50,7 @@ typedef enum kx_backend {
     KX_BACKEND_GRAPHITE_VULKAN = 2,  // Linux / Android (API >= 33)
     KX_BACKEND_GANESH_GLES = 3,      // Android fallback (API < 33)
     KX_BACKEND_GANESH_GL = 4,        // Linux / Windows fallback
-    KX_BACKEND_GRAPHITE_DAWN = 5,    // Windows (D3D12)
+    KX_BACKEND_GRAPHITE_DAWN = 5,    // Windows (D3D12) / iOS (Dawn Metal)
     KX_BACKEND_GRAPHITE_WEBGPU = 6,  // Web
     KX_BACKEND_GANESH_WEBGL2 = 7,    // Web fallback
     KX_BACKEND_GANESH_METAL = 8,     // macOS / iOS fallback (Ganesh Metal)

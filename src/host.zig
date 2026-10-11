@@ -71,11 +71,13 @@ fn displayScaleOf(window: *sdl.c.SDL_Window, layout_w: c_int, pixel_w: c_int) f3
 }
 
 /// iOS: the Graphite-Metal shim scales the frame canvas itself in
-/// gpu_begin_frame (Ganesh-Metal shares that path). Raster and Ganesh GLES
-/// do not — they rely on the host-side DPR scale in renderFrame.
+/// gpu_begin_frame (Ganesh-Metal and Graphite-Dawn share that path). Raster
+/// and Ganesh GLES do not — they rely on the host-side DPR scale in
+/// renderFrame.
 fn iosShimScalesCanvas(ctx: *kx.Ctx) bool {
     const b = kx.c.kx_backend_of(ctx);
-    return b == kx.c.KX_BACKEND_GRAPHITE_METAL or b == kx.c.KX_BACKEND_GANESH_METAL;
+    return b == kx.c.KX_BACKEND_GRAPHITE_METAL or b == kx.c.KX_BACKEND_GANESH_METAL or
+        b == kx.c.KX_BACKEND_GRAPHITE_DAWN;
 }
 
 /// Frame budget: 8.33 ms → 120 fps target (the metrics gate). The whole loop
@@ -203,8 +205,10 @@ pub const Host = struct {
         else if (is_ios)
             // HIGH_PIXEL_DENSITY: without it SDL_GetWindowSizeInPixels
             // reports points on iOS — the DPR model needs real pixels.
-            // METAL for Graphite Metal / Ganesh Metal, OPENGL for Ganesh GLES,
-            // neither for raster (SDL software renderer).
+            // METAL for Graphite Metal / Ganesh Metal / Graphite Dawn (all
+            // three attach an SDL_MetalView + CAMetalLayer; the Dawn shim
+            // presents through Dawn's queue on the same layer), OPENGL for
+            // Ganesh GLES, neither for raster (SDL software renderer).
             if (backend == kx.c.KX_BACKEND_RASTER)
                 sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
             else if (backend == kx.c.KX_BACKEND_GANESH_GLES)

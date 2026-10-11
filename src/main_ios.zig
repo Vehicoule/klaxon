@@ -33,11 +33,12 @@ const Host = host_mod.Host;
 const Node = ui.node.Node;
 
 /// Backend demandé via -Dios-backend (build.zig): graphite-metal (défaut),
-/// ganesh-gles, ganesh-metal, raster.
+/// ganesh-gles, ganesh-metal, graphite-dawn, raster.
 fn requestedBackend() kx.c.kx_backend {
     const name = build_options.ios_backend;
     if (std.mem.eql(u8, name, "ganesh-gles")) return kx.c.KX_BACKEND_GANESH_GLES;
     if (std.mem.eql(u8, name, "ganesh-metal")) return kx.c.KX_BACKEND_GANESH_METAL;
+    if (std.mem.eql(u8, name, "graphite-dawn")) return kx.c.KX_BACKEND_GRAPHITE_DAWN;
     if (std.mem.eql(u8, name, "raster")) return kx.c.KX_BACKEND_RASTER;
     return kx.c.KX_BACKEND_GRAPHITE_METAL;
 }
