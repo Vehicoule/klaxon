@@ -35,6 +35,18 @@ jobs:
             echo "Klaxon targets macOS arm64 only (no x64)."; exit 1
           fi
 
+      - name: arm64 toolchain fixes (gn x64-only; clang outline-atomics)
+        if: runner.arch == 'ARM64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y generate-ninja
+          echo "KLAXON_GN=$(command -v gn)" >> "$GITHUB_ENV"
+          # Ubuntu arm64 clang defaults to -moutline-atomics → cmake-built
+          # deps (SDL3, WAMR) would reference __aarch64_*_sync helpers that
+          # zig's bundled builtins don't provide.
+          echo "CFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
+
       - uses: ./.github/actions/setup-deps
         with:
           cache-key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
@@ -45,13 +57,6 @@ jobs:
             libwayland-dev wayland-protocols libxkbcommon-dev
             libegl1-mesa-dev libgles2-mesa-dev
             libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
-
-      - name: gn binary on arm64 (Skia's bin/fetch-gn ships x64 only)
-        if: runner.arch == 'ARM64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y generate-ninja
-          echo "KLAXON_GN=$(command -v gn)" >> "$GITHUB_ENV"
 
       - name: Build
         run: zig build

@@ -393,6 +393,16 @@ EOF
       ;;
   esac
   write_skia_args_common "$out"
+  if [ "$TAG" = "linux-arm64" ]; then
+    # Ubuntu arm64 clang defaults to -moutline-atomics: the .a calls
+    # __aarch64_*_sync helpers that zig's bundled builtins don't provide —
+    # inline the atomics instead. Last assignment wins (overrides common).
+    cat >> "$out" <<'EOF'
+
+extra_cflags = ["-mno-outline-atomics", "-Wno-error"]
+extra_cflags_cc = ["-mno-outline-atomics", "-Wno-error", "-stdlib=libc++"]
+EOF
+  fi
 }
 
 # Shared tail (icu/harfbuzz/freetype/png/zlib + module toggles) — identical
@@ -497,13 +507,18 @@ build_skia() {
   if [ "$SKIA_TARGET_OS" = "win" ]; then fetch_dawn; fi
   mkdir -p "$out"
   write_skia_args "$out/args.gn"
-  if [ ! -x "$SKIA/bin/gn" ] && [ ! -f "$SKIA/bin/gn.exe" ]; then
-    log "fetch gn binary (bin/fetch-gn)"
-    (cd "$SKIA" && python3 bin/fetch-gn)
+  local gn
+  if [ -n "${KLAXON_GN:-}" ]; then
+    gn="$KLAXON_GN" # e.g. Ubuntu arm64: bin/fetch-gn ships an x64-only binary
+  else
+    if [ ! -x "$SKIA/bin/gn" ] && [ ! -f "$SKIA/bin/gn.exe" ]; then
+      log "fetch gn binary (bin/fetch-gn)"
+      (cd "$SKIA" && python3 bin/fetch-gn)
+    fi
+    gn="$SKIA/bin/gn"
+    [ -f "$SKIA/bin/gn.exe" ] && gn="$SKIA/bin/gn.exe"
   fi
   log "gn gen out/$TAG"
-  local gn="$SKIA/bin/gn"
-  [ -f "$SKIA/bin/gn.exe" ] && gn="$SKIA/bin/gn.exe"
   (cd "$SKIA" && "$gn" gen "out/$TAG")
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run (Dawn adds ~10-20)"
   CMAKE_BUILD_PARALLEL_LEVEL=$(( JOBS > 2 ? JOBS - 2 : 1 )) \
@@ -621,14 +636,19 @@ build_skia_wasm() {
   ln -sfn "$DEPS/emsdk" "$emsdk_ext"
   mkdir -p "$out"
   write_skia_args_wasm "$out/args.gn"
-  if [ ! -x "$SKIA/bin/gn" ]; then
-    log "fetch gn binary (bin/fetch-gn)"
-    (cd "$SKIA" && python3 bin/fetch-gn)
+  if [ -n "${KLAXON_GN:-}" ]; then
+    GN="$KLAXON_GN"
+  else
+    if [ ! -x "$SKIA/bin/gn" ]; then
+      log "fetch gn binary (bin/fetch-gn)"
+      (cd "$SKIA" && python3 bin/fetch-gn)
+    fi
+    GN="$SKIA/bin/gn"
   fi
   log "activate emsdk for skia (bin/activate-emsdk)"
   (cd "$SKIA" && python3 bin/activate-emsdk)
   log "gn gen out/web-wasm"
-  (cd "$SKIA" && ./bin/gn gen out/web-wasm)
+  (cd "$SKIA" && "$GN" gen out/web-wasm)
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
   ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.wasm.a
@@ -792,12 +812,17 @@ build_skia_android() {
     eb744ea7a2b17040121b4bbb4d6f9e8a77e3cae7
   mkdir -p "$out"
   write_skia_args_android "$out/args.gn" "$ndk"
-  if [ ! -x "$SKIA/bin/gn" ]; then
-    log "fetch gn binary (bin/fetch-gn)"
-    (cd "$SKIA" && python3 bin/fetch-gn)
+  if [ -n "${KLAXON_GN:-}" ]; then
+    GN="$KLAXON_GN"
+  else
+    if [ ! -x "$SKIA/bin/gn" ]; then
+      log "fetch gn binary (bin/fetch-gn)"
+      (cd "$SKIA" && python3 bin/fetch-gn)
+    fi
+    GN="$SKIA/bin/gn"
   fi
   log "gn gen out/android-arm64"
-  (cd "$SKIA" && ./bin/gn gen "out/android-arm64")
+  (cd "$SKIA" && "$GN" gen "out/android-arm64")
   log "ninja ($JOBS jobs) — the long step, ~15-45 min on first run"
   ninja -C "$out" -j "$JOBS" skia modules/skparagraph:skparagraph modules/skshaper:skshaper
   ls -la "$out"/*.a
@@ -914,12 +939,17 @@ build_skia_ios() {
   fetch_dawn
   mkdir -p "$out"
   write_skia_args_ios "$out/args.gn" "" 0
-  if [ ! -x "$SKIA/bin/gn" ]; then
-    log "fetch gn binary (bin/fetch-gn)"
-    (cd "$SKIA" && python3 bin/fetch-gn)
+  if [ -n "${KLAXON_GN:-}" ]; then
+    GN="$KLAXON_GN"
+  else
+    if [ ! -x "$SKIA/bin/gn" ]; then
+      log "fetch gn binary (bin/fetch-gn)"
+      (cd "$SKIA" && python3 bin/fetch-gn)
+    fi
+    GN="$SKIA/bin/gn"
   fi
   log "gn gen out/ios-arm64"
-  (cd "$SKIA" && ./bin/gn gen "out/ios-arm64")
+  (cd "$SKIA" && "$GN" gen "out/ios-arm64")
   log "ninja ($JOBS jobs) — the long step; Dawn's CMake build adds ~10-20 min on first run"
   # build_dawn.py runs an inner ninja for Dawn; cap it (CMAKE_BUILD_PARALLEL_LEVEL)
   # so outer + inner clang processes stay within a 16 GB host's memory budget.
@@ -940,12 +970,17 @@ build_skia_ios_sim() {
   fetch_dawn
   mkdir -p "$out"
   write_skia_args_ios "$out/args.gn" "$sysroot" 1
-  if [ ! -x "$SKIA/bin/gn" ]; then
-    log "fetch gn binary (bin/fetch-gn)"
-    (cd "$SKIA" && python3 bin/fetch-gn)
+  if [ -n "${KLAXON_GN:-}" ]; then
+    GN="$KLAXON_GN"
+  else
+    if [ ! -x "$SKIA/bin/gn" ]; then
+      log "fetch gn binary (bin/fetch-gn)"
+      (cd "$SKIA" && python3 bin/fetch-gn)
+    fi
+    GN="$SKIA/bin/gn"
   fi
   log "gn gen out/ios-sim-arm64"
-  (cd "$SKIA" && ./bin/gn gen "out/ios-sim-arm64")
+  (cd "$SKIA" && "$GN" gen "out/ios-sim-arm64")
   log "ninja ($JOBS jobs) — the long step; Dawn's CMake build adds ~10-20 min on first run"
   # build_dawn.py runs an inner ninja for Dawn; cap it (CMAKE_BUILD_PARALLEL_LEVEL)
   # so outer + inner clang processes stay within a 16 GB host's memory budget.
