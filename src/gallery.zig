@@ -187,9 +187,9 @@ pub const Gallery = struct {
     tp_ok: *state.Signal(u32), // the time picker's OK counter
     cp_color: *state.Signal(u32), // the color picker's color (0xRRGGBBAA)
     cp_changed: *state.Signal(u32), // the color picker's change counter
-    ep_expanded: *state.Signal(bool),
+    ep_expanded: *state.Signal(bool), // the expansion panel's expanded state
     stepper_sig: *state.Signal(usize), // the stepper's current step (M3E section)
-    cal_selected: *state.Signal(?i64), // the calendar's selected day (M3E section) // the expansion panel's expanded state
+    cal_selected: *state.Signal(?i64), // the calendar's selected day (M3E section)
     /// App hook fired after a theme/platform rebuild (the app re-reads the
     /// platform tokens — e.g. host.cursors).
     on_platform_changed: ?state.Callback = null,
