@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const input_mod = @import("ui/input.zig");
 const host_mod = @import("host.zig");
 const gallery_mod = @import("gallery.zig");
+const sdl = @import("sdl.zig");
 
 // Phase 3d Android: the app is built as a static lib (build.zig android-lib)
 // and linked into libmain.so by CMake/NDK. SDLActivity loads libmain.so and
@@ -35,6 +36,7 @@ const max_frames: u64 = 600;
 const Options = struct {
     backend: kx.c.kx_backend,
     max_frames: u64 = max_frames,
+    ppm: ?[:0]const u8 = null,
 };
 
 fn optsFromArgs(args: std.process.Args) !Options {
@@ -42,6 +44,7 @@ fn optsFromArgs(args: std.process.Args) !Options {
     defer it.deinit();
     _ = it.next(); // exe name
     var backend: kx.c.kx_backend = kx.c.KX_BACKEND_RASTER;
+    var ppm: ?[:0]const u8 = null;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
@@ -51,9 +54,13 @@ fn optsFromArgs(args: std.process.Args) !Options {
             backend = kx.c.KX_BACKEND_GRAPHITE_VULKAN;
         } else if (std.mem.eql(u8, arg, "gl")) {
             backend = kx.c.KX_BACKEND_GANESH_GL;
+        } else if (std.mem.startsWith(u8, arg, "--ppm=")) {
+            // On Windows the iterator owns the converted arg storage — dupe
+            // the retained path so it survives `it.deinit()` (process-lifetime).
+            ppm = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}", .{arg["--ppm=".len..]}, 0);
         }
     }
-    return .{ .backend = backend };
+    return .{ .backend = backend, .ppm = ppm };
 }
 
 fn lerpChannel(a: u32, b: u32, shift: u5, t: f32) u32 {
@@ -94,8 +101,10 @@ fn galleryMain(opts: Options) !void {
     else
         debug_alloc.allocator();
 
-    var host = try host_mod.Host.init(allocator, width, height, opts.backend, null);
+    var host = try host_mod.Host.init(allocator, width, height, opts.backend, opts.ppm);
     defer host.deinit();
+    // Host.init's desktop window is titled "klaxon hello" — rename for the gallery.
+    _ = sdl.c.SDL_SetWindowTitle(host.window, "klaxon gallery");
     input_mod.setCurrent(&host.input); // the router is process-global (single-window P0)
     ui.anim.setCurrent(&host.timeline); // the animation timeline, same pattern
 
