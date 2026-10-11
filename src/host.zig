@@ -81,6 +81,11 @@ pub const Stats = struct {
     frames: u64 = 0,
     frame_time_ms: f32 = 0, // begin_frame → present (total frame)
     paint_time_ms: f32 = 0, // begin_frame → end_frame (drives frame_overrun)
+    /// Frame timeline breakdown (Phase 4a.4), all in ms.
+    layout_time_ms: f32 = 0, // the layout pass (0 when nothing re-laid-out)
+    record_time_ms: f32 = 0, // begin_frame → end_frame (record into the surface)
+    submit_time_ms: f32 = 0, // readback + texture update + render queue (raster)
+    present_time_ms: f32 = 0, // SDL_RenderPresent — the vsync wait (raster)
     backend: [*:0]const u8 = "unknown",
 };
 
@@ -272,6 +277,11 @@ pub const Host = struct {
         const inspector = try inspector_mod.Inspector.init(allocator);
         errdefer inspector.deinit();
 
+        // Memory ledger (Phase 4a.3): the raster pixel buffer is the
+        // renderer subsystem's tracked allocation (freed in deinit/resize).
+        var devtools = devtools_mod.DevTools{};
+        devtools.ledger.recordAlloc(.renderer, pixels.len);
+
         return .{
             .allocator = allocator,
             .window = window,
@@ -287,6 +297,7 @@ pub const Host = struct {
             .display_scale = display_scale,
             .ppm_path = ppm_path,
             .stats = .{ .backend = backend_name },
+            .devtools = devtools,
             .inspector = inspector,
             .input = .{},
             .timeline = anim.Timeline.init(allocator),
@@ -338,6 +349,7 @@ pub const Host = struct {
         if (host.gl_ctx) |ctx| _ = sdl.c.SDL_GL_DestroyContext(ctx);
         sdl.c.SDL_DestroyWindow(host.window);
         sdl.c.SDL_Quit();
+        host.devtools.ledger.recordFree(.renderer, host.pixels.len);
         host.allocator.free(host.pixels);
     }
 
@@ -472,7 +484,9 @@ pub const Host = struct {
 
     fn renderFrame(host: *Host, root: *Node) void {
         // Layout pass (Phase 1e): re-layout when sizes/structure changed.
-        // Layout moves content, so the frame repaints fully.
+        // Layout moves content, so the frame repaints fully. The pass is
+        // timed separately (Phase 4a.4 frame timeline).
+        const t_layout = sdl.c.SDL_GetTicksNS();
         if (root.layout_dirty) {
             root.layout(root.bounds);
             root.dirty = true;
@@ -480,6 +494,9 @@ pub const Host = struct {
             semantics_mod.notifyTreeDirty(); // the semantic tree may have changed
             // content moved under a stationary pointer: refresh hover (cursors)
             host.input.refreshHover(root);
+            host.stats.layout_time_ms = @as(f32, @floatFromInt(sdl.c.SDL_GetTicksNS() - t_layout)) / 1e6;
+        } else {
+            host.stats.layout_time_ms = 0;
         }
         host.frame_start_ns = sdl.c.SDL_GetTicksNS();
         kx.c.kx_begin_frame(host.ctx);
@@ -544,12 +561,26 @@ pub const Host = struct {
         if (is_android and host.display_scale != 1.0) kx.c.kx_restore(host.ctx);
         kx.c.kx_end_frame(host.ctx);
         const t_paint = sdl.c.SDL_GetTicksNS();
+        // Record phase (Phase 4a.4): begin_frame → end_frame — the same span
+        // paint_time_ms has always measured (kept for the FPS overlay and
+        // the frame_overrun signal).
+        host.stats.record_time_ms = @as(f32, @floatFromInt(t_paint - host.frame_start_ns)) / 1e6;
         root.clearDamage();
-        host.present();
+        host.present(); // fills submit_time_ms / present_time_ms (raster)
         const t1 = sdl.c.SDL_GetTicksNS();
         host.stats.frames += 1;
         host.stats.frame_time_ms = @as(f32, @floatFromInt(t1 - host.frame_start_ns)) / 1e6;
-        host.stats.paint_time_ms = @as(f32, @floatFromInt(t_paint - host.frame_start_ns)) / 1e6;
+        host.stats.paint_time_ms = host.stats.record_time_ms;
+        // Frame timeline sample (Phase 4a.4): only while the overlay is on —
+        // zero cost when off (the stats fields above update regardless).
+        if (host.devtools.enabled) {
+            host.devtools.timeline.record(
+                host.stats.layout_time_ms,
+                host.stats.record_time_ms,
+                host.stats.submit_time_ms,
+                host.stats.present_time_ms,
+            );
+        }
         // Frame budget signal (1e.7): low-priority animations pause on overrun.
         host.timeline.frame_overrun = host.stats.paint_time_ms > FRAME_BUDGET_MS;
         if (host.ppm_path != null and host.stats.frames == 30) host.dumpPpm();
@@ -832,6 +863,9 @@ pub const Host = struct {
             return;
         }
         kx.c.kx_resize(host.ctx, w, h);
+        // Memory ledger (Phase 4a.3): the pixel buffer is re-allocated —
+        // move its tracked bytes (renderer subsystem) to the new size.
+        host.devtools.ledger.recordFree(.renderer, host.pixels.len);
         host.allocator.free(host.pixels);
         // Fail-soft on OOM (an @panic here would pull std.debug into the
         // mobile compile — see log()): the next present skips the readback
@@ -840,6 +874,7 @@ pub const Host = struct {
             log("klaxon: out of memory", .{});
             break :blk &[_]u8{};
         };
+        host.devtools.ledger.recordAlloc(.renderer, host.pixels.len);
         if (host.texture) |t| {
             sdl.c.SDL_DestroyTexture(t);
             host.texture = sdl.c.SDL_CreateTexture(host.renderer.?, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, w, h);
@@ -861,14 +896,25 @@ pub const Host = struct {
     }
 
     fn present(host: *Host) void {
+        // Frame timeline (Phase 4a.4): the raster present splits into submit
+        // (readback + texture update + render-to-queue) and present (the
+        // SDL_RenderPresent vsync wait). GPU backends present inside
+        // kx_end_frame — both stay 0 there (record covers the whole span).
+        host.stats.submit_time_ms = 0;
+        host.stats.present_time_ms = 0;
         if (host.texture) |t| {
+            const t0 = sdl.c.SDL_GetTicksNS();
             var w: c_int = 0;
             var h: c_int = 0;
             if (kx.c.kx_readback_rgba(host.ctx, host.pixels.ptr, host.pixels.len, &w, &h)) {
                 _ = sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.width * 4);
                 if (host.renderer) |r| {
                     _ = sdl.c.SDL_RenderTexture(r, t, null, null);
+                    const t_submit = sdl.c.SDL_GetTicksNS();
                     _ = sdl.c.SDL_RenderPresent(r);
+                    const t_present = sdl.c.SDL_GetTicksNS();
+                    host.stats.submit_time_ms = @as(f32, @floatFromInt(t_submit - t0)) / 1e6;
+                    host.stats.present_time_ms = @as(f32, @floatFromInt(t_present - t_submit)) / 1e6;
                 }
             }
         }

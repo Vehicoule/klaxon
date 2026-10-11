@@ -10,6 +10,7 @@ const ui = @import("ui.zig");
 const input_mod = @import("ui/input.zig");
 const demo_mod = @import("demo.zig");
 const host_mod = @import("host.zig");
+const devtools_mod = @import("devtools.zig");
 
 // Phase 3f: on emscripten the browser owns the main thread — main() installs
 // the rAF loop (platform_wasm.runWasm) instead of the blocking host.run().
@@ -83,8 +84,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             fm.ring_offset = @import("theme.zig").light.platform.focus_ring_offset;
         }
 
+        // Memory ledger (Phase 4a.3): the demo tree's allocations are
+        // tracked under the wasm subsystem. Stable storage — main()'s stack
+        // unwinds (the rAF loop), so the tracker must not live on it.
+        const tracked_ptr = try stable.create(devtools_mod.TrackingAllocator);
+        tracked_ptr.* = .{ .ledger = &host_ptr.devtools.ledger, .subsystem = .wasm, .backing = stable };
         const demo_ptr = try stable.create(demo_mod.Demo);
-        demo_ptr.* = try demo_mod.buildTree(stable);
+        demo_ptr.* = try demo_mod.buildTree(tracked_ptr.allocator());
         // No defer demo.deinit(): same stable-storage rationale as the host.
         const root = demo_ptr.root;
 
@@ -117,7 +123,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         fm.ring_offset = @import("theme.zig").light.platform.focus_ring_offset;
     }
 
-    var demo = try demo_mod.buildTree(allocator);
+    // Memory ledger (Phase 4a.3): the widget tree's allocations are tracked
+    // under the ui subsystem (demo.deinit frees through the same tracker).
+    var tracked_ui: devtools_mod.TrackingAllocator = .{
+        .ledger = &host.devtools.ledger,
+        .subsystem = .ui,
+        .backing = allocator,
+    };
+    var demo = try demo_mod.buildTree(tracked_ui.allocator());
     defer demo.deinit();
     const root = demo.root;
 
