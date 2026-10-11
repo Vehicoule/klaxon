@@ -10,56 +10,149 @@ tr:nth-child(even){background:#f4f4fa}
 .meta{color:#666;font-size:.8rem}
 </style></head><body>
 <h1>Klaxon benchmarks — cross-framework report</h1>
-<p class='meta'>Generated 2026-10-11T13:16:41 — 3 frameworks, 9 scenes. fps = 1000/avg frame work time (unpaced).</p>
+<p class='meta'>Generated 2026-10-11T13:44:49 — 4 frameworks, 9 scenes. fps = 1000/avg frame work time (unpaced).</p>
 <h2>fps (higher is better)</h2><table><tr><th>scene</th>
+<th>compose</th>
 <th>flutter</th>
 <th>klaxon</th>
 <th>qt</th>
 </tr>
 <tr><td>hello</td>
+<td>23862.0 <span class='bar' style='width:97px'></span></td>
 <td>2565.1 <span class='bar' style='width:10px'></span></td>
 <td>16504.6 <span class='bar' style='width:67px'></span></td>
 <td>24491.4 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>scroll_10k</td>
+<td>732.1 <span class='bar' style='width:31px'></span></td>
 <td>1381.3 <span class='bar' style='width:59px'></span></td>
 <td>361.8 <span class='bar' style='width:15px'></span></td>
 <td>2319.6 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>text_cjk</td>
+<td>12727.5 <span class='bar' style='width:54px'></span></td>
 <td>2098.3 <span class='bar' style='width:8px'></span></td>
 <td>1903.9 <span class='bar' style='width:8px'></span></td>
 <td>23404.0 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>glass_blur</td>
+<td>3954.2 <span class='bar' style='width:54px'></span></td>
 <td>1400.4 <span class='bar' style='width:19px'></span></td>
 <td>335.3 <span class='bar' style='width:4px'></span></td>
 <td>7278.1 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>anim_100</td>
+<td>887.6 <span class='bar' style='width:66px'></span></td>
 <td>1328.5 <span class='bar' style='width:100px'></span></td>
 <td>719.1 <span class='bar' style='width:54px'></span></td>
 <td>372.4 <span class='bar' style='width:28px'></span></td>
 </tr>
 <tr><td>gallery</td>
+<td>4754.5 <span class='bar' style='width:29px'></span></td>
 <td>1330.5 <span class='bar' style='width:8px'></span></td>
 <td>19.3 <span class='bar' style='width:2px'></span></td>
 <td>16221.1 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>resize</td>
+<td>1280.1 <span class='bar' style='width:28px'></span></td>
 <td>1232.3 <span class='bar' style='width:27px'></span></td>
 <td>428.8 <span class='bar' style='width:9px'></span></td>
 <td>4488.2 <span class='bar' style='width:100px'></span></td>
 </tr>
 <tr><td>input_ime</td>
+<td>132.7 <span class='bar' style='width:14px'></span></td>
 <td>206.4 <span class='bar' style='width:23px'></span></td>
 <td>892.2 <span class='bar' style='width:100px'></span></td>
 <td>141.7 <span class='bar' style='width:15px'></span></td>
 </tr>
 <tr><td>video_playback</td>
-<td>1326.6 <span class='bar' style='width:61px'></span></td>
-<td>530.4 <span class='bar' style='width:24px'></span></td>
-<td>2157.0 <span class='bar' style='width:100px'></span></td>
+<td>2788.1 <span class='bar' style='width:100px'></span></td>
+<td>1326.6 <span class='bar' style='width:47px'></span></td>
+<td>530.4 <span class='bar' style='width:19px'></span></td>
+<td>2157.0 <span class='bar' style='width:77px'></span></td>
+</tr>
+</table>
+<h2>compose</h2>
+<p class='meta'>report: bench/results/compose/2026-10-11T11-33-15Z.json — 2026-10-11T11:33:15Z — binary 40.71 MB</p>
+<table><tr><th>scene</th>
+<th>fps</th>
+<th>avg ms</th>
+<th>p99 ms</th>
+<th>draws</th>
+<th>rss MB</th>
+<th>ttff ms</th>
+</tr>
+<tr><td>hello</td>
+<td>23862.0</td>
+<td>0.00</td>
+<td>0.10</td>
+<td>3</td>
+<td>109.1</td>
+<td>266.6</td>
+</tr>
+<tr><td>scroll_10k</td>
+<td>732.1</td>
+<td>1.40</td>
+<td>3.80</td>
+<td>55</td>
+<td>189.0</td>
+<td>125.3</td>
+</tr>
+<tr><td>text_cjk</td>
+<td>12727.5</td>
+<td>0.10</td>
+<td>0.10</td>
+<td>7</td>
+<td>197.5</td>
+<td>49.3</td>
+</tr>
+<tr><td>glass_blur</td>
+<td>3954.2</td>
+<td>0.30</td>
+<td>0.30</td>
+<td>21</td>
+<td>197.7</td>
+<td>24.5</td>
+</tr>
+<tr><td>anim_100</td>
+<td>887.6</td>
+<td>1.10</td>
+<td>1.80</td>
+<td>102</td>
+<td>220.2</td>
+<td>26.3</td>
+</tr>
+<tr><td>gallery</td>
+<td>4754.5</td>
+<td>0.20</td>
+<td>0.30</td>
+<td>187</td>
+<td>171.3</td>
+<td>205.7</td>
+</tr>
+<tr><td>resize</td>
+<td>1280.1</td>
+<td>0.80</td>
+<td>1.90</td>
+<td>50</td>
+<td>217.2</td>
+<td>26.1</td>
+</tr>
+<tr><td>input_ime</td>
+<td>132.7</td>
+<td>7.50</td>
+<td>14.20</td>
+<td>15</td>
+<td>655.5</td>
+<td>34.3</td>
+</tr>
+<tr><td>video_playback</td>
+<td>2788.1</td>
+<td>0.40</td>
+<td>0.80</td>
+<td>4</td>
+<td>767.6</td>
+<td>27.9</td>
 </tr>
 </table>
 <h2>flutter</h2>
