@@ -284,7 +284,13 @@ and shadow rasterization differ cross-platform; goldens assert structure + spec 
 
 ---
 
-## Phase 3 — Multi-platform (2-3 weeks)
+## Phase 3 — Multi-platform (2-3 weeks) — DONE except Windows (deferred)
+
+2026-10-11 status: Linux ✅ · macOS ✅ · Android arm64 ✅ (~150fps emulator,
+ganesh-gles) · iOS ✅ (simulator, 5 backends pixel-identical — see
+ARCHITECTURE.md) · WASM ✅ code / toolchain env to rebuild · Windows ❌
+deferred (Phase 3c). Android/iOS CI jobs exist but are `continue-on-error`
+until stable — making them required is part of the CI rework.
 
 ### 3a. Linux (x64 + arm64)
 
@@ -355,6 +361,13 @@ Rendering shim done in Phase 0. Remaining:
 ---
 
 ## Phase 4 — DevTools + Testing + Benchmarks (2 weeks)
+
+2026-10-11 status: 4a ✅ (overlay, inspector, memory ledger, frame timeline —
+F12/3-finger/`--devtools`) · 4b ✅ (723 unit + 144 golden; device-matrix gates
+pending real hardware) · 4c.1-4c.6 ✅ (9 scenes, `zig build bench`, Qt/Flutter/
+Compose runners, `bench/report.html`, published JSONs) — **note: the published
+`gallery` scene (19.3 fps, p99 114ms) is under investigation before results
+are treated as final** · 4c.7 conformance suite: pending · 4d P2 ✅ (80 widgets).
 
 ### 4a. DevTools
 

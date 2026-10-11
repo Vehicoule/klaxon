@@ -21,5 +21,7 @@ dist/
 # Android (Phase 3d)
 android/.gradle/
 android/app/build/
+android/app/.cxx/
+android/build/
 android/local.properties
 zig-out/android/

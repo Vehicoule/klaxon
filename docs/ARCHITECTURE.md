@@ -247,12 +247,20 @@ Static map platform→backend. **Never probing** (creators crash instead of retu
 | Platform | Primary | Fallback | Last resort |
 |---|---|---|---|
 | macOS (arm64) | graphite-metal | raster | — |
-| iOS (arm64) | graphite-metal | raster | — |
+| iOS (arm64) | graphite-metal | graphite-dawn → ganesh-metal → ganesh-gles | raster |
 | Android ≥ API 33 | graphite-vulkan | ganesh-gles | raster |
 | Android < API 33 | ganesh-gles | raster | — |
 | Linux x64/arm64 | graphite-vulkan | ganesh-gl | raster |
-| Windows x64 | graphite-dawn-d3d12 | dawn-vulkan → ganesh-gl | raster |
+| Windows x64/arm64 | graphite-dawn-d3d12 | dawn-vulkan → ganesh-gl | raster |
 | Web (WASM) | graphite-webgpu | ganesh-webgl2 | raster |
+
+Implemented + measured (iOS Simulator, 2026-10-11, `bench/results/ios-backends-20261011.json`):
+all five iOS backends render pixel-identical to graphite-metal within ~1%
+(graphite-metal 60fps/6.32ms · graphite-dawn 60fps/7.95ms · ganesh-metal
+60fps/3.16ms · ganesh-gles 12fps/79ms · raster <2fps — sim GLES↔Metal
+translation dominates). ganesh-gles is also the working path on the Android
+arm64 emulator (~150fps gallery). Windows and the iOS raster present path are
+still pending (Phase 3c).
 
 **No macOS x64.** Apple Silicon only.
 
