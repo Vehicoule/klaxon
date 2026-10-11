@@ -45,9 +45,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: arm64 toolchain fixes (gn x64-only; clang outline-atomics)
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y generate-ninja
+          echo "KLAXON_GN=$(command -v gn)" >> "$GITHUB_ENV"
+          # Ubuntu arm64 clang defaults to -moutline-atomics → cmake-built
+          # deps (SDL3, WAMR) would reference __aarch64_*_sync helpers that
+          # zig's bundled builtins don't provide.
+          echo "CFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
       - name: Linux prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build clang libc++-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang libc++-dev libc++abi-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libegl1-mesa-dev libgles2-mesa-dev \
+            libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
       - name: Build native deps
         run: scripts/fetch-deps.sh
       - name: Pack native bundle
