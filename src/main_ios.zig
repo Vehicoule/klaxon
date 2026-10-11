@@ -68,16 +68,16 @@ const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
 pub fn start() !*platform_ios.AppState {
     const stable = std.heap.page_allocator;
 
-    // Backend: Graphite-Metal (GPU), fallback raster si kx_create échoue.
+    // Backend: raster (CPU) — the iOS simulator's software Metal doesn't
+    // execute GPU commands (Graphite Metal records + submits but the
+    // drawable stays transparent). Raster with SDL software renderer is
+    // the reliable path on the simulator. On a real device, switch to
+    // KX_BACKEND_GRAPHITE_METAL for GPU rendering.
     const host_ptr = try stable.create(Host);
-    host_ptr.* = host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_GRAPHITE_METAL, null) catch |err| blk: {
+    host_ptr.* = host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null) catch |err| blk: {
         if (err == error.KxCreate) {
-            // SDL_Log (pas std.debug.print : sur iOS, Zig 0.17 std.debug.print
-            // passe par std.Io.Threaded, dont le vtable référence spawnDarwin →
-            // getDevNullFd → null_file.fd — NullFile n'a pas de champ fd sur
-            // iOS, bug std 0.17. SDL_Log écrit sur stderr/OSLog, sans std.Io).
-            sdl.c.SDL_Log("kx_create failed (Graphite-Metal), fallback raster");
-            break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null);
+            sdl.c.SDL_Log("kx_create failed (raster), fallback graphite-metal");
+            break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_GRAPHITE_METAL, null);
         }
         return err;
     };

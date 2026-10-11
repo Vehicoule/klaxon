@@ -179,7 +179,12 @@ pub const Host = struct {
         else if (is_ios)
             // HIGH_PIXEL_DENSITY: without it SDL_GetWindowSizeInPixels
             // reports points on iOS — the DPR model needs real pixels.
-            sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
+            // Raster: no OPENGL flag (simulator's GL is deprecated; SDL
+            // software renderer doesn't need a GL context).
+            if (backend == kx.c.KX_BACKEND_RASTER)
+                sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
+            else
+                sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else
             0;
         // Android: SDLActivity already created the window + surface before
@@ -201,10 +206,11 @@ pub const Host = struct {
             errdefer sdl.c.SDL_DestroyWindow(window);
         }
 
-        // Emscripten (wasm) + mobile: create the GL context and make it
+        // Emscripten (wasm) + mobile GPU: create the GL context and make it
         // current BEFORE kx.create — gpu_init checks SDL_GL_GetCurrentContext.
+        // iOS raster: no GL context (SDL software renderer).
         var gl_ctx: sdl.c.SDL_GLContext = null;
-        if (is_emscripten or is_mobile) {
+        if ((is_emscripten or is_mobile) and !(is_ios and backend == kx.c.KX_BACKEND_RASTER)) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);
             if (gl_ctx == null) {
                 log("SDL_GL_CreateContext failed: {s}", .{sdl.c.SDL_GetError()});
@@ -247,7 +253,11 @@ pub const Host = struct {
         // Raster presents through an SDL streaming texture; GPU backends present
         // inside the shim (onscreen surface attached to the window). Mobile:
         // no SDL renderer/texture — the GPU shim presents (Metal / EGL swap).
-        const renderer = if (!is_mobile and backend == kx.c.KX_BACKEND_RASTER)
+        // Exception: iOS + raster — the simulator's software Metal doesn't
+        // execute GPU commands, so raster with SDL software renderer is the
+        // reliable path on the iOS simulator.
+        const use_sdl_present = !is_mobile or (is_ios and backend == kx.c.KX_BACKEND_RASTER);
+        const renderer = if (use_sdl_present and backend == kx.c.KX_BACKEND_RASTER)
             sdl.c.SDL_CreateRenderer(window, null) orelse return error.SdlRenderer
         else
             null;
@@ -255,7 +265,7 @@ pub const Host = struct {
             if (renderer) |r| sdl.c.SDL_DestroyRenderer(r);
         }
 
-        const texture = if (is_mobile)
+        const texture = if (!use_sdl_present)
             null
         else if (renderer) |r|
             sdl.c.SDL_CreateTexture(r, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, width, height) orelse return error.SdlTexture
@@ -265,8 +275,9 @@ pub const Host = struct {
             if (texture) |t| sdl.c.SDL_DestroyTexture(t);
         }
 
-        // Mobile: no CPU pixel buffer (the GPU shim owns presentation).
-        const pixels: []u8 = if (is_mobile)
+        // Mobile GPU: no CPU pixel buffer (the GPU shim owns presentation).
+        // iOS raster: CPU pixel buffer for SDL texture upload.
+        const pixels: []u8 = if (!use_sdl_present)
             &[_]u8{}
         else
             try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4);
@@ -500,49 +511,14 @@ pub const Host = struct {
         }
         host.frame_start_ns = sdl.c.SDL_GetTicksNS();
         kx.c.kx_begin_frame(host.ctx);
-        // iOS simulator workaround: the full tree painting crashes with a
-        // use-after-free in SkRefCntBase::unref (Graphite Metal + raster both
-        // affected, crash is in the widget tree traversal, not the GPU
-        // backend). Paint a simple demo (clear + shapes + text) instead —
-        // this exercises the same draw paths (fill_rrect, text, gradient)
-        // without triggering the crash. The frame lifecycle (begin/end/present)
-        // is fully exercised and stable for 60+ frames.
-        if (is_ios) {
-            const w: f32 = @floatFromInt(host.width);
-            const h: f32 = @floatFromInt(host.height);
-            _ = h;
-            kx.c.kx_clear(host.ctx, 0x1A1A2EFF); // dark navy background (RRGGBBAA, opaque)
-            // Header bar
-            kx.c.kx_fill_rrect(host.ctx, 0, 0, w, 60, 0, 0x16213EFF);
-            kx.c.kx_draw_text(host.ctx, "Klaxon Gallery", 24, 40, 28, 0xE94560FF);
-            // Content cards
-            const card_y: f32 = 100;
-            kx.c.kx_fill_rrect(host.ctx, 24, card_y, w - 48, 120, 16, 0x0F3460FF);
-            kx.c.kx_draw_text(host.ctx, "iOS Simulator", 48, card_y + 50, 24, 0xFFFFFFFF);
-            kx.c.kx_draw_text(host.ctx, "Graphite Metal backend", 48, card_y + 90, 16, 0xAAAAAAFF);
-            // Gradient card
-            kx.c.kx_fill_rrect(host.ctx, 24, card_y + 140, w - 48, 80, 16, 0x533483FF);
-            const grad_colors = [_]u32{ 0xE94560FF, 0x0F3460FF };
-            kx.c.kx_fill_rrect_gradient(host.ctx, 48, card_y + 160, w - 96, 40, 8, 48, card_y + 180, w - 48, card_y + 180, &grad_colors, 2);
-            // Status text
-            kx.c.kx_draw_text(host.ctx, "Rendering stable on iOS simulator", 24, card_y + 250, 18, 0x4ECCA3FF);
-            kx.c.kx_end_frame(host.ctx);
-            root.clearDamage();
-            host.present();
-            const t1 = sdl.c.SDL_GetTicksNS();
-            host.stats.frames += 1;
-            host.stats.frame_time_ms = @as(f32, @floatFromInt(t1 - host.frame_start_ns)) / 1e6;
-            host.stats.paint_time_ms = host.stats.frame_time_ms;
-            host.timeline.frame_overrun = host.stats.paint_time_ms > FRAME_BUDGET_MS;
-            return;
-        }
         // Mobile (Phase 3d/3e): the canvas is pixel-sized (kx_create got
         // pixel_width/pixel_height) while the tree lays out in points —
         // Scale the point-space paint onto the pixel canvas (crisp on
-        // Retina). Android only — the iOS shim (kx_skia_ios.mm) already
-        // applies canvas->scale(DPR) in gpu_begin_frame; scaling here too
-        // would double the Retina factor.
-        if (is_android and host.display_scale != 1.0) {
+        // Retina). Android + iOS raster: the canvas is pixel-sized but the
+        // GPU shim's gpu_begin_frame scale only applies to GPU backends.
+        if (is_mobile and host.display_scale != 1.0 and
+            !(is_ios and kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER))
+        {
             kx.c.kx_save(host.ctx);
             kx.c.kx_scale(host.ctx, host.display_scale, host.display_scale);
         }
@@ -594,7 +570,9 @@ pub const Host = struct {
             host.devtools.recordFrame(host.stats.frame_time_ms);
             host.devtools.paint(host.ctx, host.width, host.height, &host.stats);
         }
-        if (is_android and host.display_scale != 1.0) kx.c.kx_restore(host.ctx);
+        if (is_mobile and host.display_scale != 1.0 and
+            !(is_ios and kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER))
+            kx.c.kx_restore(host.ctx);
         kx.c.kx_end_frame(host.ctx);
         const t_paint = sdl.c.SDL_GetTicksNS();
         // Record phase (Phase 4a.4): begin_frame → end_frame — the same span
@@ -652,6 +630,13 @@ pub const Host = struct {
     /// it from SDL_AppEvent (iOS dispatches events through the SDL main
     /// callbacks, not through this loop's drain).
     pub fn handleEvent(host: *Host, root: *Node, event: *sdl.c.SDL_Event) bool {
+        // iOS simulator: ignore QUIT/TERMINATING — the sim sends them when
+        // the simctl launch parent exits; the app should run until the OS
+        // kills it (mobile apps don't quit on their own).
+        if (is_ios and (event.type == sdl.c.SDL_EVENT_QUIT or event.type == sdl.c.SDL_EVENT_TERMINATING)) {
+            log("klaxon: ignoring event {d} on iOS", .{event.type});
+            return false;
+        }
         if (event.type == sdl.c.SDL_EVENT_QUIT) return true;
         // Mobile lifecycle (Phase 3d/3e): background/foreground gating plus
         // the low-memory / terminating notifications. On iOS these arrive
@@ -676,7 +661,15 @@ pub const Host = struct {
                     log("klaxon: low memory warning", .{});
                     return false;
                 },
-                sdl.c.SDL_EVENT_TERMINATING => return true,
+                sdl.c.SDL_EVENT_TERMINATING => {
+                    // iOS simulator sends TERMINATING when the simctl launch
+                    // parent exits — ignore it so the app keeps running.
+                    if (is_ios) {
+                        log("klaxon: ignoring SDL_EVENT_TERMINATING on iOS", .{});
+                        return false;
+                    }
+                    return true;
+                },
                 else => {},
             }
         }
