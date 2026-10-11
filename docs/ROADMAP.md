@@ -286,12 +286,14 @@ and shadow rasterization differ cross-platform; goldens assert structure + spec 
 
 ## Phase 3 — Multi-platform (2-3 weeks) — DONE except Windows (deferred)
 
-2026-10-11 status: Linux ✅ · macOS ✅ · Android arm64 ✅ (~150fps emulator,
-ganesh-gles) · iOS ✅ (simulator, 5 backends pixel-identical — see
-ARCHITECTURE.md) · WASM ✅ code / toolchain env to rebuild · Windows ❌
-deferred (Phase 3c). Android/iOS CI jobs are required merge gates (the CI
-rework removed their `continue-on-error`); the WASM job stays optional
-until the toolchain lands.
+2026-10-12 status: Linux ✅ (raster + ganesh-gl; graphite-vulkan in flight) ·
+macOS ✅ · Android arm64 ✅ (~150fps emulator, ganesh-gles) · iOS ✅
+(graphite-metal + raster only — see the backend contract in ARCHITECTURE.md) ·
+WASM ✅ (ganesh-webgl2; built + loaded locally; graphite-webgpu in flight) ·
+Windows ✅ code (dawn-d3d12 → dawn-vulkan → WGL → raster shim merged #66-70;
+CI runner lands with the windows-latest matrix PR). Android/iOS CI jobs are
+required merge gates (the CI rework removed their `continue-on-error`); the
+WASM job stays optional until the toolchain lands.
 
 ### 3a. Linux (x64 + arm64)
 
