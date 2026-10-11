@@ -187,6 +187,10 @@ pub const Host = struct {
         errdefer sdl.c.SDL_Quit();
         const t_sdl = sdl.c.SDL_GetTicksNS();
 
+        // PPM dumps go through kx_readback_rgba — raster surfaces only.
+        if (ppm_path != null and backend != kx.c.KX_BACKEND_RASTER)
+            log("warning: --ppm requires the raster backend; no PPM will be written", .{});
+
         // Emscripten (wasm) + mobile (Android/iOS): request a GLES (ES 3.0)
         // context before window creation — the GPU shims (kx_skia_wasm.cpp,
         // kx_skia_android.cpp) need a current GL context when kx.create
@@ -465,8 +469,10 @@ pub const Host = struct {
             return;
         }
         // macOS: the NSAccessibility bridge; Android: the TalkBack bridge
-        // (kx_a11y_android.cpp attaches the delegate over JNI).
-        if (builtin.os.tag == .macos or is_android) {
+        // (kx_a11y_android.cpp attaches the delegate over JNI); Windows:
+        // the UIA bridge (kx_a11y_win.cpp — a stub until the UIA provider
+        // lands; init/shutdown are still wired so the ABI is exercised).
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows or is_android) {
             kx.a11yInit(@ptrCast(root));
             defer kx.a11yShutdown();
         }

@@ -460,13 +460,10 @@ test "listView: 10k items render a frame fast (virtualized)" {
     var r = try golden.Renderer.init(std.testing.allocator, 100, 200);
     defer r.deinit();
     list.layout(.{ .x = 0, .y = 0, .w = 100, .h = 200 });
-    var ts0: std.c.timespec = undefined;
-    var ts1: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts0);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const t0 = std.Io.Clock.awake.now(io);
     r.paint(list, bg);
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts1);
-    const elapsed_ns: i128 = (@as(i128, ts1.sec) - @as(i128, ts0.sec)) * 1_000_000_000 +
-        (@as(i128, ts1.nsec) - @as(i128, ts0.nsec));
+    const elapsed_ns = t0.durationTo(std.Io.Clock.awake.now(io)).nanoseconds;
     const elapsed_ms: f32 = @as(f32, @floatFromInt(elapsed_ns)) / 1e6;
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();

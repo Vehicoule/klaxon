@@ -2,9 +2,20 @@
 // Builds the kx_skia C++/ObjC++ shim, links Skia + SDL3 (static, from deps/),
 // and builds the hello app. The deps tag must match scripts/fetch-deps.sh.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // On Windows the native default resolves to x86_64-windows-gnu (mingw
+    // ABI), whose libmingw32 CRT collides with the /MT MSVC objects our
+    // shims produce. Default to the MSVC ABI — libcmt's real crt0 then
+    // provides the entry point and runs the CRT init chain (heap, TLS,
+    // static ctors). Mirrors the platform/windows spike link recipe.
+    const target = b.standardTargetOptions(.{
+        .default_target = if (builtin.os.tag == .windows)
+            .{ .cpu_arch = builtin.cpu.arch, .os_tag = .windows, .abi = .msvc }
+        else
+            .{},
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     // Phase 3f: wasm32-emscripten web target (docs/specs/phase-3f-wasm-plan.md).
@@ -56,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/sdl_c.h"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     translate_sdl.addIncludePath(b.path("deps/SDL/include"));
 
@@ -63,7 +75,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("kx_skia/include/kx_skia.h"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    // Windows: skparagraph's ICU needs icudtl.dat next to the exe at runtime
+    // (staged by fetch-deps into the Skia out dir).
+    if (target.result.os.tag == .windows) {
+        const dat = b.fmt("deps/skia/out/{s}/icudtl.dat", .{tag});
+        b.getInstallStep().dependOn(&b.addInstallFile(b.path(dat), "bin/icudtl.dat").step);
+    }
 
     // --- hello app ---
     const exe = addApp(b, target, optimize, "hello", "src/main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
@@ -145,13 +164,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .link_libcpp = true,
+            .link_libcpp = !is_windows_local(target),
         }),
     });
     tests.root_module.addImport("sdl_c", translate_sdl.createModule());
     tests.root_module.addImport("kx_c", translate_kx.createModule());
     // Golden tests render through the shim: the test exe links the same runtime.
-    linkRuntime(b, tests.root_module, kx_skia, is_macos, tag);
+    linkRuntime(b, tests.root_module, kx_skia, target, is_macos, tag);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
@@ -166,13 +185,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .link_libcpp = true,
+            .link_libcpp = !is_windows_local(target),
         }),
         .test_runner = .{ .path = b.path("src/test_runner_golden.zig"), .mode = .simple },
     });
     golden_tests.root_module.addImport("sdl_c", translate_sdl.createModule());
     golden_tests.root_module.addImport("kx_c", translate_kx.createModule());
-    linkRuntime(b, golden_tests.root_module, kx_skia, is_macos, tag);
+    linkRuntime(b, golden_tests.root_module, kx_skia, target, is_macos, tag);
     const run_golden = b.addRunArtifact(golden_tests);
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
@@ -211,18 +230,22 @@ fn addKxSkia(
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .link_libcpp = true,
+            .link_libcpp = !is_windows_local(target),
         }),
     });
     const shim_flags = &[_][]const u8{
         "-std=c++20",  "-fno-exceptions", "-fno-rtti",
         "-DSK_GANESH", "-DSK_GRAPHITE",   "-DNDEBUG",
     };
-    kx_skia.root_module.addCSourceFiles(.{
-        .files = &.{"kx_skia/src/kx_skia_common.cpp"},
-        .flags = shim_flags,
-        .language = .cpp,
-    });
+    // On Windows, kx_skia_common.cpp goes through compileMsvcShims instead
+    // (MSVC STL ABI — see the .windows case below).
+    if (target.result.os.tag != .windows) {
+        kx_skia.root_module.addCSourceFiles(.{
+            .files = &.{"kx_skia/src/kx_skia_common.cpp"},
+            .flags = shim_flags,
+            .language = .cpp,
+        });
+    }
     switch (target.result.os.tag) {
         .macos => {
             kx_skia.root_module.addCSourceFiles(.{
@@ -241,6 +264,15 @@ fn addKxSkia(
             .flags = shim_flags,
             .language = .cpp,
         }),
+        .windows => {
+            // Compiled with MSVC cl.exe (not zig's clang): Skia/Dawn are
+            // built with MSVC and their headers exchange STL types
+            // (std::vector<Adapter>, wgpu::StringView) — a zig-libc++ shim
+            // would ABI-mismatch. Objects come from compileMsvcShims and are
+            // archived into libkx_skia like the other platforms' objects.
+            const objects = compileMsvcShims(b, target);
+            for (objects) |obj| kx_skia.root_module.addObjectFile(obj);
+        },
         else => @panic("no kx_skia platform impl for this OS yet (add kx_skia/src/kx_skia_<os>)"),
     }
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
@@ -275,12 +307,12 @@ fn addApp(
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .link_libcpp = true,
+            .link_libcpp = !is_windows_local(target),
         }),
     });
     exe.root_module.addImport("sdl_c", translate_sdl.createModule());
     exe.root_module.addImport("kx_c", translate_kx.createModule());
-    linkRuntime(b, exe.root_module, kx_skia, is_macos, tag);
+    linkRuntime(b, exe.root_module, kx_skia, target, is_macos, tag);
     return exe;
 }
 
@@ -290,11 +322,17 @@ fn linkRuntime(
     b: *std.Build,
     module: *std.Build.Module,
     kx_skia: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
     is_macos: bool,
     tag: []const u8,
 ) void {
+    const is_windows = std.mem.startsWith(u8, tag, "windows-");
     // SDL3 (static lib).
-    module.addObjectFile(b.path(b.fmt("deps/SDL/build-{s}/libSDL3.a", .{tag})));
+    if (is_windows) {
+        module.addObjectFile(b.path(b.fmt("deps/SDL/build-{s}/SDL3-static.lib", .{tag})));
+    } else {
+        module.addObjectFile(b.path(b.fmt("deps/SDL/build-{s}/libSDL3.a", .{tag})));
+    }
     if (is_macos) {
         inline for (.{
             "Cocoa",                  "IOKit",          "CoreVideo",      "CoreAudio",    "AudioToolbox", "AudioUnit",
@@ -305,16 +343,71 @@ fn linkRuntime(
         }
     }
 
-    // kx_skia shim + Skia static libs. The .a list is deterministic for our
-    // args.gn (scripts/fetch-deps.sh) — update both together if args.gn changes.
+    // kx_skia shim + Skia static libs. The .a/.lib lists are deterministic
+    // for our args.gn (scripts/fetch-deps.sh) — update both together if
+    // args.gn changes.
     module.linkLibrary(kx_skia);
     const skia_libs = [_][]const u8{
         "libfreetype2.a", "libharfbuzz.a",    "libicu.a",      "libpng.a",            "libskcms.a",
         "libskia.a",      "libskparagraph.a", "libskshaper.a", "libskunicode_core.a", "libskunicode_icu.a",
         "libzlib.a",
     };
-    for (skia_libs) |lib| {
-        module.addObjectFile(b.path(b.fmt("deps/skia/out/{s}/{s}", .{ tag, lib })));
+    const skia_libs_win = [_][]const u8{
+        // Order: dependents first (skia's graphite Dawn backend references
+        // dawn symbols; spirv_cross is referenced by the D3D12 backend).
+        "skia.lib",      "skparagraph.lib", "skshaper.lib",    "skunicode_core.lib",
+        "skunicode_icu.lib", "dawn_combined.lib", "spirv_cross.lib", "d3d12allocator.lib",
+        "harfbuzz.lib",  "icu.lib",         "freetype2.lib",   "libpng.lib",
+        "skcms.lib",     "zlib.lib",
+    };
+    if (is_windows) {
+        for (skia_libs_win) |lib| {
+            module.addObjectFile(b.path(b.fmt("deps/skia/out/{s}/{s}", .{ tag, lib })));
+        }
+        // System libs: D3D12/DXGI (graphite-dawn-d3d12), GL (ganesh-gl WGL),
+        // UIA (a11y bridge), plus SDL's own platform deps. Zig's bundled
+        // import-lib table doesn't cover all of these (d3dcompiler, dxguid,
+        // delayimp, ...), so point it at the real MSVC/WinSDK lib dirs —
+        // resolved names there take precedence over zig's bundled stubs.
+        const dirs = msvcLibDirs(b, target);
+        inline for (.{ dirs.vc, dirs.um, dirs.ucrt }) |d| {
+            module.addLibraryPath(.{ .cwd_relative = d });
+        }
+        // CRT: zig links this target as windows-gnu — lld ignores the
+        // /DEFAULTLIB records embedded in MSVC objects, so the /MT CRT libs
+        // (libcmt, libvcruntime, libcpmt, libucrt, oldnames) are linked
+        // positionally instead, exactly like the spike recipe. Keeping
+        // link_libc OFF on every module avoids zig's libmingw32, whose
+        // tlssup.obj duplicates libcmt's tlsdyn.obj.
+        for ([_][]const u8{ "dxguid.lib", "uuid.lib" }) |lib| {
+            module.addObjectFile(.{ .cwd_relative = b.fmt("{s}\\{s}", .{ dirs.um, lib }) });
+        }
+        for ([_][]const u8{ "libcmt.lib", "libvcruntime.lib", "libcpmt.lib", "delayimp.lib", "oldnames.lib" }) |lib| {
+            module.addObjectFile(.{ .cwd_relative = b.fmt("{s}\\{s}", .{ dirs.vc, lib }) });
+        }
+        for ([_][]const u8{ "libucrt.lib" }) |lib| {
+            module.addObjectFile(.{ .cwd_relative = b.fmt("{s}\\{s}", .{ dirs.ucrt, lib }) });
+        }
+        const win_libs = [_][]const u8{
+            // "delayimp", "dxguid" and "uuid" are in zig's isLibCLibName list
+            // for mingw targets — linkSystemLibrary would silently set
+            // link_libc, dragging libmingw32 in. They are linked positionally
+            // above alongside the CRT libs.
+            "d3d12",    "dxgi",       "d3dcompiler", "dxva2",
+            "opengl32", "gdi32",      "user32",      "kernel32",  "advapi32",
+            "ole32",    "oleaut32",   "dwmapi",      "ws2_32",
+            "imm32",    "version",     "setupapi",  "winmm",
+            "shell32",  "hid",        "cfgmgr32",    "uiautomationcore",
+            "dbghelp",
+            "onecore",
+        };
+        inline for (win_libs) |lib| {
+            module.linkSystemLibrary(lib, .{});
+        }
+    } else {
+        for (skia_libs) |lib| {
+            module.addObjectFile(b.path(b.fmt("deps/skia/out/{s}/{s}", .{ tag, lib })));
+        }
     }
     if (is_macos) {
         inline for (.{ "Metal", "Foundation", "CoreFoundation", "CoreGraphics", "CoreText", "QuartzCore", "IOSurface" }) |fw| {
@@ -767,4 +860,161 @@ fn addIosApp(
     ios_step.dependOn(&link.step);
     const ios_gallery_step = b.step("ios-gallery", "Build the iOS gallery app");
     ios_gallery_step.dependOn(&link.step);
+}
+
+/// Compile the kx_skia C++ shims with MSVC cl.exe (Windows only — see the
+/// .windows case in addKxSkia for why zig's clang is not used). vcvars64.bat
+/// is located through vswhere unless INCLUDE is already set (vcvars-loaded
+/// shell). Returns the produced .obj paths.
+fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std.Build.LazyPath {
+    const tag: []const u8 = if (target.result.cpu.arch == .x86_64) "windows-x64" else "windows-arm64";
+    const Shim = struct { src: []const u8, lean: bool };
+    const sources = [_]Shim{
+        .{ .src = "kx_skia/src/kx_skia_common.cpp", .lean = true },
+        .{ .src = "kx_skia/src/kx_skia_win.cpp", .lean = true },
+        // UIAutomationCore.h needs the ole2 types — no WIN32_LEAN_AND_MEAN.
+        .{ .src = "kx_skia/src/kx_a11y_win.cpp", .lean = false },
+    };
+    const vcvars = msvcVcvarsPath(b, target);
+    // Wrapper .bat: `cmd /c wrapper.bat <args>` forwards args via %* —
+    // args appended after a quoted `cmd /c "..."` string are ignored by cmd.
+    const wf = b.addWriteFiles();
+    const wrapper = wf.add("msvc-cl-wrapper.bat", if (vcvars.len == 0)
+        "@cl %*\r\n"
+    else
+        b.fmt("@call \"{s}\" >NUL 2>&1\r\n@cl %*\r\n", .{vcvars}));
+    var objs: std.ArrayList(std.Build.LazyPath) = .empty;
+    for (sources) |s| {
+        const run = b.addSystemCommand(&.{"cmd"});
+        run.addArg("/c");
+        run.addFileArg(wrapper);
+        run.addArg("/nologo");
+        run.addArg("/std:c++20");
+        run.addArg("/EHsc");
+        run.addArg("/O2");
+        run.addArg("/MT");
+        run.addArg("/bigobj");
+        run.addArg("/W3");
+        run.addArg("/DNDEBUG");
+        run.addArg("/D_CRT_SECURE_NO_WARNINGS");
+        run.addArg("/DNOMINMAX");
+        if (s.lean) run.addArg("/DWIN32_LEAN_AND_MEAN");
+        run.addArg("/DSK_GANESH");
+        run.addArg("/DSK_GRAPHITE");
+        inline for (.{ "kx_skia/include", "deps/skia", "deps/skia/include", "deps/SDL/include" }) |inc| {
+            run.addArg("/I" ++ inc);
+        }
+        // Dawn's checked-in headers + the cmake-generated webgpu_cpp.h.
+        run.addArg("/Ideps/skia/third_party/externals/dawn/include");
+        run.addArg(b.fmt("/Ideps/skia/out/{s}/cmake_dawn/gen/include", .{tag}));
+        run.addArg("/c");
+        run.addFileArg(b.path(s.src));
+        objs.append(b.allocator, run.addPrefixedOutputFileArg("/Fo:", b.fmt("{s}.obj", .{std.fs.path.stem(s.src)}))) catch @panic("OOM");
+    }
+    return objs.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// MSVC toolset lib dir + WinSDK um/ucrt lib dirs for the target arch.
+/// `zig build` runs steps with cwd = build root; returned paths are absolute.
+const WinLibDirs = struct { vc: []const u8, um: []const u8, ucrt: []const u8 };
+
+fn msvcLibDirs(b: *std.Build, target: std.Build.ResolvedTarget) WinLibDirs {
+    const io = b.graph.io;
+    const arch_dir: []const u8 = if (target.result.cpu.arch == .x86_64) "x64" else "arm64";
+    const vs_prefixes = [_][]const u8{
+        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\2022",
+    };
+    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
+    var vc_lib: ?[]const u8 = null;
+    outer: for (vs_prefixes) |p| for (editions) |e| {
+        const msvc_dir = b.fmt("{s}\\{s}\\VC\\Tools\\MSVC", .{ p, e });
+        const ver = newestSubdir(b, msvc_dir) orelse continue;
+        const cand = b.fmt("{s}\\{s}\\lib\\{s}", .{ msvc_dir, ver, arch_dir });
+        std.Io.Dir.accessAbsolute(io, cand, .{}) catch continue;
+        vc_lib = cand;
+        break :outer;
+    };
+    const sdk_lib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+    const sdk_ver = newestSubdir(b, sdk_lib) orelse
+        @panic("Windows SDK not found under C:\\Program Files (x86)\\Windows Kits\\10\\Lib");
+    return .{
+        .vc = vc_lib orelse @panic("MSVC toolset not found — install VS 2022 Build Tools (VCTools)"),
+        .um = b.fmt("{s}\\{s}\\um\\{s}", .{ sdk_lib, sdk_ver, arch_dir }),
+        .ucrt = b.fmt("{s}\\{s}\\ucrt\\{s}", .{ sdk_lib, sdk_ver, arch_dir }),
+    };
+}
+
+/// MSVC/WinSDK *include* dirs (VC toolset + um + ucrt + shared) for translate-c.
+const WinIncDirs = struct { vc: []const u8, um: []const u8, ucrt: []const u8, shared: []const u8 };
+
+fn msvcIncludeDirs(b: *std.Build, target: std.Build.ResolvedTarget) WinIncDirs {
+    _ = target;
+    const vs_prefixes = [_][]const u8{
+        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\2022",
+    };
+    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
+    var vc_inc: ?[]const u8 = null;
+    outer: for (vs_prefixes) |p| for (editions) |e| {
+        const msvc_dir = b.fmt("{s}\\{s}\\VC\\Tools\\MSVC", .{ p, e });
+        const ver = newestSubdir(b, msvc_dir) orelse continue;
+        const cand = b.fmt("{s}\\{s}\\include", .{ msvc_dir, ver });
+        std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
+        vc_inc = cand;
+        break :outer;
+    };
+    const sdk_inc = "C:\\Program Files (x86)\\Windows Kits\\10\\Include";
+    const sdk_ver = newestSubdir(b, sdk_inc) orelse
+        @panic("Windows SDK not found under C:\\Program Files (x86)\\Windows Kits\\10\\Include");
+    return .{
+        .vc = vc_inc orelse @panic("MSVC headers not found"),
+        .um = b.fmt("{s}\\{s}\\um", .{ sdk_inc, sdk_ver }),
+        .ucrt = b.fmt("{s}\\{s}\\ucrt", .{ sdk_inc, sdk_ver }),
+        .shared = b.fmt("{s}\\{s}\\shared", .{ sdk_inc, sdk_ver }),
+    };
+}
+
+/// Highest-sorting subdirectory name inside `dir`, or null if unreadable.
+fn newestSubdir(b: *std.Build, dir_path: []const u8) ?[]const u8 {
+    var dir = std.Io.Dir.openDirAbsolute(b.graph.io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(b.graph.io);
+    var it = dir.iterate();
+    var best: ?[]const u8 = null;
+    while (it.next(b.graph.io) catch null) |ent| {
+        if (ent.kind != .directory) continue;
+        if (best == null or std.mem.order(u8, ent.name, best.?) == .gt)
+            best = b.allocator.dupe(u8, ent.name) catch @panic("OOM");
+    }
+    return best;
+}
+
+/// Path to vcvars64.bat ("" when INCLUDE is already set — a vcvars shell).
+fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
+    if (b.graph.environ_map.get("INCLUDE")) |v| {
+        if (v.len > 0) return "";
+    }
+    // vcvars64 = host arch on both x64 and ARM64 native installs; crossing
+    // from an x64 host to aarch64 needs the amd64_arm64 variant instead.
+    const vcvars_name: []const u8 = if (target.result.cpu.arch == .aarch64 and
+        builtin.cpu.arch == .x86_64)
+        "vcvarsamd64_arm64.bat"
+    else
+        "vcvars64.bat";
+    // Probe the usual VS 2022 install layout (no vswhere subprocess).
+    const prefixes = [_][]const u8{
+        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\2022",
+    };
+    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
+    for (prefixes) |p| for (editions) |e| {
+        const cand = b.fmt("{s}\\{s}\\VC\\Auxiliary\\Build\\{s}", .{ p, e, vcvars_name });
+        std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
+        return cand;
+    };
+    @panic("MSVC not found: install VS 2022 Build Tools (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
+}
+
+fn is_windows_local(target: std.Build.ResolvedTarget) bool {
+    return target.result.os.tag == .windows;
 }
