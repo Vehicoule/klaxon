@@ -190,8 +190,14 @@ pub fn maxScrollOffset(n: *Node) f32 {
 /// benchmark drives this). Keeps the scroll offset + window position.
 pub fn reloadItems(n: *Node) void {
     const s = stateOf(ListState, n);
-    for (n.children.items) |child| child.deinit();
+    // deinit() detaches each child from n.children itself (the zombie sweep
+    // removes it), which mutates the array mid-iteration and leaves freed
+    // pointers in the tail slots — clear first, then snapshot-and-deinit.
+    // Zombie children early-return in deinit; their sweep frees them anyway.
+    const kids = std.heap.c_allocator.dupe(*Node, n.children.items) catch @panic("klaxon: out of memory");
+    defer std.heap.c_allocator.free(kids);
     n.children.clearRetainingCapacity();
+    for (kids) |child| child.deinit();
     if (s.scroll.viewport > 0) {
         const range = scroll_mod.visibleRange(s.opts.item_count, strideOf(s), s.scroll.viewport, s.scroll.offset, s.opts.margin);
         s.first = range.first;
