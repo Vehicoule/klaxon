@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    # chore/ci-rework: exercise the reworked jobs on the working branch
-    # before merge; drop this entry once the branch lands on main.
-    branches: [main, chore/ci-rework]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

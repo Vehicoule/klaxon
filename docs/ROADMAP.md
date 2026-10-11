@@ -289,8 +289,9 @@ and shadow rasterization differ cross-platform; goldens assert structure + spec 
 2026-10-11 status: Linux ✅ · macOS ✅ · Android arm64 ✅ (~150fps emulator,
 ganesh-gles) · iOS ✅ (simulator, 5 backends pixel-identical — see
 ARCHITECTURE.md) · WASM ✅ code / toolchain env to rebuild · Windows ❌
-deferred (Phase 3c). Android/iOS CI jobs exist but are `continue-on-error`
-until stable — making them required is part of the CI rework.
+deferred (Phase 3c). Android/iOS CI jobs are required merge gates (the CI
+rework removed their `continue-on-error`); the WASM job stays optional
+until the toolchain lands.
 
 ### 3a. Linux (x64 + arm64)
 
