@@ -396,11 +396,12 @@ EOF
   if [ "$TAG" = "linux-arm64" ]; then
     # Ubuntu arm64 clang defaults to -moutline-atomics: the .a calls
     # __aarch64_*_sync helpers that zig's bundled builtins don't provide —
-    # inline the atomics instead. Last assignment wins (overrides common).
+    # inline the atomics instead. Appends to common's lists (GN forbids
+    # re-assigning a nonempty list).
     cat >> "$out" <<'EOF'
 
-extra_cflags = ["-mno-outline-atomics", "-Wno-error"]
-extra_cflags_cc = ["-mno-outline-atomics", "-Wno-error", "-stdlib=libc++"]
+extra_cflags += ["-mno-outline-atomics"]
+extra_cflags_cc += ["-mno-outline-atomics"]
 EOF
   fi
 }
