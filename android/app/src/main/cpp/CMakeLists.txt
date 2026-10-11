@@ -51,10 +51,22 @@ target_include_directories(main PRIVATE
     "${KLAXON_ROOT}/deps/skia/include"
     "${KLAXON_ROOT}/deps/SDL/include")
 
-# Same flags as the Zig-built shim (shim_flags in build.zig).
+# Same flags as the Zig-built shim (shim_flags in build.zig). SK_GRAPHITE
+# stays: the Android Skia build keeps Graphite + Vulkan — Graphite Vulkan is
+# the planned primary backend on recent devices (API >= 33, Impeller-Vulkan-
+# style), with the Ganesh GLES shim as today's path (scripts/fetch-deps.sh).
 target_compile_options(main PRIVATE
     -std=c++20 -fno-exceptions -fno-rtti
+    -ffunction-sections -fdata-sections
     -DSK_GANESH -DSK_GRAPHITE -DSK_GL -DNDEBUG)
+
+# Section GC (Phase 4e.1, binary size): drop unreferenced sections from the
+# linked objects — with -ffunction-sections/-fdata-sections on our TUs (Skia
+# official-build objects already carry them), this prunes what the final
+# .so never calls. Safe for libmain.so: SDL_main stays exported (default
+# visibility), so SDLActivity's dlsym finds it. Measure the effect with
+# scripts/size-report.sh on the built libmain.so.
+target_link_options(main PRIVATE -Wl,--gc-sections)
 
 # --whole-archive: SDL_main is exported but referenced by nobody at link
 # time — without it the linker would drop the archive member defining it.

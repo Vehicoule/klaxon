@@ -33,6 +33,11 @@
 //           gradient fill clipped to a rounded rect — the color picker's SV
 //           square overlays + hue slider; no shader type crosses this
 //           boundary).
+//   0.11.0 — Phase 4e.1: + kx_gpu_warmup (compile the framework's op set
+//           into a small offscreen GPU surface and submit, so the first real
+//           frames do not pay one-time program compilation — retail frame
+//           p99 was dominated by first-frames shader-compile jank). Purely
+//           additive: no existing entry point changed.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -155,6 +160,17 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
 // into dst. dst_size must be >= width*height*4. Returns false on GPU backends
 // (async readback lands in Phase 1) or on failure.
 bool kx_readback_rgba(kx_ctx* ctx, void* dst, size_t dst_size, int* out_width, int* out_height);
+
+// GPU warmup (added in 0.11.0, Phase 4e.1): draw the framework's full op set
+// (fills, rrects, gradients, text, images, layers, clips) into a small
+// offscreen GPU surface and submit — the one-time shader/pipeline program
+// compilation for those ops then lands HERE, not inside the first real
+// frames (retail frame p99 on GLES was dominated by first-frames compile
+// jank). No-op returning true on raster (nothing to pre-compile). Call
+// OUTSIDE begin/end_frame — the host calls it right after the first present,
+// so TTFF is unaffected. Returns false when the backend cannot warm up
+// (surface creation failure, or a platform without an offscreen path yet).
+bool kx_gpu_warmup(kx_ctx* ctx);
 
 // Introspection.
 kx_backend kx_backend_of(const kx_ctx* ctx);

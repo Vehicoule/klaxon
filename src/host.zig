@@ -164,6 +164,9 @@ pub const Host = struct {
     fps_log_ns: i128 = 0,
     /// Mobile benchmark aid: sum of frame work times over the current window.
     fps_log_time_sum: f32 = 0,
+    /// GPU warmup (Phase 4e.1): kx_gpu_warmup ran once (after the first
+    /// present). False until then; raster backends skip the call entirely.
+    gpu_warmed: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -172,11 +175,16 @@ pub const Host = struct {
         backend: kx.c.kx_backend,
         ppm_path: ?[:0]const u8,
     ) !Host {
+        // Init stage timing (Phase 4e.1): retail TTFF is 126 ms against a
+        // < 20 ms budget; this one log line localizes the cost (SDL vs
+        // window vs GL context vs Skia init) on the next device run.
+        const t_init = sdl.c.SDL_GetTicksNS();
         if (!sdl.c.SDL_Init(sdl.c.SDL_INIT_VIDEO)) {
             log("SDL_Init failed: {s}", .{sdl.c.SDL_GetError()});
             return error.SdlInit;
         }
         errdefer sdl.c.SDL_Quit();
+        const t_sdl = sdl.c.SDL_GetTicksNS();
 
         // Emscripten (wasm) + mobile (Android/iOS): request a GLES (ES 3.0)
         // context before window creation — the GPU shims (kx_skia_wasm.cpp,
@@ -269,6 +277,7 @@ pub const Host = struct {
         if (!is_android or android_owns_window) {
             errdefer sdl.c.SDL_DestroyWindow(window);
         }
+        const t_win = sdl.c.SDL_GetTicksNS();
 
         // Emscripten (wasm) + mobile GPU: create the GL context and make it
         // current BEFORE kx.create — gpu_init checks SDL_GL_GetCurrentContext.
@@ -290,6 +299,7 @@ pub const Host = struct {
         errdefer {
             if (gl_ctx) |ctx| _ = sdl.c.SDL_GL_DestroyContext(ctx);
         }
+        const t_gl = sdl.c.SDL_GetTicksNS();
 
         // Text input events flow from window creation (TextField focus is
         // managed by the input router; refine per-platform later). Mobile:
@@ -317,6 +327,13 @@ pub const Host = struct {
             return error.KxCreate;
         };
         errdefer kx.c.kx_destroy(ctx);
+        const t_kx = sdl.c.SDL_GetTicksNS();
+        log("init stages: sdl {d:.1} ms, window {d:.1} ms, gl-ctx {d:.1} ms, kx-create {d:.1} ms", .{
+            @as(f32, @floatFromInt(t_sdl - t_init)) / 1e6,
+            @as(f32, @floatFromInt(t_win - t_sdl)) / 1e6,
+            @as(f32, @floatFromInt(t_gl - t_win)) / 1e6,
+            @as(f32, @floatFromInt(t_kx - t_gl)) / 1e6,
+        });
 
         // Raster presents through an SDL streaming texture; GPU backends present
         // inside the shim (onscreen surface attached to the window). Mobile:
@@ -702,6 +719,32 @@ pub const Host = struct {
                 root.dirty = true; // keep rendering until mapped
             } else if (sdl.c.SDL_GetTicksNS() - @as(u64, @intCast(host.ios_mapped_ns)) < 200_000_000) {
                 root.dirty = true; // 200ms grace after mapping
+            }
+        }
+
+        // GPU warmup (Phase 4e.1): right after the first present (TTFF is
+        // measured run-start -> first frame, so it stays untouched), pre-
+        // compile the backend's programs for the framework's op set into a
+        // small offscreen surface. The one-time compile lands in THIS call —
+        // outside every frame's timed span — instead of inside the first
+        // real frames (retail frame p99 was dominated by first-frames
+        // shader-compile jank). Raster backends pre-compile nothing (the
+        // call is a no-op returning true).
+        // Emscripten: the browser composites only AFTER the rAF callback
+        // returns, so warming inside callback 1 delays the first VISIBLE
+        // frame — wait for callback 2 (stats.frames counts rendered frames:
+        // reaching 2 means callback 1 fully returned and composited).
+        const warmup_due = !is_emscripten or host.stats.frames >= 2;
+        if (!host.gpu_warmed and warmup_due) {
+            host.gpu_warmed = true;
+            if (kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER) {
+                const t_warm = sdl.c.SDL_GetTicksNS();
+                if (kx.c.kx_gpu_warmup(host.ctx)) {
+                    const warm_ms = @as(f32, @floatFromInt(sdl.c.SDL_GetTicksNS() - t_warm)) / 1e6;
+                    log("gpu warmup: {d:.1} ms — programs pre-compiled ({s})", .{ warm_ms, host.stats.backend });
+                } else {
+                    log("gpu warmup: no offscreen path on this backend yet ({s}) — first frames may jank once", .{host.stats.backend});
+                }
             }
         }
     }

@@ -146,8 +146,8 @@ pub fn imageDraw(ctx: *kx.Ctx, id: u64, x: f32, y: f32, w: f32, h: f32) void {
 
 // --- tests ---
 
-test "kx ABI version reports 0.10.0 (the fill_rrect_gradient entry)" {
-    try std.testing.expectEqualStrings("0.10.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.11.0 (the gpu_warmup entry)" {
+    try std.testing.expectEqualStrings("0.11.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "paint constructors: fill keeps the defaults, stroke carries color + width" {
