@@ -64,6 +64,18 @@ pub fn rectOverlaps(a: Rect, b: Rect) bool {
         a.y < b.y + b.h and b.y < a.y + a.h;
 }
 
+/// Normalize a rect to positive extents: a map_paint_rect hook under a
+/// negative scale (a mirrored AnimatedScale) flips w/h negative; the
+/// callers' overlap/intersect tests require positive extents.
+pub fn rectNormalize(r: Rect) Rect {
+    return .{
+        .x = @min(r.x, r.x + r.w),
+        .y = @min(r.y, r.y + r.h),
+        .w = @abs(r.w),
+        .h = @abs(r.h),
+    };
+}
+
 /// Pointer cursor shapes (Phase 2d-0.5): the host maps the hovered node to
 /// a system cursor on desktop (SDL). A widget overrides via VTable.cursor;
 /// otherwise the semantic role decides (.button/.link → hand, .text_field →
@@ -426,7 +438,7 @@ pub const Node = struct {
         var r = rect;
         var n = node;
         while (n.parent) |p| {
-            if (p.vtable.map_paint_rect) |m| r = m(p, r);
+            if (p.vtable.map_paint_rect) |m| r = rectNormalize(m(p, r));
             n = p;
         }
         return r;
@@ -950,6 +962,28 @@ test "mapRectToRoot applies every transformed ancestor's map_paint_rect" {
     defer free_leaf.deinit();
     const r2 = free_leaf.mapRectToRoot(.{ .x = 1, .y = 2, .w = 3, .h = 4 });
     try std.testing.expectEqual(Rect{ .x = 1, .y = 2, .w = 3, .h = 4 }, r2);
+}
+
+const mirror_paint_vtable = blk: {
+    var vt = test_vtable;
+    vt.map_paint_rect = struct {
+        fn m(_: *Node, rect: Rect) Rect {
+            // mirror around x=50 (an AnimatedScale with factor -1)
+            return .{ .x = 50 + (rect.x - 50) * -1, .y = rect.y, .w = rect.w * -1, .h = rect.h };
+        }
+    }.m;
+    break :blk vt;
+};
+
+test "mapRectToRoot normalizes mirrored (negative-scale) rects" {
+    const root = try testNode(300, 300);
+    defer root.deinit();
+    root.vtable = &mirror_paint_vtable;
+    const leaf = try testNode(10, 10);
+    root.add(leaf);
+    // rect 60..80 mirrors to 20..40 (negative extent pre-normalization)
+    const r = leaf.mapRectToRoot(.{ .x = 60, .y = 5, .w = 20, .h = 10 });
+    try std.testing.expectEqual(Rect{ .x = 20, .y = 5, .w = 20, .h = 10 }, r);
 }
 
 test "deinit releases the node's router references (capture/hover/focus/popup)" {

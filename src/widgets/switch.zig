@@ -274,6 +274,9 @@ pub fn @"switch"(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_c
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_changed = on_changed };
     node.state = s;
+    // the 40dp state layer is centered on the handle — its cx extremes
+    // (16..36 over the 52x32 track) leave a 4dp overflow on every side
+    node.damage_overflow = .{ .left = 4, .right = 4, .top = 4, .bottom = 4 };
     ui.semantics.attach(node, .{
         .role = .toggle,
         .label = opts.a11y_label,
@@ -427,4 +430,14 @@ test "golden: disabled checked switch paints the OnSurface@0.12 track" {
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     try golden.expectPixelApprox(f, 10, 32, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF));
+}
+
+test "switch: paintRect covers the handle state layer extremes (culling/damage contract)" {
+    const sig = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer sig.deinit();
+    const b = try @"switch"(std.testing.allocator, sig, null, .{});
+    defer b.deinit();
+    b.layout(.{ .x = 100, .y = 100, .w = 52, .h = 32 });
+    // 4dp overflow each side (handle cx ∈ [16, 36] → layer -4..56)
+    try std.testing.expectEqual(ui.node.Rect{ .x = 96, .y = 96, .w = 60, .h = 40 }, b.paintRect());
 }

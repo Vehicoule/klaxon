@@ -738,7 +738,13 @@ fn countPaintNodes(n: *Node, visible: Rect) u64 {
     if (ui.node.rectOverlaps(n.mapRectToRoot(n.paintRect()), visible)) count = 1;
     if (child_region.w > 0 and child_region.h > 0) {
         for (n.children.items) |child| {
-            if (child.defer_paint) continue;
+            if (child.defer_paint) {
+                // Deferred children paint in the parent's overlay pass when
+                // visible (menuPaintOverlay's `if (child.visible)` — the
+                // overlay pass issues their draws unculled).
+                if (child.visible and n.vtable.paint_overlay != null) count += 1;
+                continue;
+            }
             count += countPaintNodes(child, child_region);
         }
     }
