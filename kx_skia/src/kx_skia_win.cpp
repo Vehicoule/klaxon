@@ -85,6 +85,7 @@ struct GpuState {
     std::unique_ptr<skgpu::graphite::Context> context;
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
     sk_sp<SkSurface> frame_surface;
+    bool dawn_acquired = false; // set by begin_frame; end_frame presents only when set
 
     // Ganesh GL (WGL)
     HDC hdc = nullptr;
@@ -210,7 +211,11 @@ static bool wgl_init(GpuState* st) {
     if (!pf || !SetPixelFormat(st->hdc, pf, &pfd)) return false;
 
     HGLRC boot = wglCreateContext(st->hdc);
-    if (!boot || !wglMakeCurrent(st->hdc, boot)) return false;
+    if (!boot || !wglMakeCurrent(st->hdc, boot)) {
+        // boot isn't in st->glrc yet — delete it here or it leaks.
+        if (boot) wglDeleteContext(boot);
+        return false;
+    }
     st->opengl32 = GetModuleHandleW(L"opengl32.dll");
     if (!st->opengl32)
         st->opengl32 = LoadLibraryW(L"opengl32.dll");
@@ -292,6 +297,13 @@ void gpu_shutdown(GpuState* st) {
         st->device = nullptr;
     }
     if (st->glrc) {
+        // Release Skia's GL objects while the context is still current —
+        // their teardown frees GPU resources through it.
+        wglMakeCurrent(st->hdc, st->glrc);
+        st->gl_surface.reset();
+        if (st->gr_ctx) st->gr_ctx->flushAndSubmit();
+        st->gr_ctx.reset();
+        st->gl_iface.reset();
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(st->glrc);
     }
@@ -337,6 +349,7 @@ SkCanvas* gpu_begin_frame(GpuState* st) {
         st->frame_surface = SkSurfaces::WrapBackendTexture(
             st->recorder.get(), bt, nullptr, nullptr);
         if (!st->frame_surface) return nullptr;
+        st->dawn_acquired = true; // end_frame presents only when this was set
         return st->frame_surface->getCanvas();
     }
     return nullptr;
@@ -349,10 +362,12 @@ void gpu_end_frame(GpuState* st) {
         SwapBuffers(st->hdc);
         return;
     }
-    if (st->context && st->recorder) {
+    if (st->context && st->recorder && st->dawn_acquired) {
+        st->dawn_acquired = false;
         if (std::unique_ptr<skgpu::graphite::Recording> recording = st->recorder->snap()) {
             skgpu::graphite::InsertRecordingInfo info{};
             info.fRecording = recording.get();
+            info.fTargetSurface = st->frame_surface.get();
             st->context->insertRecording(info);
         }
         // Synchronous submit (same as the Metal/iOS paths): the wrapped
@@ -374,8 +389,19 @@ public:
         load_font(scanner, std::make_unique<SkMemoryStream>(kKxDefaultFontData, kKxDefaultFontSize),
                   families);
 #endif
-        for (const char* file : kSystemFonts) {
-            if (auto stream = SkStream::MakeFromFile(file)) {
+        // Resolve the font dir from the OS — Windows isn't always C:\Windows.
+        wchar_t windir[MAX_PATH] = {};
+        UINT n = GetWindowsDirectoryW(windir, MAX_PATH);
+        char fonts_dir[MAX_PATH * 4] = "C:\\Windows";
+        if (n > 0 && n < MAX_PATH) {
+            // Paths pass through SkStream (UTF-8-ish ANSI API) — system dirs
+            // are effectively ASCII on every supported SKU.
+            WideCharToMultiByte(CP_UTF8, 0, windir, -1, fonts_dir, sizeof(fonts_dir), nullptr, nullptr);
+        }
+        char path[MAX_PATH * 4];
+        for (const char* name : kSystemFontNames) {
+            snprintf(path, sizeof(path), "%s\\Fonts\\%s", fonts_dir, name);
+            if (auto stream = SkStream::MakeFromFile(path)) {
                 load_font(scanner, std::move(stream), families);
             }
         }
@@ -387,17 +413,10 @@ public:
     }
 
 private:
-    static constexpr const char* kSystemFonts[] = {
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\segoeuib.ttf",
-        "C:\\Windows\\Fonts\\segoeuii.ttf",
-        "C:\\Windows\\Fonts\\seguisym.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\arialbd.ttf",
-        "C:\\Windows\\Fonts\\ariali.ttf",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\simsun.ttc",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
+    static constexpr const char* kSystemFontNames[] = {
+        "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "seguisym.ttf",
+        "arial.ttf", "arialbd.ttf", "ariali.ttf",
+        "msyh.ttc", "simsun.ttc", "tahoma.ttf",
     };
 
     static SkFontStyleSet_Custom* find_family(SkFontMgr_Custom::Families& families,
