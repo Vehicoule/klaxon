@@ -178,11 +178,14 @@ fn calPointer(n: *Node, ev: input.PointerEvent) bool {
     if (ev.y >= chev_y0 and ev.y <= chev_y1) {
         const chev_prev_x = b.x + b.w - h_pad - 16 - chevron_icon * 2 - 8;
         const chev_next_x = b.x + b.w - h_pad - 16 - chevron_icon;
-        if (ev.x >= chev_prev_x and ev.x <= chev_prev_x + chevron_icon) {
+        // Hit target is `chevron_hit` (40dp) centered on the 24dp icon —
+        // the bare icon was below the a11y touch floor.
+        const hit_inset = (chevron_hit - chevron_icon) / 2;
+        if (ev.x >= chev_prev_x - hit_inset and ev.x <= chev_prev_x + chevron_icon + hit_inset) {
             pageMonth(s, n, -1);
             return true;
         }
-        if (ev.x >= chev_next_x and ev.x <= chev_next_x + chevron_icon) {
+        if (ev.x >= chev_next_x - hit_inset and ev.x <= chev_next_x + chevron_icon + hit_inset) {
             pageMonth(s, n, 1);
             return true;
         }

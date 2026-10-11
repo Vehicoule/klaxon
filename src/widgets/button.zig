@@ -106,6 +106,7 @@ fn dimsFor(size: ButtonSize) Dims {
 
 /// Compose ButtonDefaults.MinWidth (small buttons).
 const min_width: f32 = 58;
+const min_target: f32 = 48; // a11y touch-target floor
 /// FilledTonalButtonTokens.IconSize (the small tonal icon is 18dp).
 const tonal_icon_small: f32 = 18;
 
@@ -409,6 +410,20 @@ fn buttonDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(n));
 }
 
+/// The interactive target: ≥48×48dp centered on the button — xsmall (32dp)
+/// and small (40dp) heights were below the a11y touch floor.
+fn buttonHitBounds(n: *Node) Rect {
+    const b = n.bounds;
+    const w = @max(b.w, min_target);
+    const h = @max(b.h, min_target);
+    return .{
+        .x = b.x + (b.w - w) / 2,
+        .y = b.y + (b.h - h) / 2,
+        .w = w,
+        .h = h,
+    };
+}
+
 const button_vtable = ui.node.VTable{
     .measure = buttonMeasure,
     .layout = buttonLayout,
@@ -419,6 +434,7 @@ const button_vtable = ui.node.VTable{
     .pre_children_paint = buttonPreChildrenPaint,
     .post_children_paint = buttonPostChildrenPaint,
     .child_clip = buttonChildClip,
+    .hit_bounds = buttonHitBounds,
 };
 
 /// An M3E button. `on_pressed` fires on click (pointer up inside after a

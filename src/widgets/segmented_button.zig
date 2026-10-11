@@ -69,6 +69,7 @@ pub const SegmentedButtonOptions = struct {
 
 /// M3E tokens (OutlinedSegmentedButtonTokens + SegmentedButtonDefaults).
 const seg_height: f32 = 40; // ContainerHeight
+const min_target: f32 = 48; // a11y touch-target floor
 const seg_min_w: f32 = 58; // ButtonDefaults.MinWidth
 const seg_h_pad: f32 = 12; // ContentPadding (start/end)
 const icon_size: f32 = 18; // IconSize
@@ -426,6 +427,19 @@ fn segDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
+/// The interactive target: ≥48dp tall centered on the 40dp container —
+/// seg_height was below the a11y touch floor.
+fn segHitBounds(n: *Node) Rect {
+    const b = n.bounds;
+    const h = @max(b.h, min_target);
+    return .{
+        .x = b.x,
+        .y = b.y + (b.h - h) / 2,
+        .w = b.w,
+        .h = h,
+    };
+}
+
 const seg_vtable = ui.node.VTable{
     .measure = segMeasure,
     .layout = segLayout,
@@ -433,6 +447,7 @@ const seg_vtable = ui.node.VTable{
     .deinit = segDeinit,
     .on_pointer = segOnPointer,
     .on_key = segOnKey,
+    .hit_bounds = segHitBounds,
 };
 
 /// An M3E single-choice segmented button row. The segments are internal

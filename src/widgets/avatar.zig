@@ -192,17 +192,30 @@ fn avPointer(n: *Node, ev: input.PointerEvent) bool {
             if (s.pressed) {
                 s.pressed = false;
                 n.markDirty();
-                if (s.on_tap) |cb| cb.fn_ptr(cb.userdata);
+                // Fire only when released inside — the press model cancels
+                // on an outside release like every sibling control.
+                if (n.bounds.contains(ev.x, ev.y)) {
+                    if (s.on_tap) |cb| cb.fn_ptr(cb.userdata);
+                }
             }
             return true;
         },
-        .move => {
+        // `.move` only reaches a captured node; hover otherwise arrives as
+        // enter/leave/hover_move notifications.
+        .move, .hover_move, .enter => {
             const inside = n.bounds.contains(ev.x, ev.y);
             if (inside != s.hovered) {
                 s.hovered = inside;
                 n.markDirty();
             }
-            return true;
+            return ev.phase == .move;
+        },
+        .leave => {
+            if (s.hovered) {
+                s.hovered = false;
+                n.markDirty();
+            }
+            return false;
         },
         .outside_down => {
             if (s.pressed) {
@@ -211,7 +224,6 @@ fn avPointer(n: *Node, ev: input.PointerEvent) bool {
             }
             return false;
         },
-        else => return false,
     }
 }
 

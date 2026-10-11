@@ -168,7 +168,9 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
 fn treePointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (ev.phase != .up) {
-        if (ev.phase == .move and s.opts.tappable) {
+        // `.move` only reaches a captured node; the tree never captures, so
+        // row hover tracking lives on the hover_move notification.
+        if (ev.phase == .hover_move and s.opts.tappable) {
             const b = n.bounds;
             if (ev.y >= b.y and ev.y <= b.y + n.measure(.{ .max_w = b.w, .max_h = 1e9 }).h) {
                 const dy = ev.y - b.y;
@@ -178,6 +180,9 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
                     n.markDirty();
                 }
             }
+        } else if (ev.phase == .leave and s.hovered != -1) {
+            s.hovered = -1;
+            n.markDirty();
         }
         return false;
     }

@@ -185,30 +185,47 @@ fn epPointer(n: *Node, ev: input.PointerEvent) bool {
     const b = n.bounds;
     // Only the header is tappable.
     const in_header = ev.y >= b.y and ev.y <= b.y + header_h and ev.x >= b.x and ev.x <= b.x + b.w;
-    if (!in_header) return false;
 
     switch (ev.phase) {
         .down => {
+            if (!in_header) return false;
             s.pressed = true;
             n.markDirty();
             input.requestFocus(n);
             return true;
         },
         .up => {
-            if (s.pressed) {
-                s.pressed = false;
-                n.markDirty();
-                toggle(s, n);
-            }
+            // Captured release must clear `pressed` even outside the header —
+            // previously an outside release returned early and the header
+            // stayed pressed forever.
+            if (!s.pressed) return false;
+            s.pressed = false;
+            n.markDirty();
+            if (in_header) toggle(s, n);
             return true;
         },
-        .move => {
-            const inside = in_header;
-            if (inside != s.hovered) {
-                s.hovered = inside;
+        // `.move` only reaches the captured node; plain hover comes through
+        // enter/leave/hover_move.
+        .move, .hover_move => {
+            if (in_header != s.hovered) {
+                s.hovered = in_header;
                 n.markDirty();
             }
-            return true;
+            return ev.phase == .move;
+        },
+        .enter => {
+            if (in_header != s.hovered) {
+                s.hovered = in_header;
+                n.markDirty();
+            }
+            return false;
+        },
+        .leave => {
+            if (s.hovered) {
+                s.hovered = false;
+                n.markDirty();
+            }
+            return false;
         },
         .outside_down => {
             if (s.pressed) {
@@ -217,7 +234,6 @@ fn epPointer(n: *Node, ev: input.PointerEvent) bool {
             }
             return false;
         },
-        else => return false,
     }
 }
 
