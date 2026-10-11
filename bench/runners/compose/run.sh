@@ -1,10 +1,11 @@
 #!/bin/bash
 # run.sh — build + run the Compose Multiplatform comparison benchmark runner
-# (roadmap 4c.4).
+# (roadmap 4c.4/4c.6).
 #
 # Usage: bench/runners/compose/run.sh [scene]
-#   scene   run one scene (hello, scroll_10k, text_cjk, glass_blur, anim_100,
-#           gallery, resize, input_ime, video_playback); no argument = all 9.
+#   scene   run one scene (hello, scroll_10k, ..., list_create_1k, shapes_ramp,
+#           overdraw_stack, input_latency, ...); no argument = all 33
+#           (the 9 bench.zig scenes + the 24 bench-scenes.md schema-v2 scenes).
 #
 # Builds the fat jar with the Gradle wrapper (OpenJDK 21 from Homebrew —
 # /usr/bin/java is a broken stub on this machine), then runs it headless:

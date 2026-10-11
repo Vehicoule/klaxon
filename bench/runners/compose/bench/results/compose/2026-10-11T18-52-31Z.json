@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "app_switch",
+      "frame_time_avg_ms": 0.7,
+      "frame_time_p50_ms": 0.2,
+      "frame_time_p99_ms": 27.0,
+      "frame_time_p999_ms": 35.1,
+      "jank_frames": 2,
+      "jank_pct": 1.7,
+      "fps": 1460.6,
+      "draw_calls_per_frame": 213,
+      "rss_mb": 130.0,
+      "ttff_ms": 211.2,
+      "frames_rendered": 132,
+      "extra": { "teardown_ms": 2.1, "resume_ms": 28.8, "switch_cycles": 2 }
+    }
+  ],
+  "binary_size_bytes": 40844514,
+  "timestamp": "2026-10-11T18:52:31Z"
+}
