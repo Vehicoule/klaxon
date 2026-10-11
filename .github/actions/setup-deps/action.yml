@@ -7,10 +7,10 @@ inputs:
   cache-key:
     description: >-
       Full actions/cache key for deps/. deps/ is a pure function of
-      fetch-deps.sh plus the Skia patches it applies, so callers hash both:
-      'deps-<target>-${{ hashFiles(''scripts/fetch-deps.sh'',
-      ''scripts/patches/**'') }}'. Each target needs its own deps build, so
-      every job passes a distinct prefix (deps-Linux, deps-macOS, deps-wasm,
+      fetch-deps.sh plus the Skia patches it applies, so callers build the
+      key as deps-<target>-<hashFiles over scripts/fetch-deps.sh and
+      scripts/patches/**>. Each target needs its own deps build, so every
+      job passes a distinct prefix (deps-Linux, deps-macOS, deps-wasm,
       deps-android, deps-macos-ios).
     required: true
   deps-args:
