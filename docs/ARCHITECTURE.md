@@ -250,9 +250,15 @@ Static map platform→backend. **Never probing** (creators crash instead of retu
 | iOS (arm64) | graphite-metal | graphite-dawn → ganesh-metal → ganesh-gles | raster |
 | Android ≥ API 33 | graphite-vulkan | ganesh-gles | raster |
 | Android < API 33 | ganesh-gles | raster | — |
-| Linux x64/arm64 | graphite-vulkan | ganesh-gl | raster |
+| Linux x64/arm64 | *(graphite-vulkan, Phase 3a — stubbed)* | *(ganesh-gl — stubbed)* | **raster (today)** |
 | Windows x64/arm64 | graphite-dawn-d3d12 | dawn-vulkan → ganesh-gl | raster |
 | Web (WASM) | graphite-webgpu | ganesh-webgl2 | raster |
+
+Current truth: macOS ships graphite-metal + raster; iOS ships all five
+backends; Android ships ganesh-gles + raster; **Linux is raster-only** —
+`kx_skia_linux.cpp` stubs every GPU entry point (`gpu_init` returns false)
+and the Linux deps tree is raster-only. The Linux GPU rows above are the
+target, not the state.
 
 Implemented + measured (iOS Simulator, 2026-10-11, `bench/results/ios-backends-20261011.json`):
 all five iOS backends render pixel-identical to graphite-metal within ~1%
