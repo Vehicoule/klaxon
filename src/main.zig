@@ -180,6 +180,10 @@ test "gallery" {
     std.testing.refAllDecls(@import("gallery.zig"));
 }
 
+test "bench" {
+    std.testing.refAllDecls(@import("bench.zig"));
+}
+
 test "navigator demo" {
     std.testing.refAllDecls(@import("navigator_main.zig"));
 }

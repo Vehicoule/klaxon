@@ -36,7 +36,8 @@ struct GpuState {
     int height = 0;
 };
 
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
+    (void)backend; // unused on this platform
     if (!sdl_window || !out) return false;
     auto* state = new GpuState();
     state->width = width;

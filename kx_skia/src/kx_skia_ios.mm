@@ -63,7 +63,12 @@ static void sync_layer(GpuState* state) {
     state->layer.drawableSize = CGSizeMake(state->width, state->height);
 }
 
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
+    // KX_BACKEND_GANESH_METAL: not yet implemented on iOS — fall back to
+    // Graphite Metal (which works on the simulator with the fixes below).
+    // A full Ganesh Metal path would use GrDirectContexts::MakeMetal +
+    // SkSurfaces::RenderTarget instead of the Graphite API.
+    (void)backend;
     if (!sdl_window || !out) return false;
     auto* state = new GpuState();
     state->width = width;

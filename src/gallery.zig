@@ -187,7 +187,9 @@ pub const Gallery = struct {
     tp_ok: *state.Signal(u32), // the time picker's OK counter
     cp_color: *state.Signal(u32), // the color picker's color (0xRRGGBBAA)
     cp_changed: *state.Signal(u32), // the color picker's change counter
-    ep_expanded: *state.Signal(bool), // the expansion panel's expanded state
+    ep_expanded: *state.Signal(bool),
+    stepper_sig: *state.Signal(usize), // the stepper's current step (M3E section)
+    cal_selected: *state.Signal(?i64), // the calendar's selected day (M3E section) // the expansion panel's expanded state
     /// App hook fired after a theme/platform rebuild (the app re-reads the
     /// platform tokens — e.g. host.cursors).
     on_platform_changed: ?state.Callback = null,
@@ -345,6 +347,10 @@ pub const Gallery = struct {
         errdefer g.cp_changed.deinit();
         g.ep_expanded = try state.Signal(bool).init(allocator, true);
         errdefer g.ep_expanded.deinit();
+        g.stepper_sig = try state.Signal(usize).init(allocator, 1);
+        errdefer g.stepper_sig.deinit();
+        g.cal_selected = try state.Signal(?i64).init(allocator, null);
+        errdefer g.cal_selected.deinit();
         g.desktop_mode = try state.Signal(bool).init(allocator, false);
         errdefer g.desktop_mode.deinit();
         g.bg_sig = try state.Signal(Color).init(allocator, theme_mod.dark.colors.surface);
@@ -495,6 +501,8 @@ pub const Gallery = struct {
         g.cp_color.deinit();
         g.cp_changed.deinit();
         g.ep_expanded.deinit();
+        g.stepper_sig.deinit();
+        g.cal_selected.deinit();
         g.desktop_mode.deinit();
         g.bg_sig.deinit();
         g.press_count.deinit();
@@ -1170,18 +1178,18 @@ fn buildExpansionPanelSection(g: *Gallery, theme: Theme) !*Node {
 /// Stepper (M3E P2): 4 steps, step 2 active.
 fn buildStepperSection(g: *Gallery, theme: Theme) !*Node {
     const a = g.allocator;
-    const sig = try state.Signal(usize).init(a, 1);
-    defer sig.deinit();
+    // The widget does not own the signal — it lives in the Gallery (the tree
+    // outlives this builder; a builder-local signal would dangle at paint).
     const steps = [_]stepper_w.StepperStep{ .{ .label = "Account" }, .{ .label = "Profile" }, .{ .label = "Review" }, .{ .label = "Done" } };
-    return stepper_w.stepper(a, sig, &steps, .{ .theme = theme });
+    return stepper_w.stepper(a, g.stepper_sig, &steps, .{ .theme = theme });
 }
 
 /// Calendar (M3E P2): an inline month view.
 fn buildCalendarSection(g: *Gallery, theme: Theme) !*Node {
     const a = g.allocator;
-    const sel = try state.Signal(?i64).init(a, null);
-    defer sel.deinit();
-    return calendar_w.calendar(a, sel, null, .{ .theme = theme });
+    // The widget does not own the signal — it lives in the Gallery (the tree
+    // outlives this builder; a builder-local signal would dangle at paint).
+    return calendar_w.calendar(a, g.cal_selected, null, .{ .theme = theme });
 }
 
 /// Table (M3E P2): a small data table (3 columns × 3 rows).

@@ -48,54 +48,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- kx_skia shim (C++ / ObjC++ static lib) ---
-    const kx_skia = b.addLibrary(.{
-        .name = "kx_skia",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        }),
-    });
-    const shim_flags = &[_][]const u8{
-        "-std=c++20",  "-fno-exceptions", "-fno-rtti",
-        "-DSK_GANESH", "-DSK_GRAPHITE",   "-DNDEBUG",
-    };
-    kx_skia.root_module.addCSourceFiles(.{
-        .files = &.{"kx_skia/src/kx_skia_common.cpp"},
-        .flags = shim_flags,
-        .language = .cpp,
-    });
-    switch (target.result.os.tag) {
-        .macos => {
-            kx_skia.root_module.addCSourceFiles(.{
-                .files = &.{"kx_skia/src/kx_skia_macos.mm"},
-                .flags = shim_flags,
-                .language = .objective_cpp,
-            });
-            kx_skia.root_module.addCSourceFiles(.{
-                .files = &.{"kx_skia/src/kx_a11y_macos.mm"},
-                .flags = shim_flags,
-                .language = .objective_cpp,
-            });
-        },
-        .linux => kx_skia.root_module.addCSourceFiles(.{
-            .files = &.{"kx_skia/src/kx_skia_linux.cpp"},
-            .flags = shim_flags,
-            .language = .cpp,
-        }),
-        else => @panic("no kx_skia platform impl for this OS yet (add kx_skia/src/kx_skia_<os>)"),
-    }
-    kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
-    kx_skia.root_module.addIncludePath(b.path("deps/skia"));
-    kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
-    kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
-    if (is_macos) {
-        inline for (.{ "Metal", "QuartzCore", "Foundation", "CoreGraphics", "CoreText", "CoreFoundation", "IOSurface" }) |fw| {
-            kx_skia.root_module.linkFramework(fw, .{});
-        }
-    }
+    const kx_skia = addKxSkia(b, target, optimize, "kx_skia", is_macos);
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c
     // (Zig 0.17 removed @cImport — b.addTranslateC is the replacement).
@@ -157,6 +110,35 @@ pub fn build(b: *std.Build) void {
     const a11y_step = b.step("a11y", "Build and run the a11y demo app");
     a11y_step.dependOn(&run_a11y.step);
 
+    // --- bench runner (Phase 4c.3) ---
+    // Benchmark runner: 9 canonical scenes, metrics, JSON report to stdout.
+    // Always ReleaseSmall — benchmarks must measure the shipping binary
+    // (docs/PERF-BUDGETS.md), whatever -Doptimize the user passes. The bench
+    // graph gets its OWN ReleaseSmall kx_skia shim: the shared shim is built
+    // at the user's optimize (Debug → ubsan-instrumented), which neither links
+    // into a ReleaseSmall exe nor measures realistic performance.
+    const bench_frames = b.option(u32, "bench-frames", "Benchmark frames per scene (default 600)") orelse 600;
+    const bench_scene = b.option([]const u8, "bench-scene", "Run a single scene by name (default: all 9)") orelse null;
+    const bench_output = b.option([]const u8, "bench-output", "Also write the JSON report to this file") orelse null;
+    const bench_options = b.addOptions();
+    bench_options.addOption(u32, "bench_frames", bench_frames);
+    bench_options.addOption(?[]const u8, "bench_scene", bench_scene);
+    bench_options.addOption(?[]const u8, "bench_output", bench_output);
+    // Installed runner path (zig-out/bin/bench) — the runner stats it for the
+    // report's binary_size_bytes. The run step depends on the install step,
+    // so the file is in place before the runner executes.
+    bench_options.addOption([]const u8, "bench_exe_path", "zig-out/bin/bench");
+
+    const kx_skia_bench = addKxSkia(b, target, .ReleaseSmall, "kx_skia_bench", is_macos);
+    const bench_exe = addApp(b, target, .ReleaseSmall, "bench", "src/bench_main.zig", translate_sdl, translate_kx, kx_skia_bench, is_macos, tag);
+    bench_exe.root_module.addOptions("build_options", bench_options);
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.step.dependOn(b.getInstallStep());
+    const bench_step = b.step("bench", "Run benchmarks: 9 scenes, JSON metrics to stdout (-Dbench-frames=N -Dbench-scene=NAME -Dbench-output=PATH)");
+    bench_step.dependOn(&run_bench.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
@@ -208,6 +190,69 @@ pub fn build(b: *std.Build) void {
         const pkg_dmg_step = b.step("package-macos-dmg", "Build + package gallery into a .dmg (macOS)");
         pkg_dmg_step.dependOn(&pkg_dmg.step);
     }
+}
+
+/// Create the kx_skia C++/ObjC++ shim as a static library. The native graph
+/// builds it twice: at the user's optimize (hello/gallery/tests) and at
+/// ReleaseSmall for the bench runner — the shim must match the bench binary's
+/// optimization (a Debug shim is ubsan-instrumented: it fails to link into a
+/// ReleaseSmall exe, and would skew the metrics anyway).
+fn addKxSkia(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+    is_macos: bool,
+) *std.Build.Step.Compile {
+    const kx_skia = b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        }),
+    });
+    const shim_flags = &[_][]const u8{
+        "-std=c++20",  "-fno-exceptions", "-fno-rtti",
+        "-DSK_GANESH", "-DSK_GRAPHITE",   "-DNDEBUG",
+    };
+    kx_skia.root_module.addCSourceFiles(.{
+        .files = &.{"kx_skia/src/kx_skia_common.cpp"},
+        .flags = shim_flags,
+        .language = .cpp,
+    });
+    switch (target.result.os.tag) {
+        .macos => {
+            kx_skia.root_module.addCSourceFiles(.{
+                .files = &.{"kx_skia/src/kx_skia_macos.mm"},
+                .flags = shim_flags,
+                .language = .objective_cpp,
+            });
+            kx_skia.root_module.addCSourceFiles(.{
+                .files = &.{"kx_skia/src/kx_a11y_macos.mm"},
+                .flags = shim_flags,
+                .language = .objective_cpp,
+            });
+        },
+        .linux => kx_skia.root_module.addCSourceFiles(.{
+            .files = &.{"kx_skia/src/kx_skia_linux.cpp"},
+            .flags = shim_flags,
+            .language = .cpp,
+        }),
+        else => @panic("no kx_skia platform impl for this OS yet (add kx_skia/src/kx_skia_<os>)"),
+    }
+    kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
+    kx_skia.root_module.addIncludePath(b.path("deps/skia"));
+    kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
+    kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
+    if (is_macos) {
+        inline for (.{ "Metal", "QuartzCore", "Foundation", "CoreGraphics", "CoreText", "CoreFoundation", "IOSurface" }) |fw| {
+            kx_skia.root_module.linkFramework(fw, .{});
+        }
+    }
+    return kx_skia;
 }
 
 /// Create an app executable: module + C bindings + runtime link.

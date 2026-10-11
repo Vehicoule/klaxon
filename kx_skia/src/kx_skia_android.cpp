@@ -61,7 +61,8 @@ struct GpuState {
     int height = 0;
 };
 
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
+    (void)backend; // unused on this platform
     if (!out || !sdl_window) return false;
     auto* window = static_cast<SDL_Window*>(sdl_window);
     // The caller (host, android path) creates an ES 3.0 context on the SDL

@@ -53,6 +53,7 @@ typedef enum kx_backend {
     KX_BACKEND_GRAPHITE_DAWN = 5,    // Windows (D3D12)
     KX_BACKEND_GRAPHITE_WEBGPU = 6,  // Web
     KX_BACKEND_GANESH_WEBGL2 = 7,    // Web fallback
+    KX_BACKEND_GANESH_METAL = 8,     // macOS / iOS fallback (Ganesh Metal)
 } kx_backend;
 
 typedef struct kx_ctx kx_ctx;

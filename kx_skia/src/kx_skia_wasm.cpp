@@ -72,7 +72,8 @@ struct GpuState {
     int height = 0;
 };
 
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
+    (void)backend; // unused on this platform
     if (!out || !sdl_window) return false;
     // The caller (main, emscripten path) creates a WebGL2 context on the SDL
     // window and makes it current BEFORE kx_create. Ganesh binds to whatever

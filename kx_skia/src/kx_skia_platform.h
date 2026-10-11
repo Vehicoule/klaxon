@@ -3,6 +3,7 @@
 // this header never crosses the Zig ABI.
 #pragma once
 
+#include "kx_skia.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkRefCnt.h"
@@ -13,7 +14,8 @@ namespace kx {
 struct GpuState;
 
 // Create the GPU context and attach an onscreen surface to sdl_window (SDL_Window*).
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height);
+// backend selects the GPU API (Graphite Metal, Ganesh Metal, Ganesh GLES, ...).
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend);
 void gpu_shutdown(GpuState* state);
 void gpu_resize(GpuState* state, int width, int height);
 

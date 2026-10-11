@@ -72,7 +72,7 @@ kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
         ctx->raster = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(width, height));
         if (!ctx->raster) { delete ctx; return nullptr; }
     } else {
-        if (!kx::gpu_init(&ctx->gpu, sdl_window, width, height)) { delete ctx; return nullptr; }
+        if (!kx::gpu_init(&ctx->gpu, sdl_window, width, height, backend)) { delete ctx; return nullptr; }
     }
     return ctx;
 }
@@ -343,6 +343,7 @@ const char* kx_backend_name(kx_backend backend) {
         case KX_BACKEND_GRAPHITE_DAWN: return "graphite-dawn-d3d12";
         case KX_BACKEND_GRAPHITE_WEBGPU: return "graphite-webgpu";
         case KX_BACKEND_GANESH_WEBGL2: return "ganesh-webgl2";
+        case KX_BACKEND_GANESH_METAL: return "ganesh-metal";
     }
     return "unknown";
 }

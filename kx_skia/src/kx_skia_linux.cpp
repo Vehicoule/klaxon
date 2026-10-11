@@ -12,7 +12,8 @@ namespace kx {
 
 struct GpuState {}; // stub — no GPU backend yet (Phase 3a)
 
-bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
+bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
+    (void)backend; // unused on this platform
     (void)out;
     (void)sdl_window;
     (void)width;
