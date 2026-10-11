@@ -202,9 +202,9 @@ warmup overrides the global 10+120 contract per spec). `extra.ramp[]` =
     one); the spec's "forces saveLayer/compositing cost" maps to 24
     full-screen alpha blends, not 24 saveLayer records.
 12. **images_ramp decode**: `ui.Image` decode is async in Dart; the scene
-    requests it at construction and the 64x64 decode lands inside the first
-    step's warmup, so no measured frame draws without the image (startup
-    decode excluded, per spec).
+    requests it at construction and the harness awaits it in `prepare()`
+    before the frame clock starts — no warmup or measured frame can draw
+    without the image (startup decode excluded, per spec).
 13. **app_switch**: real OS lifecycle transitions (`AppLifecycleState`) are
     engine-driven and cannot be injected from Dart. The port measures the
     closest idiom — unmount + remount of a ~230-node tree — so
