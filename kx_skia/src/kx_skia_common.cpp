@@ -325,12 +325,53 @@ bool kx_readback_rgba(kx_ctx* ctx, void* dst, size_t dst_size, int* out_width, i
     return ctx->raster->readPixels(dst_info, dst, static_cast<size_t>(ctx->width) * 4, 0, 0);
 }
 
+bool kx_gpu_warmup(kx_ctx* ctx) {
+    if (!ctx) return false;
+    if (!ctx->gpu) return true; // raster: nothing to pre-compile
+    SkCanvas* canvas = kx::gpu_begin_offscreen(ctx->gpu, 64, 64);
+    if (!canvas) return false;
+    // Draw the framework's full op set through the public entry points —
+    // the exact paint code paths real frames take, so the programs compiled
+    // here are the programs the first real frames would otherwise compile
+    // on the fly (Ganesh compiles lazily per draw op on first use).
+    ctx->canvas = canvas;
+    kx_clear(ctx, 0x000000FF);
+    kx_fill_rect(ctx, 2, 2, 20, 20, 0x3366CCFF);
+    kx_fill_rrect(ctx, 4, 4, 40, 40, 8, 0x663399FF);
+    kx_fill_rrect_corners(ctx, 0, 0, 60, 60, 12, 0, 0, 0, 0x00CC88FF);
+    kx_stroke_rrect(ctx, 6, 6, 50, 50, 10, 2, 0xCC3366FF);
+    kx_stroke_rrect_corners(ctx, 2, 2, 58, 58, 0, 8, 0, 8, 1.5f, 0x9933CCFF);
+    const float xs[4] = {0, 64, 64, 0};
+    const float ys[4] = {0, 0, 64, 64};
+    kx_fill_polygon(ctx, xs, ys, 4, 0x33AA66FF);
+    kx_stroke_polyline(ctx, xs, ys, 4, 1.0f, true, 0xAA3366FF);
+    const uint32_t grad[2] = {0xFF0000FF, 0x0000FFFF};
+    kx_fill_rrect_gradient(ctx, 8, 8, 48, 48, 10, 0, 0, 64, 64, grad, 2);
+    const uint8_t pixel[4] = {255, 128, 64, 255};
+    const uint64_t img = kx_image_create(ctx, pixel, 1, 1);
+    if (img) {
+        kx_draw_image(ctx, img, 32, 32, 16, 16);
+        kx_image_destroy(ctx, img);
+    }
+    // Clip path (scroll viewports clip their content on every backend).
+    kx_clip_rect(ctx, 0, 0, 32, 32);
+    kx_fill_rect(ctx, 8, 8, 20, 20, 0xFFFFFF80);
+    kx_clip_reset(ctx);
+    // Alpha layer (fade transitions): composite + text under a layer.
+    kx_layer_alpha(ctx, 0.5f);
+    kx_draw_text_styled(ctx, "warmup", 4, 40, 12, true, 0xFFFFFFFF);
+    kx_draw_text(ctx, "warmup", 4, 56, 12, 0xCCCCCCCC);
+    kx_restore(ctx); // pops the saveLayer pushed by kx_layer_alpha
+    ctx->canvas = nullptr;
+    return kx::gpu_end_offscreen(ctx->gpu);
+}
+
 kx_backend kx_backend_of(const kx_ctx* ctx) {
     return ctx ? ctx->backend : KX_BACKEND_RASTER;
 }
 
 const char* kx_abi_version(void) {
-    return "0.10.0";
+    return "0.11.0";
 }
 
 const char* kx_backend_name(kx_backend backend) {

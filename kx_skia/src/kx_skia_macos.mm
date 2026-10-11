@@ -29,6 +29,9 @@ struct GpuState {
     std::unique_ptr<skgpu::graphite::Context> context;
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
     sk_sp<SkSurface> frame_surface;
+    // Warmup (Phase 4e.1): recorder + surface for the offscreen pre-compile pass.
+    std::unique_ptr<skgpu::graphite::Recorder> warmup_recorder;
+    sk_sp<SkSurface> warmup_surface;
     CAMetalLayer* layer = nil;
     SDL_MetalView metal_view = nullptr;
     id<CAMetalDrawable> drawable = nil;
@@ -120,6 +123,43 @@ void gpu_end_frame(GpuState* state) {
         state->drawable = nil;
     }
     state->frame_surface = nullptr;
+}
+
+SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
+    // Warmup (Phase 4e.1): a Graphite render-target surface on its own
+    // recorder — the same draw ops, so the same pipelines the onscreen
+    // frames use (Metal compiles pipelines lazily on first use, like
+    // Ganesh's programs).
+    if (!state || !state->context || width <= 0 || height <= 0) return nullptr;
+    state->warmup_recorder = state->context->makeRecorder();
+    if (!state->warmup_recorder) return nullptr;
+    // Signature at the pinned Skia (include/gpu/graphite/Surface.h):
+    // RenderTarget(Recorder*, const SkImageInfo&, Mipmapped = kNo,
+    //              const SkSurfaceProps* = nullptr, std::string_view = {})
+    // — no Budgeted parameter on the graphite overload at this pin.
+    state->warmup_surface = SkSurfaces::RenderTarget(
+        state->warmup_recorder.get(),
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
+}
+
+bool gpu_end_offscreen(GpuState* state) {
+    if (!state || !state->context) return false;
+    if (state->warmup_recorder) {
+        std::unique_ptr<skgpu::graphite::Recording> recording = state->warmup_recorder->snap();
+        if (recording) {
+            skgpu::graphite::InsertRecordingInfo info;
+            info.fRecording = recording.get();
+            info.fTargetSurface = state->warmup_surface.get();
+            state->context->insertRecording(info);
+        }
+        state->warmup_recorder.reset();
+    }
+    // Synchronous: the pipeline compile must complete inside the warmup
+    // call, not leak into the next real frame.
+    state->context->submit(skgpu::graphite::SyncToCpu::kYes);
+    state->warmup_surface = nullptr;
+    return true;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

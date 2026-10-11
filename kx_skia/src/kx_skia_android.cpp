@@ -57,6 +57,7 @@ struct GpuState {
     SDL_Window* window = nullptr;
     sk_sp<GrDirectContext> dctx;
     sk_sp<SkSurface> frame_surface;
+    sk_sp<SkSurface> warmup_surface; // offscreen target for kx_gpu_warmup (Phase 4e.1)
     int width = 0;
     int height = 0;
 };
@@ -143,6 +144,29 @@ void gpu_end_frame(GpuState* state) {
     // SDL_GL_SwapWindow) composites SDL's EGLSurface onto the ANativeWindow.
     state->frame_surface = nullptr;
     if (state->window) SDL_GL_SwapWindow(state->window);
+}
+
+SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
+    // Warmup (Phase 4e.1): a render-target surface on the Ganesh context —
+    // the same draw ops, so the same programs the onscreen frames use.
+    if (!state || !state->dctx || width <= 0 || height <= 0) return nullptr;
+    // Signature at the pinned Skia (include/gpu/ganesh/SkSurfaceGanesh.h):
+    // RenderTarget(GrRecordingContext*, skgpu::Budgeted, const SkImageInfo&)
+    // — the 3-arg inline overload; skgpu::Budgeted comes from
+    // include/gpu/GpuTypes.h via ganesh/GrTypes.h.
+    state->warmup_surface = SkSurfaces::RenderTarget(
+        state->dctx.get(), skgpu::Budgeted::kYes,
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
+}
+
+bool gpu_end_offscreen(GpuState* state) {
+    if (!state || !state->dctx) return false;
+    // Synchronous: the program compile must complete inside the warmup call,
+    // not leak into the next real frame.
+    state->dctx->flushAndSubmit(GrSyncCpu::kYes);
+    state->warmup_surface = nullptr;
+    return true;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

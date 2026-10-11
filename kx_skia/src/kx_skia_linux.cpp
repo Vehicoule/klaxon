@@ -32,6 +32,20 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
 }
 void gpu_end_frame(GpuState* state) { (void)state; }
 
+// Warmup (Phase 4e.1): no GPU backend on this platform yet (Phase 3a brings
+// EGL + Vulkan) — the platform interface requires the symbols, warmup itself
+// is best-effort (kx_gpu_warmup returns false, the host logs and moves on).
+SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
+    (void)state;
+    (void)width;
+    (void)height;
+    return nullptr;
+}
+bool gpu_end_offscreen(GpuState* state) {
+    (void)state;
+    return false;
+}
+
 sk_sp<SkFontMgr> platform_font_mgr() {
     // System font directories (DejaVu et al. on CI runners).
     for (const char* dir : {"/usr/share/fonts", "/usr/local/share/fonts"}) {

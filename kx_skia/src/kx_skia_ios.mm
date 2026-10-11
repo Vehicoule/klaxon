@@ -527,6 +527,21 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_CoreText(nullptr);
 }
 
+// Warmup (Phase 4e.1): stubs — per-backend offscreen surfaces (Graphite
+// Metal, Graphite Dawn, Ganesh Metal, Ganesh GLES) are Phase 4e.1b; warmup
+// is best-effort, so kx_gpu_warmup returns false on iOS until then (the
+// host logs it and moves on).
+SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
+    (void)state;
+    (void)width;
+    (void)height;
+    return nullptr;
+}
+bool gpu_end_offscreen(GpuState* state) {
+    (void)state;
+    return false;
+}
+
 // iOS: check if the UIWindow's root view is attached — presents before the
 // view is mapped to the window are silently lost (black screen).
 extern "C" bool kx_ios_window_mapped(void* uiwindow) {
