@@ -195,9 +195,28 @@ pub const TextSignal = struct {
 
     /// Set the text. No-op (no notifications) when unchanged. Rejects text
     /// over `max_len` with error.TextTooLong — the old value stands.
+    /// `new_text` may borrow this signal's own buffer (a `peek()` subslice —
+    /// e.g. set(peek()[1..]) removes the first character): the bytes are
+    /// moved in place before the length/sentinel are updated.
     pub fn set(self: *TextSignal, new_text: []const u8) error{TextTooLong}!void {
         if (new_text.len > max_len) return error.TextTooLong;
         if (std.mem.eql(u8, self.buf.items, new_text)) return;
+        // Borrowed-slice update: new_text overlaps our storage — a clear or
+        // realloc would invalidate it before the copy. Move it down in place
+        // instead (dest starts at the buffer head, before src: copyForwards).
+        const buf_start = @intFromPtr(self.buf.items.ptr);
+        const buf_end = buf_start + self.buf.items.len;
+        const src_start = @intFromPtr(new_text.ptr);
+        if (new_text.len > 0 and src_start < buf_end and src_start + new_text.len > buf_start) {
+            std.mem.copyForwards(u8, self.buf.items[0..new_text.len], new_text);
+            self.buf.items.len = new_text.len;
+            // capacity already covers len+1 (it covered the longer old text).
+            self.buf.items.len += 1;
+            self.buf.items[new_text.len] = 0;
+            self.buf.items.len -= 1;
+            self.base.notify();
+            return;
+        }
         self.buf.clearRetainingCapacity();
         self.buf.ensureTotalCapacity(new_text.len + 1) catch @panic("klaxon: out of memory");
         self.buf.appendSlice(new_text) catch @panic("klaxon: out of memory");
@@ -600,4 +619,32 @@ test "text signal: input over max_len is rejected, not truncated" {
     try std.testing.expectError(error.TextTooLong, sig.set(huge));
     try std.testing.expectEqualStrings("keep me", sig.peek()); // the old value stands
     try std.testing.expectError(error.TextTooLong, TextSignal.init(std.testing.allocator, huge));
+}
+
+test "text signal: set from a borrowed subslice of peek() (in-place edit)" {
+    const sig = try TextSignal.init(std.testing.allocator, "abcdef");
+    defer sig.deinit();
+    // remove the first character — the slice borrows the signal's own buffer
+    try sig.set(sig.peek()[1..]);
+    try std.testing.expectEqualStrings("bcdef", sig.peek());
+    // prefix slice: keep the first 3 chars
+    try sig.set(sig.peek()[0..3]);
+    try std.testing.expectEqualStrings("bcd", sig.peek());
+    // middle slice
+    try sig.set(sig.peek()[1..2]);
+    try std.testing.expectEqualStrings("c", sig.peek());
+    // the sentinel still terminates the buffer
+    try std.testing.expectEqual(@as(u8, 0), sig.buf.items.ptr[sig.buf.items.len]);
+}
+
+test "text signal: set from a borrowed subslice across a capacity realloc" {
+    const sig = try TextSignal.init(std.testing.allocator, "");
+    defer sig.deinit();
+    // grow the buffer past its initial capacity, then shrink via a subslice —
+    // the source must survive any realloc of the backing store
+    const big = "abcdefghijklmnopqrstuvwxyz0123456789";
+    try sig.set(big ++ big ++ big);
+    try std.testing.expectEqual(@as(usize, big.len * 3), sig.peek().len);
+    try sig.set(sig.peek()[big.len .. big.len * 2]);
+    try std.testing.expectEqualStrings(big, sig.peek());
 }
