@@ -24,10 +24,20 @@ extern "C" {
         KX_A11Y_ANNOUNCE = 2,
         KX_A11Y_CONTROL_CHANGED = 3,
     };
+    // BridgeEventC — extern struct passed BY VALUE (mirrors BridgeEventC in
+    // ui/semantics.zig, field for field). Do NOT flatten it to scalar
+    // parameters: on arm64 a struct passed by value rides in registers
+    // differently than flattened scalars, and a flattened callback reads
+    // garbage.
+    typedef struct {
+        uint32_t kind;       // 0=tree_dirty 1=focus_changed 2=announce 3=control_changed
+        uint64_t node_id;    // Node pointer (decimal in the dump)
+        const uint8_t* text; // announce payload (borrowed during the call only)
+        size_t text_len;
+        uint32_t region;     // LiveRegion: 0=off 1=polite 2=assertive
+    } KxBridgeEventC;
     // Install the C bridge callback (from ui/semantics.zig).
-    void kx_a11y_set_bridge(void (*fn)(void* userdata, uint32_t kind, uint64_t node_id,
-                                       const char* text, size_t text_len, uint32_t region),
-                            void* userdata);
+    void kx_a11y_set_bridge(void (*fn)(void* userdata, KxBridgeEventC event), void* userdata);
     // Build the semantic tree and return a JSON-ish flat description.
     // Returns a malloc'd string (caller frees) or NULL on error.
     // Format: "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n" per node
@@ -167,11 +177,10 @@ static KXA11yElement* buildHierarchy(const char* dump) {
 }
 
 // Bridge event callback (called from Zig via setBridgeC).
-static void a11y_bridge_callback(void* userdata, uint32_t kind, uint64_t node_id,
-                                  const char* text, size_t text_len, uint32_t region) {
+static void a11y_bridge_callback(void* userdata, KxBridgeEventC event) {
     (void)userdata;
-    (void)node_id;
-    switch (kind) {
+    (void)event.node_id;
+    switch (event.kind) {
         case KX_A11Y_TREE_DIRTY: {
             // Rebuild the hierarchy from the semantic tree dump.
             if (g_zig_root_node) {
@@ -192,14 +201,14 @@ static void a11y_bridge_callback(void* userdata, uint32_t kind, uint64_t node_id
             // v1: logged only (NSAccessibility focus sync is a follow-up).
             break;
         case KX_A11Y_ANNOUNCE: {
-            if (text && text_len > 0) {
-                NSString* msg = [[NSString alloc] initWithBytes:text
-                                                          length:text_len
+            if (event.text && event.text_len > 0) {
+                NSString* msg = [[NSString alloc] initWithBytes:event.text
+                                                          length:event.text_len
                                                         encoding:NSUTF8StringEncoding];
                 if (msg) {
                     NSDictionary* info = @{
                         NSAccessibilityAnnouncementKey: msg,
-                        NSAccessibilityPriorityKey: @(region == 2 ? 10 : 5) // assertive=high
+                        NSAccessibilityPriorityKey: @(event.region == 2 ? 10 : 5) // assertive=high
                     };
                     NSAccessibilityPostNotificationWithUserInfo([NSApp mainWindow], NSAccessibilityAnnouncementRequestedNotification, info);
                 }
