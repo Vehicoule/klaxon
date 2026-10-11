@@ -3,7 +3,7 @@
 # (roadmap Phase 4c.4).
 #
 # Usage: bench/runners/flutter/run.sh [scene ...]
-#   No arguments  -> run all 9 canonical scenes, one process per scene.
+#   No arguments  -> run all 33 canonical scenes, one process per scene.
 #   One or more scene names -> run just those scenes.
 #
 # The first invocation runs `flutter build macos --release` (downloads ~1 GB of
@@ -40,7 +40,7 @@ mkdir -p "$REPO_ROOT/bench/results/flutter"
 if [ "$#" -gt 0 ]; then
   SCENES="$*"
 else
-  SCENES="hello scroll_10k text_cjk glass_blur anim_100 gallery resize input_ime video_playback"
+  SCENES="hello scroll_10k text_cjk glass_blur anim_100 gallery resize input_ime video_playback list_create_1k list_replace_1k list_update_10th list_swap_rows list_remove_row list_clear_1k shapes_ramp paths_ramp text_ramp images_ramp overdraw_stack elevation_grid relayout_storm mount_churn scroll_anim text_rich chart_live clip_path theme_switch backdrop_scroll input_latency pointer_storm semantics_build app_switch"
 fi
 
 for scene in $SCENES; do

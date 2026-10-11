@@ -1,35 +1,59 @@
-// Harness for the Flutter comparison benchmark (roadmap Phase 4c.4).
+// Harness for the Flutter comparison benchmark (roadmap Phase 4c.4,
+// extended to the bench-scenes.md v2 catalogue).
 //
-// Replicates the Klaxon bench contract (src/bench.zig + src/bench_main.zig):
+// Replicates the Klaxon bench contract (src/bench.zig + docs/specs/
+// bench-scenes.md):
 //   - fixed 640x480 logical viewport,
-//   - 10 warmup + 600 measured frames per scene, one frame per ticker tick,
+//   - 10 warmup + 120 measured frames per scene (spec harness contract),
+//     one frame per ticker tick; individual scenes may override the frame
+//     plan (list_ops: 60 measured after the op; ramp: 9 x (10+20)),
 //   - frame work = FrameTiming(build + raster) — layout is folded into
 //     buildDuration in Flutter 3.47's FrameTiming; this is Flutter's analog
 //     of Klaxon's tick + layout + paint,
+//   - jank: a frame is jank if frame_ms > 16.67 (60 Hz budget,
+//     Macrobenchmark/JankStats convention — spec schema v2),
 //   - fps = 1000 / avg(frame work),
 //   - draw_calls_per_frame = number of RenderObjects under the scene root
 //     (Klaxon's "visible painted nodes"; ListView.builder virtualization keeps
 //     this small for the scroll scenes),
 //   - rss_mb = ProcessInfo.currentRss / 1e6,
 //   - ttff_ms = scene start -> the scene's first completed frame (FrameTiming),
-//   - frames_rendered = 610.
+//   - frames_rendered = the scene's totalFrames (default 130),
+//   - scene extras under extra{} (op_ms, ramp, latency_*, nodes_per_frame,
+//     teardown_ms/resume_ms).
 //
 // The scene root is force-repainted (markNeedsPaint) every frame so that
 // static scenes still measure a real paint + raster pass, matching Klaxon's
 // renderer.paint(root, BG) on every frame.
+//
+// Wall-clock op timing: scenes that measure an operation's wall time
+// (op_ms, input latency, teardown/resume) call beginWallOp(). It records the
+// wall clock (DateTime.now().microsecondsSinceEpoch) and the current engine
+// frame number (PlatformDispatcher.frameData.frameNumber), and completes
+// when the FrameTiming carrying that frame (or a later waitFrames offset)
+// arrives — the op's own render pass is inside that frame, so the elapsed
+// wall time = mutate/build + one full render pass. FrameTiming delivery is
+// batched in release builds, so completion is matched on
+// FrameTiming.frameNumber + rasterFinishWallTime (a wall-clock timestamp on
+// DateTime's epoch), not on arrival order.
 
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
-/// Run options (src/bench.zig RunOptions, with bench_frames = 600).
+/// Run options (bench-scenes.md harness contract: 10 warmup + 120 measured).
 const int kWarmupFrames = 10;
-const int kMeasuredFrames = 600;
-const int kTotalFrames = kWarmupFrames + kMeasuredFrames; // 610
+const int kMeasuredFrames = 120;
+const int kTotalFrames = kWarmupFrames + kMeasuredFrames; // 130
+
+/// The 60 Hz frame budget for the jank metric (spec: frame is jank if
+/// frame_ms > 16.67).
+const double kJankBudgetMs = 16.67;
 
 /// The harness viewport (bench.zig: 640x480).
 const double kViewportWidth = 640;
@@ -39,10 +63,28 @@ const double kViewportHeight = 480;
 const Color kBenchBackground = Color(0xFF14141C);
 
 /// Shared text styles (bench.zig's title/body colors).
-const TextStyle kBenchTitleStyle = TextStyle(fontSize: 14, color: Color(0xFFCCCCCC));
+const TextStyle kBenchTitleStyle =
+    TextStyle(fontSize: 14, color: Color(0xFFCCCCCC));
 const TextStyle kBenchBodyStyle = TextStyle(fontSize: 14, color: Colors.white);
 
-/// One canonical bench scene (the Flutter port of a src/bench.zig scene).
+/// The spec's two accent colors (used across the new scenes).
+const Color kBenchPurple = Color(0xFF7C4DFF);
+const Color kBenchTeal = Color(0xFF03DAC6);
+
+/// The suite card/panel color (bench.zig's container color).
+const Color kBenchCardColor = Color(0xFF2A2A3E);
+
+/// Nearest-rank percentile over a set of frame times (bench.zig's
+/// percentile: idx = min(n*p/100, n-1)). 0 for an empty set.
+double percentileOf(List<double> values, double p) {
+  if (values.isEmpty) return 0;
+  final List<double> sorted = List<double>.of(values)..sort();
+  final int idx =
+      math.min((sorted.length * p / 100).floor(), sorted.length - 1);
+  return sorted[idx];
+}
+
+/// One canonical bench scene (the Flutter port of a bench-scenes.md scene).
 abstract class BenchScene {
   BenchScene(this.name);
 
@@ -55,11 +97,30 @@ abstract class BenchScene {
   /// rendered frame with the 0-based frame index (warmup frames included).
   void tick(int frame, BenchHarnessState harness);
 
+  /// Total frames this scene renders (warmup + measured). Default: the
+  /// spec contract, 10 + 120 = 130. list_ops scenes render 70 (the op is
+  /// timed on the last warmup frame, then 60 frames are measured);
+  /// ramp scenes render 270 (9 steps x (10 warmup + 20 measured)).
+  int get totalFrames => kTotalFrames;
+
+  /// Whether the 0-based frame index counts toward frame_times.
+  /// Default: the 120 frames after the 10 warmup frames.
+  bool isMeasuredFrame(int frame) => frame >= kWarmupFrames;
+
+  /// Called once per measured frame, in order, with its frame-work ms —
+  /// scenes that bucket timings per step (ramp) override this.
+  void onMeasuredFrame(int frame, double frameMs) {}
+
+  /// Scene-specific metrics emitted under "extra" in the JSON report
+  /// (missing values serialize as null).
+  Map<String, Object?> extra() => const <String, Object?>{};
+
   /// Release scene-owned resources (controllers, focus nodes, ...).
   void dispose() {}
 }
 
-/// Collected metrics for one scene (mirrors bench.zig's Metrics).
+/// Collected metrics for one scene (mirrors bench.zig's Metrics + the
+/// schema v2 additions: p99.9, jank, extra).
 class SceneMetrics {
   SceneMetrics(this.name);
 
@@ -69,6 +130,7 @@ class SceneMetrics {
   int drawCallsPerFrame = 0;
   double rssMb = 0;
   int framesRendered = kTotalFrames;
+  Map<String, Object?> extra = const <String, Object?>{};
 
   double get frameTimeAvgMs {
     if (frameTimesMs.isEmpty) return 0;
@@ -82,16 +144,40 @@ class SceneMetrics {
   double get fps => frameTimeAvgMs > 0 ? 1000.0 / frameTimeAvgMs : 0;
 
   /// Nearest-rank percentile (bench.zig's percentile: idx = min(n*p/100, n-1)).
-  double percentile(int p) {
-    if (frameTimesMs.isEmpty) return 0;
-    final List<double> sorted = List<double>.of(frameTimesMs)..sort();
-    final int idx = math.min((sorted.length * p) ~/ 100, sorted.length - 1);
-    return sorted[idx];
+  double percentile(double p) => percentileOf(frameTimesMs, p);
+
+  /// A frame is jank if its work exceeds the 60 Hz budget (16.67 ms).
+  int get jankFrames {
+    var count = 0;
+    for (final double t in frameTimesMs) {
+      if (t > kJankBudgetMs) count++;
+    }
+    return count;
   }
+
+  double get jankPct =>
+      frameTimesMs.isEmpty ? 0 : jankFrames * 100.0 / frameTimesMs.length;
+}
+
+/// A pending wall-clock op measurement. Completes when a FrameTiming arrives
+/// whose frameNumber >= startFrame + waitFrames (frameNumber matching makes
+/// this robust against the engine's ~1 Hz timing batching in release builds).
+class _WallOp {
+  _WallOp({
+    required this.startWallUs,
+    required this.startFrame,
+    required this.waitFrames,
+    required this.onDone,
+  });
+
+  final int startWallUs; // DateTime.now().microsecondsSinceEpoch
+  final int startFrame; // PlatformDispatcher.frameData.frameNumber
+  final int waitFrames;
+  final void Function(double ms, int frames) onDone;
 }
 
 /// The benchmark app: renders the active scene in a fixed 640x480 box and
-/// drives 610 frames per scene from a Ticker (one frame per tick).
+/// drives 130 frames per scene from a Ticker (one frame per tick).
 class BenchHarness extends StatefulWidget {
   const BenchHarness({super.key, required this.scenes, required this.onAllDone});
 
@@ -106,8 +192,10 @@ class BenchHarnessState extends State<BenchHarness>
     with SingleTickerProviderStateMixin {
   final GlobalKey _sceneKey = GlobalKey();
   final List<SceneMetrics> _results = <SceneMetrics>[];
+  final List<_WallOp> _wallOps = <_WallOp>[];
   late final Ticker _ticker;
   Timer? _watchdog;
+  Timer? _drainTimer; // forces scene finish if wall-op drain stalls
   int _sceneIndex = 0;
   int _tickCount = 0; // ticker ticks since scene activation (drives tick)
   int _framesCompleted = 0; // FrameTimings received since scene activation
@@ -116,6 +204,8 @@ class BenchHarnessState extends State<BenchHarness>
   DateTime _sceneStart = DateTime.now();
   DateTime _lastProgress = DateTime.now();
   SceneMetrics? _current;
+
+  BenchScene get _scene => widget.scenes[_sceneIndex];
 
   @override
   void initState() {
@@ -130,6 +220,7 @@ class BenchHarnessState extends State<BenchHarness>
   @override
   void dispose() {
     _watchdog?.cancel();
+    _drainTimer?.cancel();
     _ticker.dispose();
     SchedulerBinding.instance.removeTimingsCallback(_onTimings);
     super.dispose();
@@ -140,6 +231,25 @@ class BenchHarnessState extends State<BenchHarness>
     if (mounted) setState(() {});
   }
 
+  /// Begin a wall-clock op measurement (op_ms, input latency,
+  /// teardown/resume). Records the wall clock now; completes on the
+  /// FrameTiming whose frameNumber is the current frame's + [waitFrames]
+  /// (0 = the frame currently being built — the op's own render pass; 1 =
+  /// the next frame — e.g. an input event handled between frames whose
+  /// response paints one frame later). [onDone] receives the elapsed wall
+  /// ms and the number of frames elapsed.
+  void beginWallOp({
+    int waitFrames = 0,
+    required void Function(double ms, int frames) onDone,
+  }) {
+    _wallOps.add(_WallOp(
+      startWallUs: DateTime.now().microsecondsSinceEpoch,
+      startFrame: ui.PlatformDispatcher.instance.frameData.frameNumber,
+      waitFrames: waitFrames,
+      onDone: onDone,
+    ));
+  }
+
   void _activateScene(int i) {
     _sceneIndex = i;
     _tickCount = 0;
@@ -147,19 +257,28 @@ class BenchHarnessState extends State<BenchHarness>
     _current = SceneMetrics(widget.scenes[i].name);
     _sceneStart = DateTime.now();
     _collecting = true;
+    _wallOps.clear();
+    _drainTimer?.cancel();
+    _drainTimer = null;
     stderr.writeln('klaxon bench (flutter): ${widget.scenes[i].name} '
         '(${i + 1}/${widget.scenes.length})...');
   }
 
   void _onTick(Duration elapsed) {
     if (_finished || !_collecting) return;
+    if (_tickCount >= _scene.totalFrames) {
+      // The scene's frame plan is done; the ticker idles while in-flight
+      // FrameTimings for already-produced frames drain (they may still
+      // resolve pending wall-ops). No new ticks -> no new scene mutations.
+      return;
+    }
     try {
-      widget.scenes[_sceneIndex].tick(_tickCount, this);
+      _scene.tick(_tickCount, this);
     } catch (e, st) {
       // Fail fast: an exception in a ticker callback stops the ticker, which
       // would otherwise hang the run until the watchdog fires.
       stderr.writeln('klaxon bench (flutter): scene '
-          '${widget.scenes[_sceneIndex].name} tick($_tickCount) threw: $e\n$st');
+          '${_scene.name} tick($_tickCount) threw: $e\n$st');
       exit(1);
     }
     _tickCount++;
@@ -175,6 +294,23 @@ class BenchHarnessState extends State<BenchHarness>
       if (_finished) return;
       if (!_collecting || _current == null) continue;
       _lastProgress = DateTime.now();
+      _resolveWallOps(t);
+      if (_framesCompleted >= _scene.totalFrames) {
+        // Frame plan done. Keep draining in-flight timings while wall-ops
+        // are pending: the engine may run ahead of the ticker (animated
+        // scenes produce >1 frame per tick), so an op's resolving frame was
+        // already produced but its timing is still in the ~1 Hz batch
+        // pipeline. A 2 s backstop finishes anyway if delivery stalls (or
+        // the op's frame genuinely never rendered).
+        if (_wallOps.isEmpty) {
+          _finishScene();
+          return;
+        }
+        _drainTimer ??= Timer(const Duration(seconds: 2), () {
+          if (_collecting && !_finished) _finishScene();
+        });
+        continue;
+      }
       // Frame work = build + raster. Flutter 3.47's FrameTiming has no
       // separate layout phase — the engine folds layout into buildDuration
       // (FramePhase: vsyncStart/buildStart/buildFinish/rasterStart/
@@ -189,26 +325,59 @@ class BenchHarnessState extends State<BenchHarness>
         _current!.ttffMs =
             _lastProgress.difference(_sceneStart).inMicroseconds / 1000.0;
       }
-      if (completed >= kWarmupFrames) _current!.frameTimesMs.add(workMs);
+      if (_scene.isMeasuredFrame(completed)) {
+        _current!.frameTimesMs.add(workMs);
+        _scene.onMeasuredFrame(completed, workMs);
+      }
       _framesCompleted++;
-      if (_framesCompleted >= kTotalFrames) {
+      if (_framesCompleted >= _scene.totalFrames && _wallOps.isEmpty) {
         _finishScene();
         return;
+      }
+      // Wall-ops still pending: the next timing enters the drain branch
+      // above; a 2 s backstop timer finishes the scene regardless.
+    }
+  }
+
+  void _resolveWallOps(FrameTiming t) {
+    for (int i = _wallOps.length - 1; i >= 0; i--) {
+      final _WallOp op = _wallOps[i];
+      if (t.frameNumber >= op.startFrame + op.waitFrames) {
+        _wallOps.removeAt(i);
+        // rasterFinishWallTime is a wall-clock timestamp on DateTime's epoch
+        // — wall time of the op's own render pass (mutate + build + raster).
+        // Fallback (platforms that report 0): the frame's work time.
+        final int rasterWallUs =
+            t.timestampInMicroseconds(ui.FramePhase.rasterFinishWallTime);
+        final double ms = rasterWallUs > op.startWallUs
+            ? (rasterWallUs - op.startWallUs) / 1000.0
+            : (t.buildDuration + t.rasterDuration).inMicroseconds / 1000.0;
+        op.onDone(ms, t.frameNumber - op.startFrame);
       }
     }
   }
 
   void _finishScene() {
-    final BenchScene scene = widget.scenes[_sceneIndex];
+    _drainTimer?.cancel();
+    _drainTimer = null;
     final SceneMetrics m = _current!;
+    if (_wallOps.isNotEmpty) {
+      // A wall-op whose completing frame never arrived (e.g. an injected
+      // event that produced no frame) reports null — surface it loudly.
+      stderr.writeln('klaxon bench (flutter): ${_scene.name}: '
+          '${_wallOps.length} wall-op(s) left unresolved');
+      _wallOps.clear();
+    }
     m.drawCallsPerFrame = _countSceneRenderObjects();
     m.rssMb = ProcessInfo.currentRss / 1e6;
-    stderr.writeln('klaxon bench (flutter): ${scene.name} done — '
+    m.framesRendered = _scene.totalFrames;
+    m.extra = _scene.extra();
+    stderr.writeln('klaxon bench (flutter): ${_scene.name} done — '
         'fps ${m.fps.toStringAsFixed(1)}, '
         'avg ${m.frameTimeAvgMs.toStringAsFixed(2)} ms, '
         'draw_calls ${m.drawCallsPerFrame}');
     _results.add(m);
-    scene.dispose();
+    _scene.dispose();
     _collecting = false;
     if (_sceneIndex + 1 < widget.scenes.length) {
       setState(() => _activateScene(_sceneIndex + 1));
@@ -251,7 +420,6 @@ class BenchHarnessState extends State<BenchHarness>
 
   @override
   Widget build(BuildContext context) {
-    final BenchScene scene = widget.scenes[_sceneIndex];
     // Minimal chrome (no MaterialApp/Navigator): Localizations + Theme +
     // Material are what TextField & friends need; everything else would just
     // add per-frame paint work that Klaxon does not have.
@@ -278,7 +446,7 @@ class BenchHarnessState extends State<BenchHarness>
                   child: RepaintBoundary(
                     child: KeyedSubtree(
                       key: _sceneKey,
-                      child: scene.build(context),
+                      child: _scene.build(context),
                     ),
                   ),
                 ),
