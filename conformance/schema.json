@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "klaxon-conformance-vector",
+  "title": "Klaxon conformance vector file",
+  "description": "One domain file under conformance/tests/ — an object with a tests[] array of vectors. See conformance/SPEC.md for the behavioral contract.",
+  "type": "object",
+  "required": ["tests"],
+  "properties": {
+    "tests": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/vector" }
+    }
+  },
+  "definitions": {
+    "vector": {
+      "type": "object",
+      "required": ["id", "rule", "domain", "setup", "expect"],
+      "properties": {
+        "id":        { "type": "string", "pattern": "^[A-Z]+-[0-9]+\\.[0-9]+$", "description": "unique within the corpus, convention RULE.seq" },
+        "rule":      { "type": "string", "pattern": "^[A-Z]+-[0-9]+$", "description": "SPEC.md rule id" },
+        "domain":    { "type": "string", "enum": ["layout", "paint", "gestures", "state", "scrolling", "navigation", "focus", "a11y", "i18n"] },
+        "setup":     { "$ref": "#/definitions/setup" },
+        "actions":   { "type": "array", "items": { "$ref": "#/definitions/action" } },
+        "expect":    { "$ref": "#/definitions/expect" },
+        "tolerance": { "type": "number", "description": "float epsilon for all numeric comparisons; default 0.01" }
+      },
+      "additionalProperties": false
+    },
+    "setup": {
+      "type": "object",
+      "properties": {
+        "viewport": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+        "tree":     { "$ref": "#/definitions/node" },
+        "signals":  { "type": "object", "additionalProperties": { "oneOf": [{ "type": "boolean" }, { "type": "number" }, { "type": "string" }, { "type": "object" }] } },
+        "effects":  { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "string" }, "description": "signal deps" } },
+        "memo":     { "type": "object", "additionalProperties": { "type": "object" } },
+        "locales":  { "type": "object", "additionalProperties": { "type": "object" } },
+        "locale":   { "type": "string" },
+        "navigator":{ "type": "object" },
+        "item_focusable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "node": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type":     { "type": "string" },
+        "id":       { "type": "string", "description": "registers the node for rects/text/measured/focus" },
+        "props":    { "type": "object" },
+        "children": { "type": "array", "items": { "$ref": "#/definitions/node" } }
+      },
+      "additionalProperties": false
+    },
+    "action": {
+      "type": "object",
+      "required": ["op"],
+      "properties": {
+        "op": { "type": "string", "enum": ["pointer", "key", "text_input", "scroll", "tick", "relayout", "mark_dirty", "mark_dirty_rect", "set_scroll", "signal_set", "signal_notify", "nav_push", "nav_pop", "nav_replace", "nav_back", "nav_pop_to_root", "nav_push_path", "navigate", "list_count", "list_reload", "focus", "announce", "paint"] }
+      },
+      "description": "extra fields per op are defined in SPEC.md §3"
+    },
+    "expect": {
+      "type": "object",
+      "properties": {
+        "rects":          { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 } },
+        "measured":       { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } },
+        "pixels":         { "type": "object", "additionalProperties": { "type": "number" } },
+        "pixel_counts":   { "type": "object", "additionalProperties": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } },
+        "damage":         { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4 },
+        "children":       { "type": "object" },
+        "first_item":     { "type": "number" },
+        "scroll":         { "type": "object" },
+        "scroll_info":    { "type": "object" },
+        "signals":        { "type": "object" },
+        "effect_log":     { "type": "array" },
+        "memo_value":     { "type": "object" },
+        "events":         { "type": "array" },
+        "gestures":       { "type": "array" },
+        "text":           { "type": "object" },
+        "focus_order":    { "type": "array" },
+        "focused":        { "type": "string" },
+        "router_focused": { "type": "string" },
+        "a11y":           { "type": "array" },
+        "a11y_events":    { "type": "array" },
+        "nav":            { "type": "object" },
+        "action_error":   {},
+        "i18n":           { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

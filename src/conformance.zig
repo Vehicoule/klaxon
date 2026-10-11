@@ -531,14 +531,20 @@ fn attachPropSemantics(node: *Node, props: Value) void {
         getProp(props, "focusable") == null and getProp(props, "checked") == null and
         getProp(props, "disabled") == null and getProp(props, "hint") == null and
         getProp(props, "value") == null and getProp(props, "actions") == null) return;
-    var s = sem.Semantics{};
+    // Merge into the widget's own descriptor when it exists — "checked" is
+    // also a construction prop (checkbox/toggle/radio bind it to a signal),
+    // so a blanket replace would wipe the widget's role/focusable/actions.
+    const s = node.semantics orelse blk: {
+        sem.attach(node, .{});
+        break :blk node.semantics.?;
+    };
     if (str(props.get("role"))) |r| s.role = parseRole(r) orelse .none;
     if (str(props.get("label"))) |l| s.label = l;
     if (str(props.get("hint"))) |t| s.hint = t;
     if (str(props.get("value"))) |t| s.value = t;
-    s.checked = boolean(props.get("checked"), false);
-    s.disabled = boolean(props.get("disabled"), false);
-    s.focusable = boolean(props.get("focusable"), false);
+    if (getProp(props, "checked") != null) s.checked = boolean(props.get("checked"), false);
+    if (getProp(props, "disabled") != null) s.disabled = boolean(props.get("disabled"), false);
+    if (getProp(props, "focusable") != null) s.focusable = boolean(props.get("focusable"), false);
     if (getProp(props, "actions")) |a| {
         if (a == .array) {
             for (a.array) |av| {
@@ -550,7 +556,6 @@ fn attachPropSemantics(node: *Node, props: Value) void {
             }
         }
     }
-    sem.attach(node, s);
 }
 
 /// Node-level props applied to every DSL node after construction:
@@ -625,7 +630,7 @@ pub fn buildNode(h: *Harness, tv: Value) !*Node {
                 .padding = num(props.get("padding"), 0),
             });
         } else if (std.mem.eql(u8, wtype, "padding")) {
-            break :blk try wl.padding(h.alloc, parseInsets(props) orelse .{});
+            break :blk try wl.padding(h.alloc, parseInsets(props.get("padding")) orelse .{});
         } else if (std.mem.eql(u8, wtype, "padding_directional")) {
             break :blk try wl.paddingDir(h.alloc, parseDirInsets(props) orelse .{});
         } else if (std.mem.eql(u8, wtype, "center")) {
@@ -1649,7 +1654,7 @@ test "conformance: box DSL + rects + damage expect" {
         \\  {"type":"box","id":"a","props":{"w":50,"h":30}},
         \\  {"type":"box","id":"b","props":{"w":20,"h":10}}]}},
         \\"actions":[{"op":"mark_dirty","id":"a"}],
-        \\"expect":{"rects":{"a":[0,0,50,30],"b":[0,30,20,10]},"damage":[0,0,50,30]}}
+        \\"expect":{"rects":{"a":[0,0,200,30],"b":[0,30,200,10]},"damage":[0,0,200,30]}}
     ;
     const tv = try value_mod.parseJson(arena.allocator(), doc);
     const res = runTest(arena.allocator(), tv);

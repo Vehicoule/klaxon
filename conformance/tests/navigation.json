@@ -1,0 +1,156 @@
+{
+  "tests": [
+    {
+      "id": "NAV-001.1",
+      "rule": "NAV-001",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {
+          "routes": [
+            {"pattern": "home"},
+            {"pattern": "anime/{id}"},
+            {"pattern": "settings"}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "home"},
+        {"op": "nav_push", "pattern": "anime/{id}", "params": {"id": "42"}}
+      ],
+      "expect": {
+        "nav": {"depth": 2, "current": "anime/42", "params": {"id": "42"}},
+        "events": ["nav:push", "nav:push"]
+      }
+    },
+    {
+      "id": "NAV-002.1",
+      "rule": "NAV-002",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {
+          "routes": [{"pattern": "home"}, {"pattern": "anime/{id}"}]
+        }
+      },
+      "actions": [
+        {"op": "nav_push_path", "path": "anime/7"}
+      ],
+      "expect": {
+        "nav": {"depth": 1, "current": "anime/7", "params": {"id": "7"}},
+        "events": ["nav:push"]
+      }
+    },
+    {
+      "id": "NAV-003.1",
+      "rule": "NAV-003",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {
+          "routes": [{"pattern": "home"}, {"pattern": "anime/{id}"}]
+        }
+      },
+      "actions": [
+        {"op": "navigate", "uri": "klaxon://anime/42?tab=2"},
+        {"op": "navigate", "uri": "klaxon://anime/42?tab=2"}
+      ],
+      "expect": {
+        "nav": {"depth": 1, "current": "anime/42", "params": {"id": "42", "tab": "2"}},
+        "events": ["nav:push"]
+      }
+    },
+    {
+      "id": "NAV-004.1",
+      "rule": "NAV-004",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {"routes": [{"pattern": "home"}]}
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "nowhere"}
+      ],
+      "expect": {
+        "nav": {"depth": 0},
+        "action_error": "UnknownRoute"
+      }
+    },
+    {
+      "id": "NAV-004.2",
+      "rule": "NAV-004",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {"routes": [{"pattern": "home"}, {"pattern": "anime/{id}"}]}
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "anime/{id}"}
+      ],
+      "expect": {
+        "nav": {"depth": 0},
+        "action_error": "MissingParam"
+      }
+    },
+    {
+      "id": "NAV-005.1",
+      "rule": "NAV-005",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {
+          "routes": [
+            {"pattern": "home"},
+            {"pattern": "settings"},
+            {"pattern": "anime/{id}"}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "home"},
+        {"op": "nav_push", "pattern": "settings"},
+        {"op": "nav_push", "pattern": "anime/{id}", "params": {"id": "1"}},
+        {"op": "nav_pop"},
+        {"op": "nav_pop_to_root"}
+      ],
+      "expect": {
+        "nav": {"depth": 1, "current": "home"},
+        "events": ["nav:push", "nav:push", "nav:push", "nav:pop", "nav:reset"]
+      }
+    },
+    {
+      "id": "NAV-006.1",
+      "rule": "NAV-006",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {
+          "routes": [
+            {"pattern": "home"},
+            {"pattern": "settings"},
+            {"pattern": "anime/{id}"}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "home"},
+        {"op": "nav_push", "pattern": "settings"},
+        {"op": "nav_replace", "pattern": "anime/{id}", "params": {"id": "5"}}
+      ],
+      "expect": {
+        "nav": {"depth": 2, "current": "anime/5", "params": {"id": "5"}},
+        "events": ["nav:push", "nav:push", "nav:replace"]
+      }
+    },
+    {
+      "id": "NAV-007.1",
+      "rule": "NAV-007",
+      "domain": "navigation",
+      "setup": {
+        "navigator": {"routes": [{"pattern": "home"}]}
+      },
+      "actions": [
+        {"op": "nav_push", "pattern": "home"},
+        {"op": "nav_pop"},
+        {"op": "nav_back"}
+      ],
+      "expect": {
+        "nav": {"depth": 1, "current": "home"},
+        "events": ["nav:push"]
+      }
+    }
+  ]
+}

@@ -658,7 +658,10 @@ pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_change
     }
     setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
     node.state = s;
-    ui.semantics.attach(node, .{ .role = .text_field, .focusable = true, .hint = s.placeholder }); // Phase 2c
+    // value = the initial text too — a pre-filled field must announce its
+    // content; without it, screen readers see an empty value until the first
+    // edit re-syncs it (lines "a11y: the value follows edits" below).
+    ui.semantics.attach(node, .{ .role = .text_field, .focusable = true, .hint = s.placeholder, .value = s.text() }); // Phase 2c
     return node;
 }
 
