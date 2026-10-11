@@ -1,4 +1,5 @@
-// Bench — the benchmark runner + the 9 canonical scenes (Phase 4c.1 + 4c.2).
+// Bench — the benchmark runner + the canonical scene catalogue (Phase 4c.1
+// + 4c.2 + the 4c.6 catalogue: docs/specs/bench-scenes.md — 33 scenes).
 // Headless by construction: every scene renders through golden.zig's Renderer
 // on the RASTER backend — no window, no GPU, deterministic on CI. The same
 // scenes + metrics feed the `klaxon bench` command (4c.3) and the
@@ -6,14 +7,16 @@
 //
 //   runScene(scene, allocator) → Metrics
 //     builds the scene's widget tree, renders N frames offscreen, collects:
-//     fps, frame_time avg/p50/p99, draw_calls_per_frame, rss_mb, ttff_ms,
-//     frames_rendered.
+//     fps, frame_time avg/p50/p99/p999, jank_frames/jank_pct,
+//     draw_calls_per_frame, rss_mb, ttff_ms, frames_rendered + scene extras.
 //
 // Metric definitions:
 //   - fps: 1000 / frame_time_avg_ms (the headless loop is unpaced — it renders
 //     as fast as the raster backend allows).
 //   - frame_time_*: per-frame wall time of tick + layout + paint, measured
 //     frames only (the warmup frames are rendered but not counted).
+//   - jank: a frame is jank when frame_ms > 16.67 (the 60 Hz budget —
+//     Macrobenchmark/JankStats convention, schema v2).
 //   - ttff_ms (time to first frame): run start (scene build + ctx create
 //     included) → the END of the first completed frame.
 //   - draw_calls_per_frame: the kx_skia ABI has no draw-call counter (the C++
@@ -21,9 +24,13 @@
 //     frame — mirrors Node.paint's off-surface culling (a node's paint
 //     callback issues >= 0 kx draw calls). For the virtualized scenes this
 //     is the LIVE window (~10 nodes for scroll_10k); for retained scenes it
-//     is the on-surface fraction, matching what a real frame issues.
+//     is the on-surface fraction, matching what a real frame issues. For
+//     ramp scenes (one node painting N items) it is the final step's N.
 //   - rss_mb: devtools.readRssMb (Linux /proc/self/status VmRSS, macOS
 //     mach_task_basic_info — cross-platform, no new dependency).
+//   - extra: per-scene fields (schema v2) — op_ms (list_ops), ramp[] +
+//     n_max_60fps (ramp scenes), latency_ms/latency_frames (input_latency),
+//     nodes_per_frame (semantics_build), teardown_ms/resume_ms (app_switch).
 const std = @import("std");
 const kx = @import("kx.zig");
 const sdl = @import("sdl.zig");
@@ -44,8 +51,12 @@ const input_mod = ui.input;
 const anim_mod = ui.anim;
 const state = ui.state;
 
-/// The 9 canonical scenes (ROADMAP 4c.1).
+/// The canonical scene catalogue (ROADMAP 4c.1 + 4c.6). Enum names are the
+/// contract — the spec's catalogue tables write them snake_case, so the JSON
+/// report emits them verbatim (the spec's "kebab_case in JSON/CLI" note is
+/// reconciled by also accepting kebab on the CLI — see bench_main.zig).
 pub const BenchScene = enum {
+    // the original 9 (4c.1)
     hello,
     scroll_10k,
     text_cjk,
@@ -55,22 +66,97 @@ pub const BenchScene = enum {
     resize,
     input_ime,
     video_playback,
+    // family A — list_ops (krausest js-framework-benchmark, native adaptation)
+    list_create_1k,
+    list_replace_1k,
+    list_update_10th,
+    list_swap_rows,
+    list_remove_row,
+    list_clear_1k,
+    // family B — ramp (MotionMark methodology, stepped)
+    shapes_ramp,
+    paths_ramp,
+    text_ramp,
+    images_ramp,
+    // family C — stress (known-divergence scenarios)
+    overdraw_stack,
+    elevation_grid,
+    relayout_storm,
+    mount_churn,
+    scroll_anim,
+    text_rich,
+    chart_live,
+    clip_path,
+    theme_switch,
+    backdrop_scroll,
+    // family D — system (non-paint paths)
+    input_latency,
+    pointer_storm,
+    semantics_build,
+    app_switch,
 
     pub fn name(s: BenchScene) []const u8 {
         return @tagName(s);
     }
+
+    /// Family A: the op is timed once (extra.op_ms); frame metrics are
+    /// collected over the 60 frames after it — runListOp drives these.
+    pub fn isListOp(s: BenchScene) bool {
+        return switch (s) {
+            .list_create_1k, .list_replace_1k, .list_update_10th,
+            .list_swap_rows, .list_remove_row, .list_clear_1k => true,
+            else => false,
+        };
+    }
+
+    /// Family B: stepped ramp — 20 measured frames per step (runRamp).
+    pub fn isRamp(s: BenchScene) bool {
+        return switch (s) {
+            .shapes_ramp, .paths_ramp, .text_ramp, .images_ramp => true,
+            else => false,
+        };
+    }
 };
 
-/// Collected metrics for one scene run (ROADMAP 4c.2).
+/// The ramp step sizes (spec family B — MotionMark methodology).
+pub const RAMP_STEPS = [_]u64{ 10, 25, 50, 100, 200, 400, 800, 1600, 3200 };
+/// Measured frames per ramp step (spec); capped by opts.frames in tests.
+const RAMP_MEASURED: u64 = 20;
+/// Measured frames after a list op (spec); capped by opts.frames in tests.
+const LIST_OP_MEASURED: u64 = 60;
+/// 60 Hz frame budget — a frame is jank above it (schema v2).
+const JANK_MS: f64 = 16.67;
+
+/// One ramp step result (extra.ramp[]).
+pub const RampPoint = struct { n: u64, p50_ms: f64 };
+
+/// Per-scene extra fields (schema v2). Missing optionals serialize as null.
+pub const Extra = struct {
+    op_ms: ?f64 = null, // list_ops: wall time of the operation itself
+    ramp: [RAMP_STEPS.len]RampPoint = undefined,
+    ramp_len: usize = 0, // ramp scenes: extra.ramp[0..ramp_len]
+    n_max_60fps: ?u64 = null, // largest ramp step with p50 <= 16.67 ms
+    latency_ms: ?f64 = null, // input_latency: event → response paint
+    latency_frames: ?u64 = null,
+    nodes_per_frame: ?u64 = null, // semantics_build
+    teardown_ms: ?f64 = null, // app_switch (avg over the run's cycles)
+    resume_ms: ?f64 = null,
+};
+
+/// Collected metrics for one scene run (ROADMAP 4c.2 + schema v2).
 pub const Metrics = struct {
     fps: f64 = 0,
     frame_time_avg_ms: f64 = 0,
     frame_time_p50_ms: f64 = 0,
     frame_time_p99_ms: f64 = 0,
+    frame_time_p999_ms: f64 = 0,
+    jank_frames: u64 = 0, // frames > 16.67 ms
+    jank_pct: f64 = 0,
     draw_calls_per_frame: u64 = 0,
     rss_mb: f64 = 0,
     ttff_ms: f64 = 0, // time to first frame: run start → first completed frame
     frames_rendered: u64 = 0, // every frame painted (warmup + measured)
+    extra: Extra = .{},
 };
 
 /// How many frames a scene renders and at what size.
@@ -81,7 +167,9 @@ pub const RunOptions = struct {
     height: i32 = 480,
     // --- diagnostics (investigation tooling; NOT part of the JSON report).
     // bench_main wires these to the KLAXON_BENCH_TRACE_DIR /
-    // KLAXON_BENCH_PHASES / KLAXON_BENCH_PROFILE env vars. ---
+    // KLAXON_BENCH_PHASES / KLAXON_BENCH_PROFILE env vars. They drive the
+    // standard runFrames loop — list_ops + ramp scenes have their own run
+    // loops and skip diagnostics. ---
     /// Per-frame CSV trace written to <dir>/<scene>.csv (frame index,
     /// tick/layout/paint ms, relayout flag, damage_valid flag).
     trace_dir: ?[]const u8 = null,
@@ -95,6 +183,8 @@ pub const RunOptions = struct {
     /// Counterfactual (gallery): hide the ScrollView's content column —
     /// approximates "paint-time culling skipped the off-screen content".
     hide_scroll_content: bool = false,
+    /// Cap the ramp ladder (tests use 2; production runs the full 9 steps).
+    ramp_steps: usize = RAMP_STEPS.len,
 };
 
 /// The background the frames are cleared with (a neutral dark surface).
@@ -134,11 +224,33 @@ const SceneRunner = struct {
     timeline: ?anim_mod.Timeline = null, // anim_100 (installed process-global)
     anim_heights: [ANIM_WIDGETS]*state.Signal(f32) = undefined, // anim_100 targets
     anim_colors: [ANIM_WIDGETS]*state.Signal(Color) = undefined,
-    router: ?input_mod.InputRouter = null, // input_ime (installed process-global)
+    router: ?input_mod.InputRouter = null, // input_ime + input_latency (installed process-global)
     text_field: ?*Node = null, // input_ime
-    scroll_list: ?*Node = null, // scroll_10k
+    scroll_list: ?*Node = null, // scroll_10k + list_ops + scroll_anim + backdrop_scroll
     list_ctx: ListItemCtx = undefined, // the virtualized lists' factory ctx
     video: ?*VideoState = null, // video_playback
+    // --- 4c.6 catalogue state ---
+    bounds: Rect = .{}, // the run viewport (ticks that relayout mid-frame)
+    drive: Drive = .{}, // shared frame clock for paint-animated scene nodes
+    list_ops: ListOpsCtx = undefined, // family A model (labels + count)
+    pulse_ctx: PulseItemCtx = undefined, // scroll_anim item factory ctx
+    ramp_node: ?*Node = null, // family B workhorse node
+    storm_col: ?*Node = null, // relayout_storm (relaid out every frame)
+    churn_parent: ?*Node = null, // mount_churn pool
+    churn_next: u64 = 0,
+    theme_flip: ThemeFlip = .{}, // theme_switch palette flag
+    lat_node: ?*Node = null, // input_latency responder
+    lat_ev: u64 = std.math.maxInt(u64), // frame to inject the event on
+    lat_event_ns: u64 = 0,
+    storm_rng: u64 = 0x9E3779B97F4A7C15, // pointer_storm LCG (deterministic)
+    app_slot: ?*Node = null, // app_switch: parent of the swappable app subtree
+    app_root: ?*Node = null, // app_switch: the swapped subtree (null while paused)
+    resume_t0: u64 = 0, // set at resume-build start; closed after the frame paints
+    switch_teardown_ms: f64 = 0,
+    switch_teardowns: u64 = 0,
+    switch_resume_ms: f64 = 0,
+    switch_resumes: u64 = 0,
+    extra: Extra = .{}, // scene extras, merged into Metrics at the end
 
     fn init(allocator: std.mem.Allocator, scene: BenchScene, opts: RunOptions) !*SceneRunner {
         const r = try allocator.create(SceneRunner);
@@ -148,6 +260,8 @@ const SceneRunner = struct {
             .scene = scene,
             .root = undefined,
             .list_ctx = .{ .allocator = allocator },
+            .list_ops = .{ .allocator = allocator },
+            .pulse_ctx = .{ .allocator = allocator, .drive = &r.drive },
         };
         r.build(opts) catch |err| {
             // Clear the process-globals first (a partially built scene may
@@ -196,13 +310,40 @@ const SceneRunner = struct {
             .resize => r.root = try buildResize(r),
             .input_ime => try buildInputIme(r),
             .video_playback => r.root = try buildVideoPlayback(r),
+            // family A — list_ops (the op runs inside runListOp, not the tick)
+            .list_create_1k => try buildListOps(r, true),
+            .list_replace_1k, .list_update_10th, .list_swap_rows, .list_remove_row, .list_clear_1k => try buildListOps(r, false),
+            // family B — ramp (one workhorse node per kind; runRamp drives it)
+            .shapes_ramp => r.root = try buildRamp(r, .shapes),
+            .paths_ramp => r.root = try buildRamp(r, .paths),
+            .text_ramp => r.root = try buildRamp(r, .text),
+            .images_ramp => r.root = try buildRamp(r, .images),
+            // family C — stress
+            .overdraw_stack => r.root = try buildOverdraw(r.allocator),
+            .elevation_grid => r.root = try buildElevationGrid(r),
+            .relayout_storm => r.root = try buildRelayoutStorm(r),
+            .mount_churn => r.root = try buildMountChurn(r),
+            .scroll_anim => r.root = try buildScrollAnim(r),
+            .text_rich => r.root = try buildTextRich(r.allocator),
+            .chart_live => r.root = try buildChartLive(r),
+            .clip_path => r.root = try buildClipPath(r),
+            .theme_switch => r.root = try buildThemeSwitch(r),
+            .backdrop_scroll => r.root = try buildBackdropScroll(r),
+            // family D — system
+            .input_latency => try buildInputLatency(r),
+            .pointer_storm => r.root = try buildPointerStorm(r.allocator),
+            .semantics_build => r.root = try buildSemanticsScene(r.allocator),
+            .app_switch => try buildAppSwitch(r),
         }
     }
 
     /// Per-frame scene logic (before layout + paint). Deterministic in `frame`.
+    /// List-op and ramp scenes have their own run loops and never reach here.
     fn tick(r: *SceneRunner, renderer: *golden.Renderer, frame: u64) void {
+        r.drive.frame = frame; // the shared scene clock (paint-animated nodes)
         switch (r.scene) {
-            .hello, .text_cjk, .glass_blur, .gallery => {}, // static trees
+            .hello, .text_cjk, .glass_blur, .gallery, .overdraw_stack, .text_rich => {}, // static trees
+            .list_create_1k, .list_replace_1k, .list_update_10th, .list_swap_rows, .list_remove_row, .list_clear_1k, .shapes_ramp, .paths_ramp, .text_ramp, .images_ramp => {},
             .scroll_10k => {
                 // Scroll ~1 item per frame; the virtualization window diffs
                 // every frame (items created/destroyed as the window slides).
@@ -250,13 +391,100 @@ const SceneRunner = struct {
             .video_playback => {
                 r.video.?.frame = frame; // the widget regenerates its "frame" at paint
             },
+            .elevation_grid, .clip_path, .chart_live => {
+                r.root.markDirty(); // the drive clock changed — repaint everything
+            },
+            .theme_switch => {
+                if (frame % 30 == 0) r.theme_flip.dark = !r.theme_flip.dark;
+                r.root.markDirty();
+            },
+            .relayout_storm => {
+                // Every row's width is a function of the frame — relayout the
+                // whole column (measure + layout, NOT a compositable transform).
+                r.storm_col.?.markLayoutDirty();
+            },
+            .mount_churn => {
+                // Steady-state pool of 500: retire the 50 oldest, create 50 new.
+                const parent = r.churn_parent.?;
+                var k: usize = 0;
+                while (k < CHURN_DELTA) : (k += 1) {
+                    const victim = parent.children.items[0];
+                    _ = parent.remove(victim);
+                    victim.deinit();
+                    parent.add(churnCard(r.allocator, r.churn_next));
+                    r.churn_next +%= 1;
+                }
+            },
+            .scroll_anim => {
+                // 600 dp/s at 60 Hz ≈ 10 px/frame; the row icons pulse opacity
+                // off the drive clock at paint (PulseItemCtx.drive).
+                const list = r.scroll_list.?;
+                const max_off = widgets.list_view.maxScrollOffset(list);
+                const off = @mod(@as(f32, @floatFromInt(frame)) * 10.0, max_off + 1.0);
+                _ = widgets.list_view.setScrollOffset(list, off);
+            },
+            .backdrop_scroll => {
+                const list = r.scroll_list.?;
+                const max_off = widgets.list_view.maxScrollOffset(list);
+                const off = @mod(@as(f32, @floatFromInt(frame)) * 8.0, max_off + 1.0);
+                _ = widgets.list_view.setScrollOffset(list, off);
+            },
+            .input_latency => {
+                if (frame == r.lat_ev) {
+                    // Synthetic pointer event (a tap on the responder box).
+                    const b = r.lat_node.?.bounds;
+                    r.lat_event_ns = sdl.c.SDL_GetTicksNS();
+                    r.router.?.dispatchPointer(r.root, .{ .phase = .down, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
+                    r.router.?.dispatchPointer(r.root, .{ .phase = .up, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
+                }
+                // Latency closes post-paint — see closeLatency (runFrames).
+            },
+            .pointer_storm => {
+                // 1000 hit-test queries over the tree — pure hit-test cost.
+                var rng = r.storm_rng;
+                var i: usize = 0;
+                while (i < 1000) : (i += 1) {
+                    rng = rng *% 6364136223846793005 +% 1442695040888963407;
+                    const x = @as(f32, @floatFromInt(rng >> 33)) / 2147483648.0 * r.bounds.w;
+                    rng = rng *% 6364136223846793005 +% 1442695040888963407;
+                    const y = @as(f32, @floatFromInt(rng >> 33)) / 2147483648.0 * r.bounds.h;
+                    _ = r.root.hitTest(x, y);
+                }
+                r.storm_rng = rng;
+            },
+            .semantics_build => {
+                // Build + tear down the a11y semantics tree every frame.
+                var tree = ui.semantics.buildSemanticTree(r.allocator, r.root) catch @panic("klaxon: out of memory");
+                r.extra.nodes_per_frame = countSemNodes(&tree);
+                tree.deinit(r.allocator);
+            },
+            .app_switch => {
+                const phase = frame % 60;
+                if (phase == 30 and r.app_root != null) {
+                    // Pause: tear the app subtree down (timed).
+                    const t0 = sdl.c.SDL_GetTicksNS();
+                    _ = r.app_slot.?.remove(r.app_root.?);
+                    r.app_root.?.deinit();
+                    r.app_root = null;
+                    r.switch_teardown_ms += @as(f64, @floatFromInt(sdl.c.SDL_GetTicksNS() - t0)) / 1e6;
+                    r.switch_teardowns += 1;
+                } else if (phase == 0 and frame > 0 and r.app_root == null) {
+                    // Resume: rebuild + relayout; resume_ms closes when this
+                    // frame's paint completes (the run loop checks resume_t0).
+                    r.resume_t0 = sdl.c.SDL_GetTicksNS();
+                    r.app_root = buildAppContent(r.allocator) catch @panic("klaxon: out of memory");
+                    r.app_slot.?.add(r.app_root.?);
+                    r.root.layout(r.bounds);
+                }
+            },
         }
     }
 
     /// Render `opts.warmup_frames + opts.frames` frames and collect metrics.
     fn run(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
-        const bounds = Rect{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) };
-        r.root.layout(bounds);
+        r.bounds = Rect{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) };
+        r.lat_ev = opts.warmup_frames + @min(5, opts.frames / 2); // input_latency injection frame
+        r.root.layout(r.bounds);
         if (opts.hide_scroll_content and r.scene == .gallery) {
             // Counterfactual UPPER BOUND: hiding the whole scroll content
             // column removes visible sections too — the resulting frame time
@@ -265,6 +493,15 @@ const SceneRunner = struct {
             const sv = r.gallery.?.refs.scroll_view;
             if (sv.children.items.len > 0) sv.children.items[0].visible = false;
         }
+        if (r.scene.isListOp()) return r.runListOp(renderer, opts, start_ns);
+        if (r.scene.isRamp()) return r.runRamp(renderer, opts, start_ns);
+        return r.runFrames(renderer, opts, start_ns);
+    }
+
+    /// The standard loop: warmup + measured frames of tick → layout → paint.
+    /// Per-phase timing feeds the optional trace/phase diagnostics (3 extra
+    /// SDL_GetTicksNS calls per frame — ~0 cost when the opts are off).
+    fn runFrames(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
         var frame_times = std.array_list.Managed(f64).init(r.allocator);
         defer frame_times.deinit();
         try frame_times.ensureTotalCapacity(@intCast(opts.frames));
@@ -287,7 +524,7 @@ const SceneRunner = struct {
             r.tick(renderer, i);
             const t1 = sdl.c.SDL_GetTicksNS();
             const relayout = r.root.layout_dirty;
-            if (relayout) r.root.layout(bounds); // animated/resized scenes mark it
+            if (relayout) r.root.layout(r.bounds); // animated/resized scenes mark it
             const t2 = sdl.c.SDL_GetTicksNS();
             const had_damage = r.root.damage_valid;
             renderer.paint(r.root, BG);
@@ -296,6 +533,12 @@ const SceneRunner = struct {
             // clipped repaint (damage) or a full repaint on the host path.
             r.root.clearDamage();
             const t3 = sdl.c.SDL_GetTicksNS();
+            if (r.resume_t0 != 0) { // app_switch: the resume frame just painted
+                r.switch_resume_ms += @as(f64, @floatFromInt(t3 - r.resume_t0)) / 1e6;
+                r.switch_resumes += 1;
+                r.resume_t0 = 0;
+            }
+            r.closeLatency(); // input_latency: same-frame close-out
             if (i == 0) ttff_ms = @as(f64, @floatFromInt(t3 - start_ns)) / 1e6;
             if (i >= opts.warmup_frames) {
                 try frame_times.append(@as(f64, @floatFromInt(t3 - t0)) / 1e6);
@@ -318,14 +561,6 @@ const SceneRunner = struct {
                 });
             }
         }
-        // --- stats over the measured frames ---
-        const n = frame_times.items.len;
-        var avg: f64 = 0;
-        for (frame_times.items) |t| avg += t;
-        if (n > 0) avg /= @as(f64, @floatFromInt(n));
-        const sorted = try r.allocator.dupe(f64, frame_times.items);
-        defer r.allocator.free(sorted);
-        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
         // --- diagnostics output (stderr/files; the JSON report is unchanged) ---
         if (opts.trace_dir) |dir| writeFrameTrace(dir, r.scene, trace_csv.items);
         if (opts.phase_breakdown) {
@@ -333,7 +568,10 @@ const SceneRunner = struct {
         }
         // Capture the measured-run metrics BEFORE the optional profile: its
         // extra ticks allocate (scroll rows land in the arena) and would
-        // inflate rss_mb for this scene and the shared baseline of later ones.
+        // inflate rss_mb for this scene and the shared baseline of later
+        // ones. The app_switch extras freeze here too — profile frames keep
+        // ticking and can cross a teardown/resume boundary outside the
+        // measured range, which must not contaminate them.
         // The current surface (resize may have changed it) — the same region
         // the paint pass culls against.
         const draw_calls = countPaintNodes(r.root, .{
@@ -343,16 +581,145 @@ const SceneRunner = struct {
             .h = @floatFromInt(renderer.h),
         });
         const rss_mb = devtools.readRssMb();
+        if (r.switch_teardowns > 0) r.extra.teardown_ms = r.switch_teardown_ms / @as(f64, @floatFromInt(r.switch_teardowns));
+        if (r.switch_resumes > 0) r.extra.resume_ms = r.switch_resume_ms / @as(f64, @floatFromInt(r.switch_resumes));
         if (opts.paint_profile) try r.profilePaint(renderer, opts);
+        return r.finishMetrics(frame_times.items, ttff_ms, total, draw_calls, rss_mb);
+    }
+
+    /// Family A (list_ops): warmup on the pre-op state → the operation timed
+    /// as model mutation + rebind + layout + one full paint (extra.op_ms) →
+    /// frame metrics over LIST_OP_MEASURED frames after the op.
+    fn runListOp(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
+        var frame_times = std.array_list.Managed(f64).init(r.allocator);
+        defer frame_times.deinit();
+        const measured = @min(opts.frames, LIST_OP_MEASURED);
+        try frame_times.ensureTotalCapacity(@intCast(measured));
+        var ttff_ms: f64 = 0;
+        var i: u64 = 0;
+        while (i < opts.warmup_frames) : (i += 1) {
+            if (r.root.layout_dirty) r.root.layout(r.bounds);
+            renderer.paint(r.root, BG);
+            if (i == 0) ttff_ms = @as(f64, @floatFromInt(sdl.c.SDL_GetTicksNS() - start_ns)) / 1e6;
+        }
+        // The op: mutate the model, rebind the list, render once — timed.
+        const o0 = sdl.c.SDL_GetTicksNS();
+        applyListOp(r);
+        r.root.layout(r.bounds);
+        renderer.paint(r.root, BG);
+        const o1 = sdl.c.SDL_GetTicksNS();
+        r.extra.op_ms = @as(f64, @floatFromInt(o1 - o0)) / 1e6;
+        if (opts.warmup_frames == 0) ttff_ms = @as(f64, @floatFromInt(o1 - start_ns)) / 1e6;
+        i = 0;
+        while (i < measured) : (i += 1) {
+            const t0 = sdl.c.SDL_GetTicksNS();
+            r.tick(renderer, i);
+            if (r.root.layout_dirty) r.root.layout(r.bounds);
+            renderer.paint(r.root, BG);
+            const t1 = sdl.c.SDL_GetTicksNS();
+            try frame_times.append(@as(f64, @floatFromInt(t1 - t0)) / 1e6);
+        }
+        const draw_calls = countPaintNodes(r.root, .{
+            .x = 0,
+            .y = 0,
+            .w = @floatFromInt(renderer.w),
+            .h = @floatFromInt(renderer.h),
+        });
+        return r.finishMetrics(frame_times.items, ttff_ms, opts.warmup_frames + 1 + measured, draw_calls, devtools.readRssMb());
+    }
+
+    /// Family B (ramp): stepped ladder — `warmup + min(frames, 20)` frames per
+    /// step, per-step p50 into extra.ramp[], n_max_60fps = largest passing N.
+    fn runRamp(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
+        var frame_times = std.array_list.Managed(f64).init(r.allocator);
+        defer frame_times.deinit();
+        const steps = @min(opts.ramp_steps, RAMP_STEPS.len);
+        const per_step = @min(opts.frames, RAMP_MEASURED);
+        try frame_times.ensureTotalCapacity(@intCast(per_step * steps));
+        var step_buf: [RAMP_MEASURED]f64 = undefined;
+        var ttff_ms: f64 = 0;
+        var first_done = false;
+        var total: u64 = 0;
+        var last_n: u64 = 0;
+        for (RAMP_STEPS[0..steps], 0..) |n, si| {
+            const s: *RampState = @ptrCast(@alignCast(r.ramp_node.?.state.?));
+            s.n = n;
+            last_n = n;
+            var i: u64 = 0;
+            while (i < opts.warmup_frames + per_step) : (i += 1) {
+                const t0 = sdl.c.SDL_GetTicksNS();
+                s.frame = i;
+                if (r.root.layout_dirty) r.root.layout(r.bounds);
+                renderer.paint(r.root, BG);
+                const t1 = sdl.c.SDL_GetTicksNS();
+                total += 1;
+                if (!first_done) {
+                    ttff_ms = @as(f64, @floatFromInt(t1 - start_ns)) / 1e6;
+                    first_done = true;
+                }
+                if (i >= opts.warmup_frames) {
+                    const ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+                    step_buf[@intCast(i - opts.warmup_frames)] = ms;
+                    try frame_times.append(ms);
+                }
+            }
+            const step_times = step_buf[0..@intCast(per_step)];
+            const sorted = try r.allocator.dupe(f64, step_times);
+            defer r.allocator.free(sorted);
+            std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+            r.extra.ramp[si] = .{ .n = n, .p50_ms = percentile(sorted, 50) };
+        }
+        r.extra.ramp_len = steps;
+        // n_max_60fps: the largest step still inside the 60 Hz budget.
+        var n_max: ?u64 = null;
+        for (r.extra.ramp[0..steps]) |p| {
+            if (p.p50_ms <= JANK_MS) n_max = p.n;
+        }
+        r.extra.n_max_60fps = n_max;
+        // draw_calls_per_frame = last_n: one node paints N items (see header).
+        return r.finishMetrics(frame_times.items, ttff_ms, total, last_n, devtools.readRssMb());
+    }
+
+    /// input_latency: close the event→paint window once the lit response has
+    /// painted. Runs after the frame's paint (not in tick — the responder
+    /// stamps painted_ns inside paint), so a run ending on the injected frame
+    /// still reports latency_frames/latency_ms. No-op for other scenes.
+    fn closeLatency(r: *SceneRunner) void {
+        if (r.scene != .input_latency or r.lat_event_ns == 0 or r.extra.latency_ms != null) return;
+        const s: *LatState = @ptrCast(@alignCast(r.lat_node.?.state.?));
+        if (s.painted_ns == 0) return;
+        r.extra.latency_ms = @as(f64, @floatFromInt(s.painted_ns - r.lat_event_ns)) / 1e6;
+        r.extra.latency_frames = s.painted_frame - r.lat_ev + 1;
+    }
+
+    /// Stats over the measured frames → Metrics (extras merged from r.extra).
+    /// draw_calls + rss_mb are captured by the CALLER — before any optional
+    /// paint_profile run (its extra ticks allocate and would pollute rss_mb).
+    fn finishMetrics(r: *SceneRunner, times: []f64, ttff_ms: f64, total: u64, draw_calls: u64, rss_mb: f64) !Metrics {
+        const sorted = try r.allocator.dupe(f64, times);
+        defer r.allocator.free(sorted);
+        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+        const n = times.len;
+        var avg: f64 = 0;
+        var jank: u64 = 0;
+        for (times) |t| {
+            avg += t;
+            if (t > JANK_MS) jank += 1;
+        }
+        if (n > 0) avg /= @as(f64, @floatFromInt(n));
         return .{
             .fps = if (avg > 0) 1000.0 / avg else 0,
             .frame_time_avg_ms = avg,
             .frame_time_p50_ms = percentile(sorted, 50),
             .frame_time_p99_ms = percentile(sorted, 99),
+            .frame_time_p999_ms = percentile(sorted, 99.9),
+            .jank_frames = jank,
+            .jank_pct = if (n > 0) 100.0 * @as(f64, @floatFromInt(jank)) / @as(f64, @floatFromInt(n)) else 0,
             .draw_calls_per_frame = draw_calls,
-            .rss_mb = @as(f64, rss_mb),
+            .rss_mb = rss_mb,
             .ttff_ms = ttff_ms,
             .frames_rendered = total,
+            .extra = r.extra,
         };
     }
 
@@ -717,12 +1084,20 @@ fn printPhaseBreakdown(scene: BenchScene, totals: []const f64, ticks: []const f6
 }
 
 /// The p-th percentile of an ascending-sorted sample set (nearest-rank — the
-/// devtools.p99FrameTimeMs convention). 0 for an empty set.
-fn percentile(sorted: []const f64, p: u64) f64 {
+/// devtools.p99FrameTimeMs convention). 0 for an empty set. `p` is fractional
+/// so p99.9 uses the same convention (p999_ms schema v2).
+fn percentile(sorted: []const f64, p: f64) f64 {
     const n = sorted.len;
     if (n == 0) return 0;
-    const idx = @min((n * p) / 100, n - 1);
-    return sorted[idx];
+    const idx: usize = @intFromFloat(@floor(@as(f64, @floatFromInt(n)) * p / 100.0));
+    return sorted[@min(idx, n - 1)];
+}
+
+/// Node count of a semantics tree (semantics_build's nodes_per_frame).
+fn countSemNodes(sn: *const ui.semantics.SemanticNode) u64 {
+    var c: u64 = 1;
+    for (sn.children) |*child| c += countSemNodes(child);
+    return c;
 }
 
 /// Draw-call estimate: the nodes painted per frame (see the header) —
@@ -1064,6 +1439,866 @@ fn buildVideoPlayback(r: *SceneRunner) !*Node {
     return col;
 }
 
+// =====================================================================
+// 4c.6 scene catalogue (docs/specs/bench-scenes.md)
+// =====================================================================
+
+/// Shared per-frame clock handed to scene nodes that animate at paint time
+/// (the runner sets it at the top of tick — deterministic in `frame`).
+const Drive = struct { frame: u64 = 0 };
+
+// --- family A: list_ops — krausest ops over the virtualized list ---
+// One shared row widget: 48 dp, "Row NNNN — klaxon bench" left, a 16×16
+// #7C4DFFFF square right. Virtualization stays ON (the framework idiom): the
+// op measures the model→render path — model mutation + window rebind + one
+// full render pass — not the layout of 1000 live nodes.
+
+const LIST_ROWS = 1000;
+
+const ListOpsCtx = struct {
+    allocator: std.mem.Allocator,
+    labels: [LIST_ROWS][]const u8 = undefined,
+    bufs: [LIST_ROWS][40]u8 = undefined,
+    count: usize = 0,
+};
+
+/// (Re)generate the whole row model — `tag` distinguishes generations
+/// (list_replace_1k writes a fresh generation so the swap is observable).
+fn fillListOpsModel(ctx: *ListOpsCtx, tag: []const u8) void {
+    for (0..LIST_ROWS) |i| {
+        ctx.labels[i] = std.fmt.bufPrint(&ctx.bufs[i], "Row {d:0>4} — klaxon bench{s}", .{ i, tag }) catch "Row — klaxon bench";
+    }
+    ctx.count = LIST_ROWS;
+}
+
+fn listOpsItem(userdata: ?*anyopaque, index: usize) *Node {
+    const ctx: *ListOpsCtx = @ptrCast(@alignCast(userdata.?));
+    const a = ctx.allocator;
+    const row = widgets.layout.row(a, .{ .padding = 8, .main_align = .space_between, .cross_align = .center }) catch @panic("klaxon: out of memory");
+    row.add(widgets.text.text(a, ctx.labels[index], .{ .size = 14, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
+    row.add(golden.solidBox(a, 16, 16, 0x7C4DFFFF) catch @panic("klaxon: out of memory"));
+    return row;
+}
+
+fn buildListOps(r: *SceneRunner, empty: bool) !void {
+    const a = r.allocator;
+    r.list_ops.count = 0;
+    if (!empty) fillListOpsModel(&r.list_ops, ""); // create_1k starts empty
+    const box = try widgets.layout.constrainedBox(a, .{ .max_w = 640, .max_h = 480 });
+    const list = try widgets.list_view.listView(a, .{
+        .item_count = r.list_ops.count,
+        .factory = .{ .fn_ptr = listOpsItem, .userdata = &r.list_ops },
+        .item_height = 48,
+    });
+    r.scroll_list = list;
+    box.add(list);
+    r.root = box;
+}
+
+/// The timed list operation (inside runListOp's op window).
+fn applyListOp(r: *SceneRunner) void {
+    const list = r.scroll_list.?;
+    switch (r.scene) {
+        .list_create_1k => {
+            fillListOpsModel(&r.list_ops, "");
+            widgets.list_view.setItemCount(list, r.list_ops.count);
+        },
+        .list_replace_1k => {
+            fillListOpsModel(&r.list_ops, " ·r2"); // swap all 1000 row models
+            widgets.list_view.reloadItems(list);
+        },
+        .list_update_10th => {
+            var i: usize = 0;
+            while (i < LIST_ROWS) : (i += 10) {
+                r.list_ops.labels[i] = std.fmt.bufPrint(&r.list_ops.bufs[i], "Row {d:0>4} — klaxon bench ·upd", .{i}) catch r.list_ops.labels[i];
+            }
+            widgets.list_view.reloadItems(list);
+        },
+        .list_swap_rows => {
+            const tmp = r.list_ops.labels[5];
+            r.list_ops.labels[5] = r.list_ops.labels[995];
+            r.list_ops.labels[995] = tmp;
+            widgets.list_view.reloadItems(list);
+        },
+        .list_remove_row => {
+            const mid = r.list_ops.count / 2;
+            var i = mid;
+            while (i + 1 < r.list_ops.count) : (i += 1) r.list_ops.labels[i] = r.list_ops.labels[i + 1];
+            r.list_ops.count -= 1;
+            widgets.list_view.setItemCount(list, r.list_ops.count);
+        },
+        .list_clear_1k => {
+            r.list_ops.count = 0;
+            widgets.list_view.setItemCount(list, 0);
+        },
+        else => unreachable,
+    }
+}
+
+// --- family B: ramp — one workhorse node painting N items ---
+// Stepped MotionMark: N = RAMP_STEPS, 20 measured frames per step (spec).
+// Items are scattered deterministically and move on a Lissajous path
+// (~4 px/frame). The kx ABI has no rotate — paths_ramp rotates its
+// tessellated path in Zig into a scratch buffer (1°/frame, phase-offset).
+
+const RAMP_PATH_PTS = 204; // ~200 pts of tessellation (12 edges × 17)
+const RampKind = enum { shapes, paths, text, images };
+
+const RampState = struct {
+    kind: RampKind,
+    n: usize = 0,
+    frame: u64 = 0,
+    base_xs: [RAMP_PATH_PTS]f32 = undefined, // paths: tessellated unit blob
+    base_ys: [RAMP_PATH_PTS]f32 = undefined,
+    pts_xs: [RAMP_PATH_PTS]f32 = undefined, // rotation scratch
+    pts_ys: [RAMP_PATH_PTS]f32 = undefined,
+    pixels: [64 * 64 * 4]u8 = undefined, // images: the one decoded test image
+    img_id: u64 = 0,
+    ctx: ?*kx.Ctx = null,
+};
+
+fn rampScatter(i: usize, w: f32, h: f32) [2]f32 {
+    const fi: f32 = @floatFromInt(i);
+    return .{ @mod(fi * 137.3, @max(1, w - 70)), @mod(fi * 91.7, @max(1, h - 60)) };
+}
+
+fn rampMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = c.max_w, .h = c.max_h });
+}
+fn rampLayout(n: *Node, bounds: Rect) void {
+    _ = n;
+    _ = bounds;
+}
+fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *RampState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    const t = @as(f32, @floatFromInt(s.frame));
+    var i: usize = 0;
+    switch (s.kind) {
+        .shapes => while (i < s.n) : (i += 1) {
+            const fi: f32 = @floatFromInt(i);
+            const p = rampScatter(i, b.w, b.h);
+            const x = b.x + p[0] + 55 * @sin(0.063 * t + fi * 0.83);
+            const y = b.y + p[1] + 45 * @cos(0.081 * t + fi * 0.71);
+            ui.paint.fillRRect(ctx, x, y, 40, 24, 8, if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
+        },
+        .paths => while (i < s.n) : (i += 1) {
+            const fi: f32 = @floatFromInt(i);
+            const p = rampScatter(i, b.w, b.h);
+            const ang = (t + fi * 7.0) * (std.math.pi / 180.0);
+            const ca = @cos(ang);
+            const sa = @sin(ang);
+            const cx = b.x + 35 + p[0];
+            const cy = b.y + 30 + p[1];
+            for (s.base_xs, s.base_ys, 0..) |bx, by, k| {
+                s.pts_xs[k] = cx + bx * ca - by * sa;
+                s.pts_ys[k] = cy + bx * sa + by * ca;
+            }
+            ui.paint.fillPolygon(ctx, &s.pts_xs, &s.pts_ys, if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
+        },
+        .text => while (i < s.n) : (i += 1) {
+            const fi: f32 = @floatFromInt(i);
+            const p = rampScatter(i, b.w, b.h);
+            const x = b.x + p[0] + 28 * @sin(0.06 * t + fi * 0.4);
+            ui.paint.text(ctx, "The quick brown fox 0123456789", x, b.y + 14 + p[1], 14, false, 0xFFFFFFFF);
+        },
+        .images => {
+            if (s.ctx != ctx) { // decode/upload once — startup cost excluded
+                if (s.img_id != 0) {
+                    if (s.ctx) |old| ui.paint.imageDestroy(old, s.img_id);
+                    s.img_id = 0;
+                }
+                s.img_id = ui.paint.imageCreate(ctx, &s.pixels, 64, 64);
+                s.ctx = ctx;
+            }
+            while (i < s.n) : (i += 1) {
+                const fi: f32 = @floatFromInt(i);
+                const p = rampScatter(i, b.w, b.h);
+                const x = b.x + p[0] + 50 * @sin(0.063 * t + fi * 0.83);
+                const y = b.y + p[1] + 45 * @cos(0.081 * t + fi * 0.71);
+                ui.paint.imageDraw(ctx, s.img_id, x, y, 48, 48); // 0.75× of 64
+            }
+        },
+    }
+}
+fn rampDeinit(n: *Node) void {
+    const s: *RampState = @ptrCast(@alignCast(n.state.?));
+    if (s.img_id != 0) {
+        if (s.ctx) |ctx| ui.paint.imageDestroy(ctx, s.img_id);
+    }
+    n.allocator.destroy(s);
+}
+const ramp_vtable = ui.node.VTable{ .measure = rampMeasure, .layout = rampLayout, .paint = rampPaint, .deinit = rampDeinit };
+
+fn buildRamp(r: *SceneRunner, kind: RampKind) !*Node {
+    const a = r.allocator;
+    const node = try Node.create(a, &ramp_vtable);
+    errdefer node.allocator.destroy(node);
+    const s = try a.create(RampState);
+    errdefer a.destroy(s);
+    s.* = .{ .kind = kind, .n = @intCast(RAMP_STEPS[0]) };
+    if (kind == .paths) tessellateBlob(&s.base_xs, &s.base_ys);
+    if (kind == .images) fillChecker(&s.pixels);
+    node.state = s;
+    r.ramp_node = node;
+    return node;
+}
+
+/// The 12-point closed bezier for paths_ramp: control points on alternating
+/// radii (a lobed blob), closed quadratic-through-midpoints curve, 17
+/// segments per edge ≈ 200 pts of tessellation (spec: ~200).
+fn tessellateBlob(xs: *[RAMP_PATH_PTS]f32, ys: *[RAMP_PATH_PTS]f32) void {
+    var ctrl: [12][2]f32 = undefined;
+    for (0..12) |i| {
+        const ang = @as(f32, @floatFromInt(i)) * (std.math.pi / 6.0);
+        const rad: f32 = if (i % 2 == 0) 18.0 else 11.0;
+        ctrl[i] = .{ rad * @cos(ang), rad * @sin(ang) };
+    }
+    const SEG = RAMP_PATH_PTS / 12;
+    var k: usize = 0;
+    for (0..12) |i| {
+        const p0 = ctrl[i];
+        const p1 = ctrl[(i + 1) % 12];
+        const p2 = ctrl[(i + 2) % 12];
+        const m0 = [2]f32{ (p0[0] + p1[0]) * 0.5, (p0[1] + p1[1]) * 0.5 };
+        const m1 = [2]f32{ (p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5 };
+        for (0..SEG) |j| {
+            const t = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(SEG));
+            const u = 1.0 - t;
+            xs[k] = u * u * m0[0] + 2 * u * t * p1[0] + t * t * m1[0];
+            ys[k] = u * u * m0[1] + 2 * u * t * p1[1] + t * t * m1[1];
+            k += 1;
+        }
+    }
+}
+
+/// The 64×64 RGBA test image for images_ramp: an 8 px checkerboard,
+/// generated at startup (decode cost excluded — measures sampling/draw).
+fn fillChecker(pixels: *[64 * 64 * 4]u8) void {
+    for (0..64) |y| {
+        for (0..64) |x| {
+            const i = (y * 64 + x) * 4;
+            const dark = ((x / 8) + (y / 8)) % 2 == 0;
+            pixels[i] = if (dark) 0x7C else 0xF5;
+            pixels[i + 1] = if (dark) 0x4D else 0xF5;
+            pixels[i + 2] = if (dark) 0xFF else 0xF5;
+            pixels[i + 3] = 0xFF;
+        }
+    }
+}
+
+// --- scene: overdraw_stack — 24 full-screen rects, alpha 0x1F each ---
+// A plain translucent fill would just src-over blend; the spec's cost is the
+// saveLayer, so each rect paints inside kx_layer_alpha (like glass_blur).
+
+const OverdrawState = struct { color: Color, alpha: f32 };
+
+fn fillMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = c.max_w, .h = c.max_h });
+}
+fn noopLayout(n: *Node, bounds: Rect) void {
+    _ = n;
+    _ = bounds;
+}
+fn overdrawPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *OverdrawState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    ui.paint.layerAlpha(ctx, s.alpha);
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, s.color);
+    ui.paint.restore(ctx);
+}
+fn overdrawDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*OverdrawState, @ptrCast(@alignCast(n.state.?))));
+}
+const overdraw_vtable = ui.node.VTable{ .measure = fillMeasure, .layout = noopLayout, .paint = overdrawPaint, .deinit = overdrawDeinit };
+
+fn buildOverdraw(a: std.mem.Allocator) !*Node {
+    const stack = try widgets.layout.stack(a, .{ .fit = .expand });
+    for (0..24) |i| {
+        const node = try Node.create(a, &overdraw_vtable);
+        const s = try a.create(OverdrawState);
+        s.* = .{ .color = if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF, .alpha = 31.0 / 255.0 };
+        node.state = s;
+        stack.add(node);
+    }
+    return stack;
+}
+
+// --- scene: elevation_grid — 10×10 cards, shadow re-rasterized per frame ---
+// The kx ABI has no blur: the M3 shadow (r=12, dy=2, blur=6, rgba(0,0,0,.30))
+// is approximated by two translucent rrects (penumbra + umbra core).
+
+const ElevState = struct { i: usize, drive: *Drive };
+
+fn elevMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 48, .h = 40 });
+}
+fn elevPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *ElevState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    ui.paint.fillRRect(ctx, b.x - 3, b.y + 2, b.w + 6, b.h + 6, 14, 0x0000001A);
+    ui.paint.fillRRect(ctx, b.x, b.y + 2, b.w, b.h, 12, 0x0000004D);
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    const k = 0.04 * @sin(0.15 * t + @as(f32, @floatFromInt(s.i)) * 0.31); // ±4% lightness
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 12, shiftLight(0x7A7A96FF, k));
+}
+fn elevDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*ElevState, @ptrCast(@alignCast(n.state.?))));
+}
+const elev_vtable = ui.node.VTable{ .measure = elevMeasure, .layout = noopLayout, .paint = elevPaint, .deinit = elevDeinit };
+
+/// Add k to every RGB channel (±4% ≈ ±10/255 — a cheap lightness wobble).
+fn shiftLight(c: Color, k: f32) Color {
+    const d: i32 = @intFromFloat(k * 255.0);
+    const ch = struct {
+        fn f(v: u32, dd: i32) u32 {
+            return @intCast(std.math.clamp(@as(i32, @intCast(v)) + dd, 0, 255));
+        }
+    }.f;
+    return (ch((c >> 24) & 0xFF, d) << 24) | (ch((c >> 16) & 0xFF, d) << 16) | (ch((c >> 8) & 0xFF, d) << 8) | (c & 0xFF);
+}
+
+fn buildElevationGrid(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const grid = try widgets.layout.grid(a, .{ .columns = 10, .gap = 6, .padding = 16 });
+    for (0..100) |i| {
+        const cell = try widgets.layout.center(a);
+        const node = try Node.create(a, &elev_vtable);
+        const s = try a.create(ElevState);
+        s.* = .{ .i = i, .drive = &r.drive };
+        node.state = s;
+        cell.add(node);
+        grid.add(cell);
+    }
+    return grid;
+}
+
+// --- scene: relayout_storm — 200 rows animating width 200↔440 dp ---
+// The row width is part of MEASURE (not a compositable transform): the tick
+// marks the column layout-dirty, so every frame re-measures + re-lays out.
+
+const StormRowState = struct { i: usize, drive: *Drive };
+
+fn stormRowMeasure(n: *Node, c: Constraints) Size {
+    const s: *StormRowState = @ptrCast(@alignCast(n.state.?));
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    const phase = t * (2.0 * std.math.pi / 120.0) + @as(f32, @floatFromInt(s.i)) * 0.1; // 2 s loop at the nominal 60 Hz
+    return c.constrain(.{ .w = 320 + 120 * @sin(phase), .h = 2 });
+}
+fn stormRowPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *StormRowState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, if (s.i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
+}
+fn stormRowDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*StormRowState, @ptrCast(@alignCast(n.state.?))));
+}
+const storm_row_vtable = ui.node.VTable{ .measure = stormRowMeasure, .layout = noopLayout, .paint = stormRowPaint, .deinit = stormRowDeinit };
+
+fn buildRelayoutStorm(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    // cross_align .start: the children keep their (animated) measured width.
+    const col = try widgets.layout.column(a, .{ .gap = 0, .padding = 4, .cross_align = .start });
+    for (0..200) |i| {
+        const node = try Node.create(a, &storm_row_vtable);
+        const s = try a.create(StormRowState);
+        s.* = .{ .i = i, .drive = &r.drive };
+        node.state = s;
+        col.add(node);
+    }
+    r.storm_col = col;
+    return col;
+}
+
+// --- scene: mount_churn — destroy 50 + create 50 widgets every frame ---
+// Steady-state pool of 500 label+icon cards; ids are sequential (the spec's
+// "random id" — determinism matters more than entropy for a bench). The
+// allocator pressure IS the workload: every card is container+row+icon+text.
+
+const CHURN_POOL = 500;
+const CHURN_DELTA = 50;
+
+fn churnCard(a: std.mem.Allocator, id: u64) *Node {
+    const card = widgets.container.container(a, .{
+        .color = if (id % 2 == 0) 0x2A2A3EFF else 0x24303CFF,
+        .radius = 6,
+        .padding = .{ .left = 8, .top = 4, .right = 8, .bottom = 4 },
+    }) catch @panic("klaxon: out of memory");
+    const row = widgets.layout.row(a, .{ .gap = 8, .cross_align = .center }) catch @panic("klaxon: out of memory");
+    row.add(widgets.icon.icon(a, .star, .{ .size = 12, .color = 0xFFD54FFF }) catch @panic("klaxon: out of memory"));
+    var buf: [32]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, "card #{d}", .{id}) catch "card";
+    row.add(widgets.text.text(a, label, .{ .size = 12, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
+    card.add(row);
+    return card;
+}
+
+fn buildMountChurn(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const col = try widgets.layout.column(a, .{ .gap = 2, .padding = 8 });
+    for (0..CHURN_POOL) |i| {
+        col.add(churnCard(a, i));
+        r.churn_next = i + 1;
+    }
+    r.churn_parent = col;
+    return col;
+}
+
+// --- scene: scroll_anim — virtualized list scrolling + pulsing row icons ---
+// The icon is a 12×12 dot whose alpha follows the shared drive clock
+// (~30 live rows at item_height 16 in the bounded viewport — the spec's
+// "30 embedded row icons" ARE the live window of a virtualized 10k list).
+
+const PulseItemCtx = struct { allocator: std.mem.Allocator, drive: *Drive };
+const PulseState = struct { drive: *Drive, i: usize };
+
+fn pulseMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 12, .h = 12 });
+}
+fn pulsePaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *PulseState = @ptrCast(@alignCast(n.state.?));
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    const k = 0.25 + 0.75 * (0.5 + 0.5 * @sin(0.12 * t + @as(f32, @floatFromInt(s.i)) * 0.7));
+    const b = n.bounds;
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 6, ui.paint.withAlphaScaled(0xFFD54FFF, k));
+}
+fn pulseDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*PulseState, @ptrCast(@alignCast(n.state.?))));
+}
+const pulse_vtable = ui.node.VTable{ .measure = pulseMeasure, .layout = noopLayout, .paint = pulsePaint, .deinit = pulseDeinit };
+
+fn scrollAnimItem(userdata: ?*anyopaque, index: usize) *Node {
+    const ctx: *PulseItemCtx = @ptrCast(@alignCast(userdata.?));
+    const a = ctx.allocator;
+    const row = widgets.layout.row(a, .{ .gap = 8, .padding = 2, .cross_align = .center }) catch @panic("klaxon: out of memory");
+    const dot = Node.create(a, &pulse_vtable) catch @panic("klaxon: out of memory");
+    const s = a.create(PulseState) catch @panic("klaxon: out of memory");
+    s.* = .{ .drive = ctx.drive, .i = index };
+    dot.state = s;
+    row.add(dot);
+    var buf: [32]u8 = undefined;
+    const label = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch "Item";
+    row.add(widgets.text.text(a, label, .{ .size = 11, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
+    return row;
+}
+
+fn buildScrollAnim(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const col = try widgets.layout.column(a, .{ .gap = 8 });
+    const list = try widgets.list_view.listView(a, .{
+        .item_count = 10_000,
+        .factory = .{ .fn_ptr = scrollAnimItem, .userdata = &r.pulse_ctx },
+        .item_height = 16,
+    });
+    r.scroll_list = list;
+    const box = try widgets.layout.constrainedBox(a, .{ .max_w = 640, .max_h = 470 });
+    box.add(list);
+    col.add(box);
+    return col;
+}
+
+// --- scene: text_rich — 60 paragraphs × 3 lines of styled spans ---
+// Mixed sizes (12/16/20 sp), bold spans, one LTR+RTL bidi line per
+// paragraph. RichText measures every span at paint — the shaping stress.
+// (kx's text call has bold only, no italic flag — the mixed-style stress
+// is approximated by bold + size variation, documented per spec §C.)
+
+fn richParagraph(a: std.mem.Allocator) !*Node {
+    const col = try widgets.layout.column(a, .{ .gap = 2, .cross_align = .start });
+    col.add(try widgets.text.richText(a, &.{
+        .{ .text = "The quick brown fox ", .size = 12, .color = 0xE0E0E0FF },
+        .{ .text = "jumps", .size = 16, .color = 0xFFFFFFFF, .bold = true },
+        .{ .text = " over the lazy dog 0123456789", .size = 12, .color = 0xB0B0B0FF },
+    }));
+    col.add(try widgets.text.richText(a, &.{
+        .{ .text = "Pack my box ", .size = 16, .color = 0xE0E0E0FF },
+        .{ .text = "with five dozen", .size = 20, .color = 0xFFD54FFF, .bold = true },
+        .{ .text = " liquor jugs", .size = 12, .color = 0xB0B0B0FF },
+    }));
+    col.add(try widgets.text.richText(a, &.{
+        .{ .text = "مختصر ", .size = 14, .color = 0xE0E0E0FF },
+        .{ .text = "Klaxon", .size = 14, .color = 0x03DAC6FF, .bold = true },
+        .{ .text = " عربي test اختبار", .size = 14, .color = 0xB0B0B0FF },
+    }));
+    return col;
+}
+
+fn buildTextRich(a: std.mem.Allocator) !*Node {
+    const col = try widgets.layout.column(a, .{ .gap = 10, .padding = 16, .cross_align = .start });
+    for (0..60) |_| col.add(try richParagraph(a));
+    return col;
+}
+
+// --- scene: chart_live — 1000-point polyline rebuilt every frame ---
+// A dashboard chart: 10×8 grid + one polyline, point arrays preallocated in
+// the node state (zero allocs/frame — the rebuild is math + one draw call).
+
+const CHART_PTS = 1000;
+const ChartState = struct { drive: *Drive, xs: [CHART_PTS]f32, ys: [CHART_PTS]f32 };
+
+fn chartPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *ChartState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    var v: usize = 0;
+    while (v <= 10) : (v += 1) {
+        const x = b.x + @as(f32, @floatFromInt(v)) * b.w / 10.0;
+        ui.paint.fillRect(ctx, x, b.y, 1, b.h, 0xFFFFFF1A);
+    }
+    var h: usize = 0;
+    while (h <= 8) : (h += 1) {
+        const y = b.y + @as(f32, @floatFromInt(h)) * b.h / 8.0;
+        ui.paint.fillRect(ctx, b.x, y, b.w, 1, 0xFFFFFF1A);
+    }
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    for (0..CHART_PTS) |i| {
+        const fi: f32 = @floatFromInt(i);
+        s.xs[i] = b.x + fi * b.w / @as(f32, @floatFromInt(CHART_PTS - 1));
+        s.ys[i] = b.y + b.h * 0.5 + b.h * 0.38 * (0.7 * @sin(fi * 0.021 + t * 0.11) + 0.3 * @sin(fi * 0.007 - t * 0.05));
+    }
+    ui.paint.strokePolyline(ctx, &s.xs, &s.ys, 2.0, false, 0x03DAC6FF);
+}
+fn chartDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*ChartState, @ptrCast(@alignCast(n.state.?))));
+}
+const chart_vtable = ui.node.VTable{ .measure = fillMeasure, .layout = noopLayout, .paint = chartPaint, .deinit = chartDeinit };
+
+fn buildChartLive(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const col = try widgets.layout.column(a, .{ .gap = 8, .padding = 12 });
+    col.add(try widgets.text.text(a, "chart_live — 1000 pts, polyline rebuilt every frame", .{ .size = 12, .color = 0xCCCCCCFF }));
+    const box = try widgets.layout.constrainedBox(a, .{ .max_w = 640, .max_h = 420 });
+    const node = try Node.create(a, &chart_vtable);
+    const s = try a.create(ChartState);
+    s.* = .{ .drive = &r.drive, .xs = undefined, .ys = undefined };
+    node.state = s;
+    box.add(node);
+    col.add(box);
+    return col;
+}
+
+// --- scene: clip_path — 120 nodes clipped by a 6-point star path ---
+// The kx ABI has no arbitrary path clip: the star clip is approximated by a
+// rect clip + the star path stroked over the bounds — the scroll-under-clip
+// workload (clip + translate per node per frame) is preserved.
+
+const StarClipState = struct { i: usize, drive: *Drive };
+
+fn starClipMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 56, .h = 36 });
+}
+fn starClipPaint(n: *Node, ctx: *kx.Ctx) void {
+    _ = n;
+    _ = ctx;
+}
+fn starClipPrePaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *StarClipState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    const off = @mod(t * 2.0 + @as(f32, @floatFromInt(s.i)) * 13.0, 156.0);
+    ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
+    ui.paint.translate(ctx, 0, -off);
+}
+fn starClipPostPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *StarClipState = @ptrCast(@alignCast(n.state.?));
+    _ = s;
+    ui.paint.clipReset(ctx);
+    var xs: [13]f32 = undefined;
+    var ys: [13]f32 = undefined;
+    starPts(n.bounds, &xs, &ys);
+    ui.paint.strokePolyline(ctx, &xs, &ys, 1.5, false, 0xFFD54FFF);
+}
+fn starClipDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*StarClipState, @ptrCast(@alignCast(n.state.?))));
+}
+const star_clip_vtable = ui.node.VTable{
+    .measure = starClipMeasure,
+    .layout = starClipLayout,
+    .paint = starClipPaint,
+    .deinit = starClipDeinit,
+    .pre_children_paint = starClipPrePaint,
+    .post_children_paint = starClipPostPaint,
+};
+fn starClipLayout(n: *Node, bounds: Rect) void {
+    // The content column is 192 px tall — scrolled under the clip by the
+    // paint transform (not by relayout).
+    for (n.children.items) |child| child.layout(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 192 });
+}
+
+/// 6-point star: 12 vertices alternating outer/inner radius (closed = 13 pts).
+fn starPts(b: Rect, xs: *[13]f32, ys: *[13]f32) void {
+    const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2;
+    const r_out = @max(2, @min(b.w, b.h) / 2 - 1);
+    const r_in = r_out * 0.45;
+    for (0..12) |i| {
+        const ang = -std.math.pi / 2.0 + @as(f32, @floatFromInt(i)) * (std.math.pi / 6.0);
+        const rad = if (i % 2 == 0) r_out else r_in;
+        xs[i] = cx + rad * @cos(ang);
+        ys[i] = cy + rad * @sin(ang);
+    }
+    xs[12] = xs[0];
+    ys[12] = ys[0];
+}
+
+fn buildClipPath(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const grid = try widgets.layout.grid(a, .{ .columns = 10, .gap = 4, .padding = 8 });
+    for (0..120) |i| {
+        const node = try Node.create(a, &star_clip_vtable);
+        const s = try a.create(StarClipState);
+        s.* = .{ .i = i, .drive = &r.drive };
+        node.state = s;
+        const content = try widgets.layout.column(a, .{});
+        for (0..4) |k| {
+            content.add(try golden.solidBox(a, 56, 48, if ((i + k) % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF));
+        }
+        node.add(content);
+        grid.add(node);
+    }
+    return grid;
+}
+
+// --- scene: theme_switch — 200+ node tree, light/dark every 30 frames ---
+// Klaxon themes are build-time values, so a switch can't rebuild widgets
+// declaratively: the scene's nodes hold BOTH palettes via a shared flip
+// flag — the measured cost is the global invalidation repaint (paint with
+// the alternate scheme), matching what the other runners' theme switch
+// repaints. Documented approximation (spec §C).
+
+const ThemeFlip = struct { dark: bool = false };
+
+const ThemedState = struct { role: usize, flip: *ThemeFlip, label: [24]u8, label_len: u8 };
+
+fn themePair(dark: bool, role: usize) struct { bg: ?Color, fg: Color } {
+    const cs = if (dark) &theme_mod.dark.colors else &theme_mod.light.colors;
+    return switch (role % 5) {
+        0 => .{ .bg = cs.surface_container, .fg = cs.on_surface },
+        1 => .{ .bg = cs.primary_container, .fg = cs.on_primary_container },
+        2 => .{ .bg = cs.secondary_container, .fg = cs.on_secondary_container },
+        3 => .{ .bg = cs.tertiary_container, .fg = cs.on_tertiary_container },
+        else => .{ .bg = null, .fg = cs.on_surface }, // text-only row
+    };
+}
+fn themedMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 56, .h = 26 });
+}
+fn themedPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *ThemedState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    const p = themePair(s.flip.dark, s.role);
+    if (p.bg) |bg| ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 8, bg);
+    const label = s.label[0..s.label_len :0];
+    ui.paint.text(ctx, label, b.x + 6, b.y + b.h / 2 + 4, 11, false, p.fg);
+}
+fn themedDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*ThemedState, @ptrCast(@alignCast(n.state.?))));
+}
+const themed_vtable = ui.node.VTable{ .measure = themedMeasure, .layout = noopLayout, .paint = themedPaint, .deinit = themedDeinit };
+
+fn buildThemeSwitch(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const col = try widgets.layout.column(a, .{ .gap = 6, .padding = 12 });
+    for (0..20) |row_i| {
+        const row = try widgets.layout.row(a, .{ .gap = 6 });
+        for (0..10) |i| {
+            const node = try Node.create(a, &themed_vtable);
+            const s = try a.create(ThemedState);
+            s.* = .{ .role = (row_i + i) % 5, .flip = &r.theme_flip, .label = @splat(0), .label_len = 0 };
+            const label = std.fmt.bufPrint(&s.label, "Item {d}", .{row_i * 10 + i}) catch "Item";
+            s.label_len = @intCast(@min(label.len, 23));
+            node.state = s;
+            row.add(node);
+        }
+        col.add(row);
+    }
+    return col;
+}
+
+// --- scene: backdrop_scroll — 200 scrolling items under a blur band ---
+// The kx ABI has no blur: the backdrop-blur band (σ=12) is approximated by
+// an alpha saveLayer + frosted tint + the spec's 60% scrim (same stand-in
+// as glass_blur). The scrolling content is the 200-item virtualized list.
+
+const FrostState = struct {};
+
+fn frostMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 640, .h = 160 });
+}
+fn frostPaint(n: *Node, ctx: *kx.Ctx) void {
+    const b = n.bounds;
+    ui.paint.layerAlpha(ctx, 0.95);
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 0, 0xE8E8FF55);
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, 0x00000099); // 60% scrim
+    ui.paint.restore(ctx);
+}
+fn frostDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*FrostState, @ptrCast(@alignCast(n.state.?))));
+}
+const frost_vtable = ui.node.VTable{ .measure = frostMeasure, .layout = noopLayout, .paint = frostPaint, .deinit = frostDeinit };
+
+fn buildBackdropScroll(r: *SceneRunner) !*Node {
+    const a = r.allocator;
+    const stack = try widgets.layout.stack(a, .{ .fit = .expand });
+    const list = try widgets.list_view.listView(a, .{
+        .item_count = 200,
+        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx },
+        .item_height = 36,
+    });
+    r.scroll_list = list;
+    stack.add(list);
+    const top = try widgets.layout.alignTo(a, .{ .alignment = .top_center });
+    const band = try Node.create(a, &frost_vtable);
+    const s = try a.create(FrostState);
+    s.* = .{};
+    band.state = s;
+    top.add(band);
+    stack.add(top);
+    return stack;
+}
+
+// --- scene: input_latency — synthetic event → frames to the visual response ---
+// A tap on the responder box lights it; latency_frames = painted_frame -
+// event_frame + 1 (the response paints inside the frame it was dispatched on
+// → 1), latency_ms = wall time dispatch → end of that paint. The close-out
+// runs after the frame's paint (SceneRunner.closeLatency) — a run ending on
+// the injected frame still reports both fields.
+
+const LatState = struct {
+    drive: *Drive,
+    lit: bool = false,
+    painted_ns: u64 = 0,
+    painted_frame: u64 = 0,
+};
+
+fn latMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    return c.constrain(.{ .w = 160, .h = 48 });
+}
+fn latPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *LatState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 8, if (s.lit) 0x03DAC6FF else 0x3A3A4EFF);
+    ui.paint.text(ctx, "tap target", b.x + 8, b.y + b.h / 2 + 5, 13, false, 0xFFFFFFFF);
+    if (s.lit and s.painted_ns == 0) {
+        s.painted_ns = sdl.c.SDL_GetTicksNS();
+        s.painted_frame = s.drive.frame;
+    }
+}
+fn latOnPointer(n: *Node, ev: input_mod.PointerEvent) bool {
+    const s: *LatState = @ptrCast(@alignCast(n.state.?));
+    if (ev.phase == .down and n.bounds.contains(ev.x, ev.y)) {
+        s.lit = true;
+        n.markDirty();
+        return true;
+    }
+    return ev.phase == .down;
+}
+fn latDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*LatState, @ptrCast(@alignCast(n.state.?))));
+}
+const lat_vtable = ui.node.VTable{
+    .measure = latMeasure,
+    .layout = noopLayout,
+    .paint = latPaint,
+    .deinit = latDeinit,
+    .on_pointer = latOnPointer,
+};
+
+fn buildInputLatency(r: *SceneRunner) !void {
+    const a = r.allocator;
+    r.router = input_mod.InputRouter{};
+    input_mod.setCurrent(&r.router.?);
+    const col = try widgets.layout.column(a, .{ .gap = 12, .padding = 24 });
+    col.add(try widgets.text.text(a, "input_latency — pointer event → response paint", .{ .size = 14, .color = 0xCCCCCCFF }));
+    const box = try Node.create(a, &lat_vtable);
+    const s = try a.create(LatState);
+    s.* = .{ .drive = &r.drive };
+    box.state = s;
+    r.lat_node = box;
+    col.add(box);
+    r.root = col;
+}
+
+// --- scene: pointer_storm — 1000 hit-test queries/frame over a 500-node tree ---
+
+fn buildPointerStorm(a: std.mem.Allocator) !*Node {
+    const col = try widgets.layout.column(a, .{ .gap = 4, .padding = 8 });
+    col.add(try widgets.text.text(a, "pointer_storm — 1000 hit-tests/frame over 500 nodes", .{ .size = 12, .color = 0xCCCCCCFF }));
+    const grid = try widgets.layout.grid(a, .{ .columns = 10, .gap = 4 });
+    for (0..500) |i| {
+        grid.add(try golden.solidBox(a, 56, 6, if (i % 2 == 0) 0x2A2A3EFF else 0x24303CFF));
+    }
+    col.add(grid);
+    return col;
+}
+
+// --- scene: semantics_build — build/diff the a11y tree of 1000 nodes/frame ---
+// 250 rows × 4 semantic nodes (icon .image + 3 texts .text) = 1000-node
+// semantic tree, built and torn down every frame through the runner
+// allocator (the diff cost IS the workload).
+
+fn buildSemanticsScene(a: std.mem.Allocator) !*Node {
+    const col = try widgets.layout.column(a, .{ .gap = 4, .padding = 8 });
+    for (0..250) |i| {
+        const row = try widgets.layout.row(a, .{ .gap = 8, .cross_align = .center });
+        row.add(try widgets.icon.icon(a, .star, .{ .size = 12, .color = 0xFFD54FFF }));
+        var buf: [32]u8 = undefined;
+        for (0..3) |k| {
+            const label = std.fmt.bufPrint(&buf, "row {d} cell {d}", .{ i, k }) catch "cell";
+            row.add(try widgets.text.text(a, label, .{ .size = 11, .color = 0xE0E0E0FF }));
+        }
+        col.add(row);
+    }
+    return col;
+}
+
+// --- scene: app_switch — pause→resume cycle every 60 frames ---
+// Pause tears down the app subtree (teardown_ms); resume rebuilds + relayouts
+// it and reports the wall time until the resumed frame finishes painting
+// (resume_ms, averaged over the run's cycles).
+
+fn buildAppContent(a: std.mem.Allocator) !*Node {
+    const col = try widgets.layout.column(a, .{ .gap = 8, .padding = 12 });
+    for (0..10) |sec| {
+        var tbuf: [32]u8 = undefined;
+        const title = std.fmt.bufPrint(&tbuf, "Section {d}", .{sec}) catch "Section";
+        col.add(try widgets.text.text(a, title, .{ .size = 14, .color = 0xFFFFFFFF }));
+        const row = try widgets.layout.row(a, .{ .gap = 8 });
+        for (0..4) |i| {
+            const card = try widgets.container.container(a, .{
+                .color = if ((sec + i) % 2 == 0) 0x2A2A3EFF else 0x24303CFF,
+                .radius = 8,
+                .padding = EdgeInsets.all(8),
+            });
+            var lbuf: [32]u8 = undefined;
+            const label = std.fmt.bufPrint(&lbuf, "Card {d}", .{sec * 4 + i}) catch "Card";
+            card.add(try widgets.text.text(a, label, .{ .size = 12, .color = 0xFFFFFFFF }));
+            row.add(card);
+        }
+        col.add(row);
+    }
+    return col;
+}
+
+fn buildAppSwitch(r: *SceneRunner) !void {
+    const a = r.allocator;
+    const col = try widgets.layout.column(a, .{ .gap = 8, .padding = 8 });
+    col.add(try widgets.text.text(a, "app_switch — pause→resume every 60 frames", .{ .size = 12, .color = 0xCCCCCCFF }));
+    const slot = try widgets.layout.column(a, .{});
+    r.app_slot = slot;
+    col.add(slot);
+    r.app_root = try buildAppContent(a);
+    slot.add(r.app_root.?);
+    r.root = col;
+}
+
 // --- tests ---
 
 /// Tiny options: the tests check that scenes build + run, not the numbers.
@@ -1076,15 +2311,26 @@ test "bench: every scene builds and runs without crashing" {
         const scene: BenchScene = @fromBackingInt(@intCast(value));
         // The gallery's dialogs assert a 280px panel floor (dialog.zig) — run
         // the gallery at its natural window size, like the gallery's own tests.
-        const opts = if (scene == .gallery)
+        var opts = if (scene == .gallery)
             RunOptions{ .frames = test_opts.frames, .warmup_frames = test_opts.warmup_frames, .width = gallery_mod.WINDOW_W, .height = gallery_mod.WINDOW_H }
         else
             test_opts;
+        // Ramp scenes run the first two steps only — the 1600/3200-item steps
+        // would take seconds under a Debug test build.
+        if (scene.isRamp()) opts.ramp_steps = 2;
         const m = try runSceneWithOpts(scene, std.testing.allocator, opts);
-        try std.testing.expectEqual(@as(u64, test_opts.warmup_frames + test_opts.frames), m.frames_rendered);
+        if (scene.isListOp()) {
+            // warmup + 1 op paint + min(frames, 60) measured
+            try std.testing.expectEqual(@as(u64, test_opts.warmup_frames + 1 + test_opts.frames), m.frames_rendered);
+        } else if (scene.isRamp()) {
+            try std.testing.expectEqual(@as(u64, 2 * (test_opts.warmup_frames + test_opts.frames)), m.frames_rendered);
+        } else {
+            try std.testing.expectEqual(@as(u64, test_opts.warmup_frames + test_opts.frames), m.frames_rendered);
+        }
         try std.testing.expect(m.draw_calls_per_frame > 0);
         try std.testing.expect(m.frame_time_avg_ms >= 0);
         try std.testing.expect(m.frame_time_p50_ms <= m.frame_time_p99_ms);
+        try std.testing.expect(m.jank_pct >= 0 and m.jank_pct <= 100);
         try std.testing.expect(m.ttff_ms >= 0);
         try std.testing.expect(m.fps >= 0);
         try std.testing.expect(m.rss_mb >= 0);
@@ -1131,6 +2377,68 @@ test "bench: percentile follows the nearest-rank convention" {
     try std.testing.expectEqual(@as(f64, 1), percentile(&s, 0));
     try std.testing.expectEqual(@as(f64, 6), percentile(&s, 50)); // idx (10*50)/100 = 5
     try std.testing.expectEqual(@as(f64, 10), percentile(&s, 99)); // idx min(9, 9) = 9
+    try std.testing.expectEqual(@as(f64, 10), percentile(&s, 99.9)); // p999 = max
     try std.testing.expectEqual(@as(f64, 10), percentile(&s, 100));
     try std.testing.expectEqual(@as(f64, 0), percentile(&[_]f64{}, 99));
+}
+
+test "bench: list ops mutate the model and report op_ms" {
+    const info = @typeInfo(BenchScene).@"enum";
+    inline for (info.field_values) |value| {
+        const scene: BenchScene = @fromBackingInt(@intCast(value));
+        if (scene.isListOp()) {
+            const m = try runSceneWithOpts(scene, std.testing.allocator, test_opts);
+            try std.testing.expect(m.extra.op_ms != null);
+            try std.testing.expect(m.extra.op_ms.? >= 0);
+            try std.testing.expect(m.extra.ramp_len == 0);
+        }
+    }
+    // clear → the list renders empty after the op
+    const m = try runSceneWithOpts(.list_clear_1k, std.testing.allocator, test_opts);
+    try std.testing.expect(m.draw_calls_per_frame >= 2); // box + list chrome
+}
+
+test "bench: ramp scenes report per-step p50 and n_max_60fps" {
+    const m = try runSceneWithOpts(.shapes_ramp, std.testing.allocator, .{ .frames = 4, .warmup_frames = 2, .width = 320, .height = 240, .ramp_steps = 3 });
+    try std.testing.expectEqual(@as(usize, 3), m.extra.ramp_len);
+    try std.testing.expectEqual(@as(u64, 10), m.extra.ramp[0].n);
+    try std.testing.expectEqual(@as(u64, 25), m.extra.ramp[1].n);
+    try std.testing.expect(m.extra.ramp[0].p50_ms >= 0);
+    try std.testing.expect(m.extra.n_max_60fps != null); // tiny steps all pass
+    try std.testing.expectEqual(@as(u64, 50), m.extra.n_max_60fps.?);
+    try std.testing.expectEqual(@as(u64, 3 * 6), m.frames_rendered);
+}
+
+test "bench: input_latency records the event→paint latency" {
+    const m = try runSceneWithOpts(.input_latency, std.testing.allocator, test_opts);
+    try std.testing.expect(m.extra.latency_ms != null);
+    try std.testing.expectEqual(@as(u64, 1), m.extra.latency_frames.?); // paints the dispatch frame
+    try std.testing.expect(m.extra.latency_ms.? >= 0);
+    // A run ending on the injected frame still reports latency — the close-out
+    // is post-paint, not next-frame tick (Devin review: frames=1 regression).
+    const one = try runSceneWithOpts(.input_latency, std.testing.allocator, .{ .frames = 1, .warmup_frames = 2, .width = 320, .height = 240 });
+    try std.testing.expect(one.extra.latency_ms != null);
+    try std.testing.expectEqual(@as(u64, 1), one.extra.latency_frames.?);
+    try std.testing.expect(one.extra.latency_ms.? >= 0);
+}
+
+test "bench: semantics_build reports nodes per frame" {
+    const m = try runSceneWithOpts(.semantics_build, std.testing.allocator, test_opts);
+    try std.testing.expect(m.extra.nodes_per_frame != null);
+    try std.testing.expect(m.extra.nodes_per_frame.? >= 1000); // 250 rows × 4 + group root
+}
+
+test "bench: app_switch cycles teardown/resume over 60 frames" {
+    const m = try runSceneWithOpts(.app_switch, std.testing.allocator, .{ .frames = 70, .warmup_frames = 0, .width = 640, .height = 480 });
+    try std.testing.expect(m.extra.teardown_ms != null); // fired at frame 30
+    try std.testing.expect(m.extra.resume_ms != null); // resumed at frame 60
+    try std.testing.expect(m.extra.teardown_ms.? >= 0);
+    try std.testing.expect(m.extra.resume_ms.? >= 0);
+}
+
+test "bench: jank counters track the 16.67 ms budget" {
+    const m = try runSceneWithOpts(.hello, std.testing.allocator, test_opts);
+    try std.testing.expect(m.jank_frames <= m.frames_rendered);
+    try std.testing.expect(m.jank_pct <= 100);
+    try std.testing.expect(m.frame_time_p999_ms >= m.frame_time_p99_ms);
 }

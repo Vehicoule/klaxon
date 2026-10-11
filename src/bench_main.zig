@@ -1,7 +1,8 @@
 // Klaxon benchmark runner (Phase 4c.3) — executable entry point + JSON report.
-// bench.zig (4c.1/4c.2) owns the 9 canonical scenes and the metrics collector;
-// this file drives them: run every scene (or the single -Dbench-scene), then
-// print the JSON report to stdout (and to -Dbench-output when set).
+// bench.zig (4c.1/4c.2/4c.6) owns the scene catalogue and the metrics
+// collector; this file drives it: run every scene (or the single
+// -Dbench-scene), then print the JSON report to stdout (and to
+// -Dbench-output when set).
 //
 // Build options (build.zig "bench" step, via @import("build_options")):
 //   bench_frames   : u32          — frames per scene (-Dbench-frames=N, default 600)
@@ -19,12 +20,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    // Scene selection: -Dbench-scene=NAME runs one scene, otherwise all 9.
+    // Scene selection: -Dbench-scene=NAME runs one scene, otherwise the full
+    // catalogue (33 scenes).
     const scene_names = @typeInfo(bench.BenchScene).@"enum".field_names;
     var scenes: [scene_names.len]bench.BenchScene = undefined;
     var count: usize = 0;
     if (build_options.bench_scene) |only| {
-        const scene = std.meta.stringToEnum(bench.BenchScene, only) orelse {
+        // The spec writes scene names snake_case in the catalogue but calls
+        // them "kebab_case in JSON/CLI" — accept both (normalize - → _).
+        var name_buf: [64]u8 = undefined;
+        const norm = if (only.len <= name_buf.len) blk: {
+            for (only, 0..) |ch, j| name_buf[j] = if (ch == '-') '_' else ch;
+            break :blk name_buf[0..only.len];
+        } else only;
+        const scene = std.meta.stringToEnum(bench.BenchScene, norm) orelse {
             std.debug.print("klaxon bench: unknown scene '{s}' — valid scenes:", .{only});
             for (scene_names) |n| std.debug.print(" {s}", .{n});
             std.debug.print("\n", .{});
@@ -68,10 +77,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-/// JSON report — the 4c.3 output contract, keep the shape stable:
+/// JSON report — the 4c.3 output contract, schema version 2 (spec
+/// docs/specs/bench-scenes.md), keep the shape stable:
 /// { "scenes": [ { "name", "fps", "frame_time_avg_ms", "frame_time_p50_ms",
-///                 "frame_time_p99_ms", "draw_calls_per_frame", "rss_mb",
-///                 "ttff_ms", "frames_rendered" } ],
+///                 "frame_time_p99_ms", "frame_time_p999_ms", "jank_frames",
+///                 "jank_pct", "draw_calls_per_frame", "rss_mb", "ttff_ms",
+///                 "frames_rendered", "extra": {…} } ],
 ///   "binary_size_bytes": N, "timestamp": "YYYY-MM-DDTHH:MM:SSZ" }
 fn formatReport(allocator: std.mem.Allocator, scenes: []const bench.BenchScene, metrics: []const bench.Metrics) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -83,13 +94,17 @@ fn formatReport(allocator: std.mem.Allocator, scenes: []const bench.BenchScene, 
             \\    {{
             \\      "name": "{s}",
             \\      "fps": {d:.1},
-            \\      "frame_time_avg_ms": {d:.1},
-            \\      "frame_time_p50_ms": {d:.1},
-            \\      "frame_time_p99_ms": {d:.1},
+            \\      "frame_time_avg_ms": {d:.2},
+            \\      "frame_time_p50_ms": {d:.2},
+            \\      "frame_time_p99_ms": {d:.2},
+            \\      "frame_time_p999_ms": {d:.2},
+            \\      "jank_frames": {d},
+            \\      "jank_pct": {d:.1},
             \\      "draw_calls_per_frame": {d},
             \\      "rss_mb": {d:.1},
             \\      "ttff_ms": {d:.1},
-            \\      "frames_rendered": {d}
+            \\      "frames_rendered": {d},
+            \\      "extra": {s}
             \\    }}
         , .{
             scene.name(),
@@ -97,10 +112,14 @@ fn formatReport(allocator: std.mem.Allocator, scenes: []const bench.BenchScene, 
             m.frame_time_avg_ms,
             m.frame_time_p50_ms,
             m.frame_time_p99_ms,
+            m.frame_time_p999_ms,
+            m.jank_frames,
+            m.jank_pct,
             m.draw_calls_per_frame,
             m.rss_mb,
             m.ttff_ms,
             m.frames_rendered,
+            try formatExtra(allocator, m.extra),
         }));
     }
     try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator,
@@ -115,6 +134,56 @@ fn formatReport(allocator: std.mem.Allocator, scenes: []const bench.BenchScene, 
         try timestampIso8601(allocator),
     }));
     return buf.items;
+}
+
+/// The scene-extra object (schema v2): every contract field is emitted;
+/// fields the scene didn't produce serialize as null.
+fn formatExtra(allocator: std.mem.Allocator, e: bench.Extra) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"op_ms\": ");
+    try appendOptF(&buf, allocator, e.op_ms);
+    try buf.appendSlice(allocator, ", \"ramp\": ");
+    if (e.ramp_len == 0) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        try buf.appendSlice(allocator, "[");
+        for (e.ramp[0..e.ramp_len], 0..) |p, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{{\"n\": {d}, \"p50_ms\": {d:.2}}}", .{ p.n, p.p50_ms }));
+        }
+        try buf.appendSlice(allocator, "]");
+    }
+    try buf.appendSlice(allocator, ", \"n_max_60fps\": ");
+    try appendOptU(&buf, allocator, e.n_max_60fps);
+    try buf.appendSlice(allocator, ", \"latency_ms\": ");
+    try appendOptF(&buf, allocator, e.latency_ms);
+    try buf.appendSlice(allocator, ", \"latency_frames\": ");
+    try appendOptU(&buf, allocator, e.latency_frames);
+    try buf.appendSlice(allocator, ", \"nodes_per_frame\": ");
+    try appendOptU(&buf, allocator, e.nodes_per_frame);
+    try buf.appendSlice(allocator, ", \"teardown_ms\": ");
+    try appendOptF(&buf, allocator, e.teardown_ms);
+    try buf.appendSlice(allocator, ", \"resume_ms\": ");
+    try appendOptF(&buf, allocator, e.resume_ms);
+    try buf.appendSlice(allocator, "}");
+    return buf.items;
+}
+
+fn appendOptF(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?f64) !void {
+    if (v) |x| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d:.3}", .{x}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendOptU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?u64) !void {
+    if (v) |x| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{x}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
 }
 
 // std.c has no fseek/ftell — declare the libc externs (native targets link

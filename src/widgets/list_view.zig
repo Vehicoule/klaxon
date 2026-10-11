@@ -185,6 +185,34 @@ pub fn maxScrollOffset(n: *Node) f32 {
     return stateOf(ListState, n).scroll.maxOffset();
 }
 
+/// Re-create the live window from the factory: the model changed (row
+/// content is re-created, not diffed per node — the krausest-style list ops
+/// benchmark drives this). Keeps the scroll offset + window position.
+pub fn reloadItems(n: *Node) void {
+    const s = stateOf(ListState, n);
+    for (n.children.items) |child| child.deinit();
+    n.children.clearRetainingCapacity();
+    if (s.scroll.viewport > 0) {
+        const range = scroll_mod.visibleRange(s.opts.item_count, strideOf(s), s.scroll.viewport, s.scroll.offset, s.opts.margin);
+        s.first = range.first;
+        scroll_util.syncItemWindow(n, &s.first, s.opts.factory, range, layoutItem);
+    } else {
+        s.first = 0;
+    }
+    n.markLayoutDirty();
+    n.markDirty();
+}
+
+/// Change the item count (model size changed — insert/remove/clear) and
+/// reload the window, re-clamping the scroll offset.
+pub fn setItemCount(n: *Node, count: usize) void {
+    const s = stateOf(ListState, n);
+    s.opts.item_count = count;
+    s.scroll.content = contentHeight(s);
+    _ = s.scroll.setOffset(s.scroll.offset); // re-clamp
+    reloadItems(n);
+}
+
 // --- tests ---
 
 const red: Color = 0xFF0000FF;
@@ -371,6 +399,26 @@ test "listView: concurrent fingers drag independently (per-pointer tracks)" {
     try std.testing.expectEqual(@as(f32, 20), scrollOffset(list));
     router.dispatchPointer(list, .{ .phase = .up, .x = 50, .y = 90, .pointer = 1 });
     router.dispatchPointer(list, .{ .phase = .up, .x = 50, .y = 40, .pointer = 2 });
+}
+
+test "listView: setItemCount + reloadItems rebind the model in place" {
+    const list = try testList(100);
+    defer list.deinit();
+    list.layout(.{ .x = 0, .y = 0, .w = 100, .h = 200 });
+    try std.testing.expectEqual(@as(usize, 7), list.children.items.len);
+    setItemCount(list, 3);
+    try std.testing.expectEqual(@as(usize, 3), list.children.items.len);
+    setItemCount(list, 10_000);
+    try std.testing.expectEqual(@as(usize, 7), list.children.items.len);
+    // window follows a deep scroll, then a reload keeps it
+    _ = setScrollOffset(list, 48 * 5000);
+    try std.testing.expectEqual(@as(usize, 9), list.children.items.len);
+    reloadItems(list);
+    try std.testing.expectEqual(@as(usize, 9), list.children.items.len);
+    try std.testing.expectEqual(@as(usize, 4998), stateOf(ListState, list).first);
+    // clear → empty viewport
+    setItemCount(list, 0);
+    try std.testing.expectEqual(@as(usize, 0), list.children.items.len);
 }
 
 const input_widgets = @import("input.zig");
