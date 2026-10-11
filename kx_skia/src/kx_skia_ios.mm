@@ -38,6 +38,10 @@
 #include "include/gpu/ganesh/gl/GrGLTypes.h"
 #include "include/gpu/ganesh/gl/ios/GrGLMakeIOSInterface.h"
 #include "src/gpu/ganesh/gl/GrGLDefines.h"
+// Ganesh Metal (Phase 4c: backend matrix) — legacy Ganesh API on Metal.
+#include "include/gpu/ganesh/mtl/GrMtlBackendContext.h"
+#include "include/gpu/ganesh/mtl/GrMtlBackendSurface.h"
+#include "include/gpu/ganesh/mtl/GrMtlDirectContext.h"
 
 #include <OpenGLES/ES3/gl.h>
 
@@ -54,7 +58,7 @@ struct GpuState {
     id<CAMetalDrawable> drawable = nil;
     id<MTLTexture> drawable_texture = nil;
     id<MTLCommandQueue> command_queue = nil;
-    // Ganesh GLES path
+    // Ganesh paths (GLES + Metal)
     sk_sp<GrDirectContext> dctx;
     SDL_Window* sdl_window = nullptr;
     SDL_GLContext gl_ctx = nullptr;
@@ -108,9 +112,8 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
         return true;
     }
 
-    // Graphite Metal path (default).
-    // KX_BACKEND_GANESH_METAL: not yet implemented on iOS — fall back to
-    // Graphite Metal (which works on the simulator with the fixes below).
+    // Metal view + layer: shared by the Graphite Metal (default) and
+    // Ganesh Metal paths.
     state->metal_view = SDL_Metal_CreateView(static_cast<SDL_Window*>(sdl_window));
     if (!state->metal_view) { delete state; return false; }
     state->layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(state->metal_view);
@@ -136,6 +139,21 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
     state->command_queue = [device newCommandQueue]; // retained for presentDrawable
     sync_layer(state);
 
+    if (backend == KX_BACKEND_GANESH_METAL) {
+        // Ganesh Metal (legacy Ganesh API) on the same CAMetalLayer. The
+        // direct context renders through state->command_queue; presenting
+        // on that same queue keeps submission/present ordering correct.
+        GrMtlBackendContext mtl_backend;
+        // sk_cfp adopts the +1 CFRetain reference (and releases it).
+        mtl_backend.fDevice = sk_cfp<GrMTLHandle>((GrMTLHandle)CFRetain((__bridge CFTypeRef)device));
+        mtl_backend.fQueue = sk_cfp<GrMTLHandle>((GrMTLHandle)CFRetain((__bridge CFTypeRef)state->command_queue));
+        state->dctx = GrDirectContexts::MakeMetal(mtl_backend);
+        if (!state->dctx) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
+        *out = state;
+        return true;
+    }
+
+    // Graphite Metal path (default).
     id<MTLCommandQueue> queue = [device newCommandQueue];
 
     skgpu::graphite::MtlBackendContext mtl_ctx;
@@ -154,7 +172,7 @@ void gpu_shutdown(GpuState* state) {
     state->drawable_texture = nil;
     state->drawable = nil;
     state->command_queue = nil;
-    // Ganesh GLES: flush + release the direct context.
+    // Ganesh (GLES + Metal): flush + release the direct context.
     if (state->dctx) {
         state->dctx->flushAndSubmit(GrSyncCpu::kYes);
         state->dctx = nullptr;
@@ -208,6 +226,31 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
         return canvas;
     }
 
+    // Ganesh Metal path: wrap the layer's drawable texture as a Ganesh
+    // backend render target (top-left origin, BGRA8 — the layer's format).
+    if (state->backend == KX_BACKEND_GANESH_METAL) {
+        if (!state->dctx || !state->layer) return nullptr;
+        state->drawable = [state->layer nextDrawable];
+        if (!state->drawable) return nullptr;
+        state->drawable_texture = state->drawable.texture;
+        GrMtlTextureInfo tex_info;
+        // The sk_cfp adopts the +1 reference; the render target (kept alive
+        // by the surface) retains the texture for the frame.
+        tex_info.fTexture = sk_cfp<GrMTLHandle>((GrMTLHandle)CFRetain((__bridge CFTypeRef)state->drawable_texture));
+        const GrBackendRenderTarget target = GrBackendRenderTargets::MakeMtl(
+            state->width, state->height, tex_info);
+        state->frame_surface = SkSurfaces::WrapBackendRenderTarget(
+            state->dctx.get(), target, kTopLeft_GrSurfaceOrigin,
+            kBGRA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr);
+        if (!state->frame_surface) return nullptr;
+        // Same DPR model as the Graphite path: point-space layout, pixel
+        // drawable — scale the canvas.
+        state->scale = layer_scale(state);
+        SkCanvas* canvas = state->frame_surface->getCanvas();
+        canvas->scale(state->scale, state->scale);
+        return canvas;
+    }
+
     // Graphite Metal path.
     if (!state->context || !state->layer) return nullptr;
     state->drawable = [state->layer nextDrawable];
@@ -248,6 +291,24 @@ void gpu_end_frame(GpuState* state) {
         const Sint64 rb = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_UIKIT_OPENGL_RENDERBUFFER_NUMBER, 0);
         if (rb > 0) glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)rb);
         if (state->sdl_window) SDL_GL_SwapWindow(state->sdl_window);
+        return;
+    }
+
+    // Ganesh Metal path: flush, then present on the same queue (Skia's
+    // submissions and the presentDrawable are ordered on one queue).
+    if (state->backend == KX_BACKEND_GANESH_METAL) {
+        if (!state->dctx) return;
+        state->dctx->flushAndSubmit();
+        state->frame_surface = nullptr;
+        state->drawable_texture = nil;
+        if (state->drawable) {
+            if (state->command_queue) {
+                id<MTLCommandBuffer> cb = [state->command_queue commandBuffer];
+                [cb presentDrawable:state->drawable];
+                [cb commit];
+            }
+            state->drawable = nil;
+        }
         return;
     }
 
