@@ -98,6 +98,19 @@ jobs:
           deps-args: web-wasm
           apt-packages: python3 ninja-build cmake clang libc++-dev libc++abi-dev
 
+      # Eager cache save for the wasm deps. actions/cache's post-job save is
+      # skipped when the job fails (post-if: success()), and this job fails
+      # every run while the emscripten toolchain is broken — without this
+      # step deps-wasm-* never persists and each run pays the ~15 min cold
+      # build. Once a run has saved the key, later saves no-op; the
+      # continue-on-error covers a concurrent-save key conflict.
+      - name: Save deps cache now (job always fails before post-save)
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: deps
+          key: deps-wasm-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+
       - name: Build wasm web target
         run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall web
 
