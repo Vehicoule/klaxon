@@ -189,7 +189,12 @@ pub const Host = struct {
         const window_flags: u64 = if (is_emscripten)
             sdl.c.SDL_WINDOW_OPENGL
         else if (is_android)
-            sdl.c.SDL_WINDOW_FULLSCREEN | sdl.c.SDL_WINDOW_OPENGL
+            // OPENGL only: the activity theme (NoTitleBar.Fullscreen) already
+            // covers the screen. SDL_WINDOW_FULLSCREEN would switch the window
+            // to immersive-sticky mode, whose ImmersiveModeConfirmation dialog
+            // steals window focus (headless emulators never dismiss it) — the
+            // app then stops rendering (host.active = false).
+            sdl.c.SDL_WINDOW_OPENGL
         else if (is_ios)
             // HIGH_PIXEL_DENSITY: without it SDL_GetWindowSizeInPixels
             // reports points on iOS — the DPR model needs real pixels.
@@ -203,22 +208,45 @@ pub const Host = struct {
                 sdl.c.SDL_WINDOW_METAL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else
             0;
-        // Android: SDLActivity already created the window + surface before
-        // SDL_main runs — reuse it instead of creating a second (surface-less)
-        // window that renders into the void. Don't destroy it (SDLActivity owns it).
+        // Android: SDLActivity starts the SDL thread only once the surface is
+        // ready, but it never creates an SDL window object — the app must call
+        // SDL_CreateWindow (SDL attaches the activity's surface; Android
+        // supports exactly one window). Reuse a pre-existing window if some
+        // flow already created one, otherwise create it ourselves.
+        var android_owns_window = false;
         const window: *sdl.c.SDL_Window = if (is_android) blk: {
             var count: c_int = 0;
             const windows = sdl.c.SDL_GetWindows(&count);
             if (count > 0) {
                 if (windows[0]) |win| break :blk win;
             }
-            log("SDL_GetWindows returned no windows on Android", .{});
-            return error.SdlWindow;
+            // Request the display's natural size: Android_CreateWindow passes
+            // the requested w/h to setOrientation, and a fixed (non-resizable)
+            // window locks orientation by aspect — requesting a size whose
+            // aspect differs from the device rotates the activity (surface
+            // churn → stale EGL surface → rejected swaps, frozen screen).
+            var req_w = width;
+            var req_h = height;
+            const display = sdl.c.SDL_GetPrimaryDisplay();
+            if (display != 0) {
+                if (sdl.c.SDL_GetCurrentDisplayMode(display)) |mode| {
+                    if (mode.*.w > 0 and mode.*.h > 0) {
+                        req_w = mode.*.w;
+                        req_h = mode.*.h;
+                    }
+                }
+            }
+            const win = sdl.c.SDL_CreateWindow("klaxon gallery", req_w, req_h, window_flags) orelse {
+                log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                return error.SdlWindow;
+            };
+            android_owns_window = true;
+            break :blk win;
         } else sdl.c.SDL_CreateWindow("klaxon hello", width, height, window_flags) orelse {
             log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
             return error.SdlWindow;
         };
-        if (!is_android) {
+        if (!is_android or android_owns_window) {
             errdefer sdl.c.SDL_DestroyWindow(window);
         }
 
