@@ -730,7 +730,12 @@ pub const Host = struct {
         // real frames (retail frame p99 was dominated by first-frames
         // shader-compile jank). Raster backends pre-compile nothing (the
         // call is a no-op returning true).
-        if (!host.gpu_warmed) {
+        // Emscripten: the browser composites only AFTER the rAF callback
+        // returns, so warming inside callback 1 delays the first VISIBLE
+        // frame — wait for callback 2 (stats.frames counts rendered frames:
+        // reaching 2 means callback 1 fully returned and composited).
+        const warmup_due = !is_emscripten or host.stats.frames >= 2;
+        if (!host.gpu_warmed and warmup_due) {
             host.gpu_warmed = true;
             if (kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER) {
                 const t_warm = sdl.c.SDL_GetTicksNS();

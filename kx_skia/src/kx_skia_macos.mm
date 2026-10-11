@@ -137,9 +137,11 @@ SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
     // RenderTarget(Recorder*, const SkImageInfo&, Mipmapped = kNo,
     //              const SkSurfaceProps* = nullptr, std::string_view = {})
     // — no Budgeted parameter on the graphite overload at this pin.
+    // BGRA like the wrapped CAMetalLayer drawable — Graphite pipelines are
+    // per-target-format, so an RGBA warmup would not prime onscreen draws.
     state->warmup_surface = SkSurfaces::RenderTarget(
         state->warmup_recorder.get(),
-        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+        SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
     return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }
 

@@ -61,13 +61,29 @@ for bin in "$@"; do
   echo "================================================================"
   echo "size-report: $bin"
   echo "================================================================"
-  ls -la "$bin" | awk '{printf "  file size   : %s bytes (%.2f MiB)\n", $5, $5/1048576}'
+  # wc -c resolves symlinks (ls -la would report the link's own size).
+  size_bytes="$(wc -c < "$bin" | tr -d ' ')"
+  awk -v b="$size_bytes" 'BEGIN{printf "  file size   : %d bytes (%.2f MiB)\n", b, b/1048576}'
   echo
-  echo "--- per-library-family total (defined symbols) ---"
   # nm --print-size --size-sort: "addr size type name" per line (type first
-  # letter uppercase = defined). Bucket by family, sum sizes, sort desc.
-  "$NM" --print-size --size-sort --radix=d "$bin" 2>/dev/null \
-    | awk '$3 ~ /^[A-Z]/ { print $2, $4 }' \
+  # letter uppercase = defined). Extract once; detect the two unusable cases:
+  # a stripped release binary has no symbols at all, and some nm builds (macOS
+  # system nm on Mach-O) report symbols but no sizes — both would otherwise
+  # print empty/all-zero reports with no explanation.
+  sym_list="$("$NM" --print-size --size-sort --radix=d "$bin" 2>/dev/null \
+    | awk '$3 ~ /^[A-Z]/ && $2+0 > 0 { print $2, $4 }')"
+  if [ -z "$sym_list" ]; then
+    echo "  (no sized symbols — the binary looks stripped, or this nm reports"
+    echo "   no sizes for its format (e.g. macOS nm on Mach-O). The breakdown"
+    echo "   needs the UNSTRIPPED build read by llvm-nm: zig-out/lib/libmain.so"
+    echo "   before install-strip, or set KX_SIZE_REPORT_NM to llvm-nm. The file"
+    echo "   size above is the post-strip budget number and stays valid.)"
+    echo
+    continue
+  fi
+  echo "--- per-library-family total (defined symbols) ---"
+  # Bucket by family, sum sizes, sort desc.
+  echo "$sym_list" \
     | while read -r sz name; do echo "$(family_of "$name") $sz"; done \
     | awk '{
         total[$1] += $2; count[$1] += 1;
@@ -77,7 +93,6 @@ for bin in "$@"; do
       }' | sort -rn
   echo
   echo "--- top 25 symbols by size ---"
-  "$NM" --print-size --size-sort --radix=d "$bin" 2>/dev/null \
-    | awk '$3 ~ /^[A-Z]/ { printf "%10d bytes  %s\n", $2, $4 }' | tail -25
+  echo "$sym_list" | awk '{ printf "%10d bytes  %s\n", $1, $2 }' | tail -25
   echo
 done
