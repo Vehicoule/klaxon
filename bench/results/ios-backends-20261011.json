@@ -1,0 +1,48 @@
+{
+  "note": "Klaxon gallery app on the iOS SIMULATOR (iPhone 17 Pro Max, arm64, software Metal/GLES translation). Windowed fps + avg render work time per frame (600-frame windows, from the mobile benchmark log in host.zig). GPU backends are vsync-capped at 60 fps — the ms/frame work time is the comparable metric. Non-black % = screenshot pixel analysis of the rendered gallery.",
+  "device": "iPhone 17 Pro Max simulator (iOS 26.x, arm64, Apple Silicon Mac)",
+  "app": "com.klaxon.gallery (728-node widget tree, ganesh/graphite/raster backends via -Dios-backend)",
+  "timestamp": "2026-10-11T13:30:00+02:00",
+  "backends": [
+    {
+      "name": "ganesh-metal",
+      "api": "Ganesh (legacy) over Metal",
+      "fps": 60.0,
+      "frame_time_avg_ms": 3.16,
+      "non_black_pct": 100.0,
+      "notes": "fastest GPU backend on the simulator (~2x faster than Graphite Metal)"
+    },
+    {
+      "name": "graphite-metal",
+      "api": "Graphite over Metal (default/primary)",
+      "fps": 60.0,
+      "frame_time_avg_ms": 6.32,
+      "non_black_pct": 100.0,
+      "notes": "reference backend; screenshot is the pixel-diff baseline for the other GPU backends"
+    },
+    {
+      "name": "graphite-dawn",
+      "api": "Graphite over Dawn Metal",
+      "fps": 60.0,
+      "frame_time_avg_ms": 7.95,
+      "non_black_pct": 100.0,
+      "notes": "99.67% pixel-identical to graphite-metal; ~1.6 ms/frame Dawn overhead on the sim"
+    },
+    {
+      "name": "ganesh-gles",
+      "api": "Ganesh over OpenGL ES 3 (deprecated API, translated by the simulator)",
+      "fps": 12.0,
+      "frame_time_avg_ms": 79.02,
+      "non_black_pct": 100.0,
+      "notes": "98.94% pixel-identical to graphite-metal; GLES->Metal translation is slow on the simulator"
+    },
+    {
+      "name": "raster",
+      "api": "CPU raster + SDL software renderer/texture upload",
+      "fps": 1.8,
+      "frame_time_avg_ms": 555,
+      "non_black_pct": 99.9,
+      "notes": "UPPER BOUND: did not complete a 600-frame window in 330 s (< 1.8 fps, > 555 ms/frame) — renders correctly but the SDL software texture-upload present path dominates on the simulator"
+    }
+  ]
+}
