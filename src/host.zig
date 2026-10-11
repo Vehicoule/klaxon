@@ -186,6 +186,10 @@ pub const Host = struct {
         errdefer sdl.c.SDL_Quit();
         const t_sdl = sdl.c.SDL_GetTicksNS();
 
+        // PPM dumps go through kx_readback_rgba — raster surfaces only.
+        if (ppm_path != null and backend != kx.c.KX_BACKEND_RASTER)
+            log("warning: --ppm requires the raster backend; no PPM will be written", .{});
+
         // Emscripten (wasm) + mobile (Android/iOS): request a GLES (ES 3.0)
         // context before window creation — the GPU shims (kx_skia_wasm.cpp,
         // kx_skia_android.cpp) need a current GL context when kx.create
