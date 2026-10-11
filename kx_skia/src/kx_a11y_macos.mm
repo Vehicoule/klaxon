@@ -142,9 +142,13 @@ static KXA11yElement* buildHierarchy(const char* dump) {
                                                         value:nil
                                                     focusable:NO
                                                         frame:NSMakeRect(0, 0, 800, 600)];
-    // v1: add one child per line (flat list under the root). Manual
-    // split — sscanf's [^|] scansets reject EMPTY fields, so a control
-    // with no label used to vanish from VoiceOver entirely.
+    // Build the real hierarchy from the DFS dump: depth-stack — stack[d]
+    // is the element most recently seen at depth d, i.e. the parent of the
+    // next depth-(d+1) element. Manual split — sscanf's [^|] scansets
+    // reject EMPTY fields, so a control with no label used to vanish from
+    // VoiceOver entirely.
+    KXA11yElement* stack[128];
+    for (int i = 0; i < 128; i++) stack[i] = nil;
     const char* p = dump;
     while (*p) {
         const char* eol = strchr(p, '\n');
@@ -165,7 +169,7 @@ static KXA11yElement* buildHierarchy(const char* dump) {
             }
         }
         if (nf >= 11) {
-            (void)atoi(fields[0]); // depth — v1 is flat
+            const int depth = atoi(fields[0]);
             NSString* role = fields[1][0] ? [NSString stringWithUTF8String:fields[1]] : @"group";
             NSString* label = fields[2][0] ? [NSString stringWithUTF8String:fields[2]] : nil;
             NSString* value = fields[3][0] ? [NSString stringWithUTF8String:fields[3]] : nil;
@@ -179,9 +183,20 @@ static KXA11yElement* buildHierarchy(const char* dump) {
                                                                value:value
                                                           focusable:(BOOL)focusable
                                                               frame:NSMakeRect(x, y, w, h)];
-            child->_parent = root;
-            [root->_children addObject:child];
+            // Parent = nearest element on the stack above this depth (the
+            // dump's depth-0 root itself attaches under the synthetic root).
+            KXA11yElement* parent = root;
+            for (int d = depth - 1; d >= 0; d--) {
+                if (stack[d]) { parent = stack[d]; break; }
+            }
+            child->_parent = parent;
+            [parent->_children addObject:child];
             [child release]; // the array owns it now
+            if (depth < 128) {
+                stack[depth] = child;
+                // A new element at this depth closes every deeper level.
+                for (int d = depth + 1; d < 128 && stack[d]; d++) stack[d] = nil;
+            }
         }
         if (!eol) break;
         p = eol + 1;
