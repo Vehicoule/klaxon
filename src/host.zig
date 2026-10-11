@@ -160,6 +160,8 @@ pub const Host = struct {
     /// Mobile benchmark aid (Phase 4c): ns timestamp of the last periodic
     /// fps log (windowed over 600 frames).
     fps_log_ns: i128 = 0,
+    /// Mobile benchmark aid: sum of frame work times over the current window.
+    fps_log_time_sum: f32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -637,18 +639,25 @@ pub const Host = struct {
         host.stats.frames += 1;
         host.stats.frame_time_ms = @as(f32, @floatFromInt(t1 - host.frame_start_ns)) / 1e6;
         host.stats.paint_time_ms = host.stats.record_time_ms;
-        // Mobile benchmark aid (Phase 4c): windowed fps log to the platform
-        // log (SDL_Log → console on iOS, logcat on Android) so on-device /
-        // on-simulator frame rates can be read without a profiler.
-        if (is_mobile and host.stats.frames % 600 == 0) {
-            const now = sdl.c.SDL_GetTicksNS();
-            if (host.fps_log_ns > 0) {
-                const elapsed_s: f64 = @as(f64, @floatFromInt(now - host.fps_log_ns)) / 1e9;
-                if (elapsed_s > 0) {
-                    log("klaxon: {d:.1} fps over last 600 frames ({s})", .{ 600.0 / elapsed_s, host.stats.backend });
+        // Mobile benchmark aid (Phase 4c): windowed fps + avg frame work time
+        // log to the platform log (SDL_Log → console on iOS, logcat on
+        // Android) so on-device / on-simulator per-backend numbers can be
+        // read without a profiler. frame_time_ms is the render work time
+        // (the vsync wait happens between iterations, not inside it).
+        if (is_mobile) {
+            host.fps_log_time_sum += host.stats.frame_time_ms;
+            if (host.stats.frames % 600 == 0) {
+                const now = sdl.c.SDL_GetTicksNS();
+                if (host.fps_log_ns > 0) {
+                    const elapsed_s: f64 = @as(f64, @floatFromInt(now - host.fps_log_ns)) / 1e9;
+                    if (elapsed_s > 0) {
+                        const avg_ms: f64 = @as(f64, host.fps_log_time_sum) / 600.0;
+                        log("klaxon: {d:.1} fps, {d:.2} ms/frame over last 600 frames ({s})", .{ 600.0 / elapsed_s, avg_ms, host.stats.backend });
+                    }
                 }
+                host.fps_log_ns = now;
+                host.fps_log_time_sum = 0;
             }
-            host.fps_log_ns = now;
         }
         // Frame timeline sample (Phase 4a.4): only while the overlay is on —
         // zero cost when off (the stats fields above update regardless).
