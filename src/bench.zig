@@ -568,7 +568,10 @@ const SceneRunner = struct {
         }
         // Capture the measured-run metrics BEFORE the optional profile: its
         // extra ticks allocate (scroll rows land in the arena) and would
-        // inflate rss_mb for this scene and the shared baseline of later ones.
+        // inflate rss_mb for this scene and the shared baseline of later
+        // ones. The app_switch extras freeze here too — profile frames keep
+        // ticking and can cross a teardown/resume boundary outside the
+        // measured range, which must not contaminate them.
         // The current surface (resize may have changed it) — the same region
         // the paint pass culls against.
         const draw_calls = countPaintNodes(r.root, .{
@@ -578,9 +581,9 @@ const SceneRunner = struct {
             .h = @floatFromInt(renderer.h),
         });
         const rss_mb = devtools.readRssMb();
-        if (opts.paint_profile) try r.profilePaint(renderer, opts);
         if (r.switch_teardowns > 0) r.extra.teardown_ms = r.switch_teardown_ms / @as(f64, @floatFromInt(r.switch_teardowns));
         if (r.switch_resumes > 0) r.extra.resume_ms = r.switch_resume_ms / @as(f64, @floatFromInt(r.switch_resumes));
+        if (opts.paint_profile) try r.profilePaint(renderer, opts);
         return r.finishMetrics(frame_times.items, ttff_ms, total, draw_calls, rss_mb);
     }
 
