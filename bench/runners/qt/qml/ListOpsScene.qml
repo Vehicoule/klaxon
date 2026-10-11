@@ -13,6 +13,14 @@ Item {
     // One of: "create" | "replace" | "update10" | "swap" | "remove" | "clear"
     property string benchOp: "create"
     property int generation: 0
+    // The model installed by a "replace" op (the initial model is the
+    // declared `rowModel` below).
+    property var swappedModel: null
+
+    Component {
+        id: modelComp
+        ListModel {}
+    }
 
     // "Row NNNN — klaxon bench" — NNNN is the row index, zero-padded. The
     // generation offset keeps mutated/replaced labels distinguishable in
@@ -35,8 +43,20 @@ Item {
             fill(generation)
             break
         case "replace":  // swap all 1000 row models -> full rebuild
-            generation += 1
-            fill(generation)
+            // A real model swap: build a fresh 1000-row ListModel and
+            // assign it — not incremental clear+append into the existing
+            // model (the spec's "swap all 1000 row models").
+            {
+                generation += 1
+                const m = modelComp.createObject(root)
+                for (let i = 0; i < 1000; ++i)
+                    m.append({ "label": root.rowLabel(i, generation) })
+                const prev = root.swappedModel
+                root.swappedModel = m
+                list.model = m
+                if (prev)
+                    prev.destroy()
+            }
             break
         case "update10": // mutate every 10th row label (100 updates)
             generation += 1

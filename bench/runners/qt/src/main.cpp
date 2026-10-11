@@ -192,22 +192,27 @@ quint64 countVisibleItems(const QQuickItem *item) {
     return n;
 }
 
-// Nearest-rank percentile of an ascending-sorted sample (bench.zig). p is in
-// percent (50/99); the p99.9 tail uses the per-mille overload below.
+// Nearest-rank percentile of an ascending-sorted sample: the value at rank
+// ceil(p·n/100) — e.g. the p50 of 20 samples is the 10th value (index 9).
+// This is the strict nearest-rank convention; note bench.zig uses the
+// floor-rank index min(n*p/100, n-1), which lands one rank higher on small
+// samples — at 20 frames per ramp step the floor variant would pick the
+// 11th value and misclassify n_max_60fps. p is in percent (50/99); the
+// p99.9 tail uses the per-mille overload below.
 double percentile(const std::vector<double> &sorted, int p) {
     if (sorted.empty())
         return 0;
     const size_t n = sorted.size();
-    const size_t idx = std::min((n * size_t(p)) / 100, n - 1);
-    return sorted[idx];
+    const size_t rank = (n * size_t(p) + 99) / 100; // ceil(n*p/100)
+    return sorted[std::min(rank, n) - 1];
 }
 
 double percentilePerMille(const std::vector<double> &sorted, int pMille) {
     if (sorted.empty())
         return 0;
     const size_t n = sorted.size();
-    const size_t idx = std::min((n * size_t(pMille)) / 1000, n - 1);
-    return sorted[idx];
+    const size_t rank = (n * size_t(pMille) + 999) / 1000; // ceil
+    return sorted[std::min(rank, n) - 1];
 }
 
 quint64 imageHash(const QImage &img) {
@@ -254,8 +259,11 @@ void loadScene(QQuickView &view, const QString &path) {
 // One driven frame: the scene tick plus the frame's work (polish + sync +
 // render via grabWindow), then an untimed event drain. Klaxon's loop repaints
 // every frame unconditionally; grabWindow() drives exactly that (see the
-// header comment). Returns the frame's work time in ms and the frame image.
-double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgOut) {
+// header comment). Returns the frame's work time in ms and the frame image;
+// `endOut` (optional) receives the completion instant of the render itself —
+// the point ttff_ms is sampled at (before the untimed drain).
+double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgOut,
+                  Clock::time_point *endOut = nullptr) {
     const auto t0 = Clock::now();
     driver.tickFrame(frame); // the scene's tick (QML Connections handler)
     const QImage img = view.grabWindow(); // the frame's work
@@ -266,6 +274,8 @@ double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgO
     QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
     if (imgOut)
         *imgOut = img;
+    if (endOut)
+        *endOut = t1;
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
@@ -291,10 +301,12 @@ void computeStats(std::vector<double> &times, Metrics &m) {
     m.jankPct = 100.0 * double(jank) / double(times.size());
 }
 
-// Post-run render verification (stderr, always on): proves frames actually
-// render offscreen — the grabbed pixels change when the scene animates
-// (static scenes keep an equal hash) and the freshly grabbed frame contains
-// ink (content really painted, not a blank/cached image).
+// Post-run render verification (stderr, always on, FAILS LOUD): proves
+// frames actually render offscreen — the grabbed pixels must change when
+// the scene animates and stay equal when it is static, and the freshly
+// grabbed frame must contain ink (content really painted, not a
+// blank/cached image). A mismatch exits non-zero so a silently broken
+// render can never produce a "successful" report.
 void renderCheck(QQuickView &view, const QString &scene, quint64 hashA, quint64 hashB, bool isStatic) {
     const QImage check = view.grabWindow();
     const QRgb corner = check.pixel(2, 2);
@@ -306,12 +318,31 @@ void renderCheck(QQuickView &view, const QString &scene, quint64 hashA, quint64 
     // The corner pixel too: overdraw_stack composites to a single uniform
     // color (ink-samples is legitimately 0 — every pixel equals the
     // corner), so the corner value is what proves the stack painted.
+    const bool pixelsChanged = hashA != hashB;
     qInfo().noquote() << QStringLiteral("klaxon-bench-qt: %1 render-check — corner:#%2 ink-samples:%3 pixels-change:%4 (static:%5)")
                              .arg(scene)
                              .arg(corner & 0xFFFFFF, 6, 16, QLatin1Char('0'))
                              .arg(ink)
-                             .arg(hashA != hashB)
+                             .arg(pixelsChanged)
                              .arg(isStatic);
+    // Animated scenes must animate; static ones must not. The frame must
+    // contain ink — except list_clear_1k, whose spec outcome IS the empty
+    // state (a blank 640x480 over the bg is correct there).
+    const bool pixelsOk = isStatic ? !pixelsChanged : pixelsChanged;
+    const bool painted = ink > 0 || (corner & 0xFFFFFF) != 0x14141C;
+    const bool blankAllowed = scene == QLatin1String("list_clear_1k");
+    if (!pixelsOk || (!painted && !blankAllowed)) {
+        qWarning().noquote()
+            << QStringLiteral("klaxon-bench-qt: %1 render-check FAILED — %2%3")
+                   .arg(scene)
+                   .arg(pixelsOk ? QString() : (isStatic
+                        ? QStringLiteral("static scene's pixels changed; ")
+                        : QStringLiteral("animated scene's pixels never changed; ")))
+                   .arg((painted || blankAllowed)
+                        ? QString()
+                        : QStringLiteral("no ink painted (blank frame)"));
+        std::exit(1);
+    }
 }
 
 // The scenes whose rendered pixels stay identical between the two hash
@@ -325,7 +356,7 @@ bool isStaticScene(const QString &scene) {
         "list_create_1k", "list_replace_1k", "list_update_10th",
         "list_swap_rows", "list_remove_row", "list_clear_1k",
         // stress/system with static pixels
-        "overdraw_stack", "text_rich", "pointer_storm", "semantics_build",
+        "overdraw_stack", "pointer_storm", "semantics_build",
         "app_switch", // reloads the identical tree -> identical pixels
     };
     for (const char *const s : kStatic)
@@ -353,9 +384,10 @@ SceneResult runStandard(QQuickView &view, BenchDriver &driver, const QString &sc
 
     for (int i = 0; i < total; ++i) {
         QImage img;
-        const double ms = driveFrame(view, driver, i, &img);
+        Clock::time_point frameEnd;
+        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
         if (i == 0)
-            m.ttffMs = std::chrono::duration<double, std::milli>(Clock::now() - runStart).count();
+            m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
             times.push_back(ms);
         if (i == 30)
@@ -429,9 +461,10 @@ SceneResult runListOp(QQuickView &view, BenchDriver &driver, const QString &scen
             continue;
         }
         QImage img;
-        const double ms = driveFrame(view, driver, i, &img);
+        Clock::time_point frameEnd;
+        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
         if (i == 0)
-            m.ttffMs = std::chrono::duration<double, std::milli>(Clock::now() - runStart).count();
+            m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i > kWarmupFrames)
             times.push_back(ms);
         if (i == 30)
@@ -486,9 +519,10 @@ SceneResult runRamp(QQuickView &view, BenchDriver &driver, const QString &scene)
         stepTimes.reserve(kRampStepFrames);
         for (int i = 0; i < kWarmupFrames + kRampStepFrames; ++i, ++frame) {
             QImage img;
-            const double ms = driveFrame(view, driver, frame, &img);
+            Clock::time_point frameEnd;
+            const double ms = driveFrame(view, driver, frame, &img, &frameEnd);
             if (frame == 0)
-                m.ttffMs = std::chrono::duration<double, std::milli>(Clock::now() - runStart).count();
+                m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
             if (i >= kWarmupFrames) {
                 stepTimes.push_back(ms);
                 allTimes.push_back(ms);
@@ -573,15 +607,18 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
             // Sample the target's current paint, then inject the pointer
             // event between frames: the response can only appear in a
             // subsequent frame, so latency counts real event->paint frames.
+            // injectedAt precedes pressAt so latency_ms covers the whole
+            // event dispatch + handling + paint span.
             const QImage probe = view.grabWindow();
             baseline = probe.pixel(px);
-            driver.pressAt(center.x(), center.y());
             injectedAt = Clock::now();
+            driver.pressAt(center.x(), center.y());
         }
         QImage img;
-        const double ms = driveFrame(view, driver, i, &img);
+        Clock::time_point frameEnd;
+        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
         if (i == 0)
-            m.ttffMs = std::chrono::duration<double, std::milli>(Clock::now() - runStart).count();
+            m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
             times.push_back(ms);
         if (i == 30)
@@ -669,9 +706,10 @@ SceneResult runAppSwitch(QQuickView &view, BenchDriver &driver, const QString &s
             continue;
         }
         QImage img;
-        const double ms = driveFrame(view, driver, i, &img);
+        Clock::time_point frameEnd;
+        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
         if (i == 0)
-            m.ttffMs = std::chrono::duration<double, std::milli>(Clock::now() - runStart).count();
+            m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
             times.push_back(ms);
         if (i == 30)

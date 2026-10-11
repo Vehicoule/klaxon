@@ -56,7 +56,7 @@ to stderr) and writes the same report to
 | pacing | **unpaced** — render as fast as the raster backend allows, no vsync, no timer | bench.zig's loop |
 | per-frame work | scene tick + layout + paint, timed per frame | `SceneRunner.run` |
 | fps | `1000 / frame_time_avg_ms` | bench.zig |
-| frame_time avg/p50/p99/**p999** | over the measured frames, nearest-rank percentile | bench.zig `percentile` |
+| frame_time avg/p50/p99/**p999** | over the measured frames, **strict nearest-rank** percentile (rank `ceil(p·n/100)` — the p50 of a 20-frame ramp step is its 10th value; bench.zig's `min(n·p/100, n-1)` floor-rank lands one higher on small samples) | spec + devtools convention |
 | **jank_frames / jank_pct** | frames with `frame_ms > 16.67` (60 Hz budget) | spec (JankStats convention) |
 | draw_calls_per_frame | visible painted nodes (see below) | bench.zig `countPaintNodes` |
 | rss_mb | process RSS — `mach_task_basic_info` `resident_size` | devtools.zig |
@@ -127,6 +127,11 @@ Frames-render verification (all offscreen, printed per scene to stderr):
   (it is a swap signal, so static scenes report few — rendering is proven by
   the checks above, not by that signal).
 
+The checks **fail loud**: an animated scene whose pixels never change, a
+static scene whose pixels do, or a frame with no ink (blank render —
+`list_clear_1k`'s spec-mandated empty state excepted) exits the runner
+non-zero, so a silently broken scene can never produce a "successful" report.
+
 ### Known constant overhead vs Klaxon
 
 Each timed frame includes one backing-store→`QImage` copy (~1.2 MB at 640×480,
@@ -175,9 +180,11 @@ row delegate = 48dp card with the label `"Row NNNN — klaxon bench"` left and
 a 16×16 `#7C4DFF` square right. Virtualization stays ON (`cacheBuffer: 0`,
 ~10 live delegates — the framework's idiom). The six scene files only select
 `benchOp`; the harness runs the op once between warmup and the 60 measured
-frames via `runBenchOp()` (create → `clear`+append 1000, replace → same on a
-prefilled model, update10 → 100 `setProperty` label mutations, swap → swap
-model rows 5/995 contents, remove → `remove(500)`, clear → `clear()`).
+frames via `runBenchOp()` (create → append 1000 into the empty model,
+replace → build a fresh 1000-row `ListModel` and **assign it** — a real
+model swap, not incremental clear+append — update10 → 100 `setProperty`
+label mutations, swap → swap model rows 5/995 contents, remove →
+`remove(500)`, clear → `clear()`).
 
 Family B — `ramp` (MotionMark): each scene exposes `benchN`; the harness
 steps it through `10,25,50,100,200,400,800,1600,3200` (10 warmup + 20
@@ -196,11 +203,11 @@ Family C — `stress`: see the table below.
 | scene | spec | Qt port |
 |---|---|---|
 | overdraw_stack | 24 full-screen rects, alpha `0x1F`, alternating `#7C4DFF`/`#03DAC6` | fill alpha on 24 `Rectangle`s; composites to one uniform color (ink-samples legitimately 0 — the stderr render-check prints the corner pixel) |
-| elevation_grid | 10×10 grid of 48×40 cards, M3 shadow r=12/dy=2/blur=6/`rgba(0,0,0,.30)`, fill oscillates ±4% lightness | `RectangularGlow` (Qt5Compat) behind each card; tick re-binds `Qt.hsla` lightness |
+| elevation_grid | 10×10 grid of 48×40 cards, M3 shadow r=12/dy=2/blur=6/`rgba(0,0,0,.30)`, fill oscillates ±4% lightness | `RectangularGlow` (Qt5Compat) behind each card; the tick oscillates `glowRadius` ±0.5px + `update()` so every shadow re-rasterizes per frame (the fill change alone leaves the cached glow untouched) |
 | relayout_storm | 200 rows animating width 200↔440 (2 s loop) | `ColumnLayout` re-solves 200 `Layout.preferredWidth`s per frame; spec sets no phase → uniform 120-frame sine |
 | mount_churn | destroy 50 + create 50 widgets/frame, pool 500 | `createObject`/`destroy()` churn of a label+icon card; the detach is timed, C++ deletion completes in the untimed drain (deferred-deletion idiom, like GC) |
 | scroll_anim | scroll_10k @ 600 dp/s + 30 embedded icons pulse | 10 px/frame `contentY`; the pulse band follows the scroll (rows `[base, base+30)`) so it stays live under virtualization |
-| text_rich | 60 paragraphs × 3 lines, bold/italic + 12/16/20 + bidi line | `Text.RichText` paragraphs; static per frame — shaping happens at construction, the unpaced loop re-rasterizes the 180 lines each frame |
+| text_rich | 60 paragraphs × 3 lines, bold/italic + 12/16/20 + bidi line | `Text.RichText` paragraphs in a `Flickable` scrolling 15px/frame — every paragraph paints over the run (a fixed clip would cull ~47 of them forever; Qt culls offscreen items where Klaxon repaints the whole tree) |
 | chart_live | 1000-point polyline rebuilt/frame + 10×8 grid/axes | `Canvas` repaints grid + a fresh 1000-segment polyline each frame (one item — draw_calls granularity caveat) |
 | clip_path | 120 nodes under a 6-point star clip, contents scrolling | `StarClipItem` (C++ `QQuickPaintedItem`, `QPainterPath` clip) — see gap note |
 | theme_switch | 200+ node gallery tree, light/dark every 30 frames | ~260-node palette-bound tree; one `pal.dark` toggle re-evaluates all colors |
@@ -210,7 +217,7 @@ Family D — `system`:
 
 | scene | spec | Qt port |
 |---|---|---|
-| input_latency | pointer event → frames until the response paints | `pressAt` delivers `QMouseEvent` press+release between frames; the harness counts frames until the `latencyBox` fill shows up in the grabbed pixels (`latency_frames` = 1 — the next frame paints it — and `latency_ms` = injection→painting-frame span) |
+| input_latency | pointer event → frames until the response paints | `pressAt` delivers `QMouseEvent` press+release between frames; the harness counts frames until the `latencyBox` fill shows up in the grabbed pixels (`latency_frames` = 1 — the next frame paints it — and `latency_ms` spans event dispatch + handling through the painting frame's end) |
 | pointer_storm | 1000 hit-test queries/frame over a 500-node tree | tick issues 1000 LCG-distributed `bench.hitTest(x,y)` calls — a topmost-first contains()+descend walk, the same geometry Qt's dispatch performs (without the event objects) |
 | semantics_build | build/diff the a11y semantics tree of a 1000-node tree per frame | `bench.collectSemantics()` walks the item tree building one record per node (class, name, text, mapped bounds) + a hash diff vs the previous frame — `extra.nodes_per_frame` |
 | app_switch | pause→resume every 60 frames: `teardown_ms`, `resume_ms` | `setSource(QUrl())` + event drain (teardown) then reload + first `grabWindow` (resume); cycles at frames 60 and 120, `extra` reports the mean |

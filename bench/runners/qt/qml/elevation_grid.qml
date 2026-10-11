@@ -18,15 +18,17 @@ Item {
             id: rep
             model: 100
             Item {
-                // exposed for the tick's color oscillation
+                // exposed for the tick's color/radius oscillation
                 property alias card: cardRect
+                property alias glow: glowRect
                 width: 48
                 height: 40
                 RectangularGlow {
+                    id: glowRect
                     y: 2 // dy=2
                     width: 48
                     height: 40
-                    glowRadius: 6  // blur=6
+                    glowRadius: 6  // blur=6 (oscillates +-0.5 to force re-raster)
                     spread: 0.0
                     cornerRadius: 12 // r=12
                     color: "#4D000000" // rgba(0,0,0,0.30)
@@ -43,22 +45,30 @@ Item {
 
     Connections {
         target: bench
-        property var cards: null
+        property var cells: null
         function onTickFrame(frame) {
-            if (!cards || cards.length !== 100) {
-                cards = []
+            if (!cells || cells.length !== 100) {
+                cells = []
                 for (let i = 0; i < 100; ++i) {
                     const it = rep.itemAt(i)
                     if (!it)
                         return
-                    cards.push(it.card)
+                    cells.push(it)
                 }
             }
-            // Card fill oscillates +-4% lightness (hsl 0.66, 0.18, ~0.55);
-            // the fill change forces each shadow's region to re-rasterize.
+            // Card fill oscillates +-4% lightness (hsl 0.66, 0.18, ~0.55).
+            // The spec also requires every shadow to RE-RASTERIZE per frame:
+            // the fill change alone leaves the cached glow untouched, so the
+            // tick additionally wiggles glowRadius by +-0.5px (inside the
+            // blur=6 spec at pixel granularity) and marks the item dirty —
+            // Klaxon's immediate-mode raster repaints the shadows every
+            // frame; this makes Qt do the same work.
             for (let i = 0; i < 100; ++i) {
+                const cell = cells[i]
                 const l = 0.55 + 0.04 * Math.sin(0.07 * frame + i * 0.31)
-                cards[i].color = Qt.hsla(0.66, 0.18, l, 1.0)
+                cell.card.color = Qt.hsla(0.66, 0.18, l, 1.0)
+                cell.glow.glowRadius = 6 + 0.5 * Math.sin(0.11 * frame + i * 0.23)
+                cell.glow.update()
             }
         }
     }
