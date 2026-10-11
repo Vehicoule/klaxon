@@ -197,6 +197,12 @@ fn formatMonthYear(day: i64, buf: []u8) [:0]const u8 {
 
 /// The system clock's UTC epoch day (opts.today = null).
 fn todayFromClock() i64 {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) {
+        // RtlGetSystemTimePrecise: 100ns ticks since 1601 → unix seconds.
+        const ticks: i64 = @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise());
+        return @divFloor(@divFloor(ticks, 10_000_000) - 11644473600, 86400);
+    }
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @divFloor(ts.sec, 86400);

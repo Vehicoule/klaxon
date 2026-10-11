@@ -312,11 +312,13 @@ test "golden: the stepper paints Primary circles for completed+active, SurfaceCo
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // Step 0 (completed): Primary circle center.
+    // Step 0 (completed): Primary circle. Sample off-center (upper-left
+    // quadrant) — the ✓ ink's antialiased edge crosses dead center, and the
+    // stroke's exact landing differs ~1px between rasterizers.
     const col_w = min_step_w;
     const cx0 = 10 + col_w / 2;
     const cy = 10 + circle_d / 2;
-    try std.testing.expectEqual(t.colors.primary, f.pixelAt(@intFromFloat(cx0), @intFromFloat(cy)));
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(@intFromFloat(cx0 - 4), @intFromFloat(cy - 7)));
     // Step 2 (upcoming): SurfaceContainerHighest circle center (offset by text ink).
     const cx2 = 10 + col_w * 2 + col_w / 2;
     // Sample slightly off-center to avoid the number ink.

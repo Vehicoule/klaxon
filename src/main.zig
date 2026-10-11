@@ -27,8 +27,9 @@ const Options = struct {
     inspector: bool,
 };
 
-fn optsFromArgs(args: std.process.Args) Options {
-    var it = std.process.Args.Iterator.init(args);
+fn optsFromArgs(args: std.process.Args) !Options {
+    var it = try std.process.Args.Iterator.initAllocator(args, std.heap.page_allocator);
+    defer it.deinit();
     _ = it.next(); // exe name
     // Default backend: raster (native) / Ganesh WebGL2 (wasm, Phase 3f) —
     // the browser has no Metal/Vulkan; WebGL2 is the GPU path, raster stays
@@ -43,6 +44,12 @@ fn optsFromArgs(args: std.process.Args) Options {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
+        } else if (std.mem.eql(u8, arg, "dawn")) {
+            backend = kx.c.KX_BACKEND_GRAPHITE_DAWN;
+        } else if (std.mem.eql(u8, arg, "vulkan")) {
+            backend = kx.c.KX_BACKEND_GRAPHITE_VULKAN;
+        } else if (std.mem.eql(u8, arg, "gl")) {
+            backend = kx.c.KX_BACKEND_GANESH_GL;
         } else if (std.mem.startsWith(u8, arg, "--ppm=")) {
             ppm = arg["--ppm=".len..];
         } else if (std.mem.eql(u8, arg, "--devtools")) {
@@ -108,7 +115,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return; // unreachable with simulate_infinite_loop = 1
     }
 
-    const opts = optsFromArgs(init.args);
+    const opts = try optsFromArgs(init.args);
 
     var debug_alloc = std.heap.DebugAllocator(.{}){};
     defer _ = debug_alloc.deinit();

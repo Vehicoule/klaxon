@@ -187,8 +187,9 @@ const Options = struct {
     uri: ?[]const u8,
 };
 
-fn optsFromArgs(args: std.process.Args) Options {
-    var it = std.process.Args.Iterator.init(args);
+fn optsFromArgs(args: std.process.Args) !Options {
+    var it = try std.process.Args.Iterator.initAllocator(args, std.heap.page_allocator);
+    defer it.deinit();
     _ = it.next(); // exe name
     var backend: kx.c.kx_backend = kx.c.KX_BACKEND_RASTER;
     var uri: ?[]const u8 = null;
@@ -226,7 +227,7 @@ test "demo: the home page lays out" {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    const opts = optsFromArgs(init.args);
+    const opts = try optsFromArgs(init.args);
 
     var debug_alloc = std.heap.DebugAllocator(.{}){};
     defer _ = debug_alloc.deinit();

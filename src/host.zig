@@ -464,8 +464,10 @@ pub const Host = struct {
             return;
         }
         // macOS: the NSAccessibility bridge; Android: the TalkBack bridge
-        // (kx_a11y_android.cpp attaches the delegate over JNI).
-        if (builtin.os.tag == .macos or is_android) {
+        // (kx_a11y_android.cpp attaches the delegate over JNI); Windows:
+        // the UIA bridge (kx_a11y_win.cpp — a stub until the UIA provider
+        // lands; init/shutdown are still wired so the ABI is exercised).
+        if (builtin.os.tag == .macos or builtin.os.tag == .windows or is_android) {
             kx.a11yInit(@ptrCast(root));
             defer kx.a11yShutdown();
         }

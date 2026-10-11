@@ -135,13 +135,15 @@ fn binarySizeBytes(allocator: std.mem.Allocator) u64 {
 
 /// Current UTC time, ISO 8601 ("2026-10-11T14:03:22Z").
 fn timestampIso8601(allocator: std.mem.Allocator) ![]const u8 {
-    const clock_id: std.posix.clockid_t = std.posix.CLOCK.REALTIME;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(clock_id, &ts))) {
-        .SUCCESS => {},
-        else => return error.ClockUnavailable,
-    }
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts.sec) };
+    const builtin = @import("builtin");
+    const secs: u64 = if (builtin.os.tag == .windows)
+        @intCast(@divFloor(@as(i64, @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise())), 10_000_000) - 11644473600)
+    else blk: {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        break :blk @intCast(ts.sec);
+    };
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const year_day = epoch.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const day_sec = epoch.getDaySeconds();
@@ -158,6 +160,24 @@ fn timestampIso8601(allocator: std.mem.Allocator) ![]const u8 {
 /// Write the report to stdout. C stdio, same pattern as host.zig's dumpPpm:
 /// std.debug.print writes to stderr and must not pollute the JSON stream.
 fn writeStdout(json: []const u8) void {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) {
+        // /dev/stdout doesn't exist; write to the real output handle.
+        const k32 = struct {
+            pub extern "kernel32" fn GetStdHandle(id: u32) ?std.os.windows.HANDLE;
+            pub extern "kernel32" fn WriteFile(
+                h: std.os.windows.HANDLE,
+                buf: [*]const u8,
+                n: u32,
+                written: ?*u32,
+                overlapped: ?*anyopaque,
+            ) std.os.windows.BOOL;
+        };
+        const h = k32.GetStdHandle(@bitCast(@as(i32, -11))) orelse return; // STD_OUTPUT_HANDLE
+        var written: u32 = 0;
+        _ = k32.WriteFile(h, json.ptr, @intCast(json.len), &written, null);
+        return;
+    }
     const f = std.c.fopen("/dev/stdout", "wb") orelse return;
     defer _ = std.c.fclose(f);
     _ = std.c.fwrite(json.ptr, 1, json.len, f);
