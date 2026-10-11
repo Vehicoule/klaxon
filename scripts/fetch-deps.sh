@@ -3,7 +3,7 @@
 #
 #   Skia  @ 8643b1d64cff21b5e6f8d65ca98204c6eecb0098   (Graphite + Ganesh + raster;
 #                                                        Graphite Dawn/Metal on iOS)
-#   SDL3  @ release-3.2.16
+#   SDL3  @ release-3.4.18
 #   WAMR  @ WAMR-2.4.4   (fast-interp; plugin runtime for klaxon-plugin-sdk — the framework does not link it)
 #   emsdk @ 4.0.7        (web-wasm only — pinned by Skia's bin/activate-emsdk)
 #
@@ -30,7 +30,7 @@ DEPS="$ROOT/deps"
 JOBS="${NINJA_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)}"
 
 SKIA_PIN="8643b1d64cff21b5e6f8d65ca98204c6eecb0098"
-SDL3_PIN="release-3.2.16"
+SDL3_PIN="release-3.4.18"
 WAMR_PIN="WAMR-2.4.4"
 EMSDK_PIN="4.0.7" # pinned by Skia's bin/activate-emsdk (see MODULE.bazel)
 
