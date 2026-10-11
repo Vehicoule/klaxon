@@ -108,10 +108,17 @@ pub fn BoundText(comptime T: type) type {
             /// (kx_draw_text takes a char*). sem.label borrows it: bound()
             /// re-points the label on every format (a grow may move it).
             buf: std.array_list.Managed(u8),
+            /// The buf is stale — the signal changed since the last format.
+            /// bound() reformats only when this is set, so measure()+paint()
+            /// in one frame don't repeat the copy (dirtyCb re-arms it).
+            dirty: bool,
         };
 
         fn bound(n: *Node) [:0]const u8 {
             const s: *State = @ptrCast(@alignCast(n.state.?));
+            if (!s.dirty)
+                return s.buf.items.ptr[0..s.buf.items.len :0];
+            s.dirty = false;
             if (s.buf.capacity == 0)
                 s.buf.ensureTotalCapacity(128) catch @panic("klaxon: out of memory");
             while (true) {
@@ -166,6 +173,8 @@ pub fn BoundText(comptime T: type) type {
         }
         fn dirtyCb(userdata: ?*anyopaque) void {
             const n: *Node = @ptrCast(@alignCast(userdata.?));
+            const s: *State = @ptrCast(@alignCast(n.state.?));
+            s.dirty = true;
             _ = bound(n); // refresh the text + the a11y label for the new value
             n.markLayoutDirty(); // the text (and its size) changed
             n.markDirty(); // wake the dirty-flag render path (idle repaint)
@@ -183,7 +192,7 @@ pub fn BoundText(comptime T: type) type {
             errdefer node.allocator.destroy(node); // no state yet
             const s = try allocator.create(State);
             errdefer allocator.destroy(s);
-            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator) };
+            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true };
             errdefer s.buf.deinit();
             node.state = s;
             // Phase 2c: the label is the initial text — dynamic changes go
