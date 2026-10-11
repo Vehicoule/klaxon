@@ -2,20 +2,30 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # chore/ci-rework: exercise the reworked jobs on the working branch
+    # before merge; drop this entry once the branch lands on main.
+    branches: [main, chore/ci-rework]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Zig install, the deps/ cache and scripts/fetch-deps.sh are shared by all
+# jobs via the composite action in .github/actions/setup-deps — the cache
+# key pattern is 'deps-<target>-${{ hashFiles('scripts/fetch-deps.sh',
+# 'scripts/patches/**') }}' and MUST stay identical across jobs (a hash
+# change cold-builds every deps cache, ~15-90 min).
 
 jobs:
   build-test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check arch (macOS is arm64 only — no x64)
         if: runner.os == 'macOS'
@@ -24,38 +34,16 @@ jobs:
             echo "Klaxon targets macOS arm64 only (no x64)."; exit 1
           fi
 
-      - name: Install Zig 0.17.0 (pinned, ADR-0001)
-        run: |
-          case "$(uname -s)-$(uname -m)" in
-            Darwin-arm64)  zig_target=aarch64-macos ;;
-            Linux-x86_64)  zig_target=x86_64-linux ;;
-            *) echo "unsupported CI host: $(uname -s)-$(uname -m)"; exit 1 ;;
-          esac
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-${zig_target}-0.17.0.tar.xz"
-          tar -xf zig.tar.xz
-          zig_dir="$(pwd)/zig-${zig_target}-0.17.0"
-          echo "$zig_dir" >> "$GITHUB_PATH"
-          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
-          zig version
-
-      - name: Cache deps
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-deps
         with:
-          path: deps
-          key: deps-${{ runner.os }}-${{ hashFiles('scripts/fetch-deps.sh') }}
-
-      - name: Install Linux build deps (libc++ + X11/Wayland dev — SDL3 cmake requires them)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libc++-dev libc++abi-dev \
-            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev \
-            libwayland-dev wayland-protocols libxkbcommon-dev \
-            libegl1-mesa-dev libgles2-mesa-dev \
+          cache-key: deps-${{ runner.os }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          # Linux build deps: libc++ + X11/Wayland dev — SDL3 cmake requires them.
+          apt-packages: >-
+            libc++-dev libc++abi-dev
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev
+            libwayland-dev wayland-protocols libxkbcommon-dev
+            libegl1-mesa-dev libgles2-mesa-dev
             libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
-
-      - name: Fetch + build deps (Skia, SDL3, WAMR)
-        run: scripts/fetch-deps.sh
 
       - name: Build
         run: zig build
@@ -96,32 +84,19 @@ jobs:
   build-wasm:
     name: build-wasm (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Required gate since 2026-10-11: the emscripten sysroot include-order fix
+    # landed on main — build-wasm goes green and stays blocking.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install Zig 0.17.0 (pinned, ADR-0001)
-        run: |
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz"
-          tar -xf zig.tar.xz
-          zig_dir="$(pwd)/zig-x86_64-linux-0.17.0"
-          echo "$zig_dir" >> "$GITHUB_PATH"
-          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
-          zig version
-
-      - name: Install build deps (python3, ninja, cmake, clang)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 ninja-build cmake clang libc++-dev libc++abi-dev
-
-      - name: Cache deps (native + wasm)
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-deps
         with:
-          path: deps
-          key: deps-wasm-${{ hashFiles('scripts/fetch-deps.sh') }}
-
-      - name: Fetch + build wasm deps (emsdk + Skia wasm + SDL3 wasm)
-        run: scripts/fetch-deps.sh web-wasm
-        # NOTE: c'est lourd (~1-2 GB, 15-45 min). Le cache deps accélère les runs suivants.
+          cache-key: deps-wasm-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          # emsdk + Skia wasm + SDL3 wasm — heavy (~1-2 GB, 15-45 min cold);
+          # the deps cache makes warm runs fast.
+          deps-args: web-wasm
+          apt-packages: python3 ninja-build cmake clang libc++-dev libc++abi-dev
 
       - name: Build wasm web target
         run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall web
@@ -146,34 +121,21 @@ jobs:
   # (`zig build -Dtarget=aarch64-linux-android android-lib` ->
   # zig-out/lib/libgallery.a); Gradle + CMake/NDK link the kx_skia shim +
   # Skia + SDL3 into libmain.so and package the APK. assembleDebug only:
-  # auto-signed with the SDK debug key, no keystore in CI. Non-blocking for
-  # the first iteration — the native build-test job remains the merge gate.
+  # auto-signed with the SDK debug key, no keystore in CI.
+  # Required gate since 2026-10-11: the APK builds and renders on the
+  # emulator (Phase 3d complete).
   build-android:
     name: build-android (Linux)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig 0.17.0 (pinned, ADR-0001)
-        run: |
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz"
-          tar -xf zig.tar.xz
-          zig_dir="$(pwd)/zig-x86_64-linux-0.17.0"
-          echo "$zig_dir" >> "$GITHUB_PATH"
-          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
-          zig version
+      - uses: actions/checkout@v7
 
       - name: Setup JDK 17 (temurin)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Install build deps (ninja, cmake, clang, python3, unzip)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake clang python3 unzip
 
       - name: Install Android SDK (cmdline-tools, platform 35, build-tools 35, NDK 27.1)
         run: |
@@ -188,17 +150,14 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.1.12297006"
 
-      - name: Cache deps
-        uses: actions/cache@v4
+      # ANDROID_HOME/ANDROID_NDK_HOME exported above reach this step via
+      # GITHUB_ENV — fetch-deps.sh detect_ndk requires them.
+      - uses: ./.github/actions/setup-deps
         with:
-          path: deps
-          key: deps-android-${{ hashFiles('scripts/fetch-deps.sh') }}
-
-      - name: Fetch + build Android deps (Skia + SDL3, android-arm64)
-        run: scripts/fetch-deps.sh android-arm64
-        # NOTE: lourd (~1-2 GB, 15-45 min au premier run). Le cache deps
-        # accélère les runs suivants. Requires ANDROID_HOME/ANDROID_NDK_HOME
-        # (exported by the SDK step above — fetch-deps.sh detect_ndk).
+          cache-key: deps-android-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          # Skia + SDL3 for android-arm64 — heavy (~1-2 GB, 15-45 min cold).
+          deps-args: android-arm64
+          apt-packages: ninja-build cmake clang python3 unzip
 
       - name: Build Android static lib (zig)
         run: zig build -Dtarget=aarch64-linux-android android-lib
@@ -209,7 +168,7 @@ jobs:
           cd android && ./gradlew assembleDebug
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: klaxon-android-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
@@ -226,44 +185,37 @@ jobs:
   # Separate job on macOS arm64: Xcode is required (Skia + SDL3 iOS deps via
   # scripts/fetch-deps.sh ios, and the xcrun clang++ link step in build.zig).
   # Builds the simulator binary first (best-effort simctl smoke), then the
-  # device binary (size gate). Non-blocking for the first iteration — the ios
-  # deps take 30-90 min on first run; build-test remains the merge gate.
+  # device binary (size gate).
+  # Required gate since 2026-10-11: iOS builds for simulator + device and
+  # renders on the simulator (Phase 3e). The deps fetch is heavy (~30-90 min
+  # cold: 4 Skia/SDL3 builds) — the deps cache keeps warm runs at ~3 min.
   build-ios:
     name: build-ios (macOS)
     runs-on: macos-latest
-    continue-on-error: true
+    timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install Zig 0.17.0 (pinned, ADR-0001)
-        run: |
-          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz"
-          tar -xf zig.tar.xz
-          zig_dir="$(pwd)/zig-aarch64-macos-0.17.0"
-          echo "$zig_dir" >> "$GITHUB_PATH"
-          export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
-          zig version
-
-      - name: Cache deps
-        uses: actions/cache@v4
+      - uses: ./.github/actions/setup-deps
         with:
-          path: deps
-          key: deps-macos-ios-${{ hashFiles('scripts/fetch-deps.sh') }}
-
-      - name: Fetch + build iOS deps (Skia + SDL3, device + simulator)
-        run: scripts/fetch-deps.sh ios
-        # NOTE: très lourd (~30-90 min au premier run: 4 builds Skia/SDL3,
-        # device + sim). Le cache deps accélère les runs suivants.
+          cache-key: deps-macos-ios-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          deps-args: ios
 
       - name: Build iOS simulator binary (ReleaseSmall)
         run: zig build -Dtarget=aarch64-ios.15.0-simulator -Doptimize=ReleaseSmall ios-gallery
 
       - name: Smoke test (boot + install + launch on simulator — best effort)
+        # Stays best-effort at step level: simctl on hosted runners is
+        # occasionally flaky (slow runtime boot / install races), and the
+        # hard gate for this job is the build + size gate. A failure still
+        # surfaces as an annotation on the run.
         continue-on-error: true
         run: |
           set -e
-          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c "import json,sys; rs=json.load(sys.stdin); print(next(r['identifier'] for r in rs if r['isAvailable'] and r['name'].startswith('iOS')))")
-          DEVICE_TYPE=$(xcrun simctl list devicetypes -j | python3 -c "import json,sys; dts=json.load(sys.stdin); print(next(d['identifier'] for d in dts if 'iPhone' in d['name']))")
+          # simctl -j wraps results in an object ({runtimes,devicetypes: [...]});
+          # iterate the array, not the top-level dict.
+          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c "import json,sys; rs=json.load(sys.stdin)['runtimes']; print(next(r['identifier'] for r in rs if (r.get('isAvailable') is True or r.get('availability') == '(available)') and r.get('name','').startswith('iOS')))")
+          DEVICE_TYPE=$(xcrun simctl list devicetypes -j | python3 -c "import json,sys; dts=json.load(sys.stdin)['devicetypes']; print(next(d['identifier'] for d in dts if 'iPhone' in d.get('name','')))")
           xcrun simctl create klaxon-ci "$DEVICE_TYPE" "$RUNTIME"
           xcrun simctl boot klaxon-ci
           xcrun simctl bootstatus booted -b
