@@ -100,11 +100,27 @@ fn findNodeByPtr(node: *Node, ptr: u64) ?*Node {
     return null;
 }
 
+/// Sanitize a text field for the | -delimited dump: the bridges split
+/// positionally, so a literal '|' or '\n' in a label/value would scramble
+/// fields (or split the node across lines); NUL would truncate the dump.
+fn sanitizeA11yField(in: []const u8, out: []u8) []const u8 {
+    const n = @min(in.len, out.len);
+    for (in[0..n], 0..) |ch, i| {
+        out[i] = switch (ch) {
+            '|', '\n', '\r', 0 => ' ',
+            else => ch,
+        };
+    }
+    return out[0..n];
+}
+
 fn dumpNode(sn: *sem.SemanticNode, depth: usize, buf: *std.array_list.Managed(u8)) !void {
     // Format: "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
     const role_str = @tagName(sn.role);
-    const label = if (sn.label.len > 0) sn.label else "";
-    const value = if (sn.value.len > 0) sn.value else "";
+    var label_buf: [512]u8 = undefined;
+    var value_buf: [512]u8 = undefined;
+    const label = sanitizeA11yField(sn.label, &label_buf);
+    const value = sanitizeA11yField(sn.value, &value_buf);
     const focusable: u8 = if (sn.focusable) 1 else 0;
     const ptr: u64 = @intFromPtr(sn.node);
     // checked: 0 = null, 1 = false, 2 = true (?bool unwrapped — Zig does
@@ -117,7 +133,11 @@ fn dumpNode(sn: *sem.SemanticNode, depth: usize, buf: *std.array_list.Managed(u8
     var line_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{d}|{s}|{s}|{s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
         depth, role_str, label, value, focusable, ptr, checked, r.x, r.y, r.w, r.h,
-    }) catch return;
+    }) catch std.fmt.bufPrint(&line_buf, "{d}|{s}|||{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
+        depth, role_str, focusable, ptr, checked, r.x, r.y, r.w, r.h,
+    }) catch unreachable; // numeric fallback always fits — and the
+    // subtree is NEVER dropped: an overlong label used to `return` here,
+    // which silently vanished this node AND all its children.
     try buf.appendSlice(line);
 
     for (sn.children) |*child| {
