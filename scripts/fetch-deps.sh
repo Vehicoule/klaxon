@@ -88,8 +88,15 @@ load_msvc_env() {
   local vs_path
   vs_path="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | tr -d '\r')"
   [ -n "$vs_path" ] || die "MSVC C++ tools not found — add the VCTools workload"
-  local vcvars="$(cygpath -u "$vs_path")/VC/Auxiliary/Build/vcvars64.bat"
-  [ -f "$vcvars" ] || die "vcvars64.bat not found under $vs_path"
+  # Pick the vcvars matching the target arch. vcvars64.bat = host arch on
+  # both x64 and ARM64 native installs; cross from an x64 host to ARM64
+  # needs vcvarsamd64_arm64.bat.
+  local vcvars_name="vcvars64.bat"
+  if [ "$SKIA_TARGET_CPU" = "arm64" ] && [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "ARM64" ]; then
+    vcvars_name="vcvarsamd64_arm64.bat"
+  fi
+  local vcvars="$(cygpath -u "$vs_path")/VC/Auxiliary/Build/$vcvars_name"
+  [ -f "$vcvars" ] || die "$vcvars_name not found under $vs_path"
   # Direct `cmd //c "vcvars && set"` quoting is fragile under MSYS bash — a
   # temp .bat is deterministic.
   local tmpbat
