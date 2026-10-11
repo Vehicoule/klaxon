@@ -146,6 +146,9 @@ pub const Host = struct {
     /// where the window size is already in pixels). renderFrame scales the
     /// point-space paint onto the pixel canvas by this factor.
     display_scale: f32 = 1.0,
+    /// iOS: timestamp (ns) when the UIWindow's root view was first mapped.
+    /// -1 = not yet mapped. Presents before mapping are silently lost.
+    ios_mapped_ns: i128 = -1,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -179,12 +182,14 @@ pub const Host = struct {
         else if (is_ios)
             // HIGH_PIXEL_DENSITY: without it SDL_GetWindowSizeInPixels
             // reports points on iOS — the DPR model needs real pixels.
-            // Raster: no OPENGL flag (simulator's GL is deprecated; SDL
-            // software renderer doesn't need a GL context).
+            // METAL (not OPENGL): tells SDL to set up a Metal-capable window
+            // — SDL then auto-attaches the CAMetalLayer view. OPENGL is
+            // deprecated on iOS 12+ and the simulator's GL is unreliable.
+            // Raster: no METAL/OPENGL flag (SDL software renderer).
             if (backend == kx.c.KX_BACKEND_RASTER)
                 sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
             else
-                sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
+                sdl.c.SDL_WINDOW_METAL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else
             0;
         // Android: SDLActivity already created the window + surface before
@@ -598,6 +603,23 @@ pub const Host = struct {
         // Frame budget signal (1e.7): low-priority animations pause on overrun.
         host.timeline.frame_overrun = host.stats.paint_time_ms > FRAME_BUDGET_MS;
         if (host.ppm_path != null and host.stats.frames == 30) host.dumpPpm();
+
+        // iOS window-mapped gate: presents before the SDL view is attached
+        // to its UIWindow are silently lost (black screen). Keep rendering
+        // until the window is mapped, plus 200ms to cover the appearance
+        // transition. (Ported from klaxon-spikes kx_metal.mm.)
+        if (is_ios) {
+            if (host.ios_mapped_ns < 0) {
+                const props = sdl.c.SDL_GetWindowProperties(host.window);
+                const uiwindow = sdl.c.SDL_GetPointerProperty(props, sdl.c.SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, null);
+                if (uiwindow != null and kx.iosWindowMapped(uiwindow)) {
+                    host.ios_mapped_ns = @intCast(sdl.c.SDL_GetTicksNS());
+                }
+                root.dirty = true; // keep rendering until mapped
+            } else if (sdl.c.SDL_GetTicksNS() - @as(u64, @intCast(host.ios_mapped_ns)) < 200_000_000) {
+                root.dirty = true; // 200ms grace after mapping
+            }
+        }
     }
 
     /// Paint the open popup's overlay pass: popup content overflows its

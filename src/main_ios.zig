@@ -68,16 +68,13 @@ const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
 pub fn start() !*platform_ios.AppState {
     const stable = std.heap.page_allocator;
 
-    // Backend: raster (CPU) — the iOS simulator's software Metal doesn't
-    // execute GPU commands (Graphite Metal records + submits but the
-    // drawable stays transparent). Raster with SDL software renderer is
-    // the reliable path on the simulator. On a real device, switch to
-    // KX_BACKEND_GRAPHITE_METAL for GPU rendering.
+    // Backend: Graphite-Metal (GPU) — primary. Fallback to raster (CPU) if
+    // Metal context creation fails (e.g., simulator without Metal support).
     const host_ptr = try stable.create(Host);
-    host_ptr.* = host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null) catch |err| blk: {
+    host_ptr.* = host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_GRAPHITE_METAL, null) catch |err| blk: {
         if (err == error.KxCreate) {
-            sdl.c.SDL_Log("kx_create failed (raster), fallback graphite-metal");
-            break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_GRAPHITE_METAL, null);
+            sdl.c.SDL_Log("kx_create failed (Graphite-Metal), fallback raster");
+            break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null);
         }
         return err;
     };

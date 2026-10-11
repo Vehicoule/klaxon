@@ -9,6 +9,9 @@ pub const c_extern = struct {
     extern fn kx_a11y_init(root_node: ?*anyopaque) void;
     extern fn kx_a11y_shutdown() void;
     extern fn kx_a11y_root_element() ?*anyopaque;
+    /// iOS: true when the UIWindow's root view is attached (presents before
+    /// mapping are silently lost — see klaxon-spikes kx_metal.mm).
+    extern fn kx_ios_window_mapped(uiwindow: ?*anyopaque) bool;
 };
 
 pub fn a11yInit(root: *anyopaque) void {
@@ -17,6 +20,12 @@ pub fn a11yInit(root: *anyopaque) void {
 
 pub fn a11yShutdown() void {
     c_extern.kx_a11y_shutdown();
+}
+
+/// iOS: true when the UIWindow's root view is attached (presents before
+/// mapping are silently lost).
+pub fn iosWindowMapped(uiwindow: ?*anyopaque) bool {
+    return c_extern.kx_ios_window_mapped(uiwindow);
 }
 
 pub fn create(window: ?*anyopaque, width: c_int, height: c_int, backend: c.kx_backend) ?*Ctx {

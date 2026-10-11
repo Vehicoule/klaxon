@@ -14,6 +14,7 @@
 
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSurface.h"
+#include "include/core/SkColorSpace.h"
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
@@ -38,6 +39,7 @@ struct GpuState {
     SDL_MetalView metal_view = nullptr;
     id<CAMetalDrawable> drawable = nil;
     id<MTLTexture> drawable_texture = nil; // retained: BackendTextures::MakeMetal does NOT retain
+    id<MTLCommandQueue> command_queue = nil; // retained for presentDrawable
     int width = 0;      // pixels (host passes SDL_GetWindowSizeInPixels)
     int height = 0;     // pixels
     float scale = 1.0f; // device pixel ratio: pixels per point
@@ -72,11 +74,9 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
     state->layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(state->metal_view);
     if (!state->layer) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
 
-    // SDL's UIKit backend — unlike the Cocoa backend — does not attach the
-    // metal view to the window; without this the layer would never be
-    // onscreen. Insert at the back of the root view so SDL's text input
-    // field (added on top by the view controller) keeps working, and let the
-    // view track rotations (SDL's iOS metal view sets no autoresizing mask).
+    // With SDL_WINDOW_METAL, SDL auto-attaches the metal view to the window.
+    // Fallback: manually attach if not yet attached (defensive — some SDL
+    // versions on iOS don't auto-attach until the first frame).
     SDL_PropertiesID props = SDL_GetWindowProperties(static_cast<SDL_Window*>(sdl_window));
     UIWindow* uiwindow = (__bridge UIWindow*)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, nullptr);
     UIView* metal_view = (__bridge UIView*)state->metal_view;
@@ -91,6 +91,7 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
     state->layer.device = device;
     state->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     state->layer.framebufferOnly = YES;
+    state->command_queue = [device newCommandQueue]; // retained for presentDrawable
     sync_layer(state);
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -101,7 +102,6 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height) {
     mtl_ctx.fQueue = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)queue));
     state->context = skgpu::graphite::ContextFactory::MakeMetal(mtl_ctx, skgpu::graphite::ContextOptions{});
     if (!state->context) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
-
     *out = state;
     return true;
 }
@@ -111,6 +111,7 @@ void gpu_shutdown(GpuState* state) {
     state->frame_surface = nullptr;
     state->drawable_texture = nil;
     state->drawable = nil;
+    state->command_queue = nil;
     state->recorder.reset();
     if (state->context) {
         state->context->submit(skgpu::graphite::SyncToCpu::kYes);
@@ -140,7 +141,8 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
         SkISize::Make(state->width, state->height),
         (__bridge CFTypeRef)state->drawable_texture);
     state->frame_surface = SkSurfaces::WrapBackendTexture(
-        state->recorder.get(), backend_tex, kBGRA_8888_SkColorType, nullptr, nullptr);
+        state->recorder.get(), backend_tex, kBGRA_8888_SkColorType,
+        SkColorSpace::MakeSRGB(), nullptr);
     if (!state->frame_surface) return nullptr;
     // Layout is in points, the drawable is in pixels: scale the canvas so
     // point-space drawing lands 1:1 on the pixel grid. Recomputed per frame
@@ -172,7 +174,13 @@ void gpu_end_frame(GpuState* state) {
     state->frame_surface = nullptr;
     state->drawable_texture = nil; // release our texture reference
     if (state->drawable) {
-        [state->drawable present];
+        // Present via command buffer (not [drawable present]) — the simulator
+        // requires presentDrawable to go through the command queue.
+        if (state->command_queue) {
+            id<MTLCommandBuffer> cb = [state->command_queue commandBuffer];
+            [cb presentDrawable:state->drawable];
+            [cb commit];
+        }
         state->drawable = nil;
     }
 }
@@ -184,6 +192,16 @@ sk_sp<SkFontMgr> platform_font_mgr() {
         return mgr;
     }
     return SkFontMgr_New_CoreText(nullptr);
+}
+
+// iOS: check if the UIWindow's root view is attached — presents before the
+// view is mapped to the window are silently lost (black screen).
+extern "C" bool kx_ios_window_mapped(void* uiwindow) {
+    if (!uiwindow) return false;
+    UIWindow* w = (__bridge UIWindow*)uiwindow;
+    if (!w || w.isHidden) return false;
+    UIView* v = w.rootViewController.view;
+    return (v && v.window == w);
 }
 
 } // namespace kx
