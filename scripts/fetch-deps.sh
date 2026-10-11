@@ -560,7 +560,7 @@ xcode_sysroot = "$sysroot"
 ios_min_target = ""
 
 skia_use_metal = true
-skia_use_gl = false
+skia_use_gl = true
 skia_use_vulkan = false
 skia_use_dawn = false
 skia_use_direct3d = false
@@ -582,7 +582,7 @@ target_os = "ios"
 ios_min_target = "15.0"
 
 skia_use_metal = true
-skia_use_gl = false
+skia_use_gl = true
 skia_use_vulkan = false
 skia_use_dawn = false
 skia_use_direct3d = false

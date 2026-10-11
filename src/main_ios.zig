@@ -27,8 +27,20 @@ const platform_ios = @import("platform_ios.zig");
 const sdl = @import("sdl.zig");
 const ios_io = @import("ios_io.zig");
 
+const build_options = @import("build_options");
+
 const Host = host_mod.Host;
 const Node = ui.node.Node;
+
+/// Backend demandé via -Dios-backend (build.zig): graphite-metal (défaut),
+/// ganesh-gles, ganesh-metal, raster.
+fn requestedBackend() kx.c.kx_backend {
+    const name = build_options.ios_backend;
+    if (std.mem.eql(u8, name, "ganesh-gles")) return kx.c.KX_BACKEND_GANESH_GLES;
+    if (std.mem.eql(u8, name, "ganesh-metal")) return kx.c.KX_BACKEND_GANESH_METAL;
+    if (std.mem.eql(u8, name, "raster")) return kx.c.KX_BACKEND_RASTER;
+    return kx.c.KX_BACKEND_GRAPHITE_METAL;
+}
 
 /// Override std.Options.debug_io (fix compile iOS, Zig 0.17): le défaut
 /// std.Io.Threaded lit NullFile.fd — champ inexistant sur iOS — donc tout
@@ -68,12 +80,13 @@ const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
 pub fn start() !*platform_ios.AppState {
     const stable = std.heap.page_allocator;
 
-    // Backend: Graphite-Metal (GPU) — primary. Fallback to raster (CPU) if
-    // Metal context creation fails (e.g., simulator without Metal support).
+    // Backend: demandé via -Dios-backend (défaut Graphite-Metal). Fallback
+    // raster (CPU) si kx_create échoue (simulateur sans Metal, GLES indispo).
     const host_ptr = try stable.create(Host);
-    host_ptr.* = host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_GRAPHITE_METAL, null) catch |err| blk: {
+    const wanted = requestedBackend();
+    host_ptr.* = host_mod.Host.init(stable, 0, 0, wanted, null) catch |err| blk: {
         if (err == error.KxCreate) {
-            sdl.c.SDL_Log("kx_create failed (Graphite-Metal), fallback raster");
+            sdl.c.SDL_Log("kx_create failed (%s), fallback raster", kx.c.kx_backend_name(wanted));
             break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null);
         }
         return err;

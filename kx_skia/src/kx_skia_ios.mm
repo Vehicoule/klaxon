@@ -27,19 +27,40 @@
 #include "include/ports/SkFontMgr_mac_ct.h"
 #include "include/ports/SkFontMgr_directory.h"
 
+// Ganesh GLES (Phase 4c: backend matrix) — iOS GL interface + GL types.
+#include "include/gpu/ganesh/GrBackendSurface.h"
+#include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/SkSurfaceGanesh.h"
+#include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
+#include "include/gpu/ganesh/gl/GrGLDirectContext.h"
+#include "include/gpu/ganesh/gl/GrGLInterface.h"
+#include "include/gpu/ganesh/gl/GrGLTypes.h"
+#include "include/gpu/ganesh/gl/ios/GrGLMakeIOSInterface.h"
+#include "src/gpu/ganesh/gl/GrGLDefines.h"
+
+#include <OpenGLES/ES3/gl.h>
+
 #include <memory>
 
 namespace kx {
 
 struct GpuState {
+    // Graphite Metal path
     std::unique_ptr<skgpu::graphite::Context> context;
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
-    sk_sp<SkSurface> frame_surface;
     CAMetalLayer* layer = nil;
     SDL_MetalView metal_view = nullptr;
     id<CAMetalDrawable> drawable = nil;
-    id<MTLTexture> drawable_texture = nil; // retained: BackendTextures::MakeMetal does NOT retain
-    id<MTLCommandQueue> command_queue = nil; // retained for presentDrawable
+    id<MTLTexture> drawable_texture = nil;
+    id<MTLCommandQueue> command_queue = nil;
+    // Ganesh GLES path
+    sk_sp<GrDirectContext> dctx;
+    SDL_Window* sdl_window = nullptr;
+    SDL_GLContext gl_ctx = nullptr;
+    // Shared
+    sk_sp<SkSurface> frame_surface;
+    kx_backend backend = KX_BACKEND_GRAPHITE_METAL;
     int width = 0;      // pixels (host passes SDL_GetWindowSizeInPixels)
     int height = 0;     // pixels
     float scale = 1.0f; // device pixel ratio: pixels per point
@@ -64,16 +85,32 @@ static void sync_layer(GpuState* state) {
 }
 
 bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
-    // KX_BACKEND_GANESH_METAL: not yet implemented on iOS — fall back to
-    // Graphite Metal (which works on the simulator with the fixes below).
-    // A full Ganesh Metal path would use GrDirectContexts::MakeMetal +
-    // SkSurfaces::RenderTarget instead of the Graphite API.
-    (void)backend;
     if (!sdl_window || !out) return false;
     auto* state = new GpuState();
     state->width = width;
     state->height = height;
+    state->backend = backend;
+    state->sdl_window = static_cast<SDL_Window*>(sdl_window);
 
+    if (backend == KX_BACKEND_GANESH_GLES) {
+        // Ganesh GLES path: the host creates an SDL GL context (ES 3.0) and
+        // makes it current BEFORE kx_create. Skia binds to whatever GL
+        // context is current.
+        if (!SDL_GL_GetCurrentContext()) return false;
+        sk_sp<const GrGLInterface> interface = GrGLInterfaces::MakeIOS();
+        if (!interface) return false;
+        state->dctx = GrDirectContexts::MakeGL(std::move(interface));
+        if (!state->dctx) return false;
+        // Re-assert currency every frame (the OS may swap contexts, e.g.
+        // Dictation) — see SDL_uikitopengles.m UIKit_GL_RestoreCurrentContext.
+        state->gl_ctx = SDL_GL_GetCurrentContext();
+        *out = state;
+        return true;
+    }
+
+    // Graphite Metal path (default).
+    // KX_BACKEND_GANESH_METAL: not yet implemented on iOS — fall back to
+    // Graphite Metal (which works on the simulator with the fixes below).
     state->metal_view = SDL_Metal_CreateView(static_cast<SDL_Window*>(sdl_window));
     if (!state->metal_view) { delete state; return false; }
     state->layer = (__bridge CAMetalLayer*)SDL_Metal_GetLayer(state->metal_view);
@@ -117,6 +154,12 @@ void gpu_shutdown(GpuState* state) {
     state->drawable_texture = nil;
     state->drawable = nil;
     state->command_queue = nil;
+    // Ganesh GLES: flush + release the direct context.
+    if (state->dctx) {
+        state->dctx->flushAndSubmit(GrSyncCpu::kYes);
+        state->dctx = nullptr;
+    }
+    // Graphite Metal: submit + release the context.
     state->recorder.reset();
     if (state->context) {
         state->context->submit(skgpu::graphite::SyncToCpu::kYes);
@@ -127,14 +170,46 @@ void gpu_shutdown(GpuState* state) {
 }
 
 void gpu_resize(GpuState* state, int width, int height) {
-    if (!state || !state->layer) return;
+    if (!state) return;
+    // Ganesh GLES has no layer — the drawable FBO is re-wrapped from these
+    // dimensions on the next gpu_begin_frame.
     state->width = width;
     state->height = height;
+    if (!state->layer) return;
     sync_layer(state); // drawableSize in pixels, contentsScale = pixels/points
 }
 
 SkCanvas* gpu_begin_frame(GpuState* state) {
-    if (!state || !state->context || !state->layer) return nullptr;
+    if (!state || state->width <= 0 || state->height <= 0) return nullptr;
+
+    // Ganesh GLES path: wrap SDL's drawable FBO. On iOS SDL does NOT render
+    // to the GL default framebuffer (FBO 0): SDL_uikitopenglview creates its
+    // own FBO + renderbuffer backed by the CAEAGLLayer and exposes them as
+    // window properties. Rendering to FBO 0 goes nowhere (magenta screen).
+    if (state->backend == KX_BACKEND_GANESH_GLES) {
+        if (!state->dctx) return nullptr;
+        if (state->gl_ctx) SDL_GL_MakeCurrent(state->sdl_window, state->gl_ctx);
+        const SDL_PropertiesID props = SDL_GetWindowProperties(state->sdl_window);
+        const Sint64 fbo = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_UIKIT_OPENGL_FRAMEBUFFER_NUMBER, 0);
+        if (fbo <= 0) return nullptr;
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo);
+        state->dctx->resetContext(kRenderTarget_GrGLBackendState | kMisc_GrGLBackendState);
+        GrGLFramebufferInfo info;
+        info.fFBOID = (GrGLuint)fbo;
+        info.fFormat = GR_GL_RGBA8;
+        const GrBackendRenderTarget target = GrBackendRenderTargets::MakeGL(
+            state->width, state->height, 0, 8, info);
+        state->frame_surface = SkSurfaces::WrapBackendRenderTarget(
+            state->dctx.get(), target, kBottomLeft_GrSurfaceOrigin,
+            kRGBA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr);
+        if (!state->frame_surface) return nullptr;
+        state->scale = 1.0f; // GL path: host scales the canvas
+        SkCanvas* canvas = state->frame_surface->getCanvas();
+        return canvas;
+    }
+
+    // Graphite Metal path.
+    if (!state->context || !state->layer) return nullptr;
     state->drawable = [state->layer nextDrawable];
     if (!state->drawable) return nullptr;
     // BackendTextures::MakeMetal does NOT retain the texture — keep our own
@@ -159,7 +234,25 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
 }
 
 void gpu_end_frame(GpuState* state) {
-    if (!state || !state->context) return;
+    if (!state) return;
+
+    // Ganesh GLES path: flush + swap.
+    if (state->backend == KX_BACKEND_GANESH_GLES) {
+        if (!state->dctx) return;
+        state->dctx->flushAndSubmit();
+        state->frame_surface = nullptr;
+        // EAGL presents whichever renderbuffer is bound to GL_RENDERBUFFER;
+        // SDL's swapBuffers expects the view's renderbuffer to be bound
+        // (Skia leaves its own scratch renderbuffer bound after the flush).
+        const SDL_PropertiesID props = SDL_GetWindowProperties(state->sdl_window);
+        const Sint64 rb = SDL_GetNumberProperty(props, SDL_PROP_WINDOW_UIKIT_OPENGL_RENDERBUFFER_NUMBER, 0);
+        if (rb > 0) glBindRenderbuffer(GL_RENDERBUFFER, (GLuint)rb);
+        if (state->sdl_window) SDL_GL_SwapWindow(state->sdl_window);
+        return;
+    }
+
+    // Graphite Metal path.
+    if (!state->context) return;
     if (state->recorder) {
         std::unique_ptr<skgpu::graphite::Recording> recording = state->recorder->snap();
         if (recording) {

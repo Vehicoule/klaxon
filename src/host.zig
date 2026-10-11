@@ -70,6 +70,14 @@ fn displayScaleOf(window: *sdl.c.SDL_Window, layout_w: c_int, pixel_w: c_int) f3
     return sdl.c.SDL_GetWindowDisplayScale(window);
 }
 
+/// iOS: the Graphite-Metal shim scales the frame canvas itself in
+/// gpu_begin_frame (Ganesh-Metal shares that path). Raster and Ganesh GLES
+/// do not — they rely on the host-side DPR scale in renderFrame.
+fn iosShimScalesCanvas(ctx: *kx.Ctx) bool {
+    const b = kx.c.kx_backend_of(ctx);
+    return b == kx.c.KX_BACKEND_GRAPHITE_METAL or b == kx.c.KX_BACKEND_GANESH_METAL;
+}
+
 /// Frame budget: 8.33 ms → 120 fps target (the metrics gate). The whole loop
 /// iteration is paced to the budget (slow iterations run unthrottled and flag
 /// the timeline's frame_overrun — low-priority animations pause).
@@ -167,7 +175,10 @@ pub const Host = struct {
         // context before window creation — the GPU shims (kx_skia_wasm.cpp,
         // kx_skia_android.cpp) need a current GL context when kx.create
         // runs. Double-buffered, no depth buffer, 8-bit stencil.
-        if (is_emscripten or is_mobile) {
+        // iOS: GL attributes only for Ganesh GLES (ES 3.0).
+        const need_gl_attrs = is_emscripten or is_android or
+            (is_ios and backend == kx.c.KX_BACKEND_GANESH_GLES);
+        if (need_gl_attrs) {
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MAJOR_VERSION), 3);
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MINOR_VERSION), 0);
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_PROFILE_MASK), sdl.c.SDL_GL_CONTEXT_PROFILE_ES);
@@ -182,12 +193,12 @@ pub const Host = struct {
         else if (is_ios)
             // HIGH_PIXEL_DENSITY: without it SDL_GetWindowSizeInPixels
             // reports points on iOS — the DPR model needs real pixels.
-            // METAL (not OPENGL): tells SDL to set up a Metal-capable window
-            // — SDL then auto-attaches the CAMetalLayer view. OPENGL is
-            // deprecated on iOS 12+ and the simulator's GL is unreliable.
-            // Raster: no METAL/OPENGL flag (SDL software renderer).
+            // METAL for Graphite Metal / Ganesh Metal, OPENGL for Ganesh GLES,
+            // neither for raster (SDL software renderer).
             if (backend == kx.c.KX_BACKEND_RASTER)
                 sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
+            else if (backend == kx.c.KX_BACKEND_GANESH_GLES)
+                sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
             else
                 sdl.c.SDL_WINDOW_METAL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else
@@ -214,8 +225,12 @@ pub const Host = struct {
         // Emscripten (wasm) + mobile GPU: create the GL context and make it
         // current BEFORE kx.create — gpu_init checks SDL_GL_GetCurrentContext.
         // iOS raster: no GL context (SDL software renderer).
+        // iOS Graphite Metal: no GL context (Metal view instead).
+        // iOS Ganesh GLES: GL context (ES 3.0).
         var gl_ctx: sdl.c.SDL_GLContext = null;
-        if ((is_emscripten or is_mobile) and !(is_ios and backend == kx.c.KX_BACKEND_RASTER)) {
+        const need_gl = (is_emscripten or is_android) or
+            (is_ios and backend == kx.c.KX_BACKEND_GANESH_GLES);
+        if (need_gl) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);
             if (gl_ctx == null) {
                 log("SDL_GL_CreateContext failed: {s}", .{sdl.c.SDL_GetError()});
@@ -519,10 +534,11 @@ pub const Host = struct {
         // Mobile (Phase 3d/3e): the canvas is pixel-sized (kx_create got
         // pixel_width/pixel_height) while the tree lays out in points —
         // Scale the point-space paint onto the pixel canvas (crisp on
-        // Retina). Android + iOS raster: the canvas is pixel-sized but the
-        // GPU shim's gpu_begin_frame scale only applies to GPU backends.
+        // Retina). Skipped on iOS only for the Metal shims, which scale the
+        // canvas themselves in gpu_begin_frame (raster + Ganesh GLES need
+        // this host-side scale).
         if (is_mobile and host.display_scale != 1.0 and
-            !(is_ios and kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER))
+            !(is_ios and iosShimScalesCanvas(host.ctx)))
         {
             kx.c.kx_save(host.ctx);
             kx.c.kx_scale(host.ctx, host.display_scale, host.display_scale);
@@ -576,7 +592,7 @@ pub const Host = struct {
             host.devtools.paint(host.ctx, host.width, host.height, &host.stats);
         }
         if (is_mobile and host.display_scale != 1.0 and
-            !(is_ios and kx.c.kx_backend_of(host.ctx) != kx.c.KX_BACKEND_RASTER))
+            !(is_ios and iosShimScalesCanvas(host.ctx)))
             kx.c.kx_restore(host.ctx);
         kx.c.kx_end_frame(host.ctx);
         const t_paint = sdl.c.SDL_GetTicksNS();

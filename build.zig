@@ -605,6 +605,11 @@ fn addIosApp(
     });
     app.root_module.addImport("sdl_c", translate_sdl.createModule());
     app.root_module.addImport("kx_c", translate_kx.createModule());
+    // Backend selection: -Dios-backend=graphite-metal (default) | ganesh-gles | raster
+    const ios_backend = b.option([]const u8, "ios-backend", "iOS rendering backend (default: graphite-metal)") orelse "graphite-metal";
+    const ios_options = b.addOptions();
+    ios_options.addOption([]const u8, "ios_backend", ios_backend);
+    app.root_module.addOptions("build_options", ios_options);
     b.installArtifact(app);
 
     // Build the kx_skia iOS shim: compile the C++/ObjC++ sources with xcrun

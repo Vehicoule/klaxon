@@ -2,11 +2,12 @@
 # package-ios.sh — build + package the Klaxon gallery as an iOS .app (Phase 3e).
 #
 # Usage:
-#   scripts/package-ios.sh [sim|device] [--ipa]
+#   scripts/package-ios.sh [sim|device] [--ipa] [--backend <name>]
 #
 #   sim     Build for iOS simulator (default). Produces zig-out/ios/Gallery.app.
 #   device  Build for iOS device. Produces zig-out/ios/Gallery.app (ad-hoc signed).
 #   --ipa   Also produce a .ipa (zip of the .app) for device installs.
+#   --backend  Rendering backend: graphite-metal (default) | ganesh-gles | raster.
 #
 # Requirements:
 #   - macOS with Xcode (xcrun, iPhoneSimulator/iPhoneOS SDKs)
@@ -16,10 +17,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGET="${1:-sim}"
+TARGET="sim"
 IPA=0
-for arg in "$@"; do
-    [ "$arg" = "--ipa" ] && IPA=1
+BACKEND_FLAG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        sim|device) TARGET="$1" ;;
+        --ipa) IPA=1 ;;
+        --backend) BACKEND_FLAG="-Dios-backend=$2"; shift ;;
+        --backend=*) BACKEND_FLAG="-Dios-backend=${1#--backend=}" ;;
+    esac
+    shift
 done
 
 ZIG="${ZIG:-zig}"
@@ -28,11 +36,11 @@ BUNDLE_ID="com.klaxon.gallery"
 OUT_DIR="zig-out/ios"
 APP_DIR="$OUT_DIR/$APP_NAME.app"
 
-echo "==> Building iOS gallery ($TARGET)"
+echo "==> Building iOS gallery ($TARGET${BACKEND_FLAG:+ $BACKEND_FLAG})"
 if [ "$TARGET" = "sim" ]; then
-    $ZIG build -Dtarget=aarch64-ios.15.0-simulator -Doptimize=ReleaseSmall ios-gallery
+    $ZIG build -Dtarget=aarch64-ios.15.0-simulator -Doptimize=ReleaseSmall $BACKEND_FLAG ios-gallery
 else
-    $ZIG build -Dtarget=aarch64-ios.15.0 -Doptimize=ReleaseSmall ios-gallery
+    $ZIG build -Dtarget=aarch64-ios.15.0 -Doptimize=ReleaseSmall $BACKEND_FLAG ios-gallery
 fi
 
 echo "==> Packaging $APP_DIR"
