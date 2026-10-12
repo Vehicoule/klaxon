@@ -32,15 +32,14 @@ const build_options = @import("build_options");
 const Host = host_mod.Host;
 const Node = ui.node.Node;
 
-/// Backend demandé via -Dios-backend (build.zig): graphite-metal (défaut),
-/// ganesh-gles, ganesh-metal, graphite-dawn, raster.
+/// Backend demandé via -Dios-backend (build.zig): auto (défaut),
+/// graphite-metal, raster. Le contrat iOS = graphite-metal → raster ;
+/// kx_create marche la chaîne (les vieux codepaths gles/dawn sont retirés).
 fn requestedBackend() kx.c.kx_backend {
     const name = build_options.ios_backend;
-    if (std.mem.eql(u8, name, "ganesh-gles")) return kx.c.KX_BACKEND_GANESH_GLES;
-    if (std.mem.eql(u8, name, "ganesh-metal")) return kx.c.KX_BACKEND_GANESH_METAL;
-    if (std.mem.eql(u8, name, "graphite-dawn")) return kx.c.KX_BACKEND_GRAPHITE_DAWN;
     if (std.mem.eql(u8, name, "raster")) return kx.c.KX_BACKEND_RASTER;
-    return kx.c.KX_BACKEND_GRAPHITE_METAL;
+    if (std.mem.eql(u8, name, "graphite-metal")) return kx.c.KX_BACKEND_GRAPHITE_METAL;
+    return kx.c.KX_BACKEND_AUTO;
 }
 
 /// Override std.Options.debug_io (fix compile iOS, Zig 0.17): le défaut
@@ -81,17 +80,10 @@ const max_frames: u64 = 0; // 0 = run forever (mobile: OS terminates the app)
 pub fn start() !*platform_ios.AppState {
     const stable = std.heap.page_allocator;
 
-    // Backend: demandé via -Dios-backend (défaut Graphite-Metal). Fallback
-    // raster (CPU) si kx_create échoue (simulateur sans Metal, GLES indispo).
+    // Backend: -Dios-backend (défaut auto). kx_create marche la chaîne
+    // (graphite-metal → raster) — pas de retry manuel ici.
     const host_ptr = try stable.create(Host);
-    const wanted = requestedBackend();
-    host_ptr.* = host_mod.Host.init(stable, 0, 0, wanted, null) catch |err| blk: {
-        if (err == error.KxCreate) {
-            sdl.c.SDL_Log("kx_create failed (%s), fallback raster", kx.c.kx_backend_name(wanted));
-            break :blk try host_mod.Host.init(stable, 0, 0, kx.c.KX_BACKEND_RASTER, null);
-        }
-        return err;
-    };
+    host_ptr.* = try host_mod.Host.init(stable, 0, 0, requestedBackend(), null);
     // Pas de defer host.deinit() : le host vit aussi longtemps que l'app
     // (SDL_AppQuit appelle host.deinit).
 

@@ -82,20 +82,67 @@ static SkColor kx_to_skcolor(uint32_t rgba) {
     return SkColorSetARGB(a, r, g, b);
 }
 
+// Backend fallback chain — the contract in docs/ARCHITECTURE.md: primary is
+// Graphite on the native API, fallback is the Ganesh GL family, raster is the
+// always-available last resort. KX_BACKEND_AUTO walks the whole chain; an
+// explicit backend tries itself then raster (the app survives a missing
+// driver, never silently switches APIs).
+static const kx_backend* kx_platform_chain(size_t* count) {
+#if defined(__EMSCRIPTEN__)
+    static const kx_backend chain[] = { KX_BACKEND_GANESH_WEBGL2 };
+#elif defined(__ANDROID__)
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_VULKAN, KX_BACKEND_GANESH_GLES };
+#elif defined(__APPLE__)
+    // iOS and macOS share the chain: Metal everywhere, raster if it fails.
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_METAL };
+#elif defined(_WIN32)
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_DAWN, KX_BACKEND_GANESH_GL };
+#elif defined(__linux__)
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_VULKAN, KX_BACKEND_GANESH_GL };
+#else
+    static const kx_backend chain[] = { KX_BACKEND_RASTER };
+#endif
+    *count = sizeof(chain) / sizeof(chain[0]);
+    return chain;
+}
+
 kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
     if (width <= 0 || height <= 0) return nullptr;
-    auto* ctx = new kx_ctx();
-    ctx->width = width;
-    ctx->height = height;
-    ctx->backend = backend;
 
-    if (backend == KX_BACKEND_RASTER) {
-        ctx->raster = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(width, height));
-        if (!ctx->raster) { delete ctx; return nullptr; }
-    } else {
-        if (!kx::gpu_init(&ctx->gpu, sdl_window, width, height, backend)) { delete ctx; return nullptr; }
+    // Resolve the backend: AUTO walks the platform chain, an explicit request
+    // tries just that backend; both end on raster (which cannot fail on
+    // supported platforms) rather than returning NULL.
+    size_t chain_len = 0;
+    const kx_backend* chain = kx_platform_chain(&chain_len);
+    // Try list: [requested] for an explicit backend, the full platform chain
+    // for AUTO — raster appended at the end in both cases.
+    const kx_backend* try_list = &backend;
+    size_t try_len = 1;
+    if (backend == KX_BACKEND_AUTO) {
+        try_list = chain;
+        try_len = chain_len;
     }
-    return ctx;
+
+    for (size_t i = 0; i <= try_len; i++) {
+        const kx_backend attempt = (i < try_len) ? try_list[i] : KX_BACKEND_RASTER;
+        if (attempt == KX_BACKEND_AUTO) continue; // chain never lists AUTO
+
+        auto* ctx = new kx_ctx();
+        ctx->width = width;
+        ctx->height = height;
+        ctx->backend = attempt;
+
+        bool ok = false;
+        if (attempt == KX_BACKEND_RASTER) {
+            ctx->raster = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(width, height));
+            ok = ctx->raster != nullptr;
+        } else {
+            ok = kx::gpu_init(&ctx->gpu, sdl_window, width, height, attempt);
+        }
+        if (ok) return ctx;
+        delete ctx;
+    }
+    return nullptr;
 }
 
 void kx_destroy(kx_ctx* ctx) {
@@ -413,6 +460,7 @@ const char* kx_backend_name(kx_backend backend) {
         case KX_BACKEND_GRAPHITE_WEBGPU: return "graphite-webgpu";
         case KX_BACKEND_GANESH_WEBGL2: return "ganesh-webgl2";
         case KX_BACKEND_GANESH_METAL: return "ganesh-metal";
+        case KX_BACKEND_AUTO: return "auto";
     }
     return "unknown";
 }

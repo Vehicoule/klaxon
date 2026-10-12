@@ -59,6 +59,7 @@ typedef enum kx_backend {
     KX_BACKEND_GRAPHITE_WEBGPU = 6,  // Web
     KX_BACKEND_GANESH_WEBGL2 = 7,    // Web fallback
     KX_BACKEND_GANESH_METAL = 8,     // macOS / iOS fallback (Ganesh Metal)
+    KX_BACKEND_AUTO = 9,             // walk the platform chain: graphite → ganesh → raster
 } kx_backend;
 
 typedef struct kx_ctx kx_ctx;
