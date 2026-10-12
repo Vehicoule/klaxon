@@ -534,7 +534,9 @@ build_skia() {
   if [ "$SKIA_TARGET_OS" = "win" ]; then
     # ICU data file — must sit next to the exe at runtime (skparagraph).
     local icudtl
-    icudtl="$(find "$out" "$SKIA/third_party/externals/icu" -name icudtl.dat 2>/dev/null | head -1)"
+    icudtl="$(find "$SKIA/third_party/externals/icu" -name icudtl.dat 2>/dev/null | head -1)"
+    # find searches only externals/icu so the source is never the destination
+    # (a prior run's copy in $out made cp self-copy → Git Bash hard-fails).
     [ -n "$icudtl" ] && cp -f "$icudtl" "$out/icudtl.dat"
     ls -la "$out"/*.lib
   else
