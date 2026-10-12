@@ -1,0 +1,156 @@
+{
+  "tests": [
+    {
+      "id": "GEST-001.1",
+      "rule": "GEST-001",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 50}
+      ],
+      "expect": {"gestures": ["tap"]}
+    },
+    {
+      "id": "GEST-002.1",
+      "rule": "GEST-002",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 250}
+      ],
+      "expect": {"gestures": []}
+    },
+    {
+      "id": "GEST-002.2",
+      "rule": "GEST-002",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap", "long_press"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 400}
+      ],
+      "expect": {"gestures": []}
+    },
+    {
+      "id": "GEST-003.1",
+      "rule": "GEST-003",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap", "double_tap"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 50},
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 150},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 200}
+      ],
+      "expect": {"gestures": ["tap", "double_tap"]}
+    },
+    {
+      "id": "GEST-004.1",
+      "rule": "GEST-004",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["long_press"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "tick", "ms": 499},
+        {"op": "tick", "ms": 500},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 600}
+      ],
+      "expect": {"gestures": ["long_press"]}
+    },
+    {
+      "id": "GEST-004.2",
+      "rule": "GEST-004",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["long_press"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 600}
+      ],
+      "expect": {"gestures": ["long_press"]}
+    },
+    {
+      "id": "GEST-005.1",
+      "rule": "GEST-005",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g",
+          "props": {"gestures": ["pan_start", "pan_update", "pan_end"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "move", "x": 80, "y": 50, "t": 10},
+        {"op": "pointer", "phase": "move", "x": 95, "y": 65, "t": 20},
+        {"op": "pointer", "phase": "up", "x": 95, "y": 65, "t": 30}
+      ],
+      "expect": {"gestures": ["pan_start", "pan_update", "pan_end"]}
+    },
+    {
+      "id": "GEST-006.1",
+      "rule": "GEST-006",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [300, 300],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["swipe"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 150, "t": 0},
+        {"op": "pointer", "phase": "move", "x": 150, "y": 150, "t": 50},
+        {"op": "pointer", "phase": "up", "x": 150, "y": 150, "t": 60}
+      ],
+      "expect": {"gestures": ["swipe:right"]}
+    },
+    {
+      "id": "GEST-006.2",
+      "rule": "GEST-006",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [300, 300],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["swipe"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 150, "y": 200, "t": 0},
+        {"op": "pointer", "phase": "move", "x": 150, "y": 80, "t": 40},
+        {"op": "pointer", "phase": "up", "x": 150, "y": 80, "t": 50}
+      ],
+      "expect": {"gestures": ["swipe:up"]}
+    },
+    {
+      "id": "GEST-007.1",
+      "rule": "GEST-007",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [300, 300],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap", "pinch"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 100, "y": 150, "t": 0, "pointer": 0},
+        {"op": "pointer", "phase": "down", "x": 200, "y": 150, "t": 10, "pointer": 1},
+        {"op": "pointer", "phase": "move", "x": 250, "y": 150, "t": 30, "pointer": 1},
+        {"op": "pointer", "phase": "up", "x": 250, "y": 150, "t": 40, "pointer": 1},
+        {"op": "pointer", "phase": "up", "x": 100, "y": 150, "t": 50, "pointer": 0}
+      ],
+      "expect": {"gestures": ["pinch"]}
+    }
+  ]
+}

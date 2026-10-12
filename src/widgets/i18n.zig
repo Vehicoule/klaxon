@@ -79,6 +79,9 @@ fn resolveBase(allocator: std.mem.Allocator, base: *L10nBase, new_text: [:0]cons
     if (base.text_resolved) allocator.free(base.text);
     base.text = new_text;
     base.text_resolved = true;
+    // a11y (Phase 4c.7): the resolved string is the node's accessible name —
+    // same contract as the plain text widget (widgets/text.zig).
+    if (base.node.semantics) |s| s.label = base.text;
     base.node.markDirty();
     base.node.markLayoutDirty();
 }
@@ -158,6 +161,7 @@ pub fn L10nText(comptime Args: type) type {
             };
             s.base.effect = try ui.state.Effect.init(allocator, resolveCb, s);
             node.state = s;
+            ui.semantics.attach(node, .{ .role = .text }); // a11y: resolved string lands via resolveBase
             s.base.effect.run(); // first run: resolves the text + subscribes to the locale signal
             return node;
         }
@@ -209,6 +213,7 @@ pub fn l10nPlural(allocator: std.mem.Allocator, i18n: *i18n_mod.I18n, key: []con
     };
     s.base.effect = try ui.state.Effect.init(allocator, pluralResolveCb, s);
     node.state = s;
+    ui.semantics.attach(node, .{ .role = .text }); // a11y: resolved string lands via resolveBase
     s.base.effect.run(); // first run: resolves the text + subscribes to the locale signal
     return node;
 }
@@ -258,6 +263,7 @@ pub fn l10nPluralSig(allocator: std.mem.Allocator, i18n: *i18n_mod.I18n, key: []
     s.base.effect = try ui.state.Effect.init(allocator, pluralSigResolveCb, s);
     count_sig.subscribe(.{ .callback = .{ .fn_ptr = pluralSigResolveCb, .userdata = s } });
     node.state = s;
+    ui.semantics.attach(node, .{ .role = .text }); // a11y: resolved string lands via resolveBase
     s.base.effect.run(); // first run: resolves the text + subscribes to the locale signal
     return node;
 }

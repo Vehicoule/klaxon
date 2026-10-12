@@ -92,12 +92,22 @@ const StackState = struct { opts: StackOptions };
 
 fn stackMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(StackState, n);
-    const child_c = if (s.opts.fit == .expand) c else c.loosen();
+    // StackFit.expand: the stack itself takes the biggest size the parent
+    // allows (Flutter semantics) — children are tightened to its bounds in
+    // stackLayout. loose: shrink-wrap to the largest child. An unbounded
+    // parent falls back to the shrink-wrapped size (there is no "biggest
+    // allowed" to claim).
+    const expand = s.opts.fit == .expand;
+    const child_c = if (expand) c else c.loosen();
     var size = Size{};
     for (n.children.items) |child| {
         const cs = child.measure(child_c);
         size.w = @max(size.w, cs.w);
         size.h = @max(size.h, cs.h);
+    }
+    if (expand) {
+        if (std.math.isFinite(c.max_w)) size.w = c.max_w;
+        if (std.math.isFinite(c.max_h)) size.h = c.max_h;
     }
     return c.constrain(size);
 }

@@ -1,0 +1,622 @@
+{
+  "tests": [
+    {
+      "id": "LAYOUT-001.1",
+      "rule": "LAYOUT-001",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "a": [
+            0,
+            0,
+            200,
+            30
+          ],
+          "b": [
+            0,
+            30,
+            200,
+            10
+          ]
+        },
+        "measured": {
+          "a": [
+            50,
+            30
+          ],
+          "b": [
+            20,
+            10
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-002.1",
+      "rule": "LAYOUT-002",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          300,
+          100
+        ],
+        "tree": {
+          "type": "row",
+          "props": {
+            "gap": 10,
+            "cross_align": "center"
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "a": [
+            0,
+            35,
+            50,
+            30
+          ],
+          "b": [
+            60,
+            45,
+            20,
+            10
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-003.1",
+      "rule": "LAYOUT-003",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          300,
+          40
+        ],
+        "tree": {
+          "type": "row",
+          "children": [
+            {
+              "type": "box",
+              "id": "fixed",
+              "props": {
+                "w": 60,
+                "h": 40
+              }
+            },
+            {
+              "type": "expanded",
+              "id": "e1",
+              "props": {
+                "weight": 1
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "c1",
+                  "props": {
+                    "w": 10,
+                    "h": 10
+                  }
+                }
+              ]
+            },
+            {
+              "type": "expanded",
+              "id": "e2",
+              "props": {
+                "weight": 2
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "c2",
+                  "props": {
+                    "w": 10,
+                    "h": 10
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "fixed": [
+            0,
+            0,
+            60,
+            40
+          ],
+          "e1": [
+            60,
+            0,
+            80,
+            40
+          ],
+          "e2": [
+            140,
+            0,
+            160,
+            40
+          ],
+          "c1": [
+            60,
+            0,
+            80,
+            40
+          ],
+          "c2": [
+            140,
+            0,
+            160,
+            40
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-004.1",
+      "rule": "LAYOUT-004",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          300,
+          90
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "row",
+              "id": "r1",
+              "props": {
+                "main_align": "space_between"
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "a1",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                },
+                {
+                  "type": "box",
+                  "id": "b1",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                },
+                {
+                  "type": "box",
+                  "id": "c1",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                }
+              ]
+            },
+            {
+              "type": "row",
+              "id": "r2",
+              "props": {
+                "main_align": "end"
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "a2",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                },
+                {
+                  "type": "box",
+                  "id": "b2",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                },
+                {
+                  "type": "box",
+                  "id": "c2",
+                  "props": {
+                    "w": 50,
+                    "h": 40
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "r1": [
+            0,
+            0,
+            300,
+            40
+          ],
+          "a1": [
+            0,
+            0,
+            50,
+            40
+          ],
+          "b1": [
+            125,
+            0,
+            50,
+            40
+          ],
+          "c1": [
+            250,
+            0,
+            50,
+            40
+          ],
+          "r2": [
+            0,
+            40,
+            300,
+            40
+          ],
+          "a2": [
+            150,
+            40,
+            50,
+            40
+          ],
+          "b2": [
+            200,
+            40,
+            50,
+            40
+          ],
+          "c2": [
+            250,
+            40,
+            50,
+            40
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-005.1",
+      "rule": "LAYOUT-005",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "padding",
+          "props": {
+            "padding": {
+              "left": 10,
+              "top": 20,
+              "right": 5,
+              "bottom": 0
+            }
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "inner",
+              "props": {
+                "w": 40,
+                "h": 30
+              }
+            }
+          ]
+        }
+      },
+      "actions": [
+        {
+          "op": "relayout",
+          "w": 150,
+          "h": 100
+        }
+      ],
+      "expect": {
+        "rects": {
+          "inner": [
+            10,
+            20,
+            135,
+            80
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-006.1",
+      "rule": "LAYOUT-006",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          300,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "stack",
+              "id": "s1",
+              "props": {
+                "alignment": [
+                  1,
+                  1
+                ]
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "under",
+                  "props": {
+                    "w": 300,
+                    "h": 50
+                  }
+                },
+                {
+                  "type": "box",
+                  "id": "over",
+                  "props": {
+                    "w": 40,
+                    "h": 40
+                  }
+                }
+              ]
+            },
+            {
+              "type": "stack",
+              "id": "s2",
+              "props": {
+                "fit": "expand"
+              },
+              "children": [
+                {
+                  "type": "box",
+                  "id": "tight",
+                  "props": {
+                    "w": 10,
+                    "h": 10
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "s1": [
+            0,
+            0,
+            300,
+            50
+          ],
+          "under": [
+            0,
+            0,
+            300,
+            50
+          ],
+          "over": [
+            260,
+            10,
+            40,
+            40
+          ],
+          "s2": [
+            0,
+            50,
+            300,
+            100
+          ],
+          "tight": [
+            0,
+            50,
+            300,
+            100
+          ]
+        }
+      },
+      "note": "expand fills the parent-offered size (Flutter semantics) — the column offers its full height, so the stack claims 100 and overflows past the viewport; use expanded() for fill-remaining"
+    },
+    {
+      "id": "LAYOUT-007.1",
+      "rule": "LAYOUT-007",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          330,
+          200
+        ],
+        "tree": {
+          "type": "grid",
+          "props": {
+            "columns": 3,
+            "gap": 15
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 40,
+                "h": 40
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 40,
+                "h": 80
+              }
+            },
+            {
+              "type": "box",
+              "id": "c",
+              "props": {
+                "w": 40,
+                "h": 40
+              }
+            },
+            {
+              "type": "box",
+              "id": "d",
+              "props": {
+                "w": 40,
+                "h": 30
+              }
+            },
+            {
+              "type": "box",
+              "id": "e",
+              "props": {
+                "w": 40,
+                "h": 30
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "a": [
+            0,
+            0,
+            100,
+            80
+          ],
+          "b": [
+            115,
+            0,
+            100,
+            80
+          ],
+          "c": [
+            230,
+            0,
+            100,
+            80
+          ],
+          "d": [
+            0,
+            95,
+            100,
+            30
+          ],
+          "e": [
+            115,
+            95,
+            100,
+            30
+          ]
+        }
+      }
+    },
+    {
+      "id": "LAYOUT-008.1",
+      "rule": "LAYOUT-008",
+      "domain": "layout",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "constrained_box",
+          "id": "cbox",
+          "props": {
+            "min_w": 50,
+            "max_w": 100,
+            "min_h": 30,
+            "max_h": 60
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "big",
+              "props": {
+                "w": 200,
+                "h": 80
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "measured": {
+          "cbox": [
+            100,
+            60
+          ],
+          "big": [
+            200,
+            80
+          ]
+        }
+      }
+    }
+  ]
+}

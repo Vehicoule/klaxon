@@ -1,0 +1,230 @@
+{
+  "tests": [
+    {
+      "id": "I18N-001.1",
+      "rule": "I18N-001",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {
+            "en": {"greeting": "Hello!", "bye": "Goodbye"},
+            "fr": {"greeting": "Bonjour !"}
+          }
+        }
+      },
+      "actions": [{"op": "set_locale", "tag": "fr"}],
+      "expect": {
+        "i18n": {
+          "tr:greeting": "Bonjour !",
+          "tr:bye": "Goodbye",
+          "tr:missing_key": "missing_key",
+          "direction": "ltr"
+        }
+      }
+    },
+    {
+      "id": "I18N-002.1",
+      "rule": "I18N-002",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {
+            "en": {"items": "{count, plural, =0 {No items} one {# item} other {# items}}"}
+          }
+        }
+      },
+      "expect": {
+        "i18n": {
+          "plural:items:0": "No items",
+          "plural:items:1": "1 item",
+          "plural:items:2": "2 items",
+          "plural:items:42": "42 items"
+        }
+      }
+    },
+    {
+      "id": "I18N-003.1",
+      "rule": "I18N-003",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "dirs": {"ar": "rtl"},
+          "locales": {
+            "en": {"items": "{count, plural, other {# items}}"},
+            "ar": {"items": "{count, plural, zero {لا عناصر} one {عنصر واحد} two {عنصران} few {# عناصر} many {# عنصراً} other {# عنصر}}"}
+          }
+        }
+      },
+      "actions": [{"op": "set_locale", "tag": "ar"}],
+      "expect": {
+        "i18n": {
+          "direction": "rtl",
+          "plural:items:0": "لا عناصر",
+          "plural:items:1": "عنصر واحد",
+          "plural:items:2": "عنصران",
+          "plural:items:5": "5 عناصر",
+          "plural:items:11": "11 عنصراً",
+          "plural:items:100": "100 عنصر"
+        }
+      }
+    },
+    {
+      "id": "I18N-004.1",
+      "rule": "I18N-004",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {"en": {}}
+        }
+      },
+      "expect": {
+        "i18n": {
+          "num:1234.5": "1,234.5",
+          "num:1234567": "1,234,567",
+          "num:1234.5:dec=2": "1,234.50",
+          "num:0.42:pct": "42%",
+          "num:1234:nogroup": "1234",
+          "num:-1234.5": "-1,234.5",
+          "date:2024-03-05:short": "3/5/24",
+          "date:2024-03-05:medium": "Mar 5, 2024",
+          "date:2024-03-05:long": "March 5, 2024"
+        }
+      }
+    },
+    {
+      "id": "I18N-004.2",
+      "rule": "I18N-004",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {
+            "en": {},
+            "fr": {"items": "{count, plural, one {# élément} other {# éléments}}"}
+          }
+        }
+      },
+      "actions": [{"op": "set_locale", "tag": "fr"}],
+      "expect": {
+        "i18n": {
+          "num:1234.5": "1 234,5",
+          "num:1234.5:dec=3": "1 234,500",
+          "num:0.42:pct": "42%",
+          "date:2024-03-05:short": "05/03/2024",
+          "date:2024-03-05:long": "5 mars 2024",
+          "plural:items:0": "0 élément",
+          "plural:items:2": "2 éléments"
+        }
+      }
+    },
+    {
+      "id": "I18N-005.1",
+      "rule": "I18N-005",
+      "domain": "i18n",
+      "setup": {
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {
+            "en": {},
+            "ja": {"items": "{count, plural, other {# 個}}"}
+          }
+        }
+      },
+      "actions": [{"op": "set_locale", "tag": "ja"}],
+      "expect": {
+        "i18n": {
+          "plural:items:1": "1 個",
+          "plural:items:7": "7 個",
+          "date:2024-03-05:short": "2024/03/05",
+          "date:2024-03-05:long": "2024年3月5日"
+        }
+      }
+    },
+    {
+      "id": "I18N-006.1",
+      "rule": "I18N-006",
+      "domain": "i18n",
+      "setup": {
+        "viewport": [300, 100],
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "dirs": {"ar": "rtl"},
+          "locales": {
+            "en": {"greeting": "Hello!"},
+            "ar": {"greeting": "مرحبا"}
+          }
+        },
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "padding_directional",
+              "props": {"start": 10},
+              "children": [
+                {
+                  "type": "row",
+                  "props": {"gap": 10},
+                  "children": [
+                    {"type": "box", "id": "a", "props": {"w": 50, "h": 40}},
+                    {"type": "box", "id": "b", "props": {"w": 50, "h": 40}}
+                  ]
+                }
+              ]
+            },
+            {"type": "l10n_text", "id": "lt", "props": {"key": "greeting"}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "set_locale", "tag": "ar"},
+        {"op": "relayout", "w": 300, "h": 100}
+      ],
+      "expect": {
+        "rects": {"a": [240, 0, 50, 40], "b": [180, 0, 50, 40]},
+        "text": {"lt": "مرحبا"},
+        "i18n": {"direction": "rtl"}
+      }
+    },
+    {
+      "id": "I18N-007.1",
+      "rule": "I18N-007",
+      "domain": "i18n",
+      "setup": {
+        "viewport": [300, 100],
+        "i18n": {
+          "fallback": "en",
+          "locale": "en",
+          "locales": {
+            "en": {"items": "{count, plural, =0 {No items} one {# item} other {# items}}"}
+          }
+        },
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "l10n_plural", "id": "lp", "props": {"key": "items", "count_signal": "cnt", "count": 1}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "signal_set", "name": "cnt", "value": 5},
+        {"op": "signal_set", "name": "cnt", "value": 0}
+      ],
+      "expect": {
+        "text": {"lp": "No items"},
+        "signals": {"cnt": 0}
+      }
+    }
+  ]
+}

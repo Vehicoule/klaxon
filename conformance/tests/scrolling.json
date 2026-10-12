@@ -1,0 +1,162 @@
+{
+  "tests": [
+    {
+      "id": "SCROLL-001.1",
+      "rule": "SCROLL-001",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "scroll_view", "id": "sv",
+          "children": [{"type": "box", "id": "content", "props": {"w": 200, "h": 500}}]
+        }
+      },
+      "actions": [
+        {"op": "scroll", "x": 100, "y": 50, "dx": 0, "dy": -1}
+      ],
+      "expect": {
+        "scroll": {"sv": 48},
+        "scroll_info": {"sv": {"offset": 48, "max_offset": 400, "viewport": 100, "content": 500, "thumb": 0.2}}
+      }
+    },
+    {
+      "id": "SCROLL-001.2",
+      "rule": "SCROLL-001",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "scroll_view", "id": "sv",
+          "children": [{"type": "box", "id": "content", "props": {"w": 200, "h": 500}}]
+        }
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 100, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "move", "x": 100, "y": 30, "t": 10},
+        {"op": "pointer", "phase": "up", "x": 100, "y": 30, "t": 20}
+      ],
+      "expect": {"scroll": {"sv": 20}}
+    },
+    {
+      "id": "SCROLL-002.1",
+      "rule": "SCROLL-002",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "scroll_view", "id": "sv",
+          "children": [{"type": "box", "id": "content", "props": {"w": 200, "h": 500}}]
+        }
+      },
+      "actions": [{"op": "set_scroll", "id": "sv", "offset": 450}],
+      "expect": {"scroll": {"sv": 400}}
+    },
+    {
+      "id": "SCROLL-002.2",
+      "rule": "SCROLL-002",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "scroll_view", "id": "sv",
+          "children": [{"type": "box", "id": "content", "props": {"w": 200, "h": 500}}]
+        }
+      },
+      "actions": [{"op": "set_scroll", "id": "sv", "offset": -20}],
+      "expect": {"scroll": {"sv": 0}}
+    },
+    {
+      "id": "SCROLL-003.1",
+      "rule": "SCROLL-003",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "scroll_view", "id": "sv",
+          "children": [{"type": "box", "id": "content", "props": {"w": 200, "h": 50}}]
+        }
+      },
+      "actions": [
+        {"op": "scroll", "x": 100, "y": 50, "dx": 0, "dy": -1}
+      ],
+      "expect": {
+        "scroll": {"sv": 0},
+        "scroll_info": {"sv": {"offset": 0, "max_offset": 0, "viewport": 100, "content": 50, "thumb": 1}}
+      }
+    },
+    {
+      "id": "SCROLL-004.1",
+      "rule": "SCROLL-004",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "list_view", "id": "list",
+          "props": {"item_count": 100, "item_height": 20, "margin": 2}
+        }
+      },
+      "expect": {
+        "children": {"list": 7},
+        "first_item": {"list": 0},
+        "scroll_info": {"list": {"offset": 0, "max_offset": 1900, "viewport": 100, "content": 2000, "thumb": 0.05}}
+      }
+    },
+    {
+      "id": "SCROLL-004.2",
+      "rule": "SCROLL-004",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "list_view", "id": "list",
+          "props": {"item_count": 100, "item_height": 20, "margin": 2}
+        }
+      },
+      "actions": [{"op": "set_scroll", "id": "list", "offset": 400}],
+      "expect": {
+        "children": {"list": 9},
+        "first_item": {"list": 18},
+        "scroll": {"list": 400}
+      }
+    },
+    {
+      "id": "SCROLL-005.1",
+      "rule": "SCROLL-005",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "list_view", "id": "list",
+          "props": {"item_count": 100, "item_height": 20, "margin": 2}
+        }
+      },
+      "actions": [
+        {"op": "set_scroll", "id": "list", "offset": 1900},
+        {"op": "list_count", "id": "list", "count": 30}
+      ],
+      "expect": {
+        "scroll": {"list": 500},
+        "children": {"list": 7},
+        "first_item": {"list": 23}
+      }
+    },
+    {
+      "id": "SCROLL-006.1",
+      "rule": "SCROLL-006",
+      "domain": "scrolling",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "list_view", "id": "list",
+          "props": {"item_count": 100, "item_height": 20, "margin": 2, "item_press": true}
+        }
+      },
+      "actions": [
+        {"op": "set_scroll", "id": "list", "offset": 400},
+        {"op": "pointer", "phase": "down", "x": 100, "y": 10, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 100, "y": 10, "t": 50}
+      ],
+      "expect": {"events": ["press:list.item20"]}
+    }
+  ]
+}

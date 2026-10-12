@@ -1,0 +1,186 @@
+{
+  "tests": [
+    {
+      "id": "A11Y-001.1",
+      "rule": "A11Y-001",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 120],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "save", "props": {"w": 60, "h": 24, "role": "button", "label": "Save", "focusable": true}},
+            {"type": "text", "id": "t", "props": {"text": "Hi"}},
+            {"type": "box", "id": "sep", "props": {"w": 60, "h": 2, "role": "separator"}}
+          ]
+        }
+      },
+      "expect": {
+        "a11y": [
+          {"role": "button", "label": "Save", "focusable": true},
+          {"role": "text", "label": "Hi"},
+          {"role": "separator"}
+        ]
+      }
+    },
+    {
+      "id": "A11Y-002.1",
+      "rule": "A11Y-002",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "box", "id": "btn",
+          "props": {"w": 80, "h": 40, "role": "button", "focusable": true},
+          "children": [{"type": "text", "id": "lbl", "props": {"text": "OK"}}]
+        }
+      },
+      "expect": {
+        "a11y": [
+          {"role": "button", "label": "OK", "focusable": true},
+          {"role": "text", "label": "OK"}
+        ]
+      }
+    },
+    {
+      "id": "A11Y-003.1",
+      "rule": "A11Y-003",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "hid", "props": {"w": 40, "h": 20, "role": "button", "label": "H", "visible": false}},
+            {"type": "box", "id": "dec", "props": {"w": 40, "h": 20, "role": "text", "label": "X", "exclude_semantics": true}},
+            {"type": "box", "id": "keep", "props": {"w": 40, "h": 20, "role": "text", "label": "Y"}}
+          ]
+        }
+      },
+      "expect": {
+        "a11y": [{"role": "text", "label": "Y"}]
+      }
+    },
+    {
+      "id": "A11Y-004.1",
+      "rule": "A11Y-004",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 100],
+        "signals": {"tt": false},
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "toggle", "id": "t", "props": {"signal": "tt"}},
+            {"type": "checkbox", "id": "c", "props": {"checked": true}}
+          ]
+        }
+      },
+      "expect": {
+        "a11y": [
+          {"role": "toggle", "checked": false, "focusable": true},
+          {"role": "checkbox", "checked": true, "focusable": true}
+        ]
+      }
+    },
+    {
+      "id": "A11Y-004.2",
+      "rule": "A11Y-004",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 100],
+        "signals": {"tt": false},
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "toggle", "id": "t", "props": {"signal": "tt"}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 22, "y": 12},
+        {"op": "pointer", "phase": "up", "x": 22, "y": 12}
+      ],
+      "expect": {
+        "a11y": [{"role": "toggle", "checked": true, "focusable": true}],
+        "a11y_events": [{"kind": "control_changed"}],
+        "events": ["change:t"],
+        "signals": {"tt": true}
+      }
+    },
+    {
+      "id": "A11Y-005.1",
+      "rule": "A11Y-005",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "b", "props": {"w": 40, "h": 20, "role": "button", "label": "B", "focusable": true}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "announce", "text": "Saved", "region": "polite"},
+        {"op": "announce", "text": "Deleted", "region": "assertive"},
+        {"op": "focus", "id": "b"}
+      ],
+      "expect": {
+        "a11y_events": [
+          {"kind": "announce", "text": "Saved"},
+          {"kind": "announce", "text": "Deleted"},
+          {"kind": "focus_changed"}
+        ]
+      }
+    },
+    {
+      "id": "A11Y-006.1",
+      "rule": "A11Y-006",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [300, 200],
+        "signals": {"tt": false, "sl": 0.5},
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "button", "id": "b"},
+            {"type": "toggle", "id": "t", "props": {"signal": "tt"}},
+            {"type": "slider", "id": "s", "props": {"signal": "sl"}},
+            {"type": "text_field", "id": "tf", "props": {"placeholder": "name"}}
+          ]
+        }
+      },
+      "expect": {
+        "a11y": [
+          {"role": "button", "focusable": true},
+          {"role": "toggle", "checked": false, "focusable": true},
+          {"role": "slider", "value": "50%", "focusable": true},
+          {"role": "text_field", "focusable": true, "hint": "name"}
+        ]
+      }
+    },
+    {
+      "id": "A11Y-007.1",
+      "rule": "A11Y-007",
+      "domain": "a11y",
+      "setup": {
+        "viewport": [300, 100],
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "text_field", "id": "tf", "props": {"placeholder": "name", "initial": "ab"}}
+          ]
+        }
+      },
+      "expect": {
+        "a11y": [{"role": "text_field", "focusable": true, "value": "ab"}],
+        "text": {"tf": "ab"}
+      }
+    }
+  ]
+}

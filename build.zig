@@ -158,6 +158,17 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks: 33 scenes, JSON metrics to stdout (-Dbench-frames=N -Dbench-scene=NAME -Dbench-output=PATH)");
     bench_step.dependOn(&run_bench.step);
 
+    // --- conformance suite (Phase 4c.7) ---
+    // Runs conformance/tests/*.json against the real widget tree headlessly
+    // (raster backend), writes conformance/results-<ts>.json + a summary.
+    const conf_exe = addApp(b, target, optimize, "conformance", "src/conformance_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    b.installArtifact(conf_exe);
+
+    const run_conf = b.addRunArtifact(conf_exe);
+    run_conf.step.dependOn(b.getInstallStep());
+    const conf_step = b.step("conformance", "Run the conformance suite (conformance/tests/*.json)");
+    conf_step.dependOn(&run_conf.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),

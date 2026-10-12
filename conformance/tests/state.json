@@ -1,0 +1,114 @@
+{
+  "tests": [
+    {
+      "id": "STATE-001.1",
+      "rule": "STATE-001",
+      "domain": "state",
+      "setup": {
+        "signals": {"a": 1, "b": 2},
+        "effects": [{"name": "e", "reads": ["a", "b"], "op": "add"}]
+      },
+      "actions": [{"op": "signal_set", "name": "a", "value": 5}],
+      "expect": {
+        "effect_log": ["e=3", "e=7"],
+        "signals": {"a": 5, "b": 2}
+      }
+    },
+    {
+      "id": "STATE-002.1",
+      "rule": "STATE-002",
+      "domain": "state",
+      "setup": {
+        "signals": {"a": 1, "b": 2},
+        "effects": [{"name": "e", "reads": ["a", "b"], "op": "add"}]
+      },
+      "actions": [
+        {"op": "signal_set", "name": "a", "value": 1},
+        {"op": "signal_set", "name": "a", "value": 5},
+        {"op": "signal_set", "name": "a", "value": 5}
+      ],
+      "expect": {"effect_log": ["e=3", "e=7"]}
+    },
+    {
+      "id": "STATE-003.1",
+      "rule": "STATE-003",
+      "domain": "state",
+      "setup": {
+        "signals": {"a": 1, "b": 2},
+        "effects": [{"name": "e", "reads": ["peek:a", "b"], "op": "add"}]
+      },
+      "actions": [
+        {"op": "signal_set", "name": "a", "value": 5},
+        {"op": "signal_notify", "name": "b"}
+      ],
+      "expect": {"effect_log": ["e=3", "e=7"]}
+    },
+    {
+      "id": "STATE-004.1",
+      "rule": "STATE-004",
+      "domain": "state",
+      "setup": {
+        "signals": {"a": 1, "b": 2},
+        "effects": [{"name": "e", "reads": ["a", "memo"], "op": "add"}],
+        "memo": {"name": "m", "op": "add", "args": ["a", "b"]}
+      },
+      "actions": [{"op": "signal_set", "name": "a", "value": 5}],
+      "expect": {
+        "effect_log": ["e=1", "e=8", "e=12"],
+        "memo_value": 7,
+        "signals": {"a": 5}
+      }
+    },
+    {
+      "id": "STATE-005.1",
+      "rule": "STATE-005",
+      "domain": "state",
+      "setup": {
+        "signals": {"a": 1, "b": 2},
+        "effects": [
+          {"name": "f", "reads": ["a", "b"], "op": "first"},
+          {"name": "m", "reads": ["a", "b"], "op": "mul"}
+        ]
+      },
+      "actions": [{"op": "signal_set", "name": "a", "value": 9}],
+      "expect": {"effect_log": ["f=1", "m=2", "f=9", "m=18"]}
+    },
+    {
+      "id": "STATE-006.1",
+      "rule": "STATE-006",
+      "domain": "state",
+      "setup": {
+        "viewport": [100, 60],
+        "signals": {"t1": false},
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [{"type": "toggle", "id": "sw", "props": {"signal": "t1"}}]
+        }
+      },
+      "actions": [{"op": "signal_set", "name": "t1", "value": true}],
+      "expect": {
+        "signals": {"t1": true},
+        "events": [],
+        "a11y_events": [{"kind": "control_changed"}],
+        "a11y": [{"role": "toggle", "checked": true, "focusable": true}]
+      }
+    },
+    {
+      "id": "STATE-007.1",
+      "rule": "STATE-007",
+      "domain": "state",
+      "setup": {
+        "signals": {"txt": {"type": "text", "value": "hi"}}
+      },
+      "actions": [
+        {"op": "signal_set", "name": "txt", "value": "hello"},
+        {"op": "signal_set", "name": "txt", "value": "", "len": 1048577}
+      ],
+      "expect": {
+        "signals": {"txt": "hello"},
+        "action_error": "TextTooLong"
+      }
+    }
+  ]
+}

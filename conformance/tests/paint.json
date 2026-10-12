@@ -1,0 +1,478 @@
+{
+  "tests": [
+    {
+      "id": "PAINT-001.1",
+      "rule": "PAINT-001",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          100,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "props": {
+            "cross_align": "start"
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "red",
+              "props": {
+                "w": 60,
+                "h": 40,
+                "color": "#FF0000FF"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "pixels": [
+          {
+            "x": 30,
+            "y": 20,
+            "color": "#FF0000FF"
+          },
+          {
+            "x": 59,
+            "y": 39,
+            "color": "#FF0000FF"
+          },
+          {
+            "x": 60,
+            "y": 20,
+            "color": "#000000FF"
+          },
+          {
+            "x": 30,
+            "y": 40,
+            "color": "#000000FF"
+          }
+        ],
+        "pixel_counts": [
+          {
+            "color": "#FF0000FF",
+            "exact": 2400
+          }
+        ]
+      }
+    },
+    {
+      "id": "PAINT-002.1",
+      "rule": "PAINT-001",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30,
+                "color": "#FF0000FF"
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10,
+                "color": "#0000FFFF"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "pixel_counts": [
+          {
+            "color": "#FF0000FF",
+            "exact": 6000
+          },
+          {
+            "color": "#0000FFFF",
+            "exact": 2000
+          }
+        ]
+      }
+    },
+    {
+      "id": "PAINT-003.1",
+      "rule": "PAINT-002",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          100,
+          100
+        ],
+        "tree": {
+          "type": "stack",
+          "children": [
+            {
+              "type": "box",
+              "id": "under",
+              "props": {
+                "w": 100,
+                "h": 100,
+                "color": "#FF0000FF"
+              }
+            },
+            {
+              "type": "box",
+              "id": "over",
+              "props": {
+                "w": 50,
+                "h": 50,
+                "color": "#0000FFFF"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "pixels": [
+          {
+            "x": 25,
+            "y": 25,
+            "color": "#0000FFFF"
+          },
+          {
+            "x": 75,
+            "y": 75,
+            "color": "#FF0000FF"
+          }
+        ],
+        "pixel_counts": [
+          {
+            "color": "#0000FFFF",
+            "exact": 2500
+          },
+          {
+            "color": "#FF0000FF",
+            "exact": 7500
+          }
+        ]
+      }
+    },
+    {
+      "id": "PAINT-004.1",
+      "rule": "PAINT-003",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10
+              }
+            }
+          ]
+        }
+      },
+      "actions": [
+        {
+          "op": "mark_dirty",
+          "id": "a"
+        }
+      ],
+      "expect": {
+        "damage": [
+          0,
+          0,
+          200,
+          30
+        ]
+      }
+    },
+    {
+      "id": "PAINT-004.2",
+      "rule": "PAINT-003",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10
+              }
+            }
+          ]
+        }
+      },
+      "actions": [
+        {
+          "op": "mark_dirty",
+          "id": "a"
+        },
+        {
+          "op": "paint"
+        }
+      ],
+      "expect": {
+        "damage": null
+      }
+    },
+    {
+      "id": "PAINT-005.1",
+      "rule": "PAINT-004",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "ghost",
+              "props": {
+                "w": 50,
+                "h": 30,
+                "color": "#FF0000FF",
+                "visible": false
+              }
+            },
+            {
+              "type": "box",
+              "id": "solid",
+              "props": {
+                "w": 20,
+                "h": 10,
+                "color": "#0000FFFF"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "rects": {
+          "ghost": [
+            0,
+            0,
+            200,
+            30
+          ],
+          "solid": [
+            0,
+            30,
+            200,
+            10
+          ]
+        },
+        "pixel_counts": [
+          {
+            "color": "#FF0000FF",
+            "exact": 0
+          },
+          {
+            "color": "#0000FFFF",
+            "exact": 2000
+          }
+        ]
+      }
+    },
+    {
+      "id": "PAINT-006.1",
+      "rule": "PAINT-003",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          200,
+          100
+        ],
+        "tree": {
+          "type": "column",
+          "children": [
+            {
+              "type": "box",
+              "id": "a",
+              "props": {
+                "w": 50,
+                "h": 30,
+                "damage_overflow": [
+                  2,
+                  4,
+                  6,
+                  8
+                ]
+              }
+            },
+            {
+              "type": "box",
+              "id": "b",
+              "props": {
+                "w": 20,
+                "h": 10
+              }
+            }
+          ]
+        }
+      },
+      "actions": [
+        {
+          "op": "mark_dirty",
+          "id": "a"
+        },
+        {
+          "op": "mark_dirty_rect",
+          "id": "b",
+          "rect": [
+            10,
+            60,
+            20,
+            10
+          ]
+        }
+      ],
+      "expect": {
+        "damage": [
+          -2,
+          -4,
+          208,
+          74
+        ]
+      }
+    },
+    {
+      "id": "PAINT-007.1",
+      "rule": "PAINT-005",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          100,
+          100
+        ],
+        "tree": {
+          "type": "container",
+          "props": {
+            "color": "#112233FF",
+            "padding": 10
+          },
+          "children": [
+            {
+              "type": "box",
+              "id": "inner",
+              "props": {
+                "color": "#445566FF"
+              }
+            }
+          ]
+        }
+      },
+      "expect": {
+        "pixels": [
+          {
+            "x": 5,
+            "y": 5,
+            "color": "#112233FF"
+          },
+          {
+            "x": 50,
+            "y": 50,
+            "color": "#445566FF"
+          }
+        ]
+      }
+    },
+    {
+      "id": "PAINT-008.1",
+      "rule": "PAINT-006",
+      "domain": "paint",
+      "setup": {
+        "viewport": [
+          100,
+          60
+        ],
+        "signals": {
+          "tsw": false
+        },
+        "tree": {
+          "type": "column",
+          "props": {
+            "cross_align": "start"
+          },
+          "children": [
+            {
+              "type": "toggle",
+              "id": "sw",
+              "props": {
+                "signal": "tsw"
+              }
+            }
+          ]
+        }
+      },
+      "actions": [
+        {
+          "op": "pointer",
+          "phase": "down",
+          "x": 22,
+          "y": 12
+        },
+        {
+          "op": "pointer",
+          "phase": "up",
+          "x": 22,
+          "y": 12
+        }
+      ],
+      "expect": {
+        "signals": {
+          "tsw": true
+        },
+        "pixels": [
+          {
+            "x": 10,
+            "y": 12,
+            "color": "#3B5BDBFF"
+          }
+        ],
+        "events": [
+          "change:sw"
+        ]
+      }
+    }
+  ]
+}

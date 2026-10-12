@@ -1,0 +1,178 @@
+{
+  "tests": [
+    {
+      "id": "FOCUS-001.1",
+      "rule": "FOCUS-001",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "a", "props": {"w": 40, "h": 20, "role": "button", "focusable": true}},
+            {"type": "box", "id": "b", "props": {"w": 40, "h": 20, "role": "button", "focusable": true}},
+            {"type": "box", "id": "plain", "props": {"w": 40, "h": 20, "role": "text", "label": "p"}}
+          ]
+        }
+      },
+      "actions": [{"op": "focus", "id": "b"}],
+      "expect": {
+        "focus_order": ["a", "b"],
+        "focused": "b",
+        "router_focused": "b"
+      }
+    },
+    {
+      "id": "FOCUS-002.1",
+      "rule": "FOCUS-002",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "a", "props": {"w": 40, "h": 20, "focusable": true}},
+            {"type": "box", "id": "b", "props": {"w": 40, "h": 20, "focusable": true}},
+            {"type": "box", "id": "c", "props": {"w": 40, "h": 20, "focusable": true}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "key", "key": "tab"},
+        {"op": "key", "key": "tab"},
+        {"op": "key", "key": "tab"},
+        {"op": "key", "key": "tab"}
+      ],
+      "expect": {"focused": "a", "focus_order": ["a", "b", "c"]}
+    },
+    {
+      "id": "FOCUS-002.2",
+      "rule": "FOCUS-002",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "a", "props": {"w": 40, "h": 20, "focusable": true}},
+            {"type": "box", "id": "b", "props": {"w": 40, "h": 20, "focusable": true}},
+            {"type": "box", "id": "c", "props": {"w": 40, "h": 20, "focusable": true}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "focus", "id": "a"},
+        {"op": "key", "key": "tab", "shift": true}
+      ],
+      "expect": {"focused": "c"}
+    },
+    {
+      "id": "FOCUS-003.1",
+      "rule": "FOCUS-003",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [{"type": "button", "id": "btn"}]
+        }
+      },
+      "actions": [
+        {"op": "focus", "id": "btn"},
+        {"op": "key", "key": "enter"}
+      ],
+      "expect": {
+        "focused": "btn",
+        "events": ["press:btn"]
+      }
+    },
+    {
+      "id": "FOCUS-003.2",
+      "rule": "FOCUS-003",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "nb", "props": {"w": 40, "h": 20, "role": "button", "focusable": true, "on_press": true}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "focus", "id": "nb"},
+        {"op": "key", "key": "enter"}
+      ],
+      "expect": {"focused": "nb", "events": []}
+    },
+    {
+      "id": "FOCUS-004.1",
+      "rule": "FOCUS-004",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "props": {"cross_align": "start"},
+          "children": [
+            {"type": "text_field", "id": "tf", "props": {"placeholder": "name"}}
+          ]
+        }
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 30, "y": 10},
+        {"op": "pointer", "phase": "up", "x": 30, "y": 10},
+        {"op": "text_input", "text": "hi"},
+        {"op": "key", "key": "enter"},
+        {"op": "key", "key": "escape"}
+      ],
+      "expect": {
+        "focused": null,
+        "router_focused": null,
+        "events": ["change:tf", "submit:tf"],
+        "text": {"tf": "hi"},
+        "a11y_events": [{"kind": "focus_changed"}, {"kind": "focus_changed"}]
+      }
+    },
+    {
+      "id": "FOCUS-005.1",
+      "rule": "FOCUS-005",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "signals": {"sl": 0.5},
+        "tree": {
+          "type": "column",
+          "children": [{"type": "slider", "id": "s", "props": {"signal": "sl"}}]
+        }
+      },
+      "actions": [
+        {"op": "focus", "id": "s"},
+        {"op": "key", "key": "right"},
+        {"op": "key", "key": "up"},
+        {"op": "key", "key": "left"}
+      ],
+      "expect": {
+        "signals": {"sl": 0.55},
+        "events": ["change:s", "change:s", "change:s"]
+      }
+    },
+    {
+      "id": "FOCUS-006.1",
+      "rule": "FOCUS-006",
+      "domain": "focus",
+      "setup": {
+        "viewport": [200, 100],
+        "tree": {
+          "type": "column",
+          "children": [
+            {"type": "box", "id": "a", "props": {"w": 40, "h": 20, "focusable": true}},
+            {"type": "box", "id": "ghost", "props": {"w": 40, "h": 20, "focusable": true, "visible": false}},
+            {"type": "box", "id": "b", "props": {"w": 40, "h": 20, "focusable": true}}
+          ]
+        }
+      },
+      "expect": {"focus_order": ["a", "b"]}
+    }
+  ]
+}
