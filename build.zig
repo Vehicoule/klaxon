@@ -997,10 +997,13 @@ fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
         "vcvarsamd64_arm64.bat"
     else
         "vcvars64.bat";
-    // Probe the usual VS 2022 install layout (no vswhere subprocess).
+    // Probe the usual VS install layouts (2022, then 2026 — windows-latest
+    // runners moved to the windows-2025 image which ships VS 2026 under
+    // ...\18\<Edition>).
     const prefixes = [_][]const u8{
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
         "C:\\Program Files\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\18",
     };
     const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
     for (prefixes) |p| for (editions) |e| {
@@ -1008,7 +1011,22 @@ fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
         std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
         return cand;
     };
-    @panic("MSVC not found: install VS 2022 Build Tools (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
+    // Fallback: vswhere (always installed under Installer\ alongside any VS
+    // 2017+ install) resolves whatever the image actually has.
+    const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+    if (std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ vswhere, "-latest", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath" },
+        .stdout_limit = .limited(64 * 1024),
+    }) catch null) |res| {
+        const root = std.mem.trim(u8, res.stdout, " \r\n\t");
+        if (res.term == .exited and res.term.exited == 0 and root.len > 0) {
+            const cand = b.fmt("{s}\\VC\\Auxiliary\\Build\\{s}", .{ root, vcvars_name });
+            std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch
+                @panic("MSVC not found: install Visual Studio (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
+            return cand;
+        }
+    }
+    @panic("MSVC not found: install Visual Studio (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
 }
 
 fn is_windows_local(target: std.Build.ResolvedTarget) bool {

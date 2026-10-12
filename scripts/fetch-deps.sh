@@ -170,7 +170,10 @@ DEPS_BASE_URL="${KLAXON_DEPS_BASE_URL:-https://github.com/Vehicoule/klaxon/relea
 # stale cache) must never pass as complete: missing entries → return 1 and the
 # caller falls back to the source build.
 verify_bundle() {
-  local name="$1" m="$DEPS/.deps-manifest-$name" f missing=0
+  # Split decls: under `set -u`, expansions in a single `local` run before any
+  # assignment, so `m=...$name` would read the caller's (possibly unset) name.
+  local name="$1" f missing=0
+  local m="$DEPS/.deps-manifest-$name"
   [ -f "$m" ] || return 0
   while IFS= read -r f; do
     [ -e "$DEPS/$f" ] || missing=$((missing + 1))
