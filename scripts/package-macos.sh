@@ -11,6 +11,10 @@
 # The .app is a standard macOS bundle: Contents/{Info.plist, MacOS/<exe>, Resources/}
 set -euo pipefail
 
+# Tool checks — fail early with the install command in the message.
+command -v zig >/dev/null 2>&1 || { echo "Error: zig not found — install Zig 0.17 (brew install zig)"; exit 1; }
+command -v hdiutil >/dev/null 2>&1 || { echo "Error: hdiutil not found — this script must run on macOS (Xcode CLT)"; exit 1; }
+
 APP_NAME="${1:-gallery}"
 OUTPUT_DIR="${2:-./dist}"
 WITH_DMG=false
@@ -18,25 +22,20 @@ if [ "${3:-}" = "--dmg" ]; then WITH_DMG=true; fi
 BUNDLE_NAME="Klaxon-${APP_NAME}.app"
 BUNDLE_PATH="${OUTPUT_DIR}/${BUNDLE_NAME}"
 
-# Map app name → build step + executable name.
+# Validate the app name (it selects zig-out/bin/<name>).
 case "${APP_NAME}" in
-    hello)     BUILD_STEP="" ;;           # zig build (default = hello)
-    gallery)   BUILD_STEP="gallery" ;;
-    navigator) BUILD_STEP="navigator" ;;
-    i18n)      BUILD_STEP="i18n" ;;
-    a11y)      BUILD_STEP="a11y" ;;
+    hello|gallery|navigator|i18n|a11y) ;;
     *) echo "Unknown app: ${APP_NAME}"; echo "Valid: hello, gallery, navigator, i18n, a11y"; exit 1 ;;
 esac
 
 EXE_NAME="${APP_NAME}"
-[ "${APP_NAME}" = "hello" ] && EXE_NAME="hello"
 
 # create_dmg <bundle-path> — wrap the .app in a drag-and-drop .dmg:
 # the .app on the left, a symlink to /Applications on the right.
 # Uses hdiutil (macOS system tool, works headless).
 create_dmg() {
     local bundle_path="$1"
-    local vol_name="Klaxon Gallery"
+    local vol_name="Klaxon-${APP_NAME}"
     local dmg="${OUTPUT_DIR}/Klaxon-${APP_NAME}.dmg"
     local tmp_dmg="${OUTPUT_DIR}/.klaxon-tmp.dmg"
 
@@ -61,12 +60,11 @@ create_dmg() {
     ls -lh "$dmg"
 }
 
+# Plain `zig build`: the app steps (gallery/navigator/...) are run-steps that
+# would LAUNCH the demo — fine interactively, fatal on a headless packager.
+# The default step installs every exe to zig-out/bin; pick ours by name.
 echo "==> Building ${APP_NAME} (ReleaseSmall)..."
-if [ -n "${BUILD_STEP}" ]; then
-    zig build "${BUILD_STEP}" -Doptimize=ReleaseSmall
-else
-    zig build -Doptimize=ReleaseSmall
-fi
+zig build -Doptimize=ReleaseSmall
 
 EXE_SRC="zig-out/bin/${EXE_NAME}"
 if [ ! -f "${EXE_SRC}" ]; then

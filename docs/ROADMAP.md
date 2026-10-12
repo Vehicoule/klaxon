@@ -445,20 +445,26 @@ The advanced widgets (Table, Tree, Calendar, DatePicker, ColorPicker, Avatar, Ca
 
 ### 5b. Packaging — full matrix
 
-| Platform | Format | Arch | Tool |
-|---|---|---|---|
-| Linux | AppImage | x64, arm64 | appimagetool |
-| Linux | .deb | x64, arm64 | dpkg-deb |
-| Linux | .rpm | x64, arm64 | rpmbuild |
-| Linux | Flatpak | x64 | flatpak-builder |
-| Windows | .exe (portable) | x64 | zip |
-| Windows | .msi | x64 | WiX |
-| macOS | .app | arm64 | hdiutil |
-| macOS | .dmg | arm64 | hdiutil |
-| Android | .apk | arm64 | gradle + apksigner |
-| Android | .aab | arm64 | gradle bundle |
-| iOS | .ipa | arm64 | xcodebuild |
-| Web | .wasm + .html | wasm32 | emscripten |
+Status legend: ✅ = script exists + verified · 🟡 = script exists, limited scope · ⬜ = planned.
+
+| Platform | Format | Arch | Tool | Status |
+|---|---|---|---|---|
+| Linux | AppImage | x64, arm64 | appimagetool | ⬜ planned |
+| Linux | .deb | x64, arm64 | dpkg-deb | ⬜ planned |
+| Linux | .rpm | x64, arm64 | rpmbuild | ⬜ planned |
+| Linux | Flatpak | x64 | flatpak-builder | ⬜ planned |
+| Windows | .exe (portable) | x64 | zip | ✅ `scripts/package-windows.sh` |
+| Windows | .msi | x64 | WiX | ⬜ planned |
+| macOS | .app | arm64 | bundle + codesign | ✅ `scripts/package-macos.sh` |
+| macOS | .dmg | arm64 | hdiutil | ✅ `scripts/package-macos.sh --dmg` |
+| Android | .apk | arm64 | gradle + apksigner | ✅ `scripts/package-android.sh` (SDK debug key unless `KX_KEYSTORE` set) |
+| Android | .aab | arm64 | gradle bundle | ✅ `scripts/package-android.sh` |
+| iOS | .ipa | arm64 | Payload zip | 🟡 `scripts/package-ios.sh --ipa` — dev/sideload .ipa; TestFlight still needs distribution signing + `xcodebuild -exportArchive` (no .xcodeproj in repo) |
+| Web | .wasm + .html + .js | wasm32 | emscripten | ✅ `scripts/package-web.sh` → `dist/klaxon-web-hello.tar.gz` |
+
+`scripts/package.sh` dispatches to the platform script (defaults to the host
+OS). All artifacts land in `dist/`; the iOS `.app` stays in `zig-out/ios/` for
+`gates/device.sh` / `xcrun simctl install`.
 
 ### 5c. Documentation
 
