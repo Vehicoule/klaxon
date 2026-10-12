@@ -875,10 +875,13 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
     // Wrapper .bat: `cmd /c wrapper.bat <args>` forwards args via %* —
     // args appended after a quoted `cmd /c "..."` string are ignored by cmd.
     const wf = b.addWriteFiles();
+    // cl writes diagnostics to STDOUT; zig only surfaces stderr on failure.
+    // Redirect cl's stdout to stderr so CI logs show the actual C#### errors,
+    // and fail loudly when vcvars itself fails (cl then runs unconfigured).
     const wrapper = wf.add("msvc-cl-wrapper.bat", if (vcvars.len == 0)
-        "@cl %*\r\n"
+        "@cl %* 1>&2\r\n"
     else
-        b.fmt("@call \"{s}\" >NUL 2>&1\r\n@cl %*\r\n", .{vcvars}));
+        b.fmt("@call \"{s}\" >NUL\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n@cl %* 1>&2\r\n", .{vcvars}));
     var objs: std.ArrayList(std.Build.LazyPath) = .empty;
     for (sources) |s| {
         const run = b.addSystemCommand(&.{"cmd"});
