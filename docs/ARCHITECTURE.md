@@ -264,18 +264,21 @@ without a GL middle tier is Apple, where Metal covers 100% of supported
 hardware. Raster is always built, always tested (CI goldens), always
 reachable — it is what makes AUTO safe.
 
-Current truth: macOS ships graphite-metal + raster; iOS ships all five
-backends; Android ships ganesh-gles + raster; Linux ships **ganesh-gl +
-raster** (`KX_BACKEND_GANESH_GL`, `gl` CLI arg — SDL GL context, raster
-fallback when no GL driver). Graphite-vulkan on Linux is still Phase 3a.
+Current truth: macOS ships graphite-metal + raster; iOS ships
+graphite-metal + raster; Android ships ganesh-gles + raster; Linux ships
+**ganesh-gl + raster** (`KX_BACKEND_GANESH_GL`, `gl` CLI arg — SDL GL
+context, raster fallback when no GL driver). Graphite-vulkan on Linux is
+still Phase 3a.
 
-Implemented + measured (iOS Simulator, 2026-10-11, `bench/results/ios-backends-20261011.json`):
-all five iOS backends render pixel-identical to graphite-metal within ~1%
-(graphite-metal 60fps/6.32ms · graphite-dawn 60fps/7.95ms · ganesh-metal
-60fps/3.16ms · ganesh-gles 12fps/79ms · raster <2fps — sim GLES↔Metal
-translation dominates). ganesh-gles is also the working path on the Android
-arm64 emulator (~150fps gallery). Windows and the iOS raster present path are
-still pending (Phase 3c).
+Historical measurement (iOS Simulator, 2026-10-11,
+`bench/results/ios-backends-20261011.json`, taken while the five-backend
+dev stack still existed — shipping iOS is now graphite-metal + raster
+only): all five iOS backends rendered pixel-identical to graphite-metal
+within ~1% (graphite-metal 60fps/6.32ms · graphite-dawn 60fps/7.95ms ·
+ganesh-metal 60fps/3.16ms · ganesh-gles 12fps/79ms · raster <2fps — sim
+GLES↔Metal translation dominates). ganesh-gles is also the working path
+on the Android arm64 emulator (~150fps gallery). Windows and the iOS
+raster present path are still pending (Phase 3c).
 
 **No macOS x64.** Apple Silicon only.
 
