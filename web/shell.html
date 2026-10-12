@@ -1,11 +1,13 @@
 <!doctype html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>Klaxon</title>
   <style>
-    html, body {
+    html,
+    body {
       margin: 0;
       padding: 0;
       width: 100%;
@@ -13,6 +15,7 @@
       overflow: hidden;
       background: #000;
     }
+
     #canvas {
       display: block;
       width: 100vw;
@@ -20,6 +23,7 @@
       touch-action: none;
       outline: none;
     }
+
     #kx-a11y-root {
       position: absolute;
       width: 1px;
@@ -32,6 +36,7 @@
       white-space: nowrap;
       border: 0;
     }
+
     #kx-loader {
       position: fixed;
       inset: 0;
@@ -45,6 +50,7 @@
     }
   </style>
 </head>
+
 <body>
   <canvas id="canvas" tabindex="0"></canvas>
   <div id="kx-a11y-root"></div>
@@ -53,6 +59,20 @@
     var Module = {
       preRun: function () {
         Module.canvas = document.getElementById('canvas');
+        // emdawnwebgpu: request the WebGPU device before main() runs so
+        // emscripten_webgpu_get_device() sees it. Gate on a run dependency so
+        // main waits for the async request; on failure the runtime falls
+        // back to the WebGL2 backend chain entry.
+        if (navigator.gpu) {
+          addRunDependency('kx-webgpu-device');
+          navigator.gpu.requestAdapter()
+            .then(function (adapter) { return adapter && adapter.requestDevice(); })
+            .then(function (device) {
+              if (device) Module['preinitializedWebGPUDevice'] = device;
+            })
+            .catch(function () { })
+            .finally(function () { removeRunDependency('kx-webgpu-device'); });
+        }
       },
       postRun: function () {
         var loader = document.getElementById('kx-loader');
@@ -67,4 +87,5 @@
   </script>
   {{{ SCRIPT }}}
 </body>
+
 </html>

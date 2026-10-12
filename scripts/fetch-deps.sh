@@ -17,7 +17,7 @@
 # Usage:
 #   scripts/fetch-deps.sh              # all components
 #   scripts/fetch-deps.sh skia sdl3    # selected components
-#   scripts/fetch-deps.sh web-wasm     # Phase 3f web target (emsdk + Skia wasm + SDL3 wasm; heavy, ~1-2 GB)
+#   scripts/fetch-deps.sh web-wasm     # web target (emsdk + Skia wasm + SDL3 wasm; heavy, ~1-2 GB)
 #   scripts/fetch-deps.sh android-arm64  # Phase 3d Android target (Android NDK required; heavy)
 #   scripts/fetch-deps.sh ios            # Phase 3e iOS target (macOS arm64 + Xcode only; heavy)
 set -euo pipefail
@@ -252,7 +252,8 @@ satisfied() {
     skia)  [ -f "$SKIA/out/$TAG/libskia.a" ] ;;
     sdl3)  [ -f "$DEPS/SDL/build-$TAG/libSDL3.a" ] ;;
     wamr)  [ -d "$DEPS/wamr/build-$TAG" ] ;;
-    web-wasm)   [ -f "$SKIA/out/web-wasm/libskia.wasm.a" ] ;;
+    web-wasm)   [ -f "$SKIA/out/web-wasm/libskia.wasm.a" ] \
+                 && [ -f "$DEPS/emdawnwebgpu_pkg/emdawnwebgpu.port.py" ] ;;
     android-arm64) [ -f "$SKIA/out/android-arm64/libskia.a" ] ;;
     ios)   [ -f "$SKIA/out/ios-arm64/libskia.a" ] ;;
     *) return 1 ;;
@@ -469,9 +470,15 @@ EOF
   fi
 }
 
-# Phase 3f wasm args (target_cpu = "wasm" implies target_os = "wasm",
-# gn/BUILDCONFIG.gn). Ganesh WebGL2 only — no Graphite/Dawn (Phase 3g). The
-# wasm toolchain compiles with emcc/em++ from skia_emsdk_dir and emits
+# Phase 3g wasm args (target_cpu = "wasm" implies target_os = "wasm",
+# gn/BUILDCONFIG.gn). Graphite-Dawn over emdawnwebgpu → navigator.gpu is the
+# primary backend; Ganesh WebGL2 stays compiled in as the fallback. Skia
+# requires skia_enable_graphite whenever skia_use_dawn (gn/skia.gni assert).
+# skia_use_webgpu pulls in the wgpu:: Surface/Device helpers used by
+# src/gpu/graphite/dawn on __EMSCRIPTEN__. On wasm there is no dawn_native
+# library — patch 005 turns //third_party/dawn into a header-free config so
+# the WebGPU C API comes from Emscripten's -sUSE_WEBGPU at the app link.
+# The wasm toolchain compiles with emcc/em++ from skia_emsdk_dir and emits
 # lib<name>.wasm.a (gn/toolchain/BUILD.gn).
 write_skia_args_wasm() {
   local out="$1"
@@ -482,18 +489,19 @@ is_component_build = false
 target_cpu = "wasm"
 
 skia_emsdk_dir = "$DEPS/emsdk"
+skia_emdawnwebgpu_dir = "$DEPS/emdawnwebgpu_pkg"
 
 skia_use_webgl = true
-skia_use_webgpu = false
+skia_use_webgpu = true
 skia_use_vulkan = false
 skia_use_metal = false
-skia_use_dawn = false
+skia_use_dawn = true
 skia_use_direct3d = false
 skia_use_x11 = false
 skia_use_egl = false
 skia_use_vma = false
 skia_enable_ganesh = true
-skia_enable_graphite = false
+skia_enable_graphite = true
 skia_enable_fontmgr_custom_embedded = true
 skia_enable_fontmgr_custom_directory = true
 EOF
@@ -613,7 +621,7 @@ build_wamr() {
   find "$build" -maxdepth 1 -name 'lib*.a' -exec ls -la {} +
 }
 
-# --- web-wasm (Phase 3f) ----------------------------------------------------
+# --- web-wasm (Phase 3f + 3g) -----------------------------------------------
 # Heavy (~1-2 GB): NOT a default component. One emsdk, pinned to Skia's
 # bin/activate-emsdk version — Skia's wasm objects and the app's emcc link
 # (build.zig, `web` step) must use the same toolchain (plan §2).
@@ -634,8 +642,19 @@ build_emsdk() {
 build_skia_wasm() {
   local out="$SKIA/out/web-wasm"
   if [ -f "$out/libskia.wasm.a" ]; then
-    log "skia wasm already built (out/web-wasm)"
-    return 0
+    # Args drift (e.g. flipping skia_use_dawn) must force a rebuild — compare
+    # the args we'd write with the ones the build was generated from.
+    local want
+    want="$(mktemp)"
+    write_skia_args_wasm "$want"
+    if cmp -s "$want" "$out/args.gn"; then
+      rm -f "$want"
+      log "skia wasm already built (out/web-wasm)"
+      return 0
+    fi
+    rm -f "$want"
+    log "skia wasm args changed — wiping out/web-wasm for a clean rebuild"
+    rm -rf "$out"
   fi
   build_emsdk
   fetch_skia
@@ -701,6 +720,36 @@ build_sdl3_wasm() {
 #   static const unsigned char kKxDefaultFontData[] = { ...ttf bytes... };
 #   static const size_t kKxDefaultFontSize = sizeof(kKxDefaultFontData);
 
+# emdawnwebgpu package (Dawn release): standard-spec webgpu/webgpu_cpp headers
+# + webgpu.cpp runtime impl + library_webgpu*.js libs. Skia's graphite-dawn
+# sources compile against these headers on wasm (patches 005+007 route the
+# old-spec __EMSCRIPTEN__ forks to the standard branch); build.zig compiles
+# webgpu.cpp and links the JS libs. Emsdk 4.0.7 predates the remote port
+# (needs 4.0.10+), so the pkg is fetched directly — same content, pinned.
+EMDAWN_PKG_VER="v20261009.190412"
+EMDAWN_PKG_URL="https://github.com/google/dawn/releases/download/${EMDAWN_PKG_VER}/emdawnwebgpu_pkg-${EMDAWN_PKG_VER}.zip"
+
+fetch_emdawnwebgpu() {
+  local dir="$DEPS/emdawnwebgpu_pkg"
+  if [ -f "$dir/emdawnwebgpu.port.py" ] && [ -f "$dir/VERSION.txt" ]; then
+    log "emdawnwebgpu pkg already installed ($EMDAWN_PKG_VER)"
+    return 0
+  fi
+  local zip="$DEPS/emdawnwebgpu_pkg.zip"
+  if [ ! -f "$zip" ]; then
+    log "download emdawnwebgpu_pkg $EMDAWN_PKG_VER (~1 MB)"
+    curl -fsSL -o "$zip" "$EMDAWN_PKG_URL" || die "failed to download emdawnwebgpu pkg"
+  fi
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  python3 - "$zip" "$dir" <<'PYEOF'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    z.extractall(sys.argv[2])
+PYEOF
+  [ -f "$dir/emdawnwebgpu.port.py" ] || die "emdawnwebgpu pkg extract incomplete"
+}
+
 FONT_ZIP_URL="https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.zip"
 FONT_ZIP_MEMBER="dejavu-fonts-ttf-2.37/ttf/DejaVuSans.ttf"
 
@@ -760,6 +809,7 @@ PYEOF
 
 build_web_wasm() {
   build_emsdk
+  fetch_emdawnwebgpu
   build_skia_wasm
   build_sdl3_wasm
   generate_font_header

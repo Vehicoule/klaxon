@@ -1,0 +1,64 @@
+diff --git a/third_party/dawn/BUILD.gn b/third_party/dawn/BUILD.gn
+index 187722e..66e0760 100644
+--- a/third_party/dawn/BUILD.gn
++++ b/third_party/dawn/BUILD.gn
+@@ -132,7 +132,17 @@ group("tint") {
+ }
+ 
+ config("dawn_api_config") {
+-  if (!is_canvaskit) {
++  if (is_wasm) {
++    # klaxon: emdawnwebgpu's standard-spec headers + generated webgpu_cpp.h.
++    # Vendored dawn headers are the dawn-native superset — Skia's dawn
++    # sources only get extension-free code paths on wasm (KX_WEBGPU_OLD_SPEC
++    # is never defined; patch 007 routes every spec-version fork to the
++    # standard branch).
++    include_dirs = [
++      "$skia_emdawnwebgpu_dir/webgpu/include",
++      "$skia_emdawnwebgpu_dir/webgpu_cpp/include",
++    ]
++  } else if (!is_canvaskit) {
+     include_dirs = [
+       "../externals/dawn",
+       "../externals/dawn/include",
+@@ -154,7 +164,9 @@ config("dawn_api_config") {
+   } else {
+     libs = []
+   }
+-  libs += [ "$root_out_dir/$_dawn_lib_name" ]
++  if (!is_wasm) {
++    libs += [ "$root_out_dir/$_dawn_lib_name" ]
++  }
+ 
+   # https://dawn.googlesource.com/dawn/+/647c352f57aa8a4c2666258455158a36c0c385af/src/dawn/native/BUILD.gn#645
+   if (is_mac || is_ios) {
+@@ -318,7 +330,13 @@ config("dawn_defines") {
+ }
+ 
+ group("dawn") {
+-  public_deps = [ ":dawn_cmake" ]
++  # klaxon: on wasm there is no dawn_native library — the WebGPU C API is
++  # implemented by the emdawnwebgpu package (compiled + linked into the app
++  # by build.zig); dawn_api_config injects only the pkg's standard-spec
++  # headers.
++  if (!is_wasm) {
++    public_deps = [ ":dawn_cmake" ]
++  }
+ 
+   public_configs = [ ":dawn_api_config" ]
+ 
+diff --git a/third_party/dawn/args.gni b/third_party/dawn/args.gni
+index 755562f..a3b2af6 100644
+--- a/third_party/dawn/args.gni
++++ b/third_party/dawn/args.gni
+@@ -3,6 +3,10 @@
+ # found in the LICENSE file.
+ 
+ declare_args() {
++  # klaxon: path to the emdawnwebgpu pkg (deps/emdawnwebgpu_pkg) — the
++  # standard-spec WebGPU headers + runtime used for wasm dawn builds.
++  skia_emdawnwebgpu_dir = ""
++
+   # All of these are the same as Dawn's versions for backwards compatibility.
+   dawn_enable_d3d11 = false
+   dawn_enable_d3d12 = is_win

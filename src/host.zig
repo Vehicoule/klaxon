@@ -196,7 +196,11 @@ pub const Host = struct {
         // kx_skia_android.cpp) need a current GL context when kx.create
         // runs. Double-buffered, no depth buffer, 8-bit stencil.
         // iOS has no GL path (metal → raster only, per the backend contract).
-        const need_gl_attrs = is_emscripten or is_android;
+        // wasm: only WebGL2 claims the canvas via GL — Graphite WebGPU and
+        // raster must NOT create a GL context (a canvas supports exactly one
+        // context type; WebGL first would make navigator.gpu fail).
+        const need_gl_attrs = is_android or
+            (is_emscripten and backend == kx.c.KX_BACKEND_GANESH_WEBGL2);
         if (need_gl_attrs) {
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MAJOR_VERSION), 3);
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MINOR_VERSION), 0);
@@ -232,7 +236,12 @@ pub const Host = struct {
             );
         }
         const window_flags: u64 = if (is_emscripten)
-            sdl.c.SDL_WINDOW_OPENGL
+            // OPENGL claims the canvas for WebGL2 — WebGPU/raster must not
+            // set it (single context type per canvas).
+            if (backend == kx.c.KX_BACKEND_GANESH_WEBGL2)
+                sdl.c.SDL_WINDOW_OPENGL
+            else
+                0
         else if (is_android)
             // OPENGL only: the activity theme (NoTitleBar.Fullscreen) already
             // covers the screen. SDL_WINDOW_FULLSCREEN would switch the window
@@ -323,7 +332,12 @@ pub const Host = struct {
         // SDL_GL_GetCurrentContext. iOS/macOS Metal: no GL context (Metal
         // view instead). Raster: none.
         var gl_ctx: sdl.c.SDL_GLContext = null;
-        const need_gl = (is_emscripten or is_android) or
+        // wasm: only WebGL2 claims the canvas via GL — Graphite WebGPU and
+        // raster must NOT create a GL context (a canvas supports exactly one
+        // context type; WebGL first would make navigator.gpu fail). iOS has
+        // no GL path. Linux AUTO may still resolve to GL → request it too.
+        const need_gl = is_android or
+            (is_emscripten and backend == kx.c.KX_BACKEND_GANESH_WEBGL2) or
             (is_linux and (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO));
         if (need_gl) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);

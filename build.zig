@@ -501,8 +501,13 @@ fn addWasmWeb(
     });
     const shim_flags = &[_][]const u8{
         "-std=c++20",  "-fno-exceptions", "-fno-rtti",
-        "-DSK_GANESH", "-DSK_GL",         "-DSK_FORCE_8_BYTE_ALIGNMENT",
+        "-DSK_GANESH", "-DSK_GL",         "-DSK_GRAPHITE",
+        "-DSK_DAWN",   "-DSK_FORCE_8_BYTE_ALIGNMENT",
         "-DNDEBUG",
+        // zig cc enables UBSan instrumentation that references zig's
+        // compiler-rt symbols; emscripten's compiler_rt doesn't provide them
+        // (wasm-ld undefined __ubsan_handle_* in emdawnwebgpu's webgpu.cpp).
+        "-fno-sanitize=undefined",
         // Disable all default include paths: zig cc adds its own musl/libc++
         // headers which conflict with the emscripten sysroot. All include paths
         // are provided explicitly below (compat + c++/v1 + sysroot + project
@@ -513,6 +518,9 @@ fn addWasmWeb(
         .files = &.{
             "kx_skia/src/kx_skia_common.cpp",
             "kx_skia/src/kx_skia_wasm.cpp",
+            // emdawnwebgpu runtime impl (navigator.gpu → wgpu C API); the
+            // matching library_webgpu*.js libs are added at the emcc link.
+            "deps/emdawnwebgpu_pkg/webgpu/src/webgpu.cpp",
         },
         .flags = shim_flags,
         .language = .cpp,
@@ -520,6 +528,12 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
+    // emdawnwebgpu package headers BEFORE everything else providing
+    // webgpu/*.h: the pkg carries the standard-spec headers matching its JS
+    // runtime. The vendored Dawn headers (third_party/externals/dawn) are the
+    // dawn-native superset and must NOT leak into the wasm build.
+    kx_skia.root_module.addIncludePath(b.path("deps/emdawnwebgpu_pkg/webgpu/include"));
+    kx_skia.root_module.addIncludePath(b.path("deps/emdawnwebgpu_pkg/webgpu_cpp/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
     // Emscripten sysroot dirs, mirroring emcc's own search order (emcc -v):
     //   fakesdl → compat → c++/v1 → clang builtins → include
@@ -614,6 +628,17 @@ fn addWasmWeb(
         "web/shell.html",
         "--js-library",
         "web/kx_a11y.js",
+        // emdawnwebgpu JS runtime — the generated tables must precede
+        // library_webgpu.js (it depends on their globals), per the pkg's
+        // emdawnwebgpu.port.py linker_setup.
+        "--js-library",
+        "deps/emdawnwebgpu_pkg/webgpu/src/library_webgpu_enum_tables.js",
+        "--js-library",
+        "deps/emdawnwebgpu_pkg/webgpu/src/library_webgpu_generated_struct_info.js",
+        "--js-library",
+        "deps/emdawnwebgpu_pkg/webgpu/src/library_webgpu_generated_sig_info.js",
+        "--js-library",
+        "deps/emdawnwebgpu_pkg/webgpu/src/library_webgpu.js",
         "-sUSE_WEBGL2=1",
         "-sALLOW_MEMORY_GROWTH=1",
         "-sMAXIMUM_MEMORY=2GB",

@@ -88,9 +88,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // silently breaks, e.g. SDL's canvas selector). c_allocator grows via
         // emscripten_resize_heap, which refreshes the views.
         const stable = std.heap.c_allocator;
-        // No argv parsing on emscripten: hardcoded Ganesh WebGL2 backend.
+        // No argv parsing on emscripten: walk the wasm backend contract —
+        // Graphite WebGPU → Ganesh WebGL2 → raster. Host.init is attempted
+        // per entry: a navigator.gpu-less browser (or failed device request)
+        // drops to the next chain entry.
         const host_ptr = try stable.create(host_mod.Host);
-        host_ptr.* = try host_mod.Host.init(stable, width, height, kx.c.KX_BACKEND_GANESH_WEBGL2, null);
+        const wasm_backends = [_]kx.c.kx_backend{
+            kx.c.KX_BACKEND_GRAPHITE_WEBGPU,
+            kx.c.KX_BACKEND_GANESH_WEBGL2,
+            kx.c.KX_BACKEND_RASTER,
+        };
+        var host_opt: ?host_mod.Host = null;
+        for (wasm_backends) |b| {
+            host_opt = host_mod.Host.init(stable, width, height, b, null) catch continue;
+            break;
+        }
+        host_ptr.* = host_opt orelse return error.NoUsableBackend;
         // No defer host.deinit(): the host lives as long as the page.
         input_mod.setCurrent(&host_ptr.input); // the router is process-global (single-window P0)
         ui.anim.setCurrent(&host_ptr.timeline); // the animation timeline, same pattern

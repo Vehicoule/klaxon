@@ -107,6 +107,8 @@ for b in "${BUNDLES[@]}"; do
         "skia/include" \
         "skia/out/web-wasm" \
         "skia/modules" \
+        "skia/src" \
+        "emdawnwebgpu_pkg" \
         "SDL/include" \
         "SDL/build-web-wasm" || rc=1
       ;;
