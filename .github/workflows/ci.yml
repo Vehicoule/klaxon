@@ -87,14 +87,17 @@ jobs:
       - name: A11y headless smoke (raster, 600 frames, scripted keyboard)
         run: SDL_VIDEODRIVER=dummy ./zig-out/bin/a11y
 
-      - name: ReleaseSmall build + size gate (< 6,8 Mo)
+      - name: ReleaseSmall build + size gate (< 10 Mo)
         run: |
           zig build -Doptimize=ReleaseSmall
           bin=zig-out/bin/hello; [ -f "$bin" ] || bin="$bin.exe"
           size=$(wc -c < "$bin")
           echo "hello (ReleaseSmall): $size bytes"
-          if [ "$size" -ge 7127245 ]; then
-            echo "SIZE GATE FAILED: $size >= 6,8 Mo"; exit 1
+          # 10,5 Mo (mebibytes): ganesh-gl adds ~1,5 Mo of GL backend objects
+          # to libskia — the linux gpu binary is ~7,8 Mo. Graphite vulkan
+          # will grow it again; keep the gate honest by bumping it then.
+          if [ "$size" -ge 10485760 ]; then
+            echo "SIZE GATE FAILED: $size >= 10 Mo"; exit 1
           fi
 
   # Phase 3f — wasm web target (docs/specs/phase-3f-wasm-plan.md §7).

@@ -39,6 +39,7 @@ pub const is_emscripten = builtin.os.tag == .emscripten;
 /// context created before kx_create, the pixel-size/DPR handling, the
 /// lifecycle events, and the SDL_Log-based log() below.
 pub const is_android = builtin.os.tag == .linux and builtin.abi == .android;
+pub const is_linux = builtin.os.tag == .linux and builtin.abi != .android;
 pub const is_ios = builtin.os.tag == .ios;
 pub const is_mobile = is_android or is_ios;
 
@@ -206,6 +207,18 @@ pub const Host = struct {
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DEPTH_SIZE), 0);
             _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_STENCIL_SIZE), 8);
         }
+        // Linux Ganesh GL: desktop GL context (not ES). 3.3 core covers
+        // Ganesh's requirements; 8-bit stencil for clip masks, double
+        // buffering for swaps. SDL picks GLX or EGL under the hood.
+        const need_desktop_gl_attrs = is_linux and backend == kx.c.KX_BACKEND_GANESH_GL;
+        if (need_desktop_gl_attrs) {
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MAJOR_VERSION), 3);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MINOR_VERSION), 3);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_PROFILE_MASK), sdl.c.SDL_GL_CONTEXT_PROFILE_CORE);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DOUBLEBUFFER), 1);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DEPTH_SIZE), 0);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_STENCIL_SIZE), 8);
+        }
         // Emscripten: pin the canvas selector before SDL creates the window —
         // on the pinned SDL/emsdk combo SDL_GetHint() returns "" rather than
         // NULL for this unset hint, and Emscripten_CreateWindow then calls
@@ -239,6 +252,13 @@ pub const Host = struct {
                 sdl.c.SDL_WINDOW_OPENGL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
             else
                 sdl.c.SDL_WINDOW_METAL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
+        else if (is_linux)
+            // OPENGL only when the Ganesh GL backend is requested — raster
+            // stays on the SDL software renderer.
+            if (backend == kx.c.KX_BACKEND_GANESH_GL)
+                sdl.c.SDL_WINDOW_OPENGL
+            else
+                0
         else
             0;
         // Android: SDLActivity starts the SDL thread only once the surface is
@@ -247,7 +267,7 @@ pub const Host = struct {
         // supports exactly one window). Reuse a pre-existing window if some
         // flow already created one, otherwise create it ourselves.
         var android_owns_window = false;
-        const window: *sdl.c.SDL_Window = if (is_android) blk: {
+        var window: *sdl.c.SDL_Window = if (is_android) blk: {
             var count: c_int = 0;
             const windows = sdl.c.SDL_GetWindows(&count);
             if (count > 0) {
@@ -290,16 +310,32 @@ pub const Host = struct {
         // iOS Graphite Metal: no GL context (Metal view instead).
         // iOS Ganesh GLES: GL context (ES 3.0).
         var gl_ctx: sdl.c.SDL_GLContext = null;
+        var resolved_backend = backend;
         const need_gl = (is_emscripten or is_android) or
-            (is_ios and backend == kx.c.KX_BACKEND_GANESH_GLES);
+            (is_ios and backend == kx.c.KX_BACKEND_GANESH_GLES) or
+            (is_linux and backend == kx.c.KX_BACKEND_GANESH_GL);
         if (need_gl) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);
             if (gl_ctx == null) {
-                log("SDL_GL_CreateContext failed: {s}", .{sdl.c.SDL_GetError()});
-                return error.SdlGlContext;
+                if (is_linux and backend == kx.c.KX_BACKEND_GANESH_GL) {
+                    // Linux GPU is optional: no GL context (headless, missing
+                    // driver) → recreate the window without OPENGL and run
+                    // raster instead of failing.
+                    log("SDL_GL_CreateContext failed ({s}) — falling back to raster", .{sdl.c.SDL_GetError()});
+                    sdl.c.SDL_DestroyWindow(window);
+                    window = sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse {
+                        log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                        return error.SdlWindow;
+                    };
+                    resolved_backend = kx.c.KX_BACKEND_RASTER;
+                } else {
+                    log("SDL_GL_CreateContext failed: {s}", .{sdl.c.SDL_GetError()});
+                    return error.SdlGlContext;
+                }
+            } else {
+                _ = sdl.c.SDL_GL_MakeCurrent(window, gl_ctx);
+                _ = sdl.c.SDL_GL_SetSwapInterval(0); // the platform paces the loop (rAF / CADisplayLink / vsync)
             }
-            _ = sdl.c.SDL_GL_MakeCurrent(window, gl_ctx);
-            _ = sdl.c.SDL_GL_SetSwapInterval(0); // the platform paces the loop (rAF / CADisplayLink / vsync)
         }
         errdefer {
             if (gl_ctx) |ctx| _ = sdl.c.SDL_GL_DestroyContext(ctx);
@@ -327,8 +363,16 @@ pub const Host = struct {
             display_scale = displayScaleOf(window, win_w, pixel_w);
         }
 
-        const ctx = kx.create(@ptrCast(window), pixel_w, pixel_h, backend) orelse {
-            log("kx_create failed (backend {s})", .{kx.c.kx_backend_name(backend)});
+        var ctx_opt = kx.create(@ptrCast(window), pixel_w, pixel_h, resolved_backend);
+        if (ctx_opt == null and is_linux and resolved_backend == kx.c.KX_BACKEND_GANESH_GL) {
+            // Ganesh init failed (context present but no usable GL driver —
+            // llvmpipe still works, so this is rare): retry raster.
+            log("kx_create ganesh-gl failed — falling back to raster", .{});
+            resolved_backend = kx.c.KX_BACKEND_RASTER;
+            ctx_opt = kx.create(@ptrCast(window), pixel_w, pixel_h, resolved_backend);
+        }
+        const ctx = ctx_opt orelse {
+            log("kx_create failed (backend {s})", .{kx.c.kx_backend_name(resolved_backend)});
             return error.KxCreate;
         };
         errdefer kx.c.kx_destroy(ctx);
@@ -346,8 +390,8 @@ pub const Host = struct {
         // Exception: iOS + raster — the simulator's software Metal doesn't
         // execute GPU commands, so raster with SDL software renderer is the
         // reliable path on the iOS simulator.
-        const use_sdl_present = !is_mobile or (is_ios and backend == kx.c.KX_BACKEND_RASTER);
-        const renderer = if (use_sdl_present and backend == kx.c.KX_BACKEND_RASTER)
+        const use_sdl_present = !is_mobile or (is_ios and resolved_backend == kx.c.KX_BACKEND_RASTER);
+        const renderer = if (use_sdl_present and resolved_backend == kx.c.KX_BACKEND_RASTER)
             sdl.c.SDL_CreateRenderer(window, null) orelse return error.SdlRenderer
         else
             null;
@@ -373,7 +417,7 @@ pub const Host = struct {
             try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4);
         errdefer allocator.free(pixels);
 
-        const backend_name: [*:0]const u8 = kx.c.kx_backend_name(backend) orelse "unknown";
+        const backend_name: [*:0]const u8 = kx.c.kx_backend_name(resolved_backend) orelse "unknown";
 
         const inspector = try inspector_mod.Inspector.init(allocator);
         errdefer inspector.deinit();
