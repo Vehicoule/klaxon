@@ -265,6 +265,7 @@ pub const Host = struct {
         // supports exactly one window). Reuse a pre-existing window if some
         // flow already created one, otherwise create it ourselves.
         var android_owns_window = false;
+        var resolved_backend = backend;
         var window: *sdl.c.SDL_Window = if (is_android) blk: {
             var count: c_int = 0;
             const windows = sdl.c.SDL_GetWindows(&count);
@@ -293,7 +294,22 @@ pub const Host = struct {
             };
             android_owns_window = true;
             break :blk win;
-        } else sdl.c.SDL_CreateWindow("klaxon hello", width, height, window_flags) orelse {
+        } else blk: {
+            if (sdl.c.SDL_CreateWindow("klaxon hello", width, height, window_flags)) |w|
+                break :blk w;
+            // Linux GPU is optional: when the video driver cannot create an
+            // OpenGL window at all (headless dummy driver, missing GL
+            // support) retry without the flag and resolve to raster, same
+            // as the SDL_GL_CreateContext fallback below.
+            if (is_linux and (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO)) {
+                log("SDL_CreateWindow(OPENGL) failed ({s}) — retrying without GL", .{sdl.c.SDL_GetError()});
+                const w = sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse {
+                    log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                    return error.SdlWindow;
+                };
+                resolved_backend = kx.c.KX_BACKEND_RASTER;
+                break :blk w;
+            }
             log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
             return error.SdlWindow;
         };
@@ -307,7 +323,6 @@ pub const Host = struct {
         // SDL_GL_GetCurrentContext. iOS/macOS Metal: no GL context (Metal
         // view instead). Raster: none.
         var gl_ctx: sdl.c.SDL_GLContext = null;
-        var resolved_backend = backend;
         const need_gl = (is_emscripten or is_android) or
             (is_linux and (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO));
         if (need_gl) {
