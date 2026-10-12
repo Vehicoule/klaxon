@@ -742,10 +742,18 @@ fetch_emdawnwebgpu() {
   fi
   rm -rf "$dir"
   mkdir -p "$dir"
+  # The release zip nests a top-level emdawnwebgpu_pkg/ dir — strip it.
   python3 - "$zip" "$dir" <<'PYEOF'
 import sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as z:
-    z.extractall(sys.argv[2])
+zip_path, dst = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path) as z:
+    for info in z.infolist():
+        name = info.filename
+        if name.startswith("emdawnwebgpu_pkg/"):
+            info.filename = name[len("emdawnwebgpu_pkg/"):]
+        if not info.filename:
+            continue
+        z.extract(info, dst)
 PYEOF
   [ -f "$dir/emdawnwebgpu.port.py" ] || die "emdawnwebgpu pkg extract incomplete"
 }
