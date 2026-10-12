@@ -879,12 +879,19 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
     // args appended after a quoted `cmd /c "..."` string are ignored by cmd.
     const wf = b.addWriteFiles();
     // cl writes diagnostics to STDOUT; zig only surfaces stderr on failure.
-    // Redirect cl's stdout to stderr so CI logs show the actual C#### errors,
-    // and fail loudly when vcvars itself fails (cl then runs unconfigured).
+    // Capture full cl output to a per-invocation temp log (parallel shims
+    // must not share it) and dump it to stderr only when cl fails — zig
+    // truncates long output, and skia-header warnings would bury the error.
+    // cl is retried once: the first parallel invocations on a fresh runner
+    // race inside vcvars/vsdevcmd and can exit nonzero with no output while
+    // a sequential re-run of the same file compiles cleanly.
+    const attempt = "@cl %* >\"%kxlog%\" 2>&1 || cl %* >\"%kxlog%\" 2>&1\r\n" ++
+        "@if errorlevel 1 (echo cl failed twice - output:>&2&type \"%kxlog%\">&2&del \"%kxlog%\"&exit /b 1)\r\n" ++
+        "@del \"%kxlog%\" >NUL 2>&1\r\n";
     const wrapper = wf.add("msvc-cl-wrapper.bat", if (vcvars.len == 0)
-        "@cl %* 1>&2\r\n"
+        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n{s}", .{attempt})
     else
-        b.fmt("@call \"{s}\" >NUL\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n@cl %* 1>&2\r\n", .{vcvars}));
+        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n@call \"{s}\" >NUL 2>&1\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n{s}", .{ vcvars, attempt }));
     var objs: std.ArrayList(std.Build.LazyPath) = .empty;
     for (sources) |s| {
         const run = b.addSystemCommand(&.{"cmd"});
