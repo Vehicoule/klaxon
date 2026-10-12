@@ -27,10 +27,14 @@ DIST="$ROOT/dist"
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+# Git Bash / MSYS2 / Cygwin all report Windows hosts.
+case "$OS" in MINGW*|MSYS*|CYGWIN*) OS=Windows ;; esac
 case "$OS:$ARCH" in
   Darwin:arm64)  TAG="macos-arm64" ;;
   Linux:x86_64)  TAG="linux-x64" ;;
   Linux:aarch64) TAG="linux-arm64" ;;
+  Windows:x86_64)  TAG="windows-x64" ;;
+  Windows:aarch64|Windows:ARM64) TAG="windows-arm64" ;;
   *) echo "unsupported host $OS/$ARCH" >&2; exit 1 ;;
 esac
 
