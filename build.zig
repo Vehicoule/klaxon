@@ -259,11 +259,28 @@ fn addKxSkia(
                 .language = .objective_cpp,
             });
         },
-        .linux => kx_skia.root_module.addCSourceFiles(.{
-            .files = &.{"kx_skia/src/kx_skia_linux.cpp"},
-            .flags = shim_flags,
-            .language = .cpp,
-        }),
+        .linux => {
+            kx_skia.root_module.addCSourceFiles(.{
+                .files = &.{
+                    "kx_skia/src/kx_skia_linux.cpp",
+                    // Phase 3a: the AT-SPI2 a11y bridge — an AtkObject tree
+                    // bridged onto the a11y D-Bus by the stock at-spi2-atk
+                    // adaptor (see the file header for the design choice).
+                    "kx_skia/src/kx_a11y_linux.cpp",
+                },
+                .flags = shim_flags,
+                .language = .cpp,
+            });
+            // libatk + libatk-bridge: pkg-config supplies the include dirs
+            // (atk/atk.h, atk-bridge.h) and libs — CI installs libatk1.0-dev +
+            // libatk-bridge2.0-dev (pulls libatspi2.0-dev transitively).
+            // glib/gobject: the bridge calls g_* directly (main context,
+            // idle marshal, GObject lifecycle) — not just via libatk.
+            kx_skia.root_module.linkSystemLibrary("atk-1.0", .{});
+            kx_skia.root_module.linkSystemLibrary("atk-bridge-2.0", .{});
+            kx_skia.root_module.linkSystemLibrary("gobject-2.0", .{});
+            kx_skia.root_module.linkSystemLibrary("glib-2.0", .{});
+        },
         .windows => {
             // Compiled with MSVC cl.exe (not zig's clang): Skia/Dawn are
             // built with MSVC and their headers exchange STL types
@@ -410,6 +427,14 @@ fn linkRuntime(
     } else {
         for (skia_libs) |lib| {
             module.addObjectFile(b.path(b.fmt("deps/skia/out/{s}/{s}", .{ tag, lib })));
+        }
+        if (target.result.os.tag == .linux) {
+            // kx_a11y_linux.cpp's ATK/AT-SPI deps — the symbols live in
+            // libkx_skia.a, so every linux host exe needs the libs too.
+            module.linkSystemLibrary("atk-1.0", .{});
+            module.linkSystemLibrary("atk-bridge-2.0", .{});
+            module.linkSystemLibrary("gobject-2.0", .{});
+            module.linkSystemLibrary("glib-2.0", .{});
         }
     }
     if (is_macos) {
