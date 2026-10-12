@@ -50,20 +50,15 @@
 #include <oleauto.h>
 #include <UIAutomation.h>
 
-// mingw-w64 headers declare no IRawElementProviderUnknown — its Uia* entry
-// points take IRawElementProviderSimple and there is no separate marker IID.
-// The MSVC SDK (the shipping target) does have it. KX_UIA_PROVIDER_BASE
-// appends the extra base class only where it exists; KX_UIA_PROVIDER_ARG is
-// the parameter type UiaReturnRawElementProvider/UiaDisconnectProvider take.
-#if defined(__MINGW32__) || defined(__MINGW64__)
+// Current SDKs — MSVC included — declare no IRawElementProviderUnknown: the
+// Uia* entry points take IRawElementProviderSimple and there is no separate
+// marker IID (an earlier draft assumed the MSVC SDK had it; the windows-2025
+// toolchain proves otherwise — C2504/C2065 at every provider class).
+// KX_UIA_PROVIDER_ARG is the parameter type
+// UiaReturnRawElementProvider/UiaDisconnectProvider take.
 #define KX_UIA_PROVIDER_BASE
 #define KX_UIA_PROVIDER_ARG IRawElementProviderSimple
 #define KX_UIA_HAS_UNKNOWN 0
-#else
-#define KX_UIA_PROVIDER_BASE , public IRawElementProviderUnknown
-#define KX_UIA_PROVIDER_ARG IRawElementProviderUnknown
-#define KX_UIA_HAS_UNKNOWN 1
-#endif
 
 #include <cmath>
 #include <cstdint>
