@@ -32,8 +32,26 @@
 #include "src/gpu/ganesh/gl/GrGLDefines.h"               // GR_GL_RGBA8 (same private include as canvaskit_bindings.cpp)
 #include "include/ports/SkFontMgr_empty.h"
 
+// Graphite WebGPU path (Phase 3g): navigator.gpu via the emdawnwebgpu
+// package (standard-spec headers + JS runtime impl), linked from
+// deps/emdawnwebgpu_pkg. The browser must have assigned
+// Module['preinitializedWebGPUDevice'] before Wasm init.
+#include <webgpu/webgpu.h>
+#include <webgpu/webgpu_cpp.h>
+#include <emscripten.h> // EM_ASM_INT
+
+#include "include/gpu/graphite/Context.h"
+#include "include/gpu/graphite/ContextOptions.h"
+#include "include/gpu/graphite/Recorder.h"
+#include "include/gpu/graphite/Recording.h"
+#include "include/gpu/graphite/Surface.h"
+#include "include/gpu/graphite/BackendTexture.h"
+#include "include/gpu/graphite/dawn/DawnBackendContext.h"
+#include "include/gpu/graphite/dawn/DawnGraphiteTypes.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 // --- Embedded default font ---
 //
@@ -70,16 +88,101 @@ namespace kx {
 
 struct GpuState {
     SDL_Window* window = nullptr;
+    // Ganesh WebGL2 path (KX_BACKEND_GANESH_WEBGL2)
     sk_sp<GrDirectContext> dctx;
+    // Graphite WebGPU path (KX_BACKEND_GRAPHITE_WEBGPU)
+    std::unique_ptr<skgpu::graphite::Context> gctx;
+    std::unique_ptr<skgpu::graphite::Recorder> recorder;
+    WGPUInstance wgpu_instance = nullptr;
+    WGPUSurface wgpu_surface = nullptr;
+    WGPUTextureFormat surface_format = WGPUTextureFormat_BGRA8Unorm;
     sk_sp<SkSurface> frame_surface;
     sk_sp<SkSurface> warmup_surface; // offscreen target for kx_gpu_warmup (Phase 4e.1)
     int width = 0;
     int height = 0;
+
+    bool is_graphite() const { return gctx != nullptr; }
 };
 
+static void webgpu_destroy(GpuState* state) {
+    if (state->wgpu_surface) {
+        wgpuSurfaceUnconfigure(state->wgpu_surface);
+        wgpuSurfaceRelease(state->wgpu_surface);
+        state->wgpu_surface = nullptr;
+    }
+    if (state->wgpu_instance) {
+        wgpuInstanceRelease(state->wgpu_instance);
+        state->wgpu_instance = nullptr;
+    }
+    state->recorder = nullptr;
+    state->gctx = nullptr;
+}
+
+static void webgpu_configure_surface(GpuState* state, WGPUDevice device, int width, int height) {
+    WGPUSurfaceConfiguration config = {};
+    config.device = device;
+    config.format = state->surface_format;
+    config.usage = WGPUTextureUsage_RenderAttachment;
+    config.width = static_cast<uint32_t>(width);
+    config.height = static_cast<uint32_t>(height);
+    config.presentMode = WGPUPresentMode_Fifo;
+    config.alphaMode = WGPUCompositeAlphaMode_Auto;
+    wgpuSurfaceConfigure(state->wgpu_surface, &config);
+}
+
+static bool gpu_init_webgpu(GpuState* state, int width, int height) {
+    // The shell pre-requests adapter + device at startup and stores it on
+    // Module['preinitializedWebGPUDevice']; a missing device means
+    // navigator.gpu is unavailable or the request failed → the caller falls
+    // back to the WebGL2 chain entry. Guard before calling get_device: the
+    // JS impl asserts when the module field is unset.
+    if (!EM_ASM_INT({ return Module['preinitializedWebGPUDevice'] ? 1 : 0; })) {
+        return false;
+    }
+    WGPUDevice device = emscripten_webgpu_get_device();
+    if (!device) return false;
+
+    WGPUInstanceDescriptor inst_desc = {};
+    state->wgpu_instance = wgpuCreateInstance(&inst_desc);
+    if (!state->wgpu_instance) return false;
+
+    // SDL's emscripten backend pins the canvas selector to "#canvas" (the
+    // host sets SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR before window creation).
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvas_desc = {};
+    canvas_desc.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
+    canvas_desc.selector.data = "#canvas";
+    canvas_desc.selector.length = WGPU_STRLEN;
+    WGPUSurfaceDescriptor surf_desc = {};
+    surf_desc.nextInChain = &canvas_desc.chain;
+    state->wgpu_surface = wgpuInstanceCreateSurface(state->wgpu_instance, &surf_desc);
+    if (!state->wgpu_surface) { webgpu_destroy(state); return false; }
+
+    webgpu_configure_surface(state, device, width, height);
+
+    skgpu::graphite::DawnBackendContext dawn_ctx;
+    dawn_ctx.fInstance = wgpu::Instance::Acquire(state->wgpu_instance);
+    dawn_ctx.fDevice = wgpu::Device::Acquire(device);
+    dawn_ctx.fQueue = dawn_ctx.fDevice.GetQueue();
+    // fTick defaults to DawnNativeProcessEventsFunction → tick() pumps
+    // emdawnwebgpu's event queue via wgpuInstanceProcessEvents.
+    state->gctx = skgpu::graphite::ContextFactory::MakeDawn(dawn_ctx, {});
+    if (!state->gctx) { webgpu_destroy(state); return false; }
+    state->recorder = state->gctx->makeRecorder();
+    if (!state->recorder) { webgpu_destroy(state); return false; }
+    return true;
+}
+
 bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
-    (void)backend; // unused on this platform
     if (!out || !sdl_window) return false;
+    if (backend == KX_BACKEND_GRAPHITE_WEBGPU) {
+        auto* state = new GpuState();
+        state->window = static_cast<SDL_Window*>(sdl_window);
+        state->width = width;
+        state->height = height;
+        if (!gpu_init_webgpu(state, width, height)) { delete state; return false; }
+        *out = state;
+        return true;
+    }
     // The caller (main, emscripten path) creates a WebGL2 context on the SDL
     // window and makes it current BEFORE kx_create. Ganesh binds to whatever
     // GL context is current — MakeWebGL links GLES3 statically (no
@@ -103,7 +206,13 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
 void gpu_shutdown(GpuState* state) {
     if (!state) return;
     state->frame_surface = nullptr;
-    if (state->dctx) {
+    state->warmup_surface = nullptr;
+    if (state->is_graphite()) {
+        // Drop pending recorded work, then release wgpu objects.
+        state->recorder = nullptr;
+        state->gctx = nullptr;
+        webgpu_destroy(state);
+    } else if (state->dctx) {
         // Wait for in-flight GPU work before tearing the context down.
         state->dctx->flushAndSubmit(GrSyncCpu::kYes);
         state->dctx = nullptr;
@@ -113,14 +222,48 @@ void gpu_shutdown(GpuState* state) {
 
 void gpu_resize(GpuState* state, int width, int height) {
     if (!state) return;
-    // The onscreen target wraps FBO 0 and is re-created from these dimensions
-    // on the next gpu_begin_frame.
     state->width = width;
     state->height = height;
+    if (state->is_graphite() && state->wgpu_surface) {
+        // The surface must be reconfigured to match the new canvas size —
+        // GetCurrentTexture fails on a size mismatch.
+        // The DawnBackendContext holds the only wgpu::Device handle, so
+        // re-fetch the emscripten device for the configure call (it is the
+        // same singleton device).
+        WGPUDevice device = emscripten_webgpu_get_device();
+        if (device) webgpu_configure_surface(state, device, width, height);
+    }
+    // WebGL2: the onscreen target wraps FBO 0 and is re-created from these
+    // dimensions on the next gpu_begin_frame.
 }
 
 SkCanvas* gpu_begin_frame(GpuState* state) {
-    if (!state || !state->dctx || state->width <= 0 || state->height <= 0) return nullptr;
+    if (!state || state->width <= 0 || state->height <= 0) return nullptr;
+    if (state->is_graphite()) {
+        // Graphite WebGPU: acquire the swapchain texture for this frame and
+        // wrap it in a surface recorded on our Recorder. The texture
+        // auto-presents when its last ref is dropped (see gpu_end_frame).
+        WGPUSurfaceTexture surf_tex = {};
+        wgpuSurfaceGetCurrentTexture(state->wgpu_surface, &surf_tex);
+        if (surf_tex.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
+            surf_tex.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+            // Out-of-date (resize raced us) — reconfigure and let the next
+            // frame recover; drawing into a stale texture would assert.
+            if (surf_tex.texture) wgpuTextureRelease(surf_tex.texture);
+            WGPUDevice device = emscripten_webgpu_get_device();
+            if (device) webgpu_configure_surface(state, device, state->width, state->height);
+            return nullptr;
+        }
+        auto bt = skgpu::graphite::BackendTextures::MakeDawn(surf_tex.texture);
+        state->frame_surface = SkSurfaces::WrapBackendTexture(
+            state->recorder.get(), bt, SkColorSpace::MakeSRGB(), nullptr);
+        if (!state->frame_surface) {
+            wgpuTextureRelease(surf_tex.texture);
+            return nullptr;
+        }
+        return state->frame_surface->getCanvas();
+    }
+    if (!state->dctx) return nullptr;
 
     // The onscreen canvas is FBO 0 (the WebGL default framebuffer). Make it
     // current and tell Skia its GL state is unknown (first frame / context
@@ -142,7 +285,24 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
 }
 
 void gpu_end_frame(GpuState* state) {
-    if (!state || !state->dctx) return;
+    if (!state) return;
+    if (state->is_graphite()) {
+        // Snap recorded draw calls into a Recording, submit to the device
+        // queue, then drop the wrapped surface — releasing the frame texture
+        // is what presents the canvas (no explicit present call on webgpu).
+        if (state->recorder) {
+            if (auto recording = state->recorder->snap()) {
+                skgpu::graphite::InsertRecordingInfo info = {};
+                info.fRecording = recording.get();
+                info.fTargetSurface = state->frame_surface.get();
+                state->gctx->insertRecording(info);
+            }
+        }
+        state->gctx->submit();
+        state->frame_surface = nullptr;
+        return;
+    }
+    if (!state->dctx) return;
     state->dctx->flushAndSubmit();
     // Release the wrapped target before present: the drawing buffer is
     // composited by the browser when the rAF callback returns.
@@ -151,21 +311,43 @@ void gpu_end_frame(GpuState* state) {
 }
 
 SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
-    // Warmup (Phase 4e.1): a render-target surface on the Ganesh context —
-    // same draw ops, same programs as the onscreen (FBO 0) frames.
-    if (!state || !state->dctx || width <= 0 || height <= 0) return nullptr;
-    // Signature at the pinned Skia (include/gpu/ganesh/SkSurfaceGanesh.h):
-    // RenderTarget(GrRecordingContext*, skgpu::Budgeted, const SkImageInfo&)
-    // — the 3-arg inline overload; skgpu::Budgeted comes from
-    // include/gpu/GpuTypes.h via ganesh/GrTypes.h.
-    state->warmup_surface = SkSurfaces::RenderTarget(
-        state->dctx.get(), skgpu::Budgeted::kYes,
-        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    // Warmup (Phase 4e.1): a render-target surface on the active context —
+    // same draw ops, same programs as the onscreen frames.
+    if (!state || width <= 0 || height <= 0) return nullptr;
+    if (state->is_graphite()) {
+        state->warmup_surface = SkSurfaces::RenderTarget(
+            state->recorder.get(),
+            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    } else if (state->dctx) {
+        // Signature at the pinned Skia (include/gpu/ganesh/SkSurfaceGanesh.h):
+        // RenderTarget(GrRecordingContext*, skgpu::Budgeted, const SkImageInfo&)
+        // — the 3-arg inline overload; skgpu::Budgeted comes from
+        // include/gpu/GpuTypes.h via ganesh/GrTypes.h.
+        state->warmup_surface = SkSurfaces::RenderTarget(
+            state->dctx.get(), skgpu::Budgeted::kYes,
+            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    }
     return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }
 
 bool gpu_end_offscreen(GpuState* state) {
-    if (!state || !state->dctx) return false;
+    if (!state) return false;
+    if (state->is_graphite()) {
+        if (state->recorder) {
+            if (auto recording = state->recorder->snap()) {
+                skgpu::graphite::InsertRecordingInfo info = {};
+                info.fRecording = recording.get();
+                info.fTargetSurface = state->warmup_surface.get();
+                state->gctx->insertRecording(info);
+            }
+        }
+        // SyncToCpu::kYes — the pipeline compile must complete inside the
+        // warmup call, not leak into the next rAF frame.
+        state->gctx->submit(skgpu::graphite::SyncToCpu::kYes);
+        state->warmup_surface = nullptr;
+        return true;
+    }
+    if (!state->dctx) return false;
     // Synchronous: the program compile must complete inside the warmup call,
     // not leak into the next rAF frame.
     state->dctx->flushAndSubmit(GrSyncCpu::kYes);

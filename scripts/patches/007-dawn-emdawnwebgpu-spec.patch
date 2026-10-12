@@ -1,0 +1,357 @@
+diff --git a/include/gpu/graphite/dawn/DawnBackendContext.h b/include/gpu/graphite/dawn/DawnBackendContext.h
+index c9d2489..88ed7c0 100644
+--- a/include/gpu/graphite/dawn/DawnBackendContext.h
++++ b/include/gpu/graphite/dawn/DawnBackendContext.h
+@@ -49,7 +49,9 @@ struct ContextOptions;
+  */
+ using DawnTickFunction = void(const wgpu::Instance& device);
+ 
+-#if !defined(__EMSCRIPTEN__)
++// klaxon patch 007: emdawnwebgpu exposes wgpuInstanceProcessEvents; only the
++// legacy -sUSE_WEBGPU shim lacks it.
++#if !defined(KX_WEBGPU_OLD_SPEC)
+ SK_API inline void DawnNativeProcessEventsFunction(const wgpu::Instance& instance) {
+     instance.ProcessEvents();
+ }
+@@ -64,7 +66,7 @@ struct SK_API DawnBackendContext {
+     wgpu::Queue fQueue;
+     // See comment on DawnTickFunction.
+     DawnTickFunction* fTick =
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+             nullptr;
+ #else
+             DawnNativeProcessEventsFunction;
+diff --git a/src/gpu/graphite/dawn/DawnBackendTexture.cpp b/src/gpu/graphite/dawn/DawnBackendTexture.cpp
+index bf54156..3f2b585 100644
+--- a/src/gpu/graphite/dawn/DawnBackendTexture.cpp
++++ b/src/gpu/graphite/dawn/DawnBackendTexture.cpp
+@@ -71,7 +71,7 @@ BackendTexture MakeDawn(WGPUTexture texture) {
+ }
+ 
+ BackendTexture MakeDawn(SkISize planeDimensions, const DawnTextureInfo& info, WGPUTexture texture) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     SkASSERT(info.fAspect == wgpu::TextureAspect::All);
+ #else
+     SkASSERT(info.fAspect == wgpu::TextureAspect::All ||
+diff --git a/src/gpu/graphite/dawn/DawnBuffer.cpp b/src/gpu/graphite/dawn/DawnBuffer.cpp
+index 40ae5ea..2ededf5 100644
+--- a/src/gpu/graphite/dawn/DawnBuffer.cpp
++++ b/src/gpu/graphite/dawn/DawnBuffer.cpp
+@@ -15,7 +15,7 @@
+ 
+ namespace skgpu::graphite {
+ namespace {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ bool is_map_succeeded(WGPUBufferMapAsyncStatus status) {
+     return status == WGPUBufferMapAsyncStatus_Success;
+ }
+@@ -86,7 +86,7 @@ void log_map_error(wgpu::MapAsyncStatus status, wgpu::StringView message) {
+               static_cast<int>(message.length),
+               message.data);
+ }
+-#endif  // defined(__EMSCRIPTEN__)
++#endif  // defined(KX_WEBGPU_OLD_SPEC)
+ }  // namespace
+ 
+ sk_sp<DawnBuffer> DawnBuffer::Make(const DawnSharedContext* sharedContext,
+@@ -241,7 +241,7 @@ void DawnBuffer::onAsyncMap(GpuFinishedProc proc, GpuFinishedContext ctx) {
+     bool isWrite = fBuffer.GetUsage() & wgpu::BufferUsage::MapWrite;
+     auto buffer = sk_ref_sp(this);
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     fBuffer.MapAsync(
+             isWrite ? wgpu::MapMode::Write : wgpu::MapMode::Read,
+             0,
+diff --git a/src/gpu/graphite/dawn/DawnCaps.cpp b/src/gpu/graphite/dawn/DawnCaps.cpp
+index 3a39e05..0628b13 100644
+--- a/src/gpu/graphite/dawn/DawnCaps.cpp
++++ b/src/gpu/graphite/dawn/DawnCaps.cpp
+@@ -27,7 +27,7 @@
+ #include "src/gpu/graphite/dawn/DawnGraphiteUtils.h"
+ #include "src/sksl/SkSLUtil.h"
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ #include <emscripten/version.h>
+ #endif
+ 
+@@ -291,9 +291,9 @@ void DawnCaps::initCaps(const DawnBackendContext& backendContext, const ContextO
+ #if defined(GPU_TEST_UTILS)
+     this->setDeviceName(std::string(info.device));
+ #endif
+-#endif // defined(__EMSCRIPTEN__)
++#endif // defined(KX_WEBGPU_OLD_SPEC)
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::SupportedLimits supportedLimits;
+     [[maybe_unused]] wgpu::Status status = backendContext.fDevice.GetLimits(&supportedLimits);
+     SkASSERT(status == wgpu::Status::Success);
+@@ -301,13 +301,16 @@ void DawnCaps::initCaps(const DawnBackendContext& backendContext, const ContextO
+ #else
+     wgpu::CompatibilityModeLimits compatLimits;
+     wgpu::Limits limits{.nextInChain = &compatLimits};
++#if !defined(__EMSCRIPTEN__)
++    // klaxon patch 007: dawn extension not in emdawnwebgpu's standard spec
+     wgpu::DawnTexelCopyBufferRowAlignmentLimits alignmentLimits{};
+     if (backendContext.fDevice.HasFeature(wgpu::FeatureName::DawnTexelCopyBufferRowAlignment)) {
+         compatLimits.nextInChain = &alignmentLimits;
+     }
++#endif
+     [[maybe_unused]] wgpu::Status status = backendContext.fDevice.GetLimits(&limits);
+     SkASSERT(status == wgpu::Status::Success);
+-#endif  // defined(__EMSCRIPTEN__)
++#endif  // defined(KX_WEBGPU_OLD_SPEC)
+ 
+     fMaxTextureSize = limits.maxTextureDimension2D;
+ 
+@@ -709,6 +712,7 @@ static constexpr char swizzle_to_str(uint32_t c, char identityAnswer) {
+ 
+ std::string DawnCaps::toString(const ImmutableSamplerInfo& immutableSamplerInfo) const {
+ #if defined(__EMSCRIPTEN__)
++    // klaxon patch 007: YCbCr helpers are dawn-native only
+     return "";
+ #else
+     const wgpu::YCbCrVkDescriptor info =
+diff --git a/src/gpu/graphite/dawn/DawnCommandBuffer.cpp b/src/gpu/graphite/dawn/DawnCommandBuffer.cpp
+index ccfef80..dcfb05d 100644
+--- a/src/gpu/graphite/dawn/DawnCommandBuffer.cpp
++++ b/src/gpu/graphite/dawn/DawnCommandBuffer.cpp
+@@ -24,7 +24,7 @@
+ #include "src/gpu/graphite/dawn/DawnSharedContext.h"
+ #include "src/gpu/graphite/dawn/DawnTexture.h"
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ #include <emscripten/version.h>
+ 
+ namespace wgpu {
+@@ -38,7 +38,7 @@ namespace skgpu::graphite {
+ // On emsdk before 3.1.48 the API for RenderPass and ComputePass timestamps was different
+ // and does not map to current webgpu. We check this in DawnCaps but we also must avoid
+ // naming the types from the new API because they aren't defined.
+-#if defined(__EMSCRIPTEN__)                                                                  \
++#if defined(KX_WEBGPU_OLD_SPEC)                                                                  \
+         && ((__EMSCRIPTEN_major__ < 3)                                                       \
+          || (__EMSCRIPTEN_major__ == 3 && __EMSCRIPTEN_minor__ < 1)                          \
+          || (__EMSCRIPTEN_major__ == 3 && __EMSCRIPTEN_minor__ == 1 && __EMSCRIPTEN_tiny__ < 48))
+@@ -364,7 +364,7 @@ bool DawnCommandBuffer::beginRenderPass(const RenderPassDesc& renderPassDesc,
+ #endif
+ 
+ #if WGPU_TIMESTAMP_WRITES_DEFINED
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::RenderPassTimestampWrites wgpuTimestampWrites;
+ #else
+     wgpu::PassTimestampWrites wgpuTimestampWrites;
+@@ -472,6 +472,7 @@ bool DawnCommandBuffer::beginRenderPass(const RenderPassDesc& renderPassDesc,
+                     renderPassDesc.fSampleCount > SampleCount::k1 &&
+                     colorTexture->sampleCount() == SampleCount::k1;
+ #if defined(__EMSCRIPTEN__)
++            // klaxon patch 007: MSAARenderToSingleSampled is a dawn extension
+             SkASSERT(!isMSAAToSingleSampled);
+ #else
+             if (isMSAAToSingleSampled) {
+@@ -1139,7 +1140,7 @@ void DawnCommandBuffer::beginComputePass() {
+     SkASSERT(!fActiveComputePassEncoder);
+     wgpu::ComputePassDescriptor wgpuComputePassDescriptor = {};
+ #if WGPU_TIMESTAMP_WRITES_DEFINED
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::ComputePassTimestampWrites wgpuTimestampWrites;
+ #else
+     wgpu::PassTimestampWrites wgpuTimestampWrites;
+diff --git a/src/gpu/graphite/dawn/DawnErrorChecker.cpp b/src/gpu/graphite/dawn/DawnErrorChecker.cpp
+index f61ef22..0310349 100644
+--- a/src/gpu/graphite/dawn/DawnErrorChecker.cpp
++++ b/src/gpu/graphite/dawn/DawnErrorChecker.cpp
+@@ -41,7 +41,7 @@ SkEnumBitMask<DawnErrorType> DawnErrorChecker::popErrorScopes() {
+         return DawnErrorType::kNoError;
+     }
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     struct ErrorState {
+         SkEnumBitMask<DawnErrorType> fError;
+         int fScopeIdx;
+@@ -130,7 +130,7 @@ SkEnumBitMask<DawnErrorType> DawnErrorChecker::popErrorScopes() {
+         SKIA_LOG_E("Failed waiting for 'validation' error scope to pop.");
+     }
+     SkASSERT(status == wgpu::WaitStatus::Success);
+-#endif  // defined(__EMSCRIPTEN__)
++#endif  // defined(KX_WEBGPU_OLD_SPEC)
+ 
+     fArmed = false;
+     return errorState.fError;
+diff --git a/src/gpu/graphite/dawn/DawnGraphicsPipeline.cpp b/src/gpu/graphite/dawn/DawnGraphicsPipeline.cpp
+index f049e21..bb99a25 100644
+--- a/src/gpu/graphite/dawn/DawnGraphicsPipeline.cpp
++++ b/src/gpu/graphite/dawn/DawnGraphicsPipeline.cpp
+@@ -172,7 +172,7 @@ size_t create_vertex_attributes(SkSpan<const Attribute> attrs,
+ 
+ // TODO: share this w/ Ganesh dawn backend?
+ static wgpu::BlendFactor blend_coeff_to_dawn_blend(const DawnCaps& caps, skgpu::BlendCoeff coeff) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ #define VALUE_IF_DSB_OR_ZERO(VALUE) wgpu::BlendFactor::Zero
+ #else
+ #define VALUE_IF_DSB_OR_ZERO(VALUE) \
+@@ -312,7 +312,7 @@ void log_pipeline_creation(const AsyncPipelineCreationBase* apcb) {
+ 
+ } // anonymous namespace
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ // For wasm, we don't use async compilation.
+ struct DawnGraphicsPipeline::AsyncPipelineCreation : public AsyncPipelineCreationBase {
+     AsyncPipelineCreation(const UniqueKey& key) : AsyncPipelineCreationBase(key) {}
+@@ -627,7 +627,7 @@ sk_sp<DawnGraphicsPipeline> DawnGraphicsPipeline::Make(
+             layout.attributes = staticDataAttributes.data();
+         } else {
+             layout.arrayStride = 0;
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+             layout.stepMode = wgpu::VertexStepMode::VertexBufferNotUsed;
+ #else
+             layout.stepMode = wgpu::VertexStepMode::Undefined;
+@@ -653,7 +653,7 @@ sk_sp<DawnGraphicsPipeline> DawnGraphicsPipeline::Make(
+             layout.attributes = appendDataAttributes.data();
+         } else {
+             layout.arrayStride = 0;
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+             layout.stepMode = wgpu::VertexStepMode::VertexBufferNotUsed;
+ #else
+             layout.stepMode = wgpu::VertexStepMode::Undefined;
+@@ -705,7 +705,7 @@ sk_sp<DawnGraphicsPipeline> DawnGraphicsPipeline::Make(
+ #endif
+ 
+     if (useAsync) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+         // We shouldn't use CreateRenderPipelineAsync in wasm.
+         SK_ABORT("CreateRenderPipelineAsync shouldn't be used in WASM");
+ #else
+@@ -819,7 +819,7 @@ const wgpu::RenderPipeline& DawnGraphicsPipeline::dawnRenderPipeline() const {
+     if (fAsyncPipelineCreation->fFinished) {
+         return fAsyncPipelineCreation->fRenderPipeline;
+     }
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     // We shouldn't use CreateRenderPipelineAsync in wasm.
+     SK_ABORT("CreateRenderPipelineAsync shouldn't be used in WASM");
+ #else
+diff --git a/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp b/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
+index aa180fc..965e8a7 100644
+--- a/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
++++ b/src/gpu/graphite/dawn/DawnGraphiteUtils.cpp
+@@ -424,7 +424,7 @@ static bool check_shader_module([[maybe_unused]] const DawnSharedContext* shared
+                                 const char* shaderText,
+                                 ShaderErrorHandler* errorHandler) {
+     // Prior to emsdk 3.1.51 wgpu::ShaderModule::GetCompilationInfo is unimplemented.
+-#if defined(__EMSCRIPTEN__)                                      &&  \
++#if defined(KX_WEBGPU_OLD_SPEC)                                      &&  \
+         ((__EMSCRIPTEN_major__ <  3                               || \
+          (__EMSCRIPTEN_major__ == 3 && __EMSCRIPTEN_minor__ <  1) || \
+          (__EMSCRIPTEN_major__ == 3 && __EMSCRIPTEN_minor__ == 1 && __EMSCRIPTEN_tiny__ < 51)))
+@@ -469,7 +469,7 @@ static bool check_shader_module([[maybe_unused]] const DawnSharedContext* shared
+     Handler handler;
+     handler.fShaderText = shaderText;
+     handler.fErrorHandler = errorHandler;
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     // Deprecated function.
+     module->GetCompilationInfo(&Handler::Fn, &handler);
+ #else
+@@ -488,7 +488,7 @@ static bool check_shader_module([[maybe_unused]] const DawnSharedContext* shared
+     [[maybe_unused]] auto status =
+             instance.WaitAny(1, &waitInfo, /*timeoutNS=*/std::numeric_limits<uint64_t>::max());
+     SkASSERT(status == wgpu::WaitStatus::Success);
+-#endif  // defined(__EMSCRIPTEN__)
++#endif  // defined(KX_WEBGPU_OLD_SPEC)
+ 
+     return handler.fSuccess;
+ #endif
+@@ -499,7 +499,7 @@ bool DawnCompileWGSLShaderModule(const DawnSharedContext* sharedContext,
+                                  const SkSL::NativeShader& wgsl,
+                                  wgpu::ShaderModule* module,
+                                  ShaderErrorHandler* errorHandler) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::ShaderModuleWGSLDescriptor wgslDesc;
+ #else
+     wgpu::ShaderSourceWGSL wgslDesc;
+diff --git a/src/gpu/graphite/dawn/DawnQueueManager.cpp b/src/gpu/graphite/dawn/DawnQueueManager.cpp
+index a2a7ee2..f11386f 100644
+--- a/src/gpu/graphite/dawn/DawnQueueManager.cpp
++++ b/src/gpu/graphite/dawn/DawnQueueManager.cpp
+@@ -15,7 +15,7 @@
+ 
+ namespace skgpu::graphite {
+ namespace {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+ // GpuWorkSubmission with AsyncWait. This is useful for wasm where wgpu::Future
+ // is not available yet.
+ class DawnWorkSubmissionWithAsyncWait final : public GpuWorkSubmission {
+@@ -95,7 +95,7 @@ void DawnWorkSubmissionWithFuture::onWaitUntilFinished(const SharedContext* shar
+     SkASSERT(status == wgpu::WaitStatus::Success);
+     SkASSERT(waitInfo.completed);
+ }
+-#endif  // defined(__EMSCRIPTEN__)
++#endif  // defined(KX_WEBGPU_OLD_SPEC)
+ } // namespace
+ 
+ DawnQueueManager::DawnQueueManager(wgpu::Queue queue, const SharedContext* sharedContext)
+@@ -124,7 +124,7 @@ QueueManager::OutstandingSubmission DawnQueueManager::onSubmitToGpu(const Submit
+ 
+     fQueue.Submit(/*commandCount=*/1, &wgpuCmdBuffer);
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     return std::make_unique<DawnWorkSubmissionWithAsyncWait>(
+             std::move(fCurrentCommandBuffer), this, dawnSharedContext());
+ #else
+diff --git a/src/gpu/graphite/dawn/DawnResourceProvider.cpp b/src/gpu/graphite/dawn/DawnResourceProvider.cpp
+index 1947eb4..6a5964e 100644
+--- a/src/gpu/graphite/dawn/DawnResourceProvider.cpp
++++ b/src/gpu/graphite/dawn/DawnResourceProvider.cpp
+@@ -33,7 +33,7 @@ namespace {
+ constexpr uint32_t kBufferBindingSizeAlignment = 16;
+ 
+ wgpu::ShaderModule create_shader_module(const wgpu::Device& device, const char* source) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::ShaderModuleWGSLDescriptor wgslDesc;
+ #else
+     wgpu::ShaderSourceWGSL wgslDesc;
+diff --git a/src/gpu/graphite/dawn/DawnSharedContext.cpp b/src/gpu/graphite/dawn/DawnSharedContext.cpp
+index bd7b6d0..6084b70 100644
+--- a/src/gpu/graphite/dawn/DawnSharedContext.cpp
++++ b/src/gpu/graphite/dawn/DawnSharedContext.cpp
+@@ -20,7 +20,7 @@ namespace skgpu::graphite {
+ namespace {
+ 
+ wgpu::ShaderModule CreateNoopFragment(const wgpu::Device& device) {
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     wgpu::ShaderModuleWGSLDescriptor wgslDesc;
+ #else
+     wgpu::ShaderSourceWGSL wgslDesc;
+diff --git a/src/gpu/graphite/dawn/DawnTexture.cpp b/src/gpu/graphite/dawn/DawnTexture.cpp
+index 280c3db..5cfe5a0 100644
+--- a/src/gpu/graphite/dawn/DawnTexture.cpp
++++ b/src/gpu/graphite/dawn/DawnTexture.cpp
+@@ -142,7 +142,7 @@ std::pair<wgpu::TextureView, wgpu::TextureView> DawnTexture::CreateTextureViews(
+         return {sampleTextureView, renderTextureView};
+     }
+ 
+-#if defined(__EMSCRIPTEN__)
++#if defined(KX_WEBGPU_OLD_SPEC)
+     SkASSERT(false);
+     return {};
+ #else
