@@ -235,6 +235,17 @@ pub const Host = struct {
                 sdl.c.SDL_HINT_OVERRIDE,
             );
         }
+        // Linux Vulkan leg is only possible when the video driver answers
+        // the extension probe — loading the lib succeeds even under the
+        // dummy driver, but GetInstanceExtensions reflects the driver's
+        // actual surface support. The probe ref is released again — the
+        // shim does its own LoadLibrary inside kx.create. Unused off linux.
+        var vk_ext_count: c_uint = 0;
+        const vulkan_possible = is_linux and
+            (backend == kx.c.KX_BACKEND_GRAPHITE_VULKAN or backend == kx.c.KX_BACKEND_AUTO) and
+            sdl.c.SDL_Vulkan_LoadLibrary(null) and
+            (sdl.c.SDL_Vulkan_GetInstanceExtensions(&vk_ext_count) != null and vk_ext_count > 0);
+        if (vulkan_possible) sdl.c.SDL_Vulkan_UnloadLibrary();
         const window_flags: u64 = if (is_emscripten)
             // OPENGL claims the canvas for WebGL2 — WebGPU/raster must not
             // set it (single context type per canvas).
@@ -262,11 +273,15 @@ pub const Host = struct {
         else if (is_linux)
             // AUTO/graphite-vulkan: VULKAN window first — no GL context is
             // created for the Vulkan attempt (SDL_Vulkan_CreateSurface
-            // requires the flag). Explicit ganesh-gl: OPENGL. Raster stays
-            // on the software renderer.
-            if (backend == kx.c.KX_BACKEND_GRAPHITE_VULKAN or backend == kx.c.KX_BACKEND_AUTO)
+            // requires the flag). Only when the driver can actually serve
+            // Vulkan: a VULKAN-flagged create on a driver without surface
+            // support (dummy/headless) leaves SDL video half-initialized and
+            // even a plain-window retry then fails. The extension probe is
+            // the driver's own capability answer. Explicit ganesh-gl:
+            // OPENGL. Raster stays on the software renderer.
+            if (vulkan_possible)
                 sdl.c.SDL_WINDOW_VULKAN
-            else if (backend == kx.c.KX_BACKEND_GANESH_GL)
+            else if (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO)
                 sdl.c.SDL_WINDOW_OPENGL
             else
                 0
@@ -276,8 +291,7 @@ pub const Host = struct {
         // backend chain falls through to raster, the ganesh-gl leg is retried
         // below on a recreated OPENGL window (see the retry block after
         // kx_create).
-        const vulkan_window_first = is_linux and
-            (backend == kx.c.KX_BACKEND_GRAPHITE_VULKAN or backend == kx.c.KX_BACKEND_AUTO);
+        const vulkan_window_first = is_linux and vulkan_possible;
         // Android: SDLActivity starts the SDL thread only once the surface is
         // ready, but it never creates an SDL window object — the app must call
         // SDL_CreateWindow (SDL attaches the activity's surface; Android
