@@ -43,8 +43,9 @@ runs:
       shell: bash
       run: |
         case "$(uname -s)-$(uname -m)" in
-          Darwin-arm64)  zig_target=aarch64-macos ;;
-          Linux-x86_64)  zig_target=x86_64-linux ;;
+          Darwin-arm64)   zig_target=aarch64-macos ;;
+          Linux-x86_64)   zig_target=x86_64-linux ;;
+          Linux-aarch64)  zig_target=aarch64-linux ;;
           *) echo "unsupported CI host: $(uname -s)-$(uname -m)"; exit 1 ;;
         esac
         curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${{ inputs.zig-version }}/zig-${zig_target}-${{ inputs.zig-version }}.tar.xz"

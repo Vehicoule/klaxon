@@ -190,7 +190,11 @@ pub fn maxScrollOffset(n: *Node) f32 {
 /// benchmark drives this). Keeps the scroll offset + window position.
 pub fn reloadItems(n: *Node) void {
     const s = stateOf(ListState, n);
-    for (n.children.items) |child| child.deinit();
+    // deinit() detaches the child (removes it from children.items) — drain
+    // from the back instead of iterating a mutating slice.
+    while (n.children.items.len > 0) {
+        n.children.items[n.children.items.len - 1].deinit();
+    }
     n.children.clearRetainingCapacity();
     if (s.scroll.viewport > 0) {
         const range = scroll_mod.visibleRange(s.opts.item_count, strideOf(s), s.scroll.viewport, s.scroll.offset, s.opts.margin);

@@ -21,7 +21,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-24.04-arm covers the linux-arm64 target (fetch-deps
+        # linux-arm64 tag); x64 stays on ubuntu-latest. Windows joins the
+        # matrix once the win backend stack lands.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -32,9 +35,21 @@ jobs:
             echo "Klaxon targets macOS arm64 only (no x64)."; exit 1
           fi
 
+      - name: arm64 toolchain fixes (gn x64-only; clang outline-atomics)
+        if: runner.arch == 'ARM64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y generate-ninja
+          echo "KLAXON_GN=$(command -v gn)" >> "$GITHUB_ENV"
+          # Ubuntu arm64 clang defaults to -moutline-atomics → cmake-built
+          # deps (SDL3, WAMR) would reference __aarch64_*_sync helpers that
+          # zig's bundled builtins don't provide.
+          echo "CFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-mno-outline-atomics" >> "$GITHUB_ENV"
+
       - uses: ./.github/actions/setup-deps
         with:
-          cache-key: deps-${{ runner.os }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          cache-key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
           # Linux build deps: libc++ + X11/Wayland dev — SDL3 cmake requires them.
           apt-packages: >-
             libc++-dev libc++abi-dev
