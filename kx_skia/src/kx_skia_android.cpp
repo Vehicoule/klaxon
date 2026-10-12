@@ -182,9 +182,14 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_Custom_Empty();
 }
 
-const char* platform_font_family() { return nullptr; }
+// Never return nullptr for the family: the custom directory manager falls
+// back to the first font in /system/fonts, which sorts AndroidClock.ttf first
+// — a digits-only clock face (labels silently vanish). "Roboto" ships on
+// every Android; "Droid Sans" is the legacy name still present on all
+// versions for API < 21 skins that alias Roboto.
+const char* platform_font_family() { return "Roboto"; }
 
-const char* platform_fallback_font_family() { return nullptr; }
+const char* platform_fallback_font_family() { return "Droid Sans"; }
 
 } // namespace kx
 
