@@ -402,7 +402,10 @@ fn linkRuntime(
             "onecore",
         };
         inline for (win_libs) |lib| {
-            module.linkSystemLibrary(lib, .{});
+            // .use_pkg_config = .no: these resolve through the MSVC/Windows
+            // SDK import libs — there is no pkg-config on Windows runners
+            // (zig would spawn `pkg-config --list-all` and hard-fail).
+            module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
         }
     } else {
         for (skia_libs) |lib| {
