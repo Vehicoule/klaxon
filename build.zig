@@ -917,25 +917,19 @@ const WinLibDirs = struct { vc: []const u8, um: []const u8, ucrt: []const u8 };
 fn msvcLibDirs(b: *std.Build, target: std.Build.ResolvedTarget) WinLibDirs {
     const io = b.graph.io;
     const arch_dir: []const u8 = if (target.result.cpu.arch == .x86_64) "x64" else "arm64";
-    const vs_prefixes = [_][]const u8{
-        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
-        "C:\\Program Files\\Microsoft Visual Studio\\2022",
-    };
-    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
-    var vc_lib: ?[]const u8 = null;
-    outer: for (vs_prefixes) |p| for (editions) |e| {
-        const msvc_dir = b.fmt("{s}\\{s}\\VC\\Tools\\MSVC", .{ p, e });
-        const ver = newestSubdir(b, msvc_dir) orelse continue;
-        const cand = b.fmt("{s}\\{s}\\lib\\{s}", .{ msvc_dir, ver, arch_dir });
-        std.Io.Dir.accessAbsolute(io, cand, .{}) catch continue;
-        vc_lib = cand;
-        break :outer;
-    };
+    const root = vsInstallRoot(b) orelse
+        @panic("MSVC toolset not found — install Visual Studio (VCTools), or run `zig build` inside a vcvars shell");
+    const msvc_dir = b.fmt("{s}\\VC\\Tools\\MSVC", .{root});
+    const ver = newestSubdir(b, msvc_dir) orelse
+        @panic("MSVC toolset not found — no VC\\Tools\\MSVC\\<ver> under the VS install root");
+    const vc_lib = b.fmt("{s}\\{s}\\lib\\{s}", .{ msvc_dir, ver, arch_dir });
+    std.Io.Dir.accessAbsolute(io, vc_lib, .{}) catch
+        @panic("MSVC toolset lib dir missing for the target arch — install the matching VCTools component");
     const sdk_lib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
     const sdk_ver = newestSubdir(b, sdk_lib) orelse
         @panic("Windows SDK not found under C:\\Program Files (x86)\\Windows Kits\\10\\Lib");
     return .{
-        .vc = vc_lib orelse @panic("MSVC toolset not found — install VS 2022 Build Tools (VCTools)"),
+        .vc = vc_lib,
         .um = b.fmt("{s}\\{s}\\um\\{s}", .{ sdk_lib, sdk_ver, arch_dir }),
         .ucrt = b.fmt("{s}\\{s}\\ucrt\\{s}", .{ sdk_lib, sdk_ver, arch_dir }),
     };
@@ -946,25 +940,19 @@ const WinIncDirs = struct { vc: []const u8, um: []const u8, ucrt: []const u8, sh
 
 fn msvcIncludeDirs(b: *std.Build, target: std.Build.ResolvedTarget) WinIncDirs {
     _ = target;
-    const vs_prefixes = [_][]const u8{
-        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
-        "C:\\Program Files\\Microsoft Visual Studio\\2022",
-    };
-    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
-    var vc_inc: ?[]const u8 = null;
-    outer: for (vs_prefixes) |p| for (editions) |e| {
-        const msvc_dir = b.fmt("{s}\\{s}\\VC\\Tools\\MSVC", .{ p, e });
-        const ver = newestSubdir(b, msvc_dir) orelse continue;
-        const cand = b.fmt("{s}\\{s}\\include", .{ msvc_dir, ver });
-        std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
-        vc_inc = cand;
-        break :outer;
-    };
+    const root = vsInstallRoot(b) orelse
+        @panic("MSVC headers not found — install Visual Studio (VCTools)");
+    const msvc_dir = b.fmt("{s}\\VC\\Tools\\MSVC", .{root});
+    const ver = newestSubdir(b, msvc_dir) orelse
+        @panic("MSVC headers not found — no VC\\Tools\\MSVC\\<ver> under the VS install root");
+    const vc_inc = b.fmt("{s}\\{s}\\include", .{ msvc_dir, ver });
+    std.Io.Dir.accessAbsolute(b.graph.io, vc_inc, .{}) catch
+        @panic("MSVC headers not found under the VS install root");
     const sdk_inc = "C:\\Program Files (x86)\\Windows Kits\\10\\Include";
     const sdk_ver = newestSubdir(b, sdk_inc) orelse
         @panic("Windows SDK not found under C:\\Program Files (x86)\\Windows Kits\\10\\Include");
     return .{
-        .vc = vc_inc orelse @panic("MSVC headers not found"),
+        .vc = vc_inc,
         .um = b.fmt("{s}\\{s}\\um", .{ sdk_inc, sdk_ver }),
         .ucrt = b.fmt("{s}\\{s}\\ucrt", .{ sdk_inc, sdk_ver }),
         .shared = b.fmt("{s}\\{s}\\shared", .{ sdk_inc, sdk_ver }),
@@ -985,6 +973,33 @@ fn newestSubdir(b: *std.Build, dir_path: []const u8) ?[]const u8 {
     return best;
 }
 
+/// VS install root (`...\Microsoft Visual Studio\2022\Enterprise`,
+/// `...\18\Enterprise`, ...). Probes the known layouts first, then falls
+/// back to vswhere — always installed under Installer\ alongside any VS
+/// 2017+ install — so future VS versions resolve without code changes.
+fn vsInstallRoot(b: *std.Build) ?[]const u8 {
+    const prefixes = [_][]const u8{
+        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\2022",
+        "C:\\Program Files\\Microsoft Visual Studio\\18",
+        "C:\\Program Files\\Microsoft Visual Studio\\2026",
+    };
+    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
+    for (prefixes) |p| for (editions) |e| {
+        const cand = b.fmt("{s}\\{s}", .{ p, e });
+        std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
+        return cand;
+    };
+    const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+    const res = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ vswhere, "-latest", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath" },
+        .stdout_limit = .limited(64 * 1024),
+    }) catch return null;
+    const root = std.mem.trim(u8, res.stdout, " \r\n\t");
+    if (res.term == .exited and res.term.exited == 0 and root.len > 0) return root;
+    return null;
+}
+
 /// Path to vcvars64.bat ("" when INCLUDE is already set — a vcvars shell).
 fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     if (b.graph.environ_map.get("INCLUDE")) |v| {
@@ -997,36 +1012,16 @@ fn msvcVcvarsPath(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
         "vcvarsamd64_arm64.bat"
     else
         "vcvars64.bat";
-    // Probe the usual VS install layouts (2022, then 2026 — windows-latest
-    // runners moved to the windows-2025 image which ships VS 2026 under
-    // ...\18\<Edition>).
-    const prefixes = [_][]const u8{
-        "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022",
-        "C:\\Program Files\\Microsoft Visual Studio\\2022",
-        "C:\\Program Files\\Microsoft Visual Studio\\18",
-    };
-    const editions = [_][]const u8{ "BuildTools", "Community", "Professional", "Enterprise" };
-    for (prefixes) |p| for (editions) |e| {
-        const cand = b.fmt("{s}\\{s}\\VC\\Auxiliary\\Build\\{s}", .{ p, e, vcvars_name });
-        std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch continue;
-        return cand;
-    };
-    // Fallback: vswhere (always installed under Installer\ alongside any VS
-    // 2017+ install) resolves whatever the image actually has.
-    const vswhere = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-    if (std.process.run(b.allocator, b.graph.io, .{
-        .argv = &.{ vswhere, "-latest", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath" },
-        .stdout_limit = .limited(64 * 1024),
-    }) catch null) |res| {
-        const root = std.mem.trim(u8, res.stdout, " \r\n\t");
-        if (res.term == .exited and res.term.exited == 0 and root.len > 0) {
-            const cand = b.fmt("{s}\\VC\\Auxiliary\\Build\\{s}", .{ root, vcvars_name });
-            std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch
-                @panic("MSVC not found: install Visual Studio (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
-            return cand;
-        }
-    }
-    @panic("MSVC not found: install Visual Studio (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
+    // One install root for vcvars, lib dirs and include dirs — probe the
+    // usual layouts (2022, then VS 2026: windows-latest is now the
+    // windows-2025 image which ships VS 2026 under ...\18\<Edition>) and
+    // fall back to vswhere for whatever the image actually has.
+    const root = vsInstallRoot(b) orelse
+        @panic("MSVC not found: install Visual Studio (VCTools + a Windows SDK), or run `zig build` inside a vcvars shell");
+    const cand = b.fmt("{s}\\VC\\Auxiliary\\Build\\{s}", .{ root, vcvars_name });
+    std.Io.Dir.accessAbsolute(b.graph.io, cand, .{}) catch
+        @panic("MSVC not found: vcvars missing under the VS install root — run `zig build` inside a vcvars shell");
+    return cand;
 }
 
 fn is_windows_local(target: std.Build.ResolvedTarget) bool {
