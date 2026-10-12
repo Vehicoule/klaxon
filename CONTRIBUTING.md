@@ -48,6 +48,28 @@ scripts/bench-report.py                  # regenerate bench/report.html
 Scene semantics are contractual — `docs/specs/bench-scenes.md`. All four
 runners (Klaxon / Flutter / Compose / Qt) must produce comparable numbers.
 
+## Packaging
+
+Each platform has a `scripts/package-<os>.sh` that builds the app
+(ReleaseSmall) and emits artifacts to `./dist/`:
+
+```bash
+scripts/package-macos.sh gallery ./dist         # Klaxon-gallery.app (arm64)
+scripts/package-macos.sh gallery ./dist --dmg   # + drag-and-drop .dmg
+scripts/package-windows.sh gallery ./dist       # portable .zip (x64)
+scripts/package-linux.sh gallery x64            # AppImage + .deb + .rpm + Flatpak manifest
+scripts/package-linux.sh gallery arm64 deb rpm  # subset of formats also works
+scripts/package-linux.sh --dry-run              # print the plan + tool check
+```
+
+`package-linux.sh` covers the Phase 5b Linux matrix: AppImage, .deb and .rpm
+for x64 and arm64, plus a Flatpak manifest (`org.klaxon.<App>.yml`) that is
+always emitted; the `.flatpak` bundle builds when `flatpak-builder` is
+installed. `appimagetool` is downloaded on demand into `deps/tools/` — the
+rest (`dpkg-deb`, `rpmbuild`) come from the distro (`apt install dpkg rpm
+flatpak-builder`). There is also a `zig build package-linux` step on Linux
+hosts (gallery, all formats).
+
 ## Style
 
 - `zig fmt` on touched files before pushing.

@@ -220,6 +220,17 @@ pub fn build(b: *std.Build) void {
         const pkg_dmg_step = b.step("package-macos-dmg", "Build + package gallery into a .dmg (macOS)");
         pkg_dmg_step.dependOn(&pkg_dmg.step);
     }
+
+    // --- package-linux: build + package gallery for Linux (Phase 3a.2/5b) ---
+    // The script produces all four formats (AppImage/.deb/.rpm/Flatpak
+    // manifest) under ./dist; android/ios return above before reaching this.
+    if (target.result.os.tag == .linux) {
+        const linux_arch: []const u8 = if (target.result.cpu.arch == .x86_64) "x64" else "arm64";
+        const pkg = b.addSystemCommand(&.{ "scripts/package-linux.sh", "gallery", linux_arch });
+        pkg.step.dependOn(b.getInstallStep());
+        const pkg_step = b.step("package-linux", "Build + package gallery for Linux (AppImage, deb, rpm, Flatpak)");
+        pkg_step.dependOn(&pkg.step);
+    }
 }
 
 /// Create the kx_skia C++/ObjC++ shim as a static library. The native graph
