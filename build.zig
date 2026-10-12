@@ -893,8 +893,16 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
     else
         b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n@call \"{s}\" >NUL 2>&1\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n{s}", .{ vcvars, attempt }));
     var objs: std.ArrayList(std.Build.LazyPath) = .empty;
+    // cl runs serialized: parallel invocations on a fresh runner race on a
+    // shared file (cl temp intermediates / identical %RANDOM% log names in
+    // simultaneously spawned cmd processes) and die with "The process cannot
+    // access the file because it is being used by another process". 3 small
+    // TUs ≈ 15 s — not worth parallelizing.
+    var prev: ?*std.Build.Step = null;
     for (sources) |s| {
         const run = b.addSystemCommand(&.{"cmd"});
+        if (prev) |p| run.step.dependOn(p);
+        prev = &run.step;
         run.addArg("/c");
         run.addFileArg(wrapper);
         run.addArg("/nologo");
