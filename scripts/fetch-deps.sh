@@ -918,13 +918,13 @@ EOF
   fi
   write_skia_args_common "$out"
   if [ "$sim" = "1" ]; then
-    # gn rejects reassigning a declared arg in args.gn — clear, then set.
+    # gn rejects a second `=` on an arg already set (common writes
+    # extra_cflags/_cc above) — append with += instead. extra_ldflags is
+    # unset by common, so `=` is correct there.
     cat >> "$out" <<'EOF'
 
-extra_cflags = []
-extra_cflags = ["-mios-simulator-version-min=15.0", "-Wno-error"]
-extra_cflags_cc = []
-extra_cflags_cc = ["-mios-simulator-version-min=15.0", "-Wno-error", "-stdlib=libc++"]
+extra_cflags += ["-mios-simulator-version-min=15.0"]
+extra_cflags_cc += ["-mios-simulator-version-min=15.0"]
 extra_ldflags = ["-mios-simulator-version-min=15.0"]
 EOF
   fi
