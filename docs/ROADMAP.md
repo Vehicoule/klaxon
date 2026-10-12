@@ -365,12 +365,15 @@ Rendering shim done in Phase 0. Remaining:
 
 ## Phase 4 — DevTools + Testing + Benchmarks (2 weeks)
 
-2026-10-11 status: 4a ✅ (overlay, inspector, memory ledger, frame timeline —
-F12/3-finger/`--devtools`) · 4b ✅ (723 unit + 144 golden; device-matrix gates
+2026-10-12 status: 4a ✅ (overlay, inspector, memory ledger, frame timeline —
+F12/3-finger/`--devtools`) · 4b ✅ (755 unit + 144 golden; device-matrix gates
 pending real hardware) · 4c.1-4c.6 ✅ (9 scenes, `zig build bench`, Qt/Flutter/
-Compose runners, `bench/report.html`, published JSONs) — **note: the published
-`gallery` scene (19.3 fps, p99 114ms) is under investigation before results
-are treated as final** · 4c.7 conformance suite: pending · 4d P2 ✅ (80 widgets).
+Compose runners, `bench/report.html`, published JSONs) — **the published
+`gallery` scene (19.3 fps) is stale: paint culling (#58, merged) + the shaped
+text cache (#88, in flight) raise it to ~8000 fps raster — the official report
+will be regenerated once those land** · 4c.7 conformance suite: in flight
+(engine + runner landed; the JSON vector corpus is being authored) ·
+4d P2 ✅ (80 widgets).
 
 ### 4a. DevTools
 
