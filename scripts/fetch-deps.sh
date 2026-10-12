@@ -156,7 +156,13 @@ git_clone_at() {
 #   KLAXON_DEPS_SOURCE=1   force source builds, never download
 #   KLAXON_DEPS_BASE_URL   override the release base (testing/mirrors)
 
-DEPS_ID="$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -c1-12)"
+# sha256 helper — Git Bash on Windows only ships sha256sum; macOS/Linux runners
+# may only have shasum. Both print "<hash>  <file>" so cut -c/-d' ' work alike.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
+
+DEPS_ID="$(sha256_file "${BASH_SOURCE[0]}" | cut -c1-12)"
 DEPS_BASE_URL="${KLAXON_DEPS_BASE_URL:-https://github.com/Vehicoule/klaxon/releases/download/deps-$DEPS_ID}"
 
 # verify_bundle <bundle> — when the tarball embedded a .deps-manifest-<name>,
@@ -199,7 +205,7 @@ try_artifact() {
   fi
   local want got
   want="$(cut -d' ' -f1 < "$tmp.sha256")"
-  got="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  got="$(sha256_file "$tmp" | cut -d' ' -f1)"
   if [ "$want" != "$got" ]; then
     rm -f "$tmp" "$tmp.sha256"
     die "checksum mismatch on $base — refusing to extract (want $want, got $got)"

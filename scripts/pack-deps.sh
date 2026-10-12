@@ -22,6 +22,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# sha256 helper — Windows Git Bash ships sha256sum, macOS runners ship shasum.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
 DEPS="$ROOT/deps"
 DIST="$ROOT/dist"
 
@@ -67,7 +72,7 @@ pack_bundle() {
   cp "$filelist" "$DEPS/.deps-manifest-$name"
   tar -czf "$out" -C "$DEPS" -T "$filelist"
   rm -f "$DEPS/.deps-manifest-$name" "$filelist"
-  (cd "$DIST" && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256")
+  (cd "$DIST" && sha256_file "$(basename "$out")" > "$(basename "$out").sha256")
   log "packed $(basename "$out") ($(du -sh "$out" | cut -f1))"
 }
 
