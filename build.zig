@@ -896,7 +896,11 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         run.addArg("/O2");
         run.addArg("/MT");
         run.addArg("/bigobj");
-        run.addArg("/W3");
+        // /w, not /W3: Skia's headers emit hundreds of C4244/C4267 warnings
+        // that flood zig's captured stderr — on failure the actual C####
+        // error was truncated away and CI showed warnings only. Errors still
+        // print; the warning noise is third-party, not actionable.
+        run.addArg("/w");
         run.addArg("/DNDEBUG");
         run.addArg("/D_CRT_SECURE_NO_WARNINGS");
         run.addArg("/DNOMINMAX");
