@@ -87,6 +87,9 @@ for b in "${BUNDLES[@]}"; do
         "skia/include" \
         "skia/out/$TAG" \
         "skia/modules" \
+        "skia/third_party/externals/dawn/include" \
+        "skia/third_party/externals/dawn/src/dawn/partition_alloc" \
+        "skia/third_party/externals/abseil-cpp" \
         "SDL/include" \
         "SDL/build-$TAG" \
         "wamr/core/iwasm/include" \
