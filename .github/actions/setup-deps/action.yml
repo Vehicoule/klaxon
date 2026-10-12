@@ -52,8 +52,13 @@ runs:
           *) echo "unsupported CI host: $(uname -s)-$(uname -m)"; exit 1 ;;
         esac
         curl -fsSL -o "zig.$ext" "https://ziglang.org/download/${{ inputs.zig-version }}/zig-${zig_target}-${{ inputs.zig-version }}.$ext"
-        # bsdtar (what `tar` resolves to on Windows runners) also reads .zip.
-        tar -xf "zig.$ext"
+        if [ "$ext" = "zip" ]; then
+          # Git Bash's `tar` is GNU tar (no zip support); System32 tar.exe is
+          # bsdtar and reads .zip.
+          /c/Windows/System32/tar.exe -xf "zig.$ext"
+        else
+          tar -xf "zig.$ext"
+        fi
         zig_dir="$(pwd)/zig-${zig_target}-${{ inputs.zig-version }}"
         echo "$zig_dir" >> "$GITHUB_PATH"
         export PATH="$zig_dir:$PATH" # GITHUB_PATH only applies to later steps
