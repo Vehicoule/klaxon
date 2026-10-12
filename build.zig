@@ -562,12 +562,17 @@ fn addWasmWeb(
     translate_kx.addIncludePath(b.path(b.fmt("{s}/compat", .{sysroot_include})));
     translate_kx.addIncludePath(b.path(sysroot_include));
 
-    // --- hello app as a static library (Zig cannot link an exe for emscripten) ---
+    // App selection: -Dweb-app=hello (default) | gallery — mirrors -Dios-app.
+    const web_app = b.option([]const u8, "web-app", "web app to build: hello|gallery") orelse "hello";
+    const app_name: []const u8 = if (std.mem.eql(u8, web_app, "gallery")) "gallery" else "hello";
+    const root_src: []const u8 = if (std.mem.eql(u8, app_name, "gallery")) "src/gallery_main.zig" else "src/main.zig";
+
+    // --- app as a static library (Zig cannot link an exe for emscripten) ---
     const app = b.addLibrary(.{
-        .name = "hello",
+        .name = app_name,
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path(root_src),
             .target = target,
             .optimize = optimize,
             .link_libc = false, // emcc links musl
@@ -596,7 +601,7 @@ fn addWasmWeb(
     };
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(b.allocator, b.fmt("{s}/upstream/emscripten/emcc", .{emsdk})) catch unreachable;
-    argv.append(b.allocator, "zig-out/lib/libhello.a") catch unreachable;
+    argv.append(b.allocator, b.fmt("zig-out/lib/lib{s}.a", .{app_name})) catch unreachable;
     argv.append(b.allocator, "zig-out/lib/libkx_skia.a") catch unreachable;
     argv.append(b.allocator, b.fmt("deps/SDL/build-{s}/libSDL3.a", .{tag})) catch unreachable;
     for (skia_libs) |lib| {
@@ -604,7 +609,7 @@ fn addWasmWeb(
     }
     argv.appendSlice(b.allocator, &.{
         "-o",
-        "zig-out/web/hello.html",
+        b.fmt("zig-out/web/{s}.html", .{app_name}),
         "--shell-file",
         "web/shell.html",
         "--js-library",
@@ -627,7 +632,7 @@ fn addWasmWeb(
     link.step.dependOn(&mkdir.step);
     // Installs libhello.a + libkx_skia.a into zig-out/lib (paths referenced above).
     link.step.dependOn(b.getInstallStep());
-    const web_step = b.step("web", "Build the wasm web target (hello.html)");
+    const web_step = b.step("web", "Build the wasm web target (-Dweb-app=hello|gallery)");
     web_step.dependOn(&link.step);
 }
 
