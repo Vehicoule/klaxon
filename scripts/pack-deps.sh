@@ -83,13 +83,20 @@ rc=0
 for b in "${BUNDLES[@]}"; do
   case "$b" in
     native)
+      # Dawn/abseil externals are synced only on platforms whose Skia build
+      # uses dawn (windows-x64 today — its shim includes <webgpu/webgpu_cpp.h>).
+      # Pack them when present, skip them where they were never fetched.
+      local dawn_dirs=()
+      for d in "skia/third_party/externals/dawn/include" \
+               "skia/third_party/externals/dawn/src/dawn/partition_alloc" \
+               "skia/third_party/externals/abseil-cpp"; do
+        [ -d "$DEPS/$d" ] && dawn_dirs+=("$d")
+      done
       pack_bundle "native-$TAG" \
         "skia/include" \
         "skia/out/$TAG" \
         "skia/modules" \
-        "skia/third_party/externals/dawn/include" \
-        "skia/third_party/externals/dawn/src/dawn/partition_alloc" \
-        "skia/third_party/externals/abseil-cpp" \
+        "${dawn_dirs[@]}" \
         "SDL/include" \
         "SDL/build-$TAG" \
         "wamr/core/iwasm/include" \
