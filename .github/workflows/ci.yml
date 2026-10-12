@@ -76,6 +76,9 @@ jobs:
       - name: Golden tests
         run: zig build test-golden
 
+      - name: Conformance suite
+        run: zig build conformance
+
       - name: Headless smoke (raster, 600 frames)
         run: SDL_VIDEODRIVER=dummy ./zig-out/bin/hello
 
