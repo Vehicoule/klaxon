@@ -23,12 +23,17 @@ pub const TextOptions = struct {
 const TextState = struct {
     text: [:0]const u8, // owned, null-terminated
     opts: TextOptions,
+    /// Metrics measured once at construction: a Text's string and the
+    /// metrics-relevant opts (size, bold) are immutable for the node's
+    /// lifetime — only the color mutates (setColor, which doesn't affect
+    /// measurement). measure/paint/paintBounds read this instead of
+    /// re-measuring every frame.
+    m: ui.paint.TextMetrics,
 };
 
 fn textMeasure(n: *Node, c: Constraints) Size {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
-    const m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
-    return c.constrain(.{ .w = m.width, .h = m.height });
+    return c.constrain(.{ .w = s.m.width, .h = s.m.height });
 }
 fn textLayout(n: *Node, bounds: Rect) void {
     _ = n;
@@ -48,10 +53,9 @@ fn textX(n: *Node, m: ui.paint.TextMetrics, text_align: ui.layout.TextAlign) f32
 
 fn textPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
-    const m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
-    const x = textX(n, m, s.opts.text_align);
+    const x = textX(n, s.m, s.opts.text_align);
     // Skia draws from the baseline: one ascent below the top.
-    ui.paint.text(ctx, s.text, x, n.bounds.y + m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+    ui.paint.text(ctx, s.text, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
 }
 fn textDeinit(n: *Node) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
@@ -63,8 +67,7 @@ fn textDeinit(n: *Node) void {
 /// damage consult it.
 fn textPaintBounds(n: *Node) Rect {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
-    const m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
-    return .{ .x = textX(n, m, s.opts.text_align), .y = n.bounds.y, .w = m.width, .h = m.height };
+    return .{ .x = textX(n, s.m, s.opts.text_align), .y = n.bounds.y, .w = s.m.width, .h = s.m.height };
 }
 const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds };
 
@@ -77,7 +80,7 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
     errdefer allocator.free(buf);
     @memcpy(buf[0..str.len], str);
     buf[str.len] = 0;
-    s.* = .{ .text = buf[0..str.len :0], .opts = opts };
+    s.* = .{ .text = buf[0..str.len :0], .opts = opts, .m = ui.paint.measureText(buf[0..str.len :0], opts.size, opts.bold) };
     node.state = s;
     ui.semantics.attach(node, .{ .role = .text, .label = s.text }); // Phase 2c
     return node;
@@ -120,6 +123,11 @@ pub fn BoundText(comptime T: type) type {
             /// bound() reformats only when this is set, so measure()+paint()
             /// in one frame don't repeat the copy (dirtyCb re-arms it).
             dirty: bool,
+            /// Metrics of the CURRENT buf contents — refreshed inside
+            /// bound()'s reformat: the same `dirty` flag that gates the
+            /// reformat gates the re-measure, so measure()/paint()/
+            /// paintBounds() never measure a stale or repeated string.
+            m: ui.paint.TextMetrics,
         };
 
         fn bound(n: *Node) [:0]const u8 {
@@ -159,14 +167,15 @@ pub fn BoundText(comptime T: type) type {
             s.buf.items[s.buf.items.len - 1] = 0;
             s.buf.items.len -= 1;
             const str = s.buf.items.ptr[0..s.buf.items.len :0];
+            s.m = ui.paint.measureText(str, s.opts.size, s.opts.bold); // reformatted → re-measure once
             if (n.semantics) |sem| sem.label = str; // re-point: a grow may have moved the buffer
             return str;
         }
 
         fn measure(n: *Node, c: Constraints) Size {
             const s: *State = @ptrCast(@alignCast(n.state.?));
-            const m = ui.paint.measureText(bound(n), s.opts.size, s.opts.bold);
-            return c.constrain(.{ .w = m.width, .h = m.height });
+            _ = bound(n); // refresh buf + metrics when the signal changed
+            return c.constrain(.{ .w = s.m.width, .h = s.m.height });
         }
         fn layout(n: *Node, bounds: Rect) void {
             _ = n;
@@ -175,9 +184,8 @@ pub fn BoundText(comptime T: type) type {
         fn paint(n: *Node, ctx: *kx.Ctx) void {
             const s: *State = @ptrCast(@alignCast(n.state.?));
             const str = bound(n);
-            const m = ui.paint.measureText(str, s.opts.size, s.opts.bold);
-            const x = textX(n, m, s.opts.text_align);
-            ui.paint.text(ctx, str, x, n.bounds.y + m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+            const x = textX(n, s.m, s.opts.text_align);
+            ui.paint.text(ctx, str, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
         }
         fn dirtyCb(userdata: ?*anyopaque) void {
             const n: *Node = @ptrCast(@alignCast(userdata.?));
@@ -195,8 +203,8 @@ pub fn BoundText(comptime T: type) type {
         }
         fn paintBounds(n: *Node) Rect {
             const s: *State = @ptrCast(@alignCast(n.state.?));
-            const m = ui.paint.measureText(bound(n), s.opts.size, s.opts.bold);
-            return .{ .x = textX(n, m, s.opts.text_align), .y = n.bounds.y, .w = m.width, .h = m.height };
+            _ = bound(n); // keep metrics in step with the current string
+            return .{ .x = textX(n, s.m, s.opts.text_align), .y = n.bounds.y, .w = s.m.width, .h = s.m.height };
         }
         const vtable = ui.node.VTable{ .measure = measure, .layout = layout, .paint = paint, .deinit = deinit, .paint_bounds = paintBounds };
 
@@ -205,7 +213,7 @@ pub fn BoundText(comptime T: type) type {
             errdefer node.allocator.destroy(node); // no state yet
             const s = try allocator.create(State);
             errdefer allocator.destroy(s);
-            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true };
+            s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true, .m = std.mem.zeroes(ui.paint.TextMetrics) };
             errdefer s.buf.deinit();
             node.state = s;
             // Phase 2c: the label is the initial text — dynamic changes go
@@ -231,6 +239,9 @@ const SpanState = struct {
     size: f32,
     color: Color,
     bold: bool,
+    /// Metrics measured once at construction — spans are immutable, so
+    /// measure/paint/paintBounds read this instead of re-measuring.
+    m: ui.paint.TextMetrics,
 };
 
 const RichTextState = struct {
@@ -242,9 +253,8 @@ fn richTextMeasure(n: *Node, c: Constraints) Size {
     var w: f32 = 0;
     var h: f32 = 0;
     for (s.spans.items) |span| {
-        const m = ui.paint.measureText(span.text, span.size, span.bold);
-        w += m.width;
-        h = @max(h, m.height);
+        w += span.m.width;
+        h = @max(h, span.m.height);
     }
     return c.constrain(.{ .w = w, .h = h });
 }
@@ -257,15 +267,13 @@ fn richTextPaint(n: *Node, ctx: *kx.Ctx) void {
     // Shared baseline: the tallest span's ascent.
     var ascent: f32 = 0;
     for (s.spans.items) |span| {
-        const m = ui.paint.measureText(span.text, span.size, span.bold);
-        ascent = @max(ascent, m.ascent);
+        ascent = @max(ascent, span.m.ascent);
     }
     const baseline = n.bounds.y + ascent;
     var x = n.bounds.x;
     for (s.spans.items) |span| {
-        const m = ui.paint.measureText(span.text, span.size, span.bold);
         ui.paint.text(ctx, span.text, x, baseline, span.size, span.bold, span.color);
-        x += m.width;
+        x += span.m.width;
     }
 }
 fn richTextDeinit(n: *Node) void {
@@ -282,9 +290,8 @@ fn richTextPaintBounds(n: *Node) Rect {
     var w: f32 = 0;
     var h: f32 = 0;
     for (s.spans.items) |span| {
-        const m = ui.paint.measureText(span.text, span.size, span.bold);
-        w += m.width;
-        h = @max(h, m.height);
+        w += span.m.width;
+        h = @max(h, span.m.height);
     }
     return .{ .x = n.bounds.x, .y = n.bounds.y, .w = w, .h = h };
 }
@@ -307,6 +314,7 @@ pub fn richText(allocator: std.mem.Allocator, spans: []const TextSpan) !*Node {
             .size = span.size,
             .color = span.color,
             .bold = span.bold,
+            .m = ui.paint.measureText(buf[0..span.text.len :0], span.size, span.bold),
         }) catch {
             allocator.free(buf);
             return error.OutOfMemory;
