@@ -62,6 +62,9 @@ const tooltip_w = @import("widgets/tooltip.zig");
 const bottom_sheet_w = @import("widgets/bottom_sheet.zig");
 const dialog_w = @import("widgets/dialog.zig");
 const snackbar_w = @import("widgets/snackbar.zig");
+const fab_w = @import("widgets/fab.zig");
+const carousel_w = @import("widgets/carousel.zig");
+const bottom_app_bar_w = @import("widgets/bottom_app_bar.zig");
 const golden = @import("golden.zig"); // tests
 
 /// Options type for widgets without options.
@@ -117,7 +120,11 @@ pub const WidgetEntry = struct {
 /// collapsed circle indicator / expanded pill, live selection) + side sheet
 /// (2d.3 PR D5: the M3E side sheet — standard coplanar / modal + scrim,
 /// start/end anchored) + pull-to-refresh (2d.3 PR D5: the M3E PTR container
-/// — pull gesture + arc indicator, live refreshing signal).
+/// — pull gesture + arc indicator, live refreshing signal) + FAB batch
+/// (2d.5: the M3E FAB — 4 sizes, action + toggle morph — and the extended
+/// FAB — 3 sizes, icon + label) + carousel (2d.5: the M3 carousel —
+/// multi-browse + uncontained keyline layouts) + bottom app bar (2d.5:
+/// the M3E bottom app bar — actions slot + docked FAB slot).
 /// Batch 1+ widgets self-register here.
 pub const widgets = [_]WidgetEntry{
     .{ .name = "column", .category = "layout", .build = buildColumn, .schema = schemaColumn },
@@ -166,6 +173,10 @@ pub const widgets = [_]WidgetEntry{
     .{ .name = "badged_box", .category = "display", .build = buildBadgedBox, .schema = schemaBadgedBox },
     .{ .name = "tooltip", .category = "feedback", .build = buildTooltip, .schema = schemaTooltip },
     .{ .name = "snackbar", .category = "feedback", .build = buildSnackBar, .schema = schemaSnackBar },
+    .{ .name = "fab", .category = "input", .build = buildFab, .schema = schemaFab },
+    .{ .name = "extended_fab", .category = "input", .build = buildExtendedFab, .schema = schemaExtendedFab },
+    .{ .name = "carousel", .category = "display", .build = buildCarousel, .schema = schemaCarousel },
+    .{ .name = "bottom_app_bar", .category = "navigation", .build = buildBottomAppBar, .schema = schemaBottomAppBar },
 };
 
 pub fn byName(name: []const u8) ?WidgetEntry {
@@ -1071,9 +1082,10 @@ fn schemaTable(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
 }
 
 fn buildTree(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
-    _ = ctx; _ = opts;
+    _ = ctx;
+    _ = opts;
     // Simplified: a single root node (full nested parsing is a follow-up).
-    const root = tree_w.TreeNode{ .label = "Root", .children = &.{ .{ .label = "Child" } } };
+    const root = tree_w.TreeNode{ .label = "Root", .children = &.{.{ .label = "Child" }} };
     const n = try tree_w.tree(allocator, &root, null, .{});
     return .{ .node = n, .skip_children = true };
 }
@@ -1282,6 +1294,49 @@ fn buildSnackBar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anye
     const n = try snackbar_w.snackBar(allocator, sig, null, null, sopts);
     // the node's children (internal bg + content) are not document children
     return .{ .node = n, .live = .{ .signal = sig, .field = "visible", .read = readBoolSignal }, .skip_children = true };
+}
+
+// --- batch 2d.5: FAB + carousel + bottom app bar (M3E) ---
+
+/// M3E FAB (2d.5): a "checked" option makes it a toggle FAB (a ctx-owned
+/// bool signal drives the checked morph — the 56dp full-circle solid
+/// FAB); without it, a plain action FAB. The icon is internal chrome —
+/// document children never serialize.
+fn buildFab(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const fopts = try value_mod.optionsFromValue(fab_w.FabOptions, opts, null, null);
+    // a null "checked" means the field default (an action FAB), not a toggle
+    const has_checked = if (opts.get("checked")) |v| v != .null else false;
+    if (has_checked) {
+        const sig = try buildBoolSignal(allocator, opts, ctx, "checked");
+        const n = try fab_w.fab(allocator, sig, null, fopts);
+        return .{ .node = n, .live = .{ .signal = sig, .field = "checked", .read = readBoolSignal }, .skip_children = true };
+    }
+    return .{ .node = try fab_w.fab(allocator, null, null, fopts), .skip_children = true };
+}
+
+/// M3E extended FAB (2d.5): the icon + label are internal chrome built
+/// from the options (no toggle — the M3E ToggleFAB is icon-only) —
+/// document children never serialize.
+fn buildExtendedFab(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    const eopts = try value_mod.optionsFromValue(fab_w.ExtendedFabOptions, opts, null, null);
+    return .{ .node = try fab_w.extendedFab(allocator, null, eopts), .skip_children = true };
+}
+
+/// M3 carousel (2d.5): a container — the children ARE the carousel items
+/// (document data), laid out on the keylines.
+fn buildCarousel(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    const copts = try value_mod.optionsFromValue(carousel_w.CarouselOptions, opts, null, null);
+    return .{ .node = try carousel_w.carousel(allocator, copts) };
+}
+
+/// M3E bottom app bar (2d.5): actions/fab are option slots — the node's
+/// children are the slots, preserved verbatim in the snapshot.
+fn buildBottomAppBar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const bopts = try value_mod.optionsFromValue(bottom_app_bar_w.BottomAppBarOptions, opts, buildSlotNode, ctx);
+    errdefer deinitSlot2(bopts.actions, bopts.fab);
+    return .{ .node = try bottom_app_bar_w.bottomAppBar(allocator, bopts), .skip_children = true };
 }
 
 // --- per-widget inspector schemas (comptime-generated from options types) ---
@@ -1532,6 +1587,29 @@ fn schemaSnackBar(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema 
     return value_mod.appendSchemaProp(base, allocator, "visible", .toggle, &.{}, .{ .bool = false });
 }
 
+fn schemaFab(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    // size/color/icon/checked_icon/enabled/a11y_label — automatic;
+    // "checked" is live (a toggle FAB); theme is unsupported
+    const base = try value_mod.schemaOf(fab_w.FabOptions, allocator);
+    return value_mod.appendSchemaProp(base, allocator, "checked", .toggle, &.{}, .{ .bool = false });
+}
+
+fn schemaExtendedFab(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    // size/color/icon/label/enabled — automatic; theme is unsupported
+    return value_mod.schemaOf(fab_w.ExtendedFabOptions, allocator);
+}
+
+fn schemaCarousel(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    // variant (select), item_width/item_spacing (number), label (text) —
+    // automatic; theme is unsupported
+    return value_mod.schemaOf(carousel_w.CarouselOptions, allocator);
+}
+
+fn schemaBottomAppBar(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    // actions/fab are slots, height/label automatic; theme is unsupported
+    return value_mod.schemaOf(bottom_app_bar_w.BottomAppBarOptions, allocator);
+}
+
 // --- tests ---
 
 fn slotBuilder(userdata: ?*anyopaque, v: Value) anyerror!*Node {
@@ -1545,7 +1623,7 @@ test "registry: byName finds entries, rejects unknown" {
     try std.testing.expect(byName("slider") != null);
     try std.testing.expect(byName("snackbar") != null);
     try std.testing.expect(byName("nope") == null);
-    try std.testing.expectEqual(@as(usize, 46), widgets.len);
+    try std.testing.expectEqual(@as(usize, 50), widgets.len);
 }
 
 test "registry: builds a node with defaults from a minimal value" {

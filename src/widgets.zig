@@ -58,7 +58,14 @@
 // weekday row, day grid, Cancel/OK) — Phase 2d.4 PR #33.
 // TimePicker (1): the M3E time picker (dial: time plates + AM/PM, clock face
 // with hour/minute modes) — Phase 2d.4 PR #33.
-// ~73 widgets at v1 (see docs/ROADMAP.md).
+// FAB (2): the M3E floating action button (4 sizes x 4 color families,
+// plain + toggleable) + the extended FAB (3 sizes, icon + label) — Phase
+// 2d.5 batch 4.
+// Carousel (1): the M3 carousel (multi-browse + uncontained, keyline size
+// morphing, scroll-snap, arrow-key nav) — Phase 2d.5 batch 4.
+// BottomAppBar (1): the M3E bottom app bar (80dp, actions row + docked FAB
+// slot) — Phase 2d.5 batch 4.
+// ~77 widgets at v1 (see docs/ROADMAP.md).
 pub const layout = @import("widgets/layout.zig");
 pub const text = @import("widgets/text.zig");
 pub const icon = @import("widgets/icon.zig");
@@ -87,6 +94,9 @@ pub const loading_indicator = @import("widgets/loading_indicator.zig");
 pub const date_picker = @import("widgets/date_picker.zig");
 pub const time_picker = @import("widgets/time_picker.zig");
 pub const color_picker = @import("widgets/color_picker.zig");
+pub const fab = @import("widgets/fab.zig");
+pub const carousel = @import("widgets/carousel.zig");
+pub const bottom_app_bar = @import("widgets/bottom_app_bar.zig");
 pub const gestures = @import("widgets/gestures.zig");
 pub const anim = @import("widgets/anim.zig");
 pub const list_view = @import("widgets/list_view.zig");

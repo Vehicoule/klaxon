@@ -119,13 +119,16 @@ pub const TypeScale = struct {
 };
 
 /// M3 shape scale (corner radii, px). "Full" (pill) has no fixed token —
-/// components compute it as height/2.
+/// components compute it as height/2. M3E added `large_increased` (20) and
+/// `extra_extra_large` (48) to the classic five-step scale.
 pub const Shape = struct {
     extra_small: f32, // 4
     small: f32, // 8
     medium: f32, // 12
     large: f32, // 16
+    large_increased: f32, // 20 (M3E)
     extra_large: f32, // 28
+    extra_extra_large: f32, // 48 (M3E)
 };
 
 /// One elevation level as a raster shadow approximation. M3 specifies
@@ -270,7 +273,7 @@ const type_scale: TypeScale = .{
     .label_small = .{ .size = 11, .line_height = 16, .weight = 500, .letter_spacing = 0.5 },
 };
 
-const shape: Shape = .{ .extra_small = 4, .small = 8, .medium = 12, .large = 16, .extra_large = 28 };
+const shape: Shape = .{ .extra_small = 4, .small = 8, .medium = 12, .large = 16, .large_increased = 20, .extra_large = 28, .extra_extra_large = 48 };
 
 const elevation: Elevation = .{
     .level0 = .{ .dy = 0, .blur = 0, .alpha = 0 },
