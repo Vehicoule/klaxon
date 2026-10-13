@@ -286,8 +286,46 @@ Granularity caveats (inherent to the mapping, not bugs):
 ## Results (this machine, 2026-10-11; see `bench/results/compose/`)
 
 > **Note:** the tables below are schema-v1 numbers (600 measured frames, no
-> p999/jank/extra) from the original 9-scene suite — kept for history; v2
-> results land in `bench/results/compose/*.json` as they are generated.
+> p999/jank/extra) from the original 9-scene suite — kept for history.
+>
+> The first **full 33-scene schema-v2 run** on this machine is
+> `bench/results/compose/2026-10-13T18-49-48Z.json` (macOS arm64,
+> `bench/runners/compose/run.sh`, one process). Headline numbers (avg /
+> p999 ms, jank, draws, extras):
+
+| scene | avg ms | p999 ms | jank | draws | extras |
+|---|---:|---:|---:|---:|---|
+| list_create_1k | 0.0 | 0.1 | 0 | 32 | op_ms 24.1 |
+| list_replace_1k | 0.0 | 0.1 | 0 | 32 | op_ms 32.4 |
+| list_update_10th | 0.0 | 0.0 | 0 | 32 | op_ms 1.4 |
+| list_swap_rows | 0.0 | 0.0 | 0 | 32 | op_ms 0.7 |
+| list_remove_row | 0.0 | 0.1 | 0 | 32 | op_ms 0.6 |
+| list_clear_1k | 0.0 | 0.1 | 0 | 2 | op_ms 0.7 |
+| shapes_ramp | 3.7 | 19.7 | 16 | 3202 | n_max_60fps 1600 |
+| paths_ramp | 4.8 | 29.0 | 20 | 3202 | n_max_60fps 1600 |
+| text_ramp | 2.7 | 15.9 | 0 | 3202 | n_max_60fps 3200 |
+| images_ramp | 8.0 | 42.2 | 38 | 6402 | n_max_60fps 800 |
+| overdraw_stack | 3.4 | 3.8 | 0 | 26 | — |
+| elevation_grid | 4.1 | 4.4 | 0 | 102 | — |
+| relayout_storm | 0.2 | 0.3 | 0 | 202 | — |
+| mount_churn | 11.4 | 15.1 | 0 | 1502 | — |
+| scroll_anim | 0.3 | 0.8 | 0 | 62 | — |
+| text_rich | 0.1 | 0.2 | 0 | 182 | — |
+| chart_live | 1.6 | 1.8 | 0 | 2 | — |
+| clip_path | 0.8 | 0.9 | 0 | 482 | — |
+| theme_switch | 0.2 | 1.3 | 0 | 363 | — |
+| backdrop_scroll | 3.0 | 3.6 | 0 | 81 | — |
+| input_latency | 0.1 | 4.5 | 0 | 16 | latency_frames 1, latency_ms 4.5 |
+| pointer_storm | 23.4 | 46.8 | 120 | 502 | hit_tests_per_frame 1000 |
+| semantics_build | 5.2 | 12.6 | 0 | 1002 | nodes_per_frame 1001 |
+| app_switch | 0.3 | 12.3 | 0 | 213 | teardown_ms 0.2, resume_ms 11.8 |
+
+Reading the v2 additions: `op_ms` ranks the ops as expected (create/replace
+≫ update/swap/remove/clear — a full 1000-row model build costs ~30× a
+targeted mutation, virtualization on). The ramps degrade monotonically and
+split the workloads (`text_ramp` stays at 60 fps through 3200 texts; image
+sampling breaks at 1600). `pointer_storm` is the only scene fully over the
+60 Hz budget — 1000 synchronous move-event dispatches/frame dominate.
 
 Compose side: `bench/runners/compose/run.sh` (all 9 scenes, one process).
 Klaxon side: `zig build bench` (`scripts/bench.sh`), same session. Qt side:
