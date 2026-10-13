@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "relayout_storm",
+      "frame_time_avg_ms": 6.1,
+      "frame_time_p50_ms": 6.0,
+      "frame_time_p99_ms": 7.8,
+      "frame_time_p999_ms": 8.3,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 162.9,
+      "draw_calls_per_frame": 401,
+      "rss_mb": 243.0,
+      "ttff_ms": 20.8,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:50:02Z"
+}

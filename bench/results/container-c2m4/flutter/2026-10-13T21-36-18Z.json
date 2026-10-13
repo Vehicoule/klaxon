@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "overdraw_stack",
+      "frame_time_avg_ms": 1.2,
+      "frame_time_p50_ms": 1.2,
+      "frame_time_p99_ms": 2.0,
+      "frame_time_p999_ms": 2.0,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 829.5,
+      "draw_calls_per_frame": 73,
+      "rss_mb": 223.0,
+      "ttff_ms": 12.5,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:36:18Z"
+}

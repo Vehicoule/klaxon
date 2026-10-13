@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "list_update_10th",
+      "frame_time_avg_ms": 2.5,
+      "frame_time_p50_ms": 2.4,
+      "frame_time_p99_ms": 4.7,
+      "frame_time_p999_ms": 4.7,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 400.6,
+      "draw_calls_per_frame": 104,
+      "rss_mb": 243.5,
+      "ttff_ms": 19.9,
+      "frames_rendered": 70,
+      "extra": {"op_ms":1.015}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:35:22Z"
+}

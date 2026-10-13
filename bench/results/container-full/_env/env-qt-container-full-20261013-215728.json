@@ -1,0 +1,8 @@
+{
+  "config": "container-full",
+  "framework": "qt",
+  "timestamp": "2026-10-13T21:57:51Z",
+  "cpus_quota": "9/800000 100000",
+  "memory_max": "17179869184",
+  "kernel": "Linux 6.18.35 aarch64"
+}

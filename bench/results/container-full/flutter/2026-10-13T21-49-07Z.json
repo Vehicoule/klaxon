@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "list_swap_rows",
+      "frame_time_avg_ms": 1.7,
+      "frame_time_p50_ms": 1.6,
+      "frame_time_p99_ms": 3.3,
+      "frame_time_p999_ms": 3.3,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 598.6,
+      "draw_calls_per_frame": 104,
+      "rss_mb": 243.6,
+      "ttff_ms": 19.3,
+      "frames_rendered": 70,
+      "extra": {"op_ms":0.783}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:49:07Z"
+}

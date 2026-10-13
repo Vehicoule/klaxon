@@ -66,53 +66,70 @@ def extra_summary(sc):
 
 
 def load_reports():
-    """Return {framework: {scene: metrics-dict, ...}, ...} plus metadata.
+    """Return {config: {framework: {scene: metrics-dict, ...}, ...}}.
 
-    All JSON files of a framework are MERGED (union of scenes; a later file
-    overrides an earlier one for the same scene) — some runners write one
-    report per scene, others a single all-scenes report.
+    Two-level layout: bench/results/<config>/<framework>/*.json — config is
+    the run environment ("container-full", "ios-sim", …). Legacy flat files
+    (results/*.json → klaxon) and legacy framework dirs (results/<fw>/*.json
+    — they contain .json directly) map to config "macos". Dirs holding only
+    subdirectories are configs; dirs named _* are ignored.
+
+    All JSON files of a framework inside a config are MERGED (union of
+    scenes; a later file overrides an earlier one for the same scene) — some
+    runners write one report per scene, others a single all-scenes report.
     """
-    raw = {}  # framework -> list of (timestamp, path, data)
-    # Flat files = Klaxon's own runner.
-    for path in glob.glob(os.path.join(RESULTS, "*.json")):
+    raw = {}  # config -> framework -> list of (timestamp, path, data)
+
+    def ingest(cfg, fw, path):
         try:
             with open(path) as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
+            return
+        raw.setdefault(cfg, {}).setdefault(fw, []).append(
+            (data.get("timestamp", ""), path, data))
+
+    # Flat files = Klaxon's own runner (legacy macOS layout).
+    for path in glob.glob(os.path.join(RESULTS, "*.json")):
+        ingest("macos", "klaxon", path)
+    for first in sorted(glob.glob(os.path.join(RESULTS, "*"))):
+        if not os.path.isdir(first) or os.path.basename(first).startswith("_"):
             continue
-        raw.setdefault("klaxon", []).append((data.get("timestamp", ""), path, data))
-    # Per-framework directories.
-    for fw_dir in sorted(glob.glob(os.path.join(RESULTS, "*"))):
-        if not os.path.isdir(fw_dir):
-            continue
-        fw = os.path.basename(fw_dir)
-        for path in glob.glob(os.path.join(fw_dir, "*.json")):
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
-            raw.setdefault(fw, []).append((data.get("timestamp", ""), path, data))
+        name = os.path.basename(first)
+        if glob.glob(os.path.join(first, "*.json")):
+            # Legacy framework dir → macOS config.
+            for path in glob.glob(os.path.join(first, "*.json")):
+                ingest("macos", name, path)
+        else:
+            # Config dir → framework subdirs.
+            for fw_dir in sorted(glob.glob(os.path.join(first, "*"))):
+                if not os.path.isdir(fw_dir):
+                    continue
+                fw = os.path.basename(fw_dir)
+                for path in glob.glob(os.path.join(fw_dir, "*.json")):
+                    ingest(name, fw, path)
     out = {}
-    for fw, entries in raw.items():
-        entries.sort(key=lambda e: e[0])  # oldest first — later overrides
-        scenes = {}
-        binary = 0
-        paths = []
-        last_ts = ""
-        for ts, path, data in entries:
-            for s in data.get("scenes", []):
-                scenes[s["name"]] = s
-            if data.get("binary_size_bytes"):
-                binary = data["binary_size_bytes"]
-            paths.append(os.path.relpath(path, ROOT))
-            last_ts = ts or last_ts
-        out[fw] = {
-            "scenes": scenes,
-            "binary_size_bytes": binary,
-            "timestamp": last_ts,
-            "path": ", ".join(paths) if len(paths) <= 3 else f"{len(paths)} reports ({paths[0]} … {paths[-1]})",
-        }
+    for cfg, fws in raw.items():
+        out[cfg] = {}
+        for fw, entries in fws.items():
+            entries.sort(key=lambda e: e[0])  # oldest first — later overrides
+            scenes = {}
+            binary = 0
+            paths = []
+            last_ts = ""
+            for ts, path, data in entries:
+                for s in data.get("scenes", []):
+                    scenes[s["name"]] = s
+                if data.get("binary_size_bytes"):
+                    binary = data["binary_size_bytes"]
+                paths.append(os.path.relpath(path, ROOT))
+                last_ts = ts or last_ts
+            out[cfg][fw] = {
+                "scenes": scenes,
+                "binary_size_bytes": binary,
+                "timestamp": last_ts,
+                "path": ", ".join(paths) if len(paths) <= 3 else f"{len(paths)} reports ({paths[0]} … {paths[-1]})",
+            }
     return out
 
 
@@ -157,15 +174,14 @@ def console_table(reports, scenes):
     return "\n".join(lines)
 
 
-def html_report(reports, scenes):
-    fw_names = sorted(reports)
+def html_report(configs):
     esc = html.escape
     parts = [
         "<!DOCTYPE html><html><head><meta charset='utf-8'>",
         "<title>Klaxon benchmarks — cross-framework report</title>",
         "<style>",
         "body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;color:#1a1a2e;background:#fafaff}",
-        "h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:2rem}",
+        "h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:2rem} h3{font-size:.95rem;color:#444}",
         "table{border-collapse:collapse;margin:1rem 0} th,td{border:1px solid #d5d5e5;padding:4px 10px;text-align:right;font-size:.85rem}",
         "th{background:#ececf6} td:first-child,th:first-child{text-align:left}",
         "tr:nth-child(even){background:#f4f4fa}",
@@ -174,10 +190,24 @@ def html_report(reports, scenes):
         "</style></head><body>",
         "<h1>Klaxon benchmarks — cross-framework report</h1>",
         f"<p class='meta'>Generated {datetime.now().isoformat(timespec='seconds')} — "
-        f"{len(fw_names)} frameworks, {len(scenes)} scenes. fps = 1000/avg frame work time (unpaced).</p>",
+        f"{len(configs)} configs. fps = 1000/avg frame work time (unpaced).</p>",
     ]
+    for cfg in sorted(configs):
+        reports = configs[cfg]
+        scenes = scene_list(reports)
+        fw_names = sorted(reports)
+        parts.append(f"<h2>{esc(cfg)}</h2>")
+        parts.append(f"<p class='meta'>{len(fw_names)} frameworks, {len(scenes)} scenes</p>")
+        parts.append(config_section(reports, scenes, fw_names))
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def config_section(reports, scenes, fw_names):
+    esc = html.escape
+    parts = []
     # Summary table: fps per framework x scene, with bars scaled to the best.
-    parts.append("<h2>fps (higher is better)</h2><table><tr><th>scene</th>")
+    parts.append("<h3>fps (higher is better)</h3><table><tr><th>scene</th>")
     for fw in fw_names:
         parts.append(f"<th>{esc(fw)}</th>")
     parts.append("</tr>")
@@ -201,7 +231,7 @@ def html_report(reports, scenes):
     # Detailed metrics per framework.
     for fw in fw_names:
         r = reports[fw]
-        parts.append(f"<h2>{esc(fw)}</h2>")
+        parts.append(f"<h3>{esc(fw)}</h3>")
         parts.append(f"<p class='meta'>report: {esc(r['path'])} — {esc(r['timestamp'])} — "
                      f"binary {r['binary_size_bytes']/1e6:.2f} MB</p>")
         parts.append("<table><tr><th>scene</th>")
@@ -218,7 +248,6 @@ def html_report(reports, scenes):
             parts.append(f"<td class='meta'>{esc(extra_summary(sc))}</td>")
             parts.append("</tr>")
         parts.append("</table>")
-    parts.append("</body></html>")
     return "\n".join(parts)
 
 
@@ -227,15 +256,17 @@ def main():
     ap.add_argument("--out", default=os.path.join(ROOT, "bench", "report.html"))
     args = ap.parse_args()
 
-    reports = load_reports()
-    if not reports:
+    configs = load_reports()
+    if not configs:
         raise SystemExit(f"no reports found under {RESULTS}")
-    scenes = scene_list(reports)
 
-    print(console_table(reports, scenes))
+    for cfg in sorted(configs):
+        reports = configs[cfg]
+        print(f"\n=== {cfg} ===")
+        print(console_table(reports, scene_list(reports)))
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        f.write(html_report(reports, scenes))
+        f.write(html_report(configs))
     print(f"\nwrote {os.path.relpath(args.out, ROOT)}")
 
 

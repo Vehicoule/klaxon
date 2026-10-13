@@ -70,11 +70,15 @@
 #include <QQuickView>
 #include <QTextStream>
 
+#if defined(__APPLE__)
 #include <mach/mach.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "BenchDriver.h"
@@ -168,14 +172,31 @@ struct Metrics {
 
 using Clock = std::chrono::steady_clock;
 
-// Resident set size in MB — mach_task_basic_info's resident_size, the same
-// source devtools.readRssMbMac uses.
+// Resident set size in MB — mach_task_basic_info's resident_size on macOS
+// (same source devtools.readRssMbMac uses), /proc/self/status VmRSS on Linux.
 double readRssMb() {
+#if defined(__APPLE__)
     mach_task_basic_info_data_t info;
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
         return 0.0;
     return double(info.resident_size) / (1024.0 * 1024.0);
+#elif defined(__linux__)
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0.0;
+    double mb = 0.0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            mb = strtod(line + 6, nullptr) / 1024.0;
+            break;
+        }
+    }
+    fclose(f);
+    return mb;
+#else
+    return 0.0;
+#endif
 }
 
 // The draw-call estimate: visible QQuickItems under the scene's root item

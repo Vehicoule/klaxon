@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "text_cjk",
+      "frame_time_avg_ms": 2.9,
+      "frame_time_p50_ms": 2.6,
+      "frame_time_p99_ms": 5.0,
+      "frame_time_p999_ms": 5.2,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 344.1,
+      "draw_calls_per_frame": 11,
+      "rss_mb": 251.0,
+      "ttff_ms": 20.7,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:34:54Z"
+}

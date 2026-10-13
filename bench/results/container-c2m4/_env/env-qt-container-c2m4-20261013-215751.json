@@ -1,0 +1,8 @@
+{
+  "config": "container-c2m4",
+  "framework": "qt",
+  "timestamp": "2026-10-13T21:58:14Z",
+  "cpus_quota": "3/200000 100000",
+  "memory_max": "4294967296",
+  "kernel": "Linux 6.18.35 aarch64"
+}

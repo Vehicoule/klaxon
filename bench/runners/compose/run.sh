@@ -22,7 +22,16 @@ set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../../.. && pwd)"
 
-export JAVA_HOME=/opt/homebrew/opt/openjdk@21
+# JAVA_HOME: Homebrew openjdk@21 on macOS (system /usr/bin/java can be a
+# broken stub); on Linux fall back to the distro JDK via `readlink java`.
+if [ -z "${JAVA_HOME:-}" ]; then
+  if [ -d /opt/homebrew/opt/openjdk@21 ]; then
+    JAVA_HOME=/opt/homebrew/opt/openjdk@21
+  else
+    JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+  fi
+fi
+export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
 
 # Build chatter goes to stderr so the JSON report on stdout stays clean.
