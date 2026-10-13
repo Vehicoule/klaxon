@@ -431,6 +431,11 @@ The advanced widgets (Table, Tree, Calendar, DatePicker, ColorPicker, Avatar, Ca
 
 ### 5a. CLI
 
+✅ `tools/klaxon/main.zig` — `zig build cli` → `zig-out/bin/klaxon`. Commands
+below exist and are verified on macOS arm64 (`klaxon create` verified
+end-to-end: scaffolded app builds + runs against the repo as a path
+dependency). See docs/BUILD.md.
+
 | Command | Description |
 |---|---|
 | `klaxon create <name>` | Scaffold a new project from template |
