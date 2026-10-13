@@ -235,6 +235,17 @@ pub const Host = struct {
                 sdl.c.SDL_HINT_OVERRIDE,
             );
         }
+        // Linux Vulkan leg is only possible when the video driver answers
+        // the extension probe — loading the lib succeeds even under the
+        // dummy driver, but GetInstanceExtensions reflects the driver's
+        // actual surface support. The probe ref is released again — the
+        // shim does its own LoadLibrary inside kx.create. Unused off linux.
+        var vk_ext_count: c_uint = 0;
+        const vulkan_possible = is_linux and
+            (backend == kx.c.KX_BACKEND_GRAPHITE_VULKAN or backend == kx.c.KX_BACKEND_AUTO) and
+            sdl.c.SDL_Vulkan_LoadLibrary(null) and
+            (sdl.c.SDL_Vulkan_GetInstanceExtensions(&vk_ext_count) != null and vk_ext_count > 0);
+        if (vulkan_possible) sdl.c.SDL_Vulkan_UnloadLibrary();
         const window_flags: u64 = if (is_emscripten)
             // OPENGL claims the canvas for WebGL2 — WebGPU/raster must not
             // set it (single context type per canvas).
@@ -260,14 +271,27 @@ pub const Host = struct {
             else
                 sdl.c.SDL_WINDOW_METAL | sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY
         else if (is_linux)
-            // OPENGL when a GL-capable backend is requested (explicit or
-            // AUTO's chain member) — raster stays on the software renderer.
-            if (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO)
+            // AUTO/graphite-vulkan: VULKAN window first — no GL context is
+            // created for the Vulkan attempt (SDL_Vulkan_CreateSurface
+            // requires the flag). Only when the driver can actually serve
+            // Vulkan: a VULKAN-flagged create on a driver without surface
+            // support (dummy/headless) leaves SDL video half-initialized and
+            // even a plain-window retry then fails. The extension probe is
+            // the driver's own capability answer. Explicit ganesh-gl:
+            // OPENGL. Raster stays on the software renderer.
+            if (vulkan_possible)
+                sdl.c.SDL_WINDOW_VULKAN
+            else if (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO)
                 sdl.c.SDL_WINDOW_OPENGL
             else
                 0
         else
             0;
+        // Linux only: the first window carries SDL_WINDOW_VULKAN — if the
+        // backend chain falls through to raster, the ganesh-gl leg is retried
+        // below on a recreated OPENGL window (see the retry block after
+        // kx_create).
+        const vulkan_window_first = is_linux and vulkan_possible;
         // Android: SDLActivity starts the SDL thread only once the surface is
         // ready, but it never creates an SDL window object — the app must call
         // SDL_CreateWindow (SDL attaches the activity's surface; Android
@@ -330,19 +354,27 @@ pub const Host = struct {
         // Emscripten (wasm) + Android + Linux-GL: create the GL context and
         // make it current BEFORE kx.create — gpu_init checks
         // SDL_GL_GetCurrentContext. iOS/macOS Metal: no GL context (Metal
-        // view instead). Raster: none.
+        // view instead). Linux AUTO/graphite-vulkan: deliberately none — the
+        // Vulkan attempt must not have a GL context; if it fails, the GL leg
+        // is retried on a recreated OPENGL window below. Raster: none.
         var gl_ctx: sdl.c.SDL_GLContext = null;
         // wasm: only WebGL2 claims the canvas via GL — Graphite WebGPU and
         // raster must NOT create a GL context (a canvas supports exactly one
         // context type; WebGL first would make navigator.gpu fail). iOS has
-        // no GL path. Linux AUTO may still resolve to GL → request it too.
+        // no GL path. Linux AUTO takes the Vulkan window first — no GL
+        // context on that leg; the GL retry happens on a recreated OPENGL
+        // window if the chain settles on raster. AUTO without a usable
+        // Vulkan driver goes straight to an OPENGL window and needs the
+        // context now — ganesh-gl is the next leg.
+        const linux_gl_first = is_linux and
+            (backend == kx.c.KX_BACKEND_GANESH_GL or (backend == kx.c.KX_BACKEND_AUTO and !vulkan_possible));
         const need_gl = is_android or
             (is_emscripten and backend == kx.c.KX_BACKEND_GANESH_WEBGL2) or
-            (is_linux and (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO));
+            linux_gl_first;
         if (need_gl) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);
             if (gl_ctx == null) {
-                if (is_linux and (backend == kx.c.KX_BACKEND_GANESH_GL or backend == kx.c.KX_BACKEND_AUTO)) {
+                if (linux_gl_first) {
                     // Linux GPU is optional: no GL context (headless, missing
                     // driver) → recreate the window without OPENGL and run
                     // raster instead of failing.
@@ -390,12 +422,68 @@ pub const Host = struct {
 
         // kx_create walks the backend fallback chain internally (explicit
         // request → itself → raster; AUTO → full platform chain → raster).
-        const ctx = kx.create(@ptrCast(window), pixel_w, pixel_h, resolved_backend) orelse {
+        var ctx = kx.create(@ptrCast(window), pixel_w, pixel_h, resolved_backend) orelse {
             log("kx_create failed (backend {s})", .{kx.c.kx_backend_name(resolved_backend)});
             return error.KxCreate;
         };
         resolved_backend = kx.c.kx_backend_of(ctx); // the backend that actually won
         errdefer kx.c.kx_destroy(ctx);
+
+        // Linux Vulkan-first windows carry no GL context, so the AUTO
+        // chain's ganesh-gl leg could not actually run (gpu_init needs a
+        // current SDL GL context) — if the chain settled on raster, retry
+        // the GL leg on a recreated OPENGL window before settling. An
+        // explicit graphite-vulkan that fell through to raster also gets a
+        // plain window (the VULKAN flag is meaningless without the shim's
+        // swapchain).
+        if (vulkan_window_first and resolved_backend == kx.c.KX_BACKEND_RASTER) {
+            if (backend == kx.c.KX_BACKEND_AUTO) {
+                const gl_window = sdl.c.SDL_CreateWindow("klaxon hello", width, height, sdl.c.SDL_WINDOW_OPENGL) orelse {
+                    log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                    return error.SdlWindow;
+                };
+                const new_gl = sdl.c.SDL_GL_CreateContext(gl_window);
+                if (new_gl == null) {
+                    // No GL either — keep the raster ctx (it never references
+                    // the window) and settle on a plain window.
+                    log("SDL_GL_CreateContext failed ({s}) — staying on raster", .{sdl.c.SDL_GetError()});
+                    sdl.c.SDL_DestroyWindow(gl_window);
+                    const plain = sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse {
+                        log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                        return error.SdlWindow;
+                    };
+                    sdl.c.SDL_DestroyWindow(window);
+                    window = plain;
+                    if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+                } else {
+                    _ = sdl.c.SDL_GL_MakeCurrent(gl_window, new_gl);
+                    _ = sdl.c.SDL_GL_SetSwapInterval(0); // the platform paces the loop
+                    const gl_kx = kx.create(@ptrCast(gl_window), pixel_w, pixel_h, kx.c.KX_BACKEND_GANESH_GL) orelse {
+                        _ = sdl.c.SDL_GL_DestroyContext(new_gl);
+                        sdl.c.SDL_DestroyWindow(gl_window);
+                        log("kx_create retry failed (backend ganesh-gl)", .{});
+                        return error.KxCreate;
+                    };
+                    // Swap succeeded — drop the transient raster ctx and the
+                    // vulkan window.
+                    kx.c.kx_destroy(ctx);
+                    sdl.c.SDL_DestroyWindow(window);
+                    ctx = gl_kx;
+                    window = gl_window;
+                    gl_ctx = new_gl;
+                    resolved_backend = kx.c.kx_backend_of(ctx);
+                    if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+                }
+            } else {
+                const plain = sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse {
+                    log("SDL_CreateWindow failed: {s}", .{sdl.c.SDL_GetError()});
+                    return error.SdlWindow;
+                };
+                sdl.c.SDL_DestroyWindow(window);
+                window = plain;
+                if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+            }
+        }
         const t_kx = sdl.c.SDL_GetTicksNS();
         log("init stages: sdl {d:.1} ms, window {d:.1} ms, gl-ctx {d:.1} ms, kx-create {d:.1} ms", .{
             @as(f32, @floatFromInt(t_sdl - t_init)) / 1e6,

@@ -3,3 +3,7 @@
  * SDL_main is disabled: the app provides its own main(). */
 #define SDL_MAIN_HANDLED 1
 #include <SDL3/SDL.h>
+/* SDL_vulkan.h is opt-in (SDL.h does not pull it) — the Linux
+ * graphite-vulkan host probes SDL_Vulkan_LoadLibrary/GetInstanceExtensions
+ * before flagging the window. */
+#include <SDL3/SDL_vulkan.h>
