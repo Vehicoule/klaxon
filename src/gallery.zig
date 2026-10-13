@@ -68,6 +68,9 @@ const tooltip_w = widgets.tooltip;
 const bottom_sheet_w = widgets.bottom_sheet;
 const dialog_w = widgets.dialog;
 const snackbar_w = widgets.snackbar;
+const fab_w = widgets.fab;
+const carousel_w = widgets.carousel;
+const bottom_app_bar_w = widgets.bottom_app_bar;
 
 pub const WINDOW_W: i32 = 960;
 pub const WINDOW_H: i32 = 640;
@@ -102,6 +105,10 @@ const Refs = struct {
     dp_m3e: *Node, // the M3E date picker panel (Date picker section)
     tp_m3e: *Node, // the M3E time picker panel (Time picker section)
     cp_m3e: *Node, // the M3E color picker panel (Color picker section)
+    fab_m3e: *Node, // the M3E action FAB (FABs section)
+    fab_toggle_m3e: *Node, // the M3E toggle FAB (FABs section)
+    carousel_mb: *Node, // the multi-browse carousel (Carousel section)
+    bab_fab: *Node, // the bottom app bar's docked FAB (Bottom app bar section)
     theme_toggle: *Node,
     desktop_toggle: *Node, // mobile/desktop density switch (Phase 2d-0.5)
     sb_list: *Node, // the list scrollbar (style follows the platform tokens)
@@ -187,6 +194,10 @@ pub const Gallery = struct {
     cp_color: *state.Signal(u32), // the color picker's color (0xRRGGBBAA)
     cp_changed: *state.Signal(u32), // the color picker's change counter
     ep_expanded: *state.Signal(bool), // the expansion panel's expanded state
+    // the FABs + bottom app bar's signals (M3E sections, batch 2d.5)
+    fab_toggle: *state.Signal(bool), // the toggle FAB's checked state
+    fab_press: *state.Signal(u32), // the action FAB's press counter
+    bab_press: *state.Signal(u32), // the bottom app bar's docked FAB counter
     stepper_sig: *state.Signal(usize), // the stepper's current step (M3E section)
     cal_selected: *state.Signal(?i64), // the calendar's selected day (M3E section)
     /// App hook fired after a theme/platform rebuild (the app re-reads the
@@ -224,6 +235,7 @@ pub const Gallery = struct {
     saved_scroll: f32 = 0,
     saved_list: f32 = 0,
     saved_grid: f32 = 0,
+    saved_carousel: f32 = 0, // the multi-browse carousel's scroll offset
     // the M3E text fields' entries (restored across theme switches)
     saved_tf_m3e: [5]std.array_list.Managed(u8),
     // the M3E search bar's entry (restored across theme switches)
@@ -350,6 +362,12 @@ pub const Gallery = struct {
         errdefer g.stepper_sig.deinit();
         g.cal_selected = try state.Signal(?i64).init(allocator, null);
         errdefer g.cal_selected.deinit();
+        g.fab_toggle = try state.Signal(bool).init(allocator, true);
+        errdefer g.fab_toggle.deinit();
+        g.fab_press = try state.Signal(u32).init(allocator, 0);
+        errdefer g.fab_press.deinit();
+        g.bab_press = try state.Signal(u32).init(allocator, 0);
+        errdefer g.bab_press.deinit();
         g.desktop_mode = try state.Signal(bool).init(allocator, false);
         errdefer g.desktop_mode.deinit();
         g.bg_sig = try state.Signal(Color).init(allocator, theme_mod.dark.colors.surface);
@@ -422,6 +440,7 @@ pub const Gallery = struct {
             g.saved_scroll = widgets.scroll_view.scrollOffset(g.refs.scroll_view);
             g.saved_list = widgets.list_view.scrollOffset(g.refs.list_10k);
             g.saved_grid = widgets.grid_view.scrollOffset(g.refs.grid);
+            g.saved_carousel = carousel_w.scrollOffset(g.refs.carousel_mb);
             for (g.refs.tf_m3e, 0..) |tf, i| {
                 const txt = text_field_w.text(tf);
                 g.saved_tf_m3e[i].clearRetainingCapacity();
@@ -445,6 +464,7 @@ pub const Gallery = struct {
             _ = widgets.scroll_view.setScrollOffset(g.refs.scroll_view, g.saved_scroll);
             _ = widgets.list_view.setScrollOffset(g.refs.list_10k, g.saved_list);
             _ = widgets.grid_view.setScrollOffset(g.refs.grid, g.saved_grid);
+            _ = carousel_w.setScrollOffset(g.refs.carousel_mb, g.saved_carousel);
         }
     }
 
@@ -503,6 +523,9 @@ pub const Gallery = struct {
         g.ep_expanded.deinit();
         g.stepper_sig.deinit();
         g.cal_selected.deinit();
+        g.fab_toggle.deinit();
+        g.fab_press.deinit();
+        g.bab_press.deinit();
         g.desktop_mode.deinit();
         g.bg_sig.deinit();
         g.press_count.deinit();
@@ -562,6 +585,9 @@ fn buildTree(g: *Gallery, theme: Theme) !*Node {
     content.add(try section(a, theme, "Calendar (M3E)", try buildCalendarSection(g, theme)));
     content.add(try section(a, theme, "Table (M3E)", try buildTableSection(g, theme)));
     content.add(try section(a, theme, "Tree (M3E)", try buildTreeSection(g, theme)));
+    content.add(try section(a, theme, "FABs (M3E)", try buildFabsSection(g, theme)));
+    content.add(try section(a, theme, "Carousel (M3)", try buildCarouselSection(g, theme)));
+    content.add(try section(a, theme, "Bottom app bar (M3E)", try buildBottomAppBarSection(g, theme)));
     content.add(try section(a, theme, "Navigation chrome", try buildNavSection(g, theme)));
     content.add(try section(a, theme, "Feedback", try buildFeedbackSection(g, theme)));
     content.add(try section(a, theme, "Gestures", try buildGestureSection(g, theme)));
@@ -1215,6 +1241,110 @@ fn buildTreeSection(g: *Gallery, theme: Theme) !*Node {
         },
     };
     return tree_w.tree(a, &root, null, .{ .theme = theme });
+}
+
+fn fabPressCb(userdata: ?*anyopaque) void {
+    const g = galleryOf(userdata);
+    g.fab_press.set(g.fab_press.peek() + 1);
+}
+
+fn babFabPressCb(userdata: ?*anyopaque) void {
+    const g = galleryOf(userdata);
+    g.bab_press.set(g.bab_press.peek() + 1);
+}
+
+/// FABs (M3E, batch 2d.5): the 4 sizes, the color families, a toggle FAB
+/// (the 56dp full-circle checked morph), a disabled FAB + the 3 extended
+/// FAB sizes and an action-FAB press counter.
+fn buildFabsSection(g: *Gallery, theme: Theme) !*Node {
+    const a = g.allocator;
+    const col = try layout.column(a, .{ .gap = 12 });
+    // sizes: small 40 / baseline 56 / medium 80 / large 96 + the toggle FAB
+    const r1 = try layout.row(a, .{ .gap = 16, .cross_align = .center });
+    r1.add(try fab_w.fab(a, null, null, .{ .size = .small, .a11y_label = "Small FAB", .theme = theme }));
+    const act = try fab_w.fab(a, null, .{ .fn_ptr = fabPressCb, .userdata = g }, .{ .a11y_label = "Add" });
+    g.refs.fab_m3e = act;
+    r1.add(act);
+    const tog = try fab_w.fab(a, g.fab_toggle, null, .{ .icon = .heart, .a11y_label = "Favorite" });
+    g.refs.fab_toggle_m3e = tog;
+    r1.add(tog);
+    r1.add(try fab_w.fab(a, null, null, .{ .size = .medium, .a11y_label = "Medium FAB", .theme = theme }));
+    r1.add(try fab_w.fab(a, null, null, .{ .size = .large, .a11y_label = "Large FAB", .theme = theme }));
+    col.add(r1);
+    // the press counter + the color families + disabled
+    const r2 = try layout.row(a, .{ .gap = 16, .cross_align = .center });
+    r2.add(try fab_w.fab(a, null, null, .{ .color = .secondary, .icon = .star, .a11y_label = "Secondary FAB", .theme = theme }));
+    r2.add(try fab_w.fab(a, null, null, .{ .color = .tertiary, .icon = .heart, .a11y_label = "Tertiary FAB", .theme = theme }));
+    r2.add(try fab_w.fab(a, null, null, .{ .color = .surface, .icon = .search, .a11y_label = "Surface FAB", .theme = theme }));
+    r2.add(try fab_w.fab(a, null, null, .{ .enabled = false, .a11y_label = "Disabled FAB", .theme = theme }));
+    r2.add(try text_w.BoundText(u32).text(a, g.fab_press, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    col.add(r2);
+    // extended FABs: small 56 / medium 80 / large 96 (+ a text-only one)
+    const r3 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    r3.add(try fab_w.extendedFab(a, null, .{ .size = .small, .icon = .plus, .label = "Create", .theme = theme }));
+    r3.add(try fab_w.extendedFab(a, null, .{ .size = .medium, .icon = .heart, .label = "Compose", .theme = theme }));
+    r3.add(try fab_w.extendedFab(a, null, .{ .size = .large, .icon = .star, .label = "Large", .theme = theme }));
+    col.add(r3);
+    const r4 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    r4.add(try fab_w.extendedFab(a, null, .{ .icon = null, .label = "Text only", .theme = theme }));
+    r4.add(try fab_w.extendedFab(a, null, .{ .enabled = false, .icon = .plus, .label = "Disabled", .theme = theme }));
+    col.add(r4);
+    return col;
+}
+
+/// A carousel item tile: a fixed-height themed container (the carousel
+/// lays the child out at the keyline-morph width — the container fills it).
+fn carouselItem(a: std.mem.Allocator, theme: Theme, color: Color, label: []const u8) !*Node {
+    const box = try layout.constrainedBox(a, .{ .min_h = 140, .max_h = 140 });
+    const tile = try container_w.container(a, .{ .color = color, .radius = theme.shape.large });
+    const center = try layout.center(a);
+    center.add(try text_w.text(a, label, .{ .size = 14, .color = theme.colors.on_surface }));
+    tile.add(center);
+    box.add(tile);
+    return box;
+}
+
+/// Carousel (M3, batch 2d.5): a multi-browse strip (the fitted
+/// large/medium/small keyline arrangement — drag, snap, arrow keys) and
+/// an uncontained strip (fixed item width, a cut-off item at the edge).
+fn buildCarouselSection(g: *Gallery, theme: Theme) !*Node {
+    const a = g.allocator;
+    const col = try layout.column(a, .{ .gap = 12 });
+    const palette = [_]Color{ theme.colors.primary_container, theme.colors.secondary_container, theme.colors.tertiary_container, theme.colors.surface_container_highest };
+    const labels = [_][]const u8{ "One", "Two", "Three", "Four", "Five", "Six", "Seven" };
+    // multi-browse: 7 items on the fitted keylines
+    const mb = try carousel_w.carousel(a, .{ .item_width = 186, .theme = theme, .label = "Multi-browse carousel" });
+    g.refs.carousel_mb = mb;
+    for (0..7) |i| mb.add(try carouselItem(a, theme, palette[i % palette.len], labels[i]));
+    col.add(mb);
+    col.add(try text_w.text(a, "Multi-browse — drag or use the arrow keys (snaps to the focal item)", .{ .size = 12, .color = theme.colors.on_surface_variant }));
+    // uncontained: a fixed item width with a partially-visible edge item
+    const uc = try carousel_w.carousel(a, .{ .variant = .uncontained, .item_width = 150, .theme = theme, .label = "Uncontained carousel" });
+    for (0..6) |i| uc.add(try carouselItem(a, theme, palette[(i + 1) % palette.len], labels[i]));
+    col.add(uc);
+    col.add(try text_w.text(a, "Uncontained — fixed 150dp slots, the end item cuts off", .{ .size = 12, .color = theme.colors.on_surface_variant }));
+    return col;
+}
+
+/// Bottom app bar (M3E, batch 2d.5): the 80dp surface_container bar —
+/// an actions row at the start edge, a FAB docked 16dp from the end.
+fn buildBottomAppBarSection(g: *Gallery, theme: Theme) !*Node {
+    const a = g.allocator;
+    const col = try layout.column(a, .{ .gap = 12 });
+    const actions = try layout.row(a, .{ .gap = 4 });
+    actions.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .menu, .a11y_label = "Menu", .theme = theme }));
+    actions.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .search, .a11y_label = "Search", .theme = theme }));
+    actions.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .star, .a11y_label = "Star", .theme = theme }));
+    const docked = try fab_w.fab(a, null, .{ .fn_ptr = babFabPressCb, .userdata = g }, .{ .icon = .plus, .a11y_label = "Add" });
+    g.refs.bab_fab = docked;
+    col.add(try bottom_app_bar_w.bottomAppBar(a, .{ .theme = theme, .actions = actions, .fab = docked }));
+    col.add(try text_w.BoundText(u32).text(a, g.bab_press, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    // the plain bar (no FAB) — actions only
+    const actions2 = try layout.row(a, .{ .gap = 4 });
+    actions2.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .home, .a11y_label = "Home", .theme = theme }));
+    actions2.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .heart, .a11y_label = "Favorite", .theme = theme }));
+    col.add(try bottom_app_bar_w.bottomAppBar(a, .{ .theme = theme, .actions = actions2 }));
+    return col;
 }
 
 /// Navigation chrome (M3E batch 1): AppBar, NavBar, Tabs, Drawer.
@@ -2686,6 +2816,46 @@ test "gallery: feedback — tooltip, bottom sheet, dialog and snackbar are wired
     try std.testing.expect(!g.snack_visible.peek());
     tl.tick(4300); // the hide tween settled
     try std.testing.expect(!snack.visible);
+}
+
+test "gallery: FABs + carousel + bottom app bar are wired (batch 2d.5)" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    var g = try Gallery.init(std.testing.allocator);
+    defer g.deinit();
+    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(WINDOW_W), .h = @floatFromInt(WINDOW_H) });
+    const sv = g.refs.scroll_view;
+    // the FABs section: the action FAB fires its counter, the toggle FAB
+    // flips its signal
+    const fb = g.refs.fab_m3e.bounds;
+    const tb = g.refs.fab_toggle_m3e.bounds;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, fb.y - sv.bounds.y));
+    const sy = widgets.scroll_view.scrollOffset(sv);
+    try std.testing.expectEqual(@as(u32, 0), g.fab_press.peek());
+    try std.testing.expect(g.fab_toggle.peek()); // starts checked
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = fb.x + fb.w / 2, .y = fb.y + fb.h / 2 - sy });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = fb.x + fb.w / 2, .y = fb.y + fb.h / 2 - sy });
+    try std.testing.expectEqual(@as(u32, 1), g.fab_press.peek());
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = tb.x + tb.w / 2, .y = tb.y + tb.h / 2 - sy });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = tb.x + tb.w / 2, .y = tb.y + tb.h / 2 - sy });
+    try std.testing.expect(!g.fab_toggle.peek()); // clicked -> unchecked
+    // the carousel: a horizontal drag moves the strip
+    const cb = g.refs.carousel_mb.bounds;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, cb.y - sv.bounds.y));
+    const sy2 = widgets.scroll_view.scrollOffset(sv);
+    try std.testing.expectEqual(@as(f32, 0), carousel_w.scrollOffset(g.refs.carousel_mb));
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = cb.x + cb.w / 2, .y = cb.y + cb.h / 2 - sy2 });
+    router.dispatchPointer(g.root, .{ .phase = .move, .x = cb.x + cb.w / 2 - 60, .y = cb.y + cb.h / 2 - sy2 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = cb.x + cb.w / 2 - 60, .y = cb.y + cb.h / 2 - sy2 });
+    try std.testing.expect(carousel_w.scrollOffset(g.refs.carousel_mb) > 0);
+    // the bottom app bar's docked FAB fires its counter
+    const bb = g.refs.bab_fab.bounds;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, bb.y - sv.bounds.y));
+    const sy3 = widgets.scroll_view.scrollOffset(sv);
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = bb.x + bb.w / 2, .y = bb.y + bb.h / 2 - sy3 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = bb.x + bb.w / 2, .y = bb.y + bb.h / 2 - sy3 });
+    try std.testing.expectEqual(@as(u32, 1), g.bab_press.peek());
 }
 
 test "gallery: the 10k list stays virtualized after a big scroll" {
