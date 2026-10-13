@@ -363,14 +363,18 @@ pub const Host = struct {
         // context type; WebGL first would make navigator.gpu fail). iOS has
         // no GL path. Linux AUTO takes the Vulkan window first — no GL
         // context on that leg; the GL retry happens on a recreated OPENGL
-        // window if the chain settles on raster.
+        // window if the chain settles on raster. AUTO without a usable
+        // Vulkan driver goes straight to an OPENGL window and needs the
+        // context now — ganesh-gl is the next leg.
+        const linux_gl_first = is_linux and
+            (backend == kx.c.KX_BACKEND_GANESH_GL or (backend == kx.c.KX_BACKEND_AUTO and !vulkan_possible));
         const need_gl = is_android or
             (is_emscripten and backend == kx.c.KX_BACKEND_GANESH_WEBGL2) or
-            (is_linux and backend == kx.c.KX_BACKEND_GANESH_GL);
+            linux_gl_first;
         if (need_gl) {
             gl_ctx = sdl.c.SDL_GL_CreateContext(window);
             if (gl_ctx == null) {
-                if (is_linux and backend == kx.c.KX_BACKEND_GANESH_GL) {
+                if (linux_gl_first) {
                     // Linux GPU is optional: no GL context (headless, missing
                     // driver) → recreate the window without OPENGL and run
                     // raster instead of failing.
