@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "input_latency",
+      "frame_time_avg_ms": 0.2,
+      "frame_time_p50_ms": 0.2,
+      "frame_time_p99_ms": 0.3,
+      "frame_time_p999_ms": 0.4,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 6035.0,
+      "draw_calls_per_frame": 8,
+      "rss_mb": 137.1,
+      "ttff_ms": 7.4,
+      "frames_rendered": 130,
+      "extra": {"latency_ms":9.039,"latency_frames":1}
+    }
+  ],
+  "binary_size_bytes": 132896,
+  "timestamp": "2026-10-13T18:54:13Z"
+}

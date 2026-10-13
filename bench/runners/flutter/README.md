@@ -2,7 +2,8 @@
 
 Renders the same scenes as Klaxon's own bench (`src/bench.zig`,
 `src/bench_main.zig`, `docs/specs/bench-scenes.md`) through Flutter on
-macOS, collects the same metrics, and emits the **same JSON report**
+macOS **and on Linux (headless under Xvfb — the containerized raster
+tier)**, collects the same metrics, and emits the **same JSON report**
 (schema v2), so Klaxon and Flutter can be compared head-to-head. This
 directory is self-contained: it does not touch `src/`, `kx_skia/`,
 `build.zig`, or `scripts/`.
@@ -14,10 +15,13 @@ bench/runners/flutter/run.sh                 # build (first time) + run all 33 s
 bench/runners/flutter/run.sh hello anim_100  # run a subset
 ```
 
-`run.sh` runs `flutter build macos --release` on first use (the first build
-downloads ~1 GB of engine artifacts and takes a while), then runs the built
-.app once **per scene** from the repo root. Each run prints the JSON report
-to stdout and writes it to `bench/results/flutter/<ISO8601-timestamp>.json`
+`run.sh` detects the host OS. On **macOS** it runs `flutter build macos
+--release` on first use (the first build downloads ~1 GB of engine
+artifacts and takes a while), then runs the built .app once **per scene**
+from the repo root. On **Linux** it runs `flutter build linux --release`
+and launches the GTK bundle — under `xvfb-run` when no `DISPLAY` is set
+(see "Linux headless" below). Each run prints the JSON report to stdout and
+writes it to `bench/results/flutter/<ISO8601-timestamp>.json`
 (colons in the timestamp are replaced with `-` for filesystem safety; the
 output directory can be overridden with `KLAXON_BENCH_OUT_DIR`).
 
@@ -29,6 +33,57 @@ APP=bench/runners/flutter/build/macos/Build/Products/Release/klaxon_bench.app
 "$APP/Contents/MacOS/klaxon_bench" hello     # one scene
 "$APP/Contents/MacOS/klaxon_bench"           # all 33
 ```
+
+## Linux headless
+
+The Linux platform dir (`linux/`, from `flutter create --platforms linux`)
+lets the same runner build as a GTK app and render under **Xvfb** — the
+containerized tier where no real display or GPU exists. GTK/Flutter picks
+Mesa's software rasterizer (`LIBGL_ALWAYS_SOFTWARE=1`) so every scene is
+raster-rendered, matching the suite's raster contract. The JSON report is
+byte-for-byte the same schema v2 as the macOS run.
+
+Deps (Debian/Ubuntu, aarch64 or x86_64):
+
+```sh
+apt-get install clang cmake ninja-build pkg-config libgtk-3-dev \
+                xvfb xauth libgl1-mesa-dri fonts-noto-cjk fonts-noto-core
+# xauth — xvfb-run's own dependency; missing on minimal images.
+# + a flutter SDK on PATH (or FLUTTER=/opt/flutter/bin/flutter)
+```
+
+The `fonts-noto-*` packages give the CJK/Arabic fallback chains a real
+font under Linux (see "Known non-parities"); without them `text_cjk` and
+the `text_rich` bidi line render as tofu boxes.
+
+Invocation — identical to macOS; `run.sh` handles the Xvfb wrapping:
+
+```sh
+bench/runners/flutter/run.sh            # xvfb-run + all 33 scenes
+bench/runners/flutter/run.sh anim_100   # one scene
+```
+
+Equivalent manual invocation (what run.sh does when `DISPLAY` is unset):
+
+```sh
+cd bench/runners/flutter && flutter build linux --release
+cd ../../..
+xvfb-run -a -s "-screen 0 800x600x24" \
+  env LIBGL_ALWAYS_SOFTWARE=1 \
+  bench/runners/flutter/build/linux/*/release/bundle/klaxon_bench hello
+```
+
+Notes:
+
+- `linux/runner/my_application.cc` fixes the viewport the same way macOS
+  does: `gtk_window_set_default_size(640, 480)` for the no-WM Xvfb case
+  plus `gtk_widget_set_size_request(view, 640, 480)` so a decorated window
+  keeps the Flutter surface itself at 640×480.
+- If a `DISPLAY` is already set (inside an existing Xvfb session or a real
+  desktop), `run.sh` runs the bundle directly — no nested X server.
+- `dart:io` use is portable: `ProcessInfo.currentRss`,
+  `Platform.resolvedExecutable`, `/dev/stdout` all work identically on
+  Linux; there are no macOS-only assumptions in `lib/`.
 
 ## Scene mapping
 
@@ -105,8 +160,10 @@ warmup overrides the global 10+120 contract per spec). `extra.ramp[]` =
 
 ## Methodology
 
-- **Viewport**: the macOS window is fixed at **640x480 logical points**
-  (`macos/Runner/MainFlutterWindow.swift` sets the content size). Every scene
+- **Viewport**: the window is fixed at **640x480 logical points**
+  (`macos/Runner/MainFlutterWindow.swift` sets the content size;
+  `linux/runner/my_application.cc` sets the same via
+  `gtk_window_set_default_size` + a view size request). Every scene
   renders inside a fixed 640x480 `SizedBox` centered in the window, inside a
   `RepaintBoundary` (so the forced per-frame repaint is scoped to the scene,
   like Klaxon painting only its tree). The harness chrome is minimal
@@ -224,6 +281,18 @@ warmup overrides the global 10+120 contract per spec). `extra.ramp[]` =
 17. **list_ops frames_rendered = 70 / ramp = 270**: per the spec these
     families measure 60 post-op frames and 9x30 stepped frames
     respectively, not the default 130.
+18. **Linux/Xvfb raster path**: under `xvfb-run` + `LIBGL_ALWAYS_SOFTWARE=1`
+    the GTK embedder renders through Mesa llvmpipe (software GL), not
+    Impeller-on-Metal — raster-bound scene times are not comparable to the
+    macOS numbers 1:1 (the same caveat as any cross-runner raster
+    comparison). DPR is 1 under Xvfb (vs 2x retina on macOS), so
+    raster-bound scenes also draw ~4x fewer pixels.
+19. **Linux fonts**: `text_cjk` needs `fonts-noto-cjk` ('Noto Sans CJK SC'
+    is already in its fallback chain); `text_rich`'s bidi line falls back
+    through 'Noto Naskh Arabic'/'Noto Sans Arabic'/'DejaVu Sans' after the
+    macOS fonts. Missing fonts degrade to tofu boxes — metrics still run
+    but shaping cost drops, so install the Noto packages for comparable
+    numbers.
 
 ## Files
 
@@ -235,10 +304,14 @@ bench/runners/flutter/
 │                            bases (list_ops_base, ramp_base, gallery_tree)
 ├── macos/                   flutter create --platforms macos scaffold
 │   └── Runner/MainFlutterWindow.swift   fixed 640x480 window
-├── run.sh                   build + run all scenes, save JSONs
+├── linux/                   flutter create --platforms linux scaffold (GTK/Xvfb)
+│   └── runner/my_application.cc         fixed 640x480 window + view size request
+├── run.sh                   build + run all scenes, save JSONs (macOS + Linux)
 ├── pubspec.yaml
 └── .gitignore               (.dart_tool/, build/, macos/Flutter/ephemeral, ...)
 bench/results/flutter/       one JSON report per run (committed)
 ```
 
-Do not commit `build/` or `.dart_tool/` (gitignored).
+Do not commit `build/` or `.dart_tool/` (gitignored). The scaffold's
+`test/` widget test is removed — it references the counter template, not
+this app.

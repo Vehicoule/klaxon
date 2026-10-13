@@ -15,10 +15,15 @@ import 'package:flutter/material.dart';
 
 import '../harness.dart';
 
-/// Fallback chain for the Arabic bidi line (macOS system fonts).
+/// Fallback chain for the Arabic bidi line (macOS system fonts first, then
+/// the Linux/Noto names — fontFamilyFallback is order-preserving, so the
+/// extra entries are no-ops on macOS and only matter under Linux/Xvfb).
 const List<String> _arabicFallback = <String>[
   'Geeza Pro',
   'Al Nile',
+  'Noto Naskh Arabic',
+  'Noto Sans Arabic',
+  'DejaVu Sans',
   'Arial',
 ];
 
