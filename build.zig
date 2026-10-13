@@ -84,6 +84,16 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&b.addInstallFile(b.path(dat), "bin/icudtl.dat").step);
     }
 
+    // --- external app mode (Phase 5a) ---
+    // `klaxon create`d projects depend on klaxon and pass -Dapp-root=<their
+    // root>: the app's src/main.zig is compiled here as the "app" artifact,
+    // with the framework exposed as the "klaxon" module (@import("klaxon")).
+    // None of the in-repo apps/test steps are registered in this mode.
+    if (b.option([]const u8, "app-root", "external project root — builds <app-root>/src/main.zig as the 'app' artifact")) |app_root| {
+        addExternalApp(b, target, optimize, translate_sdl, translate_kx, kx_skia, is_macos, tag, app_root);
+        return;
+    }
+
     // --- hello app ---
     const exe = addApp(b, target, optimize, "hello", "src/main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
     b.installArtifact(exe);
@@ -207,6 +217,19 @@ pub fn build(b: *std.Build) void {
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
 
+    // --- klaxon CLI (Phase 5a) ---
+    // The `klaxon` launcher — a plain Zig exe, no SDL/skia linkage.
+    const cli = b.addExecutable(.{
+        .name = "klaxon",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/klaxon/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const cli_step = b.step("cli", "Build the klaxon CLI (zig-out/bin/klaxon)");
+    cli_step.dependOn(&b.addInstallArtifact(cli, .{}).step);
+
     // --- package-macos: build + bundle a .app (macOS only) ---
     if (is_macos) {
         const pkg = b.addSystemCommand(&.{ "scripts/package-macos.sh", "gallery", "./dist" });
@@ -231,6 +254,48 @@ pub fn build(b: *std.Build) void {
         const pkg_step = b.step("package-linux", "Build + package gallery for Linux (AppImage, deb, rpm, Flatpak)");
         pkg_step.dependOn(&pkg.step);
     }
+}
+
+/// Phase 5a external-app mode (klaxon-as-a-dependency): the consumer project's
+/// src/main.zig is the exe root; the framework is one "klaxon" module rooted
+/// at src/klaxon.zig — a single module instance, so every file-relative import
+/// inside src/ resolves into the same compilation (no split globals/types).
+/// The binary registers as "app" — retrievable via dependency.artifact("app").
+fn addExternalApp(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    translate_sdl: *std.Build.Step.TranslateC,
+    translate_kx: *std.Build.Step.TranslateC,
+    kx_skia: *std.Build.Step.Compile,
+    is_macos: bool,
+    tag: []const u8,
+    app_root: []const u8,
+) void {
+    const klaxon_mod = b.createModule(.{
+        .root_source_file = b.path("src/klaxon.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = !is_windows_local(target),
+    });
+    klaxon_mod.addImport("sdl_c", translate_sdl.createModule());
+    klaxon_mod.addImport("kx_c", translate_kx.createModule());
+
+    const app = b.addExecutable(.{
+        .name = "app",
+        .root_module = b.createModule(.{
+            // Absolute consumer path — outside this package's build root.
+            .root_source_file = b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{app_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = !is_windows_local(target),
+        }),
+    });
+    app.root_module.addImport("klaxon", klaxon_mod);
+    linkRuntime(b, app.root_module, kx_skia, target, is_macos, tag);
+    b.installArtifact(app);
 }
 
 /// Create the kx_skia C++/ObjC++ shim as a static library. The native graph
