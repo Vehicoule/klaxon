@@ -1,0 +1,22 @@
+name: klaxon_conformance_flutter
+description: >-
+  Klaxon Conformance Suite — Flutter adapter. Executes the shared
+  framework-neutral corpus (conformance/tests/*.json) through the real
+  Flutter widget/layout/gesture/raster pipeline.
+publish_to: "none"
+version: 0.0.0
+
+environment:
+  sdk: ">=3.13.0 <4.0.0"
+  flutter: ">=3.47.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: false

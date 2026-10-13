@@ -1,0 +1,496 @@
+{
+  "framework": "flutter",
+  "version": "p0",
+  "timestamp": "2026-10-13T14-34-46",
+  "score_pct": 100.0,
+  "by_domain": {
+    "layout": {
+      "pass": 8,
+      "fail": 0
+    },
+    "paint": {
+      "pass": 9,
+      "fail": 0
+    },
+    "gestures": {
+      "pass": 10,
+      "fail": 0
+    },
+    "i18n": {
+      "pass": 8,
+      "fail": 0
+    },
+    "focus": {
+      "pass": 8,
+      "fail": 0
+    },
+    "a11y": {
+      "pass": 8,
+      "fail": 0
+    },
+    "navigation": {
+      "pass": 8,
+      "fail": 0
+    },
+    "scrolling": {
+      "pass": 9,
+      "fail": 0
+    },
+    "state": {
+      "pass": 7,
+      "fail": 0
+    }
+  },
+  "tests": [
+    {
+      "id": "LAYOUT-001.1",
+      "domain": "layout",
+      "rule": "LAYOUT-001",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-002.1",
+      "domain": "layout",
+      "rule": "LAYOUT-002",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-003.1",
+      "domain": "layout",
+      "rule": "LAYOUT-003",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-004.1",
+      "domain": "layout",
+      "rule": "LAYOUT-004",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-005.1",
+      "domain": "layout",
+      "rule": "LAYOUT-005",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-006.1",
+      "domain": "layout",
+      "rule": "LAYOUT-006",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-007.1",
+      "domain": "layout",
+      "rule": "LAYOUT-007",
+      "passed": true
+    },
+    {
+      "id": "LAYOUT-008.1",
+      "domain": "layout",
+      "rule": "LAYOUT-008",
+      "passed": true
+    },
+    {
+      "id": "PAINT-001.1",
+      "domain": "paint",
+      "rule": "PAINT-001",
+      "passed": true
+    },
+    {
+      "id": "PAINT-002.1",
+      "domain": "paint",
+      "rule": "PAINT-001",
+      "passed": true
+    },
+    {
+      "id": "PAINT-003.1",
+      "domain": "paint",
+      "rule": "PAINT-002",
+      "passed": true
+    },
+    {
+      "id": "PAINT-004.1",
+      "domain": "paint",
+      "rule": "PAINT-003",
+      "passed": true
+    },
+    {
+      "id": "PAINT-004.2",
+      "domain": "paint",
+      "rule": "PAINT-003",
+      "passed": true
+    },
+    {
+      "id": "PAINT-005.1",
+      "domain": "paint",
+      "rule": "PAINT-004",
+      "passed": true
+    },
+    {
+      "id": "PAINT-006.1",
+      "domain": "paint",
+      "rule": "PAINT-003",
+      "passed": true
+    },
+    {
+      "id": "PAINT-007.1",
+      "domain": "paint",
+      "rule": "PAINT-005",
+      "passed": true
+    },
+    {
+      "id": "PAINT-008.1",
+      "domain": "paint",
+      "rule": "PAINT-006",
+      "passed": true
+    },
+    {
+      "id": "GEST-001.1",
+      "domain": "gestures",
+      "rule": "GEST-001",
+      "passed": true
+    },
+    {
+      "id": "GEST-002.1",
+      "domain": "gestures",
+      "rule": "GEST-002",
+      "passed": true
+    },
+    {
+      "id": "GEST-002.2",
+      "domain": "gestures",
+      "rule": "GEST-002",
+      "passed": true
+    },
+    {
+      "id": "GEST-003.1",
+      "domain": "gestures",
+      "rule": "GEST-003",
+      "passed": true
+    },
+    {
+      "id": "GEST-004.1",
+      "domain": "gestures",
+      "rule": "GEST-004",
+      "passed": true
+    },
+    {
+      "id": "GEST-004.2",
+      "domain": "gestures",
+      "rule": "GEST-004",
+      "passed": true
+    },
+    {
+      "id": "GEST-005.1",
+      "domain": "gestures",
+      "rule": "GEST-005",
+      "passed": true
+    },
+    {
+      "id": "GEST-006.1",
+      "domain": "gestures",
+      "rule": "GEST-006",
+      "passed": true
+    },
+    {
+      "id": "GEST-006.2",
+      "domain": "gestures",
+      "rule": "GEST-006",
+      "passed": true
+    },
+    {
+      "id": "GEST-007.1",
+      "domain": "gestures",
+      "rule": "GEST-007",
+      "passed": true
+    },
+    {
+      "id": "I18N-001.1",
+      "domain": "i18n",
+      "rule": "I18N-001",
+      "passed": true
+    },
+    {
+      "id": "I18N-002.1",
+      "domain": "i18n",
+      "rule": "I18N-002",
+      "passed": true
+    },
+    {
+      "id": "I18N-003.1",
+      "domain": "i18n",
+      "rule": "I18N-003",
+      "passed": true
+    },
+    {
+      "id": "I18N-004.1",
+      "domain": "i18n",
+      "rule": "I18N-004",
+      "passed": true
+    },
+    {
+      "id": "I18N-004.2",
+      "domain": "i18n",
+      "rule": "I18N-004",
+      "passed": true
+    },
+    {
+      "id": "I18N-005.1",
+      "domain": "i18n",
+      "rule": "I18N-005",
+      "passed": true
+    },
+    {
+      "id": "I18N-006.1",
+      "domain": "i18n",
+      "rule": "I18N-006",
+      "passed": true
+    },
+    {
+      "id": "I18N-007.1",
+      "domain": "i18n",
+      "rule": "I18N-007",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-001.1",
+      "domain": "focus",
+      "rule": "FOCUS-001",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-002.1",
+      "domain": "focus",
+      "rule": "FOCUS-002",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-002.2",
+      "domain": "focus",
+      "rule": "FOCUS-002",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-003.1",
+      "domain": "focus",
+      "rule": "FOCUS-003",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-003.2",
+      "domain": "focus",
+      "rule": "FOCUS-003",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-004.1",
+      "domain": "focus",
+      "rule": "FOCUS-004",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-005.1",
+      "domain": "focus",
+      "rule": "FOCUS-005",
+      "passed": true
+    },
+    {
+      "id": "FOCUS-006.1",
+      "domain": "focus",
+      "rule": "FOCUS-006",
+      "passed": true
+    },
+    {
+      "id": "A11Y-001.1",
+      "domain": "a11y",
+      "rule": "A11Y-001",
+      "passed": true
+    },
+    {
+      "id": "A11Y-002.1",
+      "domain": "a11y",
+      "rule": "A11Y-002",
+      "passed": true
+    },
+    {
+      "id": "A11Y-003.1",
+      "domain": "a11y",
+      "rule": "A11Y-003",
+      "passed": true
+    },
+    {
+      "id": "A11Y-004.1",
+      "domain": "a11y",
+      "rule": "A11Y-004",
+      "passed": true
+    },
+    {
+      "id": "A11Y-004.2",
+      "domain": "a11y",
+      "rule": "A11Y-004",
+      "passed": true
+    },
+    {
+      "id": "A11Y-005.1",
+      "domain": "a11y",
+      "rule": "A11Y-005",
+      "passed": true
+    },
+    {
+      "id": "A11Y-006.1",
+      "domain": "a11y",
+      "rule": "A11Y-006",
+      "passed": true
+    },
+    {
+      "id": "A11Y-007.1",
+      "domain": "a11y",
+      "rule": "A11Y-007",
+      "passed": true
+    },
+    {
+      "id": "NAV-001.1",
+      "domain": "navigation",
+      "rule": "NAV-001",
+      "passed": true
+    },
+    {
+      "id": "NAV-002.1",
+      "domain": "navigation",
+      "rule": "NAV-002",
+      "passed": true
+    },
+    {
+      "id": "NAV-003.1",
+      "domain": "navigation",
+      "rule": "NAV-003",
+      "passed": true
+    },
+    {
+      "id": "NAV-004.1",
+      "domain": "navigation",
+      "rule": "NAV-004",
+      "passed": true
+    },
+    {
+      "id": "NAV-004.2",
+      "domain": "navigation",
+      "rule": "NAV-004",
+      "passed": true
+    },
+    {
+      "id": "NAV-005.1",
+      "domain": "navigation",
+      "rule": "NAV-005",
+      "passed": true
+    },
+    {
+      "id": "NAV-006.1",
+      "domain": "navigation",
+      "rule": "NAV-006",
+      "passed": true
+    },
+    {
+      "id": "NAV-007.1",
+      "domain": "navigation",
+      "rule": "NAV-007",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-001.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-001",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-001.2",
+      "domain": "scrolling",
+      "rule": "SCROLL-001",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-002.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-002",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-002.2",
+      "domain": "scrolling",
+      "rule": "SCROLL-002",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-003.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-003",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-004.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-004",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-004.2",
+      "domain": "scrolling",
+      "rule": "SCROLL-004",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-005.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-005",
+      "passed": true
+    },
+    {
+      "id": "SCROLL-006.1",
+      "domain": "scrolling",
+      "rule": "SCROLL-006",
+      "passed": true
+    },
+    {
+      "id": "STATE-001.1",
+      "domain": "state",
+      "rule": "STATE-001",
+      "passed": true
+    },
+    {
+      "id": "STATE-002.1",
+      "domain": "state",
+      "rule": "STATE-002",
+      "passed": true
+    },
+    {
+      "id": "STATE-003.1",
+      "domain": "state",
+      "rule": "STATE-003",
+      "passed": true
+    },
+    {
+      "id": "STATE-004.1",
+      "domain": "state",
+      "rule": "STATE-004",
+      "passed": true
+    },
+    {
+      "id": "STATE-005.1",
+      "domain": "state",
+      "rule": "STATE-005",
+      "passed": true
+    },
+    {
+      "id": "STATE-006.1",
+      "domain": "state",
+      "rule": "STATE-006",
+      "passed": true
+    },
+    {
+      "id": "STATE-007.1",
+      "domain": "state",
+      "rule": "STATE-007",
+      "passed": true
+    }
+  ]
+}
