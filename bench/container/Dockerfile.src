@@ -1,0 +1,5 @@
+# Derived image: bake the repo source in so NO volume mounts are needed
+# (Apple `container` 1.5.0 on macOS 27.2 hangs VM boot on any -v mount).
+FROM klaxon-bench:latest
+COPY . /repo
+ENTRYPOINT ["/repo/bench/container/run-one.sh"]

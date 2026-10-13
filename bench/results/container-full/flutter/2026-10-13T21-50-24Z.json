@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "backdrop_scroll",
+      "frame_time_avg_ms": 7.9,
+      "frame_time_p50_ms": 7.9,
+      "frame_time_p99_ms": 8.3,
+      "frame_time_p999_ms": 8.3,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 126.6,
+      "draw_calls_per_frame": 358,
+      "rss_mb": 265.0,
+      "ttff_ms": 131.7,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:50:24Z"
+}

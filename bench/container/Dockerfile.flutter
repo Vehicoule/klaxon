@@ -1,0 +1,11 @@
+# Flutter flavour: bake the host-cloned SDK in (no mounts possible).
+# Context = bench/container/sdk (NOT the repo): build with
+#   container build -f bench/container/Dockerfile.flutter -t klaxon-bench-flutter bench/container/sdk
+# The SDK clone is pre-seeded on the host with linux-arm64 dart-sdk +
+# engine stamps (fetch-flutter.sh) — update_dart_sdk.sh then skips its
+# ~300MB download, which runs at ~10 KB/s inside the VM over IPv4.
+FROM klaxon-bench-src:latest
+COPY flutter-linux /opt/flutter-host
+# curl inside the VM is fast only over IPv6 (~22 MB/s vs ~200 KB/s on v4).
+RUN git config --global --add safe.directory /opt/flutter-host || true \
+    && echo ipv6 > /root/.curlrc

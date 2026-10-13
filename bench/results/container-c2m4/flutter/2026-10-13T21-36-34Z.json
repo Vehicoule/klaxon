@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "text_rich",
+      "frame_time_avg_ms": 4.2,
+      "frame_time_p50_ms": 4.2,
+      "frame_time_p99_ms": 6.1,
+      "frame_time_p999_ms": 6.9,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 236.8,
+      "draw_calls_per_frame": 136,
+      "rss_mb": 250.5,
+      "ttff_ms": 22.7,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:36:34Z"
+}

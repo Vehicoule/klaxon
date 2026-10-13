@@ -1,0 +1,11 @@
+.git
+deps
+.zig-cache
+zig-cache
+zig-out
+bench/results
+bench/container/sdk
+bench/runners/*/build
+bench/runners/flutter/build
+node_modules
+*.app

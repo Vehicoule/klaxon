@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "input_ime",
+      "frame_time_avg_ms": 4.1,
+      "frame_time_p50_ms": 4.1,
+      "frame_time_p99_ms": 6.3,
+      "frame_time_p999_ms": 7.8,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 243.8,
+      "draw_calls_per_frame": 34,
+      "rss_mb": 240.8,
+      "ttff_ms": 21.8,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:35:12Z"
+}

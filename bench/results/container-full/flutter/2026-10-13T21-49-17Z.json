@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "shapes_ramp",
+      "frame_time_avg_ms": 7.6,
+      "frame_time_p50_ms": 5.4,
+      "frame_time_p99_ms": 26.2,
+      "frame_time_p999_ms": 29.3,
+      "jank_frames": 21,
+      "jank_pct": 11.7,
+      "fps": 131.5,
+      "draw_calls_per_frame": 1,
+      "rss_mb": 379.3,
+      "ttff_ms": 17.1,
+      "frames_rendered": 270,
+      "extra": {"ramp":[{"n":10,"p50_ms":1.39},{"n":25,"p50_ms":2.3},{"n":50,"p50_ms":2.9},{"n":100,"p50_ms":4.46},{"n":200,"p50_ms":5.09},{"n":400,"p50_ms":5.73},{"n":800,"p50_ms":7.14},{"n":1600,"p50_ms":12.53},{"n":3200,"p50_ms":23.98}],"n_max_60fps":1600}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-13T21:49:17Z"
+}
