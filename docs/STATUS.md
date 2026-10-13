@@ -2,7 +2,7 @@
 
 > Updated at the end of every session. Photo of where we are right now.
 
-**Last updated**: 2026-10-12 (MERGE CASCADE — 12 PRs integrated green on the 7-job matrix: backend contract #81, AT-SPI2 #93, UIA #92, Graphite-WebGPU wasm #98, conformance suite #96, packaging linux/matrix/msi #87/#89/#86, text cache #88, web-app selector #85, android font #95, docs #84; Windows CI now green end-to-end incl. UIA; deps republished deps-899ee32c549c with dawn headers; graphite-vulkan #112 in flight — see "Merge cascade + CI stabilization" below; earlier: Phase 4e.1 PERF HOT-SPOTS — GPU warmup, TTFF timing, size-report; Phase 3 iOS five-backend matrix + Android ~150 fps; Phase 4c benchmarks + report.html; 723 unit + 144 golden tests green; 80 widgets; Phases 0-2 complete)
+**Last updated**: 2026-10-12 (MERGE CASCADE — 12 PRs integrated green on the 7-job matrix: backend contract #81, AT-SPI2 #93, UIA #92, Graphite-WebGPU wasm #98, conformance suite #96, packaging linux/matrix/msi #87/#89/#86, text cache #88, web-app selector #85, android font #95, docs #84; Windows CI now green end-to-end incl. UIA; deps republished deps-899ee32c549c with dawn headers; graphite-vulkan #112 merged green — see "Merge cascade + CI stabilization" below; earlier: Phase 4e.1 PERF HOT-SPOTS — GPU warmup, TTFF timing, size-report; Phase 3 iOS five-backend matrix + Android ~150 fps; Phase 4c benchmarks + report.html; 723 unit + 144 golden tests green; 80 widgets; Phases 0-2 complete)
 
 ## Current phase
 
@@ -83,7 +83,9 @@ CI/deps bugs fixed along the way: GNU-vs-BSD tar on windows zig zip (#100), VS 2
 
 Deps release `deps-899ee32c549c` republished with all 7 bundles incl. dawn headers + embedded manifests. Bench re-run on the merged tree: hello ReleaseSmall 6,68 Mo, report regenerated (`bench/report.html`).
 
-**Remaining**: graphite-vulkan Linux (#112 — VMA external + skia_use_vulkan; driver-probe fix for headless in flight, source-build CI ~50 min). Device-gated: real-GL/VK Linux box, windows dawn runtime check, physical devices.
+**#112 merged**: Graphite-Vulkan Linux (SDL_Vulkan surface + VMA + swapchain; `SDL_Vulkan_LoadLibrary`/`GetInstanceExtensions` probe gates the VULKAN window flag — headless/dummy falls to the GL leg; AUTO without a vulkan driver goes straight to GL on an OPENGL window). Green 7/7 on run 38358078876.
+
+**Remaining**: Device-gated — real-GL/VK Linux box, windows dawn runtime check, physical devices.
 - Klaxon infra (9 canonical scenes, metrics collector, `zig build bench`, JSON contract, scripts/bench.sh) + official results (bench/results/20261011-124018.json).
 - Comparison runners (4c.4): **Qt** (bench/runners/qt — Qt6 Quick/QML, headless offscreen+software, 9/9 scenes), **Flutter** (bench/runners/flutter — macOS, FrameTiming build+raster work, 9/9), **Compose** (bench/runners/compose — ComposeScene + CPU raster Skiko, 9/9). All emit the same JSON schema.
 - Report generator (4c.5): scripts/bench-report.py → bench/report.html (4-framework matrix with fps bars + per-framework metric tables).
