@@ -995,6 +995,45 @@ fn addIosApp(
     ios_gallery_step.dependOn(&link.step);
 }
 
+/// Serial cursor shared across EVERY compileMsvcShims call: addKxSkia runs
+/// twice per build (main lib + kx_skia_bench), and two independently
+/// serialized chains still race each other on the shared cl/vcvars temp
+/// state — one global chain removes the race for good.
+var msvc_cl_serial: ?*std.Build.Step = null;
+
+/// vcvars64's environment, imported once at graph time and replayed via
+/// `set` lines in the wrapper — cached so the second compileMsvcShims call
+/// doesn't re-run vsdevcmd.
+const MsvcEnv = struct { path: []const u8, include: []const u8 };
+var msvc_env_cache: ?MsvcEnv = null;
+var msvc_env_tried: bool = false;
+
+/// Import vcvars64's PATH/INCLUDE once per build. Every cl invocation then
+/// `set`s them directly instead of re-entering vsdevcmd — per-invocation
+/// vcvars raced on its own shared temp state (the recurring "The process
+/// cannot access the file because it is being used by another process"
+/// failures) and cost ~1-3 s per TU on top.
+fn msvcEnvCapture(b: *std.Build, vcvars: []const u8) ?MsvcEnv {
+    if (msvc_env_tried) return msvc_env_cache;
+    msvc_env_tried = true;
+    const res = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ "cmd", "/c", b.fmt("\"{s}\" >NUL 2>&1 && set", .{vcvars}) },
+        .stdout_limit = .limited(4 * 1024 * 1024),
+    }) catch return null;
+    if (res.term != .exited or res.term.exited != 0) return null;
+    var path: ?[]const u8 = null;
+    var include: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, res.stdout, '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trimEnd(u8, line, "\r");
+        if (std.ascii.startsWithIgnoreCase(l, "PATH=")) path = b.dupe(l[5..]);
+        if (std.ascii.startsWithIgnoreCase(l, "INCLUDE=")) include = b.dupe(l[8..]);
+    }
+    if (path == null or include == null) return null;
+    msvc_env_cache = .{ .path = path.?, .include = include.? };
+    return msvc_env_cache;
+}
+
 /// Compile the kx_skia C++ shims with MSVC cl.exe (Windows only — see the
 /// .windows case in addKxSkia for why zig's clang is not used). vcvars64.bat
 /// is located through vswhere unless INCLUDE is already set (vcvars-loaded
@@ -1022,21 +1061,28 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
     const attempt = "@cl %* >\"%kxlog%\" 2>&1 || cl %* >\"%kxlog%\" 2>&1\r\n" ++
         "@if errorlevel 1 (echo cl failed twice - output:>&2&type \"%kxlog%\">&2&del \"%kxlog%\"&exit /b 1)\r\n" ++
         "@del \"%kxlog%\" >NUL 2>&1\r\n";
-    const wrapper = wf.add("msvc-cl-wrapper.bat", if (vcvars.len == 0)
-        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n{s}", .{attempt})
+    // Environment prelude: the captured vcvars env (preferred — no vsdevcmd
+    // re-entry per TU), else @call vcvars each time, else nothing when
+    // INCLUDE is already set (vcvars-loaded shell).
+    const env_prelude = if (vcvars.len == 0)
+        ""
+    else if (msvcEnvCapture(b, vcvars)) |env|
+        b.fmt("@set \"PATH={s}\"\r\n@set \"INCLUDE={s}\"\r\n", .{ env.path, env.include })
     else
-        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n@call \"{s}\" >NUL 2>&1\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n{s}", .{ vcvars, attempt }));
+        b.fmt("@call \"{s}\" >NUL 2>&1\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n", .{vcvars});
+    const wrapper = wf.add("msvc-cl-wrapper.bat",
+        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n{s}{s}", .{ env_prelude, attempt }));
     var objs: std.ArrayList(std.Build.LazyPath) = .empty;
-    // cl runs serialized: parallel invocations on a fresh runner race on a
-    // shared file (cl temp intermediates / identical %RANDOM% log names in
-    // simultaneously spawned cmd processes) and die with "The process cannot
-    // access the file because it is being used by another process". 3 small
-    // TUs ≈ 15 s — not worth parallelizing.
-    var prev: ?*std.Build.Step = null;
+    // cl runs serialized across ALL shim compiles (global msvc_cl_serial):
+    // parallel invocations on a fresh runner race on shared temp state (cl
+    // intermediates, identical %RANDOM% log names in simultaneous cmds,
+    // vsdevcmd writes) and die with "The process cannot access the file
+    // because it is being used by another process". 6 small TUs ≈ 30 s —
+    // not worth parallelizing.
     for (sources) |s| {
         const run = b.addSystemCommand(&.{"cmd"});
-        if (prev) |p| run.step.dependOn(p);
-        prev = &run.step;
+        if (msvc_cl_serial) |p| run.step.dependOn(p);
+        msvc_cl_serial = &run.step;
         run.addArg("/c");
         run.addFileArg(wrapper);
         run.addArg("/nologo");
