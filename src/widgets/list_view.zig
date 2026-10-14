@@ -65,6 +65,12 @@ fn listMeasure(n: *Node, c: Constraints) Size {
 
 fn layoutItem(n: *Node, child: *Node, index: usize) void {
     const s = stateOf(ListState, n);
+    // The item-texture idiom: a clean row re-blits while the list scrolls
+    // (the canvas translate shifts it) instead of repainting its content —
+    // rows that DO animate per frame drop the cache for free (auto policy
+    // skips the raster on dirty frames). Raster 0.26→0.08; Metal pays the
+    // entering row's raster (~0.06/frame) — net positive cross-backend.
+    child.auto_retain = true;
     child.layout(.{
         .x = n.bounds.x,
         .y = n.bounds.y + @as(f32, @floatFromInt(index)) * strideOf(s),

@@ -249,6 +249,13 @@ pub const Node = struct {
     /// frame loop skip its clear. Correct only where the backdrop behind the
     /// node is constant (roots, nodes over a solid frame background).
     retained_bg: ?u32 = null,
+    /// Per-instance opt-in to the vtable's `auto_retain` policy (same rules:
+    /// rasterize on a clean frame, drop the cache on dirty frames without
+    /// wasting a raster). A container type can mark ITS item children this
+    /// way without forcing the flag onto every node of the child's vtable —
+    /// e.g. list rows re-blit while scrolling, which is the item-texture
+    /// idiom, but the same row type used elsewhere need not be cached.
+    auto_retain: bool = false,
     /// Paint that extends BEYOND the bounds (a floating label's upper half,
     /// a cutout stroke margin): markDirty damages the bounds EXPANDED by
     /// these insets (negative values would shrink — never set them). Widgets
@@ -539,17 +546,28 @@ pub const Node = struct {
         // draws, so a cached blit is indistinguishable from a repaint.
         if (node.retained) {
             if (node.paintRetained(ctx, subtree_dirty, false)) return;
-        } else if (node.vtable.auto_retain and !node.backdrop_subtree) {
+        } else if ((node.vtable.auto_retain or node.auto_retain) and !node.backdrop_subtree) {
             if (subtree_dirty) {
                 node.retained_blocked = false; // re-evaluate on the next clean pass
                 node.clearRetained(); // the stale image can never blit again
-            } else if (!node.retained_blocked and
+            } else if (!node.retained_blocked and !autoRetainOffscreenExpensive(ctx) and
                 node.paintRetained(ctx, false, true))
             {
                 return;
             }
         }
         node.paintContent(ctx, own_hit, child_region, children_hit);
+    }
+
+    /// Backend cost model for AUTO-retain (not the explicit `retained` flag —
+    /// an app opting in keeps its semantics): on Ganesh-GLES-class renderers
+    /// an offscreen pass + texture upload + one blit costs measurably more
+    /// than re-emitting a small subtree's few ops (bench emulator: retained
+    /// list rows 1.05ms vs 0.25 direct). Skip auto-retain there entirely;
+    /// raster/Graphite keep it — their per-op and upload costs are low.
+    fn autoRetainOffscreenExpensive(ctx: *kx.Ctx) bool {
+        const b = kx.c.kx_backend_of(ctx);
+        return b == kx.c.KX_BACKEND_GANESH_GLES or b == kx.c.KX_BACKEND_GANESH_WEBGL2;
     }
 
     /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
