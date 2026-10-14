@@ -101,9 +101,11 @@ A text with axes paints through a retained `kx_text_layout` paragraph that
 rebuilds on axis/text/style change (re-shaping per animated frame is the
 honest cost — identical to Compose's FontVariation path) and repaints free
 when static. Axes absent from the resolved font are ignored; `wght` only
-takes effect on variable fonts, so shipping an M3E variable family requires
-a font-family selection API (not yet in `kx_text_style` — the paragraph path
-uses the platform default typeface today).
+takes effect on variable fonts — select one via `TextOptions.family` /
+`TextSpan.family` (resolved through the platform font manager: "SF Compact",
+a bundled font's PostScript name, …). E.g. `.{ .family = "SF Compact",
+.variations = &.{.{ .axis = ui.paint.axis_wght, .value = v }} }` animates a
+real `wght` ramp on a variable-capable system face.
 
 ## Dirty-rect (1e.6)
 

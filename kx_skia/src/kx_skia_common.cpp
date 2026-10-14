@@ -1755,10 +1755,10 @@ static SkPath kx_build_path(const float* pts, const int* verbs, int n_verbs,
     }
     const ptrdiff_t n = p - pts;
     if (n >= 2) {
-        float l = p[0], t = p[1], r = p[0], bo = p[1];
+        float l = pts[0], t = pts[1], r = pts[0], bo = pts[1];
         for (ptrdiff_t i = 2; i + 1 < n; i += 2) {
-            l = std::min(l, p[i]); r = std::max(r, p[i]);
-            t = std::min(t, p[i + 1]); bo = std::max(bo, p[i + 1]);
+            l = std::min(l, pts[i]); r = std::max(r, pts[i]);
+            t = std::min(t, pts[i + 1]); bo = std::max(bo, pts[i + 1]);
         }
         *ctrl_bounds = SkRect::MakeLTRB(l, t, r, bo);
     }
@@ -1986,6 +1986,8 @@ void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text
             style->slant == 1 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
     ts.setColor(kx_to_skcolor(style->color));
     if (style->letter_spacing != 0.0f) ts.setLetterSpacing(style->letter_spacing);
+    if (style->family && style->family[0])
+        ts.setFontFamilies({SkString(style->family)}); // copied; per-glyph fallback still applies
     if (style->variation_count > 0) {
         // Variable-font axes (0.17.0) — pinned in the design space at build
         // time; a 'wght' coord overrides fontStyle weight on variable fonts.

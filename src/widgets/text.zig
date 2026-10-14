@@ -23,27 +23,59 @@ pub const TextOptions = struct {
     /// overrides the bold→400/700 derivation on variable fonts. Caller-owned
     /// slice — copied at construction; animate via setAxisValue/setAxes.
     variations: []const ui.paint.FontAxis = &.{},
+    /// Font family override (0.17.0) — "SF Compact", "New York", a
+    /// PostScript name; null = platform default. Copied at construction
+    /// (≤63 bytes kept). Selects a variable-capable face so `variations`
+    /// actually move the glyphs.
+    family: ?[]const u8 = null,
 };
 
 /// Variable-font paint state shared by Text and BoundText: when `axes_n > 0`
-/// the node paints through a retained kx_text_layout (the simple
-/// kx_draw_text_styled path carries no axes) and `m` is filled from that
-/// layout's metrics. `layout_dirty` re-arms on text/style/axis change —
-/// the next measure/paint rebuilds once.
+/// or a family override is set the node paints through a retained
+/// kx_text_layout (the simple kx_draw_text_styled path carries neither) and
+/// `m` is filled from that layout's metrics. `layout_dirty` re-arms on
+/// text/style/axis change — the next measure/paint rebuilds once.
 const VarText = struct {
     axes: [ui.paint.max_font_variations]ui.paint.FontAxis = undefined,
     axes_n: u8 = 0,
+    /// Family override bytes (≤63) + sentinel — copied at construction so
+    /// the retained layout can rebuild long after opts.family dangles.
+    family: [64]u8 = undefined,
+    family_n: u8 = 0,
     layout: ?*ui.paint.TextLayout = null,
     layout_dirty: bool = false,
+
+    /// The layout path is needed for axes OR a family override — the simple
+    /// draw call carries neither.
+    fn needsLayout(self: *const VarText) bool {
+        return self.axes_n > 0 or self.family_n > 0;
+    }
+
+    /// Copy the immutable-per-node font bits (axes + family) out of opts —
+    /// used at construction, BEFORE the node is attached (no dirty marks:
+    /// layout_dirty is set so the first measure/paint builds once).
+    fn seed(self: *VarText, opts: TextOptions) void {
+        self.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
+        @memcpy(self.axes[0..self.axes_n], opts.variations[0..self.axes_n]);
+        if (opts.family) |f| {
+            const n: u8 = @intCast(@min(f.len, self.family.len - 1));
+            @memcpy(self.family[0..n], f[0..n]);
+            self.family[n] = 0;
+            self.family_n = n;
+        }
+        self.layout_dirty = self.needsLayout();
+    }
 
     fn styleOf(self: *const VarText, opts: TextOptions) ui.paint.TextStyle {
         var st = ui.paint.textStyle(opts.size, if (opts.bold) 700 else 400, 0, 0, opts.color);
         ui.paint.withVariations(&st, self.axes[0..self.axes_n]);
+        if (self.family_n > 0)
+            st.family = @ptrCast(self.family[0..self.family_n :0].ptr);
         return st;
     }
 
     fn ensureLayout(self: *VarText, opts: TextOptions, str: [:0]const u8, m: *ui.paint.TextMetrics) void {
-        if (self.axes_n == 0) return;
+        if (!self.needsLayout()) return;
         if (self.layout != null and !self.layout_dirty) return;
         if (self.layout) |l| ui.paint.textLayoutDestroy(l);
         self.layout = ui.paint.textLayoutBegin(0);
@@ -167,12 +199,10 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
     @memcpy(buf[0..str.len], str);
     buf[str.len] = 0;
     s.* = .{ .text = buf[0..str.len :0], .opts = opts, .m = ui.paint.measureText(buf[0..str.len :0], opts.size, opts.bold) };
-    // Seed the axes WITHOUT the dirty marks — setAxes dereferences
+    // Seed the axes/family WITHOUT the dirty marks — setAxes dereferences
     // n.state for the damage paths and this node isn't attached yet.
-    s.vt.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
-    @memcpy(s.vt.axes[0..s.vt.axes_n], opts.variations[0..s.vt.axes_n]);
-    s.vt.layout_dirty = s.vt.axes_n > 0;
-    if (s.vt.axes_n > 0)
+    s.vt.seed(opts);
+    if (s.vt.needsLayout())
         s.vt.ensureLayout(s.opts, s.text, &s.m); // seed metrics from the variable-font layout
     node.state = s;
     ui.semantics.attach(node, .{ .role = .text, .label = s.text }); // Phase 2c
@@ -184,7 +214,7 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
 pub fn setColor(n: *Node, color: Color) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
     s.opts.color = color;
-    if (s.vt.axes_n > 0) s.vt.layout_dirty = true; // span color is baked at build
+    if (s.vt.needsLayout()) s.vt.layout_dirty = true; // span color is baked at build
     n.markDirty();
 }
 
@@ -342,9 +372,7 @@ pub fn BoundText(comptime T: type) type {
             errdefer allocator.destroy(s);
             s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true, .m = std.mem.zeroes(ui.paint.TextMetrics) };
             errdefer s.buf.deinit();
-            s.vt.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
-            @memcpy(s.vt.axes[0..s.vt.axes_n], opts.variations[0..s.vt.axes_n]);
-            s.vt.layout_dirty = s.vt.axes_n > 0;
+            s.vt.seed(opts);
             node.state = s;
             // Phase 2c: the label is the initial text — dynamic changes go
             // through live regions (semantics.announce).
@@ -369,6 +397,9 @@ pub const TextSpan = struct {
     /// Variable-font axes for this span (0.17.0) — a 'wght' coord overrides
     /// weight on variable fonts. Caller-owned; copied at build.
     variations: []const ui.paint.FontAxis = &.{},
+    /// Font family override for this span (0.17.0); null = platform
+    /// default. Consumed at build (≤63 bytes kept).
+    family: ?[]const u8 = null,
 };
 
 const RichTextState = struct {
@@ -435,6 +466,13 @@ pub fn richText(allocator: std.mem.Allocator, spans: []const TextSpan) !*Node {
         if (l) |layout| {
             var st = ui.paint.textStyle(span.size, weight, if (span.italic) 1 else 0, span.letter_spacing, span.color);
             ui.paint.withVariations(&st, span.variations);
+            var fam_buf: [64]u8 = undefined;
+            if (span.family) |f| {
+                const flen = @min(f.len, fam_buf.len - 1);
+                @memcpy(fam_buf[0..flen], f[0..flen]);
+                fam_buf[flen] = 0;
+                st.family = @ptrCast(fam_buf[0..flen :0].ptr);
+            }
             ui.paint.textLayoutSpan(layout, buf[0..span.text.len :0], st);
         }
     }
@@ -678,4 +716,28 @@ test "rich text span honors a per-span variation axis" {
     });
     defer rt.deinit();
     try std.testing.expect(rt.measure(.{}).w > 0);
+}
+
+test "text family override: selects the face and reaches the wght axis" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    // "SF Compact" resolves to SFCompact.ttf — a variable face — so the wght
+    // axis must actually move the advance.
+    const light = try text(std.testing.allocator, "Ag", .{
+        .size = 24,
+        .family = "SF Compact",
+        .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 300 }},
+    });
+    defer light.deinit();
+    const heavy = try text(std.testing.allocator, "Ag", .{
+        .size = 24,
+        .family = "SF Compact",
+        .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 900 }},
+    });
+    defer heavy.deinit();
+    const s: *TextState = @ptrCast(@alignCast(heavy.state.?));
+    try std.testing.expect(s.vt.family_n == 10); // "SF Compact" copied, layout path engaged
+    const wl = light.measure(.{}).w;
+    const wh = heavy.measure(.{}).w;
+    try std.testing.expect(wl > 0 and wh > 0);
+    try std.testing.expect(@abs(wh - wl) > 0.5); // wght 300→900 moves a variable face
 }

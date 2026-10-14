@@ -130,6 +130,14 @@ typedef struct kx_text_style {
     uint32_t variation_count;
     uint32_t variation_axes[8];
     float    variation_values[8];
+    // Font family override (0.17.0): family or PostScript name resolved
+    // through the platform font manager ("SF Compact", "New York", ...);
+    // NULL/empty keeps the platform default. Consumed synchronously by
+    // kx_text_layout_span (the name is copied into the span style) — the
+    // pointer need only outlive that call. This is what makes the
+    // variation axes above actually reachable: a 'wght' coordinate only
+    // moves glyphs when the resolved face is variable.
+    const char* family;
 } kx_text_style;
 kx_text_layout* kx_text_layout_begin(float max_width); // <=0 = unconstrained
 void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text_style* style);

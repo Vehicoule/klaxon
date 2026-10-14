@@ -199,6 +199,14 @@ pub fn withVariations(s: *TextStyle, axes: []const FontAxis) void {
     s.variation_count = @intCast(n);
 }
 
+/// Font family override ("SF Compact", "New York", a PostScript name — 0 = platform
+/// default). Consumed synchronously by textLayoutSpan: `family` need only
+/// outlive that call. This is what makes variation axes reachable — 'wght'
+/// only moves glyphs when the resolved face is variable.
+pub fn withFamily(s: *TextStyle, family: ?[*:0]const u8) void {
+    s.family = family;
+}
+
 /// Begin a layout. `max_width <= 0` lays out unconstrained (longest line =
 /// intrinsic width). Returns null when the paragraph backend is missing.
 pub fn textLayoutBegin(max_width: f32) ?*TextLayout {
