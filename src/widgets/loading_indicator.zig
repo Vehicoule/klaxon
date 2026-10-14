@@ -14,21 +14,18 @@
 //   - determinate: morphs Circle -> SoftBurst with progress (0..1), rotating
 //     -180° over the full range
 //
-// The widget is a LEAF: it paints its container + the current shape (a
-// filled polygon generated in Zig; no path crosses the kx ABI —
-// kx_fill_polygon, ABI 0.9.0).
+// The widget is a LEAF: it paints its container + the current morph frame.
+// The M3E shapes are ui.shapes RoundedPolygon presets (the real androidx
+// SoftBurst/Cookie9Sided/Pentagon/Pill/Sunny/Cookie4Sided/Oval geometry —
+// rounded corners, vertex normalization), interpolated by Morph: the matched
+// cubics at progress t are emitted as a verb path (move + N×cubic + close)
+// and filled through kx_fill_path (ABI 0.16.0). The polygons + pairwise
+// morphs are built once per widget; per-frame emission reuses preallocated
+// scratch, so paint allocates nothing.
 //
-// v1 deviations (documented, fixed later):
-//   - The shapes are REGULAR N-gons + a circle + a pill (a stadium) rendered
-//     as sharp filled polygons — the M3E RoundedPolygon corner rounding and
-//     vertex-count normalization are a follow-up (a RoundedPolygon port).
-//   - No morph VERTEX interpolation: the indeterminate loop switches shapes
-//     discretely every 650ms (the within-morph +90° rotation still animates,
-//     linearly — the M3E spring is a follow-up); the determinate variant
-//     switches circle -> burst at progress 0.5.
-//   - The v1 shape sequence approximates the M3E one by vertex count:
-//     [12-gon (SoftBurst), 9-gon (Cookie9Sided), pentagon (Pentagon), pill
-//     (Pill), 8-gon (Sunny), square (Cookie4Sided), circle (Oval)].
+// Remaining deviation (documented): the indeterminate morph tween is LINEAR
+// — the M3E morph spring is a follow-up (asCubics extrapolates past t=1, so
+// the spring can drive the same path when it lands).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -36,6 +33,7 @@ const input = @import("../ui/input.zig");
 const anim = ui.anim;
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
+const shapes = ui.shapes;
 
 const Node = ui.node.Node;
 const Rect = ui.node.Rect;
@@ -59,26 +57,9 @@ const morph_interval_ms: u32 = 650; // MorphIntervalMillis
 const rotation_period_ms: u32 = 4666; // GlobalRotationDurationMillis
 const quarter: f32 = 90; // +90° of shape rotation per morph
 
-/// A shape: a regular N-gon, a pill (a stadium), or a circle.
-const ShapeKind = enum { ngon, pill, circle };
-const ShapeDef = struct { kind: ShapeKind, n: usize = 0 }; // n: ngons only
-
-/// The v1 indeterminate sequence (7 shapes, approximating the M3E one).
-const indeterminate_shapes = [_]ShapeDef{
-    .{ .kind = .ngon, .n = 12 }, // SoftBurst
-    .{ .kind = .ngon, .n = 9 }, // Cookie9Sided
-    .{ .kind = .ngon, .n = 5 }, // Pentagon
-    .{ .kind = .pill }, // Pill
-    .{ .kind = .ngon, .n = 8 }, // Sunny
-    .{ .kind = .ngon, .n = 4 }, // Cookie4Sided (a square)
-    .{ .kind = .circle }, // Oval
-};
-
-/// The v1 determinate sequence (Circle -> SoftBurst, 2 shapes).
-const determinate_shapes = [_]ShapeDef{
-    .{ .kind = .circle },
-    .{ .kind = .ngon, .n = 12 },
-};
+/// The M3E shape sequences live in ui.shapes (shapes.indeterminate_sequence:
+/// SoftBurst -> Cookie9Sided -> Pentagon -> Pill -> Sunny -> Cookie4Sided ->
+/// Oval, wrapping; shapes.determinate_sequence: Circle -> SoftBurst).
 
 const LiState = struct {
     opts: LoadingIndicatorOptions,
@@ -95,6 +76,15 @@ const LiState = struct {
     /// indeterminate indicator announces no value (like progress.zig).
     value_buf: [16]u8 = std.mem.zeroes([16]u8),
     value_len: usize = 0,
+    // The shape geometry, built once by initGeometry: the normalized preset
+    // polygons + one Morph per adjacent pair (indeterminate wraps last ->
+    // first), plus the emission scratch sized to the largest morph — the
+    // per-frame emitPath writes into it, so paint allocates nothing.
+    polys: []shapes.RoundedPolygon = &.{},
+    morphs: []shapes.Morph = &.{},
+    scratch_cubics: []shapes.Cubic = &.{},
+    path_pts: []f32 = &.{},
+    path_verbs: []i32 = &.{},
 };
 
 fn stateOf(n: *Node) *LiState {
@@ -127,68 +117,56 @@ fn liLayout(n: *Node, bounds: Rect) void {
     if (s.sig == null and !s.loop_running) startLoop(n, s);
 }
 
-/// Paint a shape centered at (cx, cy): a regular N-gon, a pill (a stadium
-/// 2r x r), or a circle, rotated by `rotation` degrees (clockwise).
-fn paintShape(ctx: *kx.Ctx, shape: ShapeDef, cx: f32, cy: f32, r: f32, rotation: f32, color: Color) void {
-    if (color & 0xFF == 0) return;
-    switch (shape.kind) {
-        .circle => {
-            ui.paint.fillRRect(ctx, cx - r, cy - r, r * 2, r * 2, r, color);
-        },
-        .pill => {
-            // a stadium (2r wide, r tall) rotated by `rotation`: sample the
-            // capsule outline (two semicircular caps + tangent lines) and
-            // fill the polygon — a rotated rrect cannot express the angle
-            const rot = rotation * std.math.pi / 180;
-            const cr = r / 2; // the cap radius
-            const co = r - cr; // the cap centers' offset from the center
-            const cos_r = @cos(rot);
-            const sin_r = @sin(rot);
-            var xs: [25]f32 = undefined;
-            var ys: [25]f32 = undefined;
-            var k: usize = 0;
-            var i: usize = 0;
-            while (i <= 12) : (i += 1) {
-                // the left cap arc: 90°..270° around (-co, 0)
-                const a = std.math.pi / 2.0 + std.math.pi * @as(f32, @floatFromInt(i)) / 12.0;
-                const px = -co + @cos(a) * cr;
-                const py = @sin(a) * cr;
-                xs[k] = cx + px * cos_r - py * sin_r;
-                ys[k] = cy + px * sin_r + py * cos_r;
-                k += 1;
-            }
-            i = 1;
-            while (i <= 12) : (i += 1) {
-                // the right cap arc: 270°..450° around (+co, 0)
-                const a = std.math.pi * 1.5 + std.math.pi * @as(f32, @floatFromInt(i)) / 12.0;
-                const px = co + @cos(a) * cr;
-                const py = @sin(a) * cr;
-                xs[k] = cx + px * cos_r - py * sin_r;
-                ys[k] = cy + px * sin_r + py * cos_r;
-                k += 1;
-            }
-            ui.paint.fillPolygon(ctx, xs[0..k], ys[0..k], color);
-        },
-        .ngon => {
-            const n: usize = shape.n;
-            // even N-gons get a flat top (a square stays axis-aligned), odd
-            // N-gons a vertex up
-            const start: f32 = if (n % 2 == 0)
-                -std.math.pi / 2.0 + std.math.pi / @as(f32, @floatFromInt(n))
-            else
-                -std.math.pi / 2.0;
-            const rot = rotation * std.math.pi / 180;
-            var xs: [16]f32 = undefined;
-            var ys: [16]f32 = undefined;
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                const a = start + rot + 2 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
-                xs[i] = cx + @cos(a) * r;
-                ys[i] = cy + @sin(a) * r;
-            }
-            ui.paint.fillPolygon(ctx, xs[0..n], ys[0..n], color);
-        },
+/// Build the shape geometry once per widget: the normalized preset
+/// RoundedPolygons + a Morph per adjacent pair (the indeterminate loop wraps
+/// last -> first; the determinate chain is linear), plus the per-frame
+/// emission scratch sized to the largest morph's segment count.
+fn initGeometry(allocator: std.mem.Allocator, s: *LiState, seq: []const shapes.Preset) !void {
+    const polys = try allocator.alloc(shapes.RoundedPolygon, seq.len);
+    var built_p: usize = 0;
+    errdefer {
+        for (polys[0..built_p]) |*p| p.deinit();
+        allocator.free(polys);
     }
+    for (seq, 0..) |preset, i| {
+        polys[i] = try shapes.presetShape(allocator, preset);
+        built_p += 1;
+    }
+    const n_morphs = if (s.sig == null) seq.len else seq.len - 1;
+    const morphs = try allocator.alloc(shapes.Morph, n_morphs);
+    var built_m: usize = 0;
+    errdefer {
+        for (morphs[0..built_m]) |*m| m.deinit();
+        allocator.free(morphs);
+    }
+    var max_seg: usize = 0;
+    for (0..n_morphs) |i| {
+        morphs[i] = try shapes.Morph.init(allocator, &polys[i], &polys[(i + 1) % seq.len]);
+        built_m += 1;
+        max_seg = @max(max_seg, morphs[i].segmentCount());
+    }
+    const counts = shapes.pathCounts(max_seg);
+    const scratch = try allocator.alloc(shapes.Cubic, max_seg);
+    errdefer allocator.free(scratch);
+    const pts = try allocator.alloc(f32, counts.pts);
+    errdefer allocator.free(pts);
+    const verbs = try allocator.alloc(i32, counts.verbs);
+    errdefer allocator.free(verbs);
+    s.polys = polys;
+    s.morphs = morphs;
+    s.scratch_cubics = scratch;
+    s.path_pts = pts;
+    s.path_verbs = verbs;
+}
+
+fn deinitGeometry(allocator: std.mem.Allocator, s: *LiState) void {
+    for (s.morphs) |*m| m.deinit();
+    allocator.free(s.morphs);
+    for (s.polys) |*p| p.deinit();
+    allocator.free(s.polys);
+    allocator.free(s.scratch_cubics);
+    allocator.free(s.path_pts);
+    allocator.free(s.path_verbs);
 }
 
 fn liPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -204,23 +182,29 @@ fn liPaint(n: *Node, ctx: *kx.Ctx) void {
     }
     // the indicator color
     const color: Color = if (s.opts.contained) t.colors.on_primary_container else t.colors.primary;
-    // the shape box: square, scaled 38/48 within the container
-    const r = d / 2 * (indicator_size / container_size);
-    // the current shape + rotation
-    if (s.sig) |sig| {
-        const p = std.math.clamp(sig.peek(), 0, 1);
-        const shape = determinate_shapes[if (p < 0.5) 0 else 1]; // v1: discrete
-        paintShape(ctx, shape, cx, cy, r, -p * 180, color);
-    } else {
-        const shape = indeterminate_shapes[s.morph_index % indeterminate_shapes.len];
-        paintShape(ctx, shape, cx, cy, r, shapeRotation(n), color);
-    }
+    if (color & 0xFF == 0 or s.morphs.len == 0) return;
+    // the morph frame: indeterminate runs morph[morph_index] at
+    // morph_progress (shape i -> i+1, wrapping); determinate runs the single
+    // Circle -> SoftBurst morph at the clamped progress.
+    const mi: usize = if (s.sig != null) 0 else s.morph_index % s.morphs.len;
+    const prog: f32 = if (s.sig) |sig| std.math.clamp(sig.peek(), 0, 1) else s.morph_progress;
+    const cubics = s.morphs[mi].asCubicsInto(prog, s.scratch_cubics);
+    // the shape box: square, 38/48 of the container, centered — painted by
+    // transforming the canvas (presets live in the normalized 0..1 box)
+    const side = d * (indicator_size / container_size);
+    ui.paint.save(ctx);
+    ui.paint.translate(ctx, cx, cy);
+    ui.paint.rotate(ctx, shapeRotation(n));
+    ui.paint.scale(ctx, side, side);
+    ui.paint.translate(ctx, -0.5, -0.5);
+    shapes.fillCubics(ctx, cubics, s.path_pts, s.path_verbs, color, false); // winding
+    ui.paint.restore(ctx);
 }
 
 /// The indeterminate loop, driven by the timeline: a morph tween (650ms
-/// linear — the within-morph +90° rotation) chained per morph, and a global
-/// rotation tween (4666ms linear) chained per period. Without a timeline the
-/// indicator stays static (golden tests).
+/// linear — morph_progress, the within-morph cubic lerp + its +90° rotation)
+/// chained per morph, and a global rotation tween (4666ms linear) chained
+/// per period. Without a timeline the indicator stays static (golden tests).
 fn startLoop(n: *Node, s: *LiState) void {
     const tl = anim.timeline() orelse return;
     _ = tl.play(.{
@@ -250,7 +234,7 @@ fn liMorphUpdateCb(userdata: ?*anyopaque, value: anim.Vec4) void {
 fn liMorphCompleteCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
-    s.morph_index = (s.morph_index + 1) % indeterminate_shapes.len;
+    s.morph_index = (s.morph_index + 1) % s.morphs.len;
     s.morph_rotation = @mod(s.morph_rotation + quarter, 360);
     s.morph_progress = 0;
     n.markDirty();
@@ -310,6 +294,7 @@ fn liDeinit(n: *Node) void {
     }
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = liSyncCb, .userdata = n } });
     input.releaseNode(n);
+    deinitGeometry(n.allocator, s);
     n.allocator.destroy(s);
 }
 
@@ -322,8 +307,8 @@ const li_vtable = ui.node.VTable{
 
 /// An M3E loading indicator. `progress` = null → the indeterminate morph
 /// loop (timeline-driven; static without a timeline); non-null → determinate
-/// (the signal's 0..1 value selects the shape + rotation). The widget is a
-/// leaf: it paints its container + the current shape.
+/// (the signal's 0..1 value selects the morph position + rotation). The
+/// widget is a leaf: it paints its container + the current morph frame.
 pub fn loadingIndicator(allocator: std.mem.Allocator, progress: ?*ui.state.Signal(f32), opts: LoadingIndicatorOptions) !*Node {
     const node = try Node.create(allocator, &li_vtable);
     errdefer node.allocator.destroy(node); // no state yet
@@ -331,6 +316,12 @@ pub fn loadingIndicator(allocator: std.mem.Allocator, progress: ?*ui.state.Signa
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = progress };
     node.state = s;
+    // The preset polygons + pairwise morphs (the indeterminate sequence
+    // wraps; the determinate chain is linear) — built once.
+    try initGeometry(allocator, s, if (progress != null)
+        &shapes.determinate_sequence
+    else
+        &shapes.indeterminate_sequence);
     // Phase 2c: indeterminate announces no value; determinate announces the
     // clamped progress percentage (the same pattern as the slider).
     if (progress) |sig| {
@@ -361,6 +352,28 @@ test "loading_indicator: without a timeline the indeterminate loop stays static 
     n.layout(.{ .x = 0, .y = 0, .w = 48, .h = 48 });
     try std.testing.expectEqual(@as(usize, 0), morphIndex(n));
     try std.testing.expectEqual(@as(f32, 0), shapeRotation(n));
+}
+
+test "loading_indicator: the geometry builds once — 7 wrapping morphs indeterminate, 1 determinate" {
+    const n = try loadingIndicator(std.testing.allocator, null, .{});
+    defer n.deinit();
+    const s = stateOf(n);
+    try std.testing.expectEqual(@as(usize, shapes.indeterminate_sequence.len), s.polys.len);
+    try std.testing.expectEqual(@as(usize, shapes.indeterminate_sequence.len), s.morphs.len);
+    // the emission scratch fits the largest morph's outline
+    var max_seg: usize = 0;
+    for (s.morphs) |*m| max_seg = @max(max_seg, m.segmentCount());
+    try std.testing.expect(max_seg > 0);
+    const counts = shapes.pathCounts(max_seg);
+    try std.testing.expectEqual(counts.pts, s.path_pts.len);
+    try std.testing.expectEqual(counts.verbs, s.path_verbs.len);
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    const d = try loadingIndicator(std.testing.allocator, sig, .{});
+    defer d.deinit();
+    const ds = stateOf(d);
+    try std.testing.expectEqual(@as(usize, shapes.determinate_sequence.len), ds.polys.len);
+    try std.testing.expectEqual(@as(usize, shapes.determinate_sequence.len - 1), ds.morphs.len);
 }
 
 test "loading_indicator: the indeterminate loop advances the morph + rotation on the timeline" {
@@ -402,6 +415,27 @@ test "loading_indicator: a completed morph advances the index + 90° (and the ro
     try std.testing.expect(stateOf(n).global_rotation > 0);
 }
 
+test "loading_indicator: the indeterminate morph steps through all 7 shapes and wraps" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const n = try loadingIndicator(std.testing.allocator, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 48, .h = 48 });
+    tl.tick(0); // lazy start
+    // a morph completes every 650ms: 7 morphs walk the whole sequence and
+    // the index wraps to 0 (the +90° morph rotation keeps accumulating —
+    // 7×90 = 630 ≡ 270, it does not wrap with the shape index).
+    for (1..7) |i| {
+        tl.tick(650 * i);
+        try std.testing.expectEqual(i, morphIndex(n));
+    }
+    tl.tick(650 * 7);
+    try std.testing.expectEqual(@as(usize, 0), morphIndex(n));
+    try std.testing.expectEqual(@as(f32, 270), stateOf(n).morph_rotation);
+}
+
 test "loading_indicator: determinate — the signal selects the shape + rotation" {
     const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
     defer sig.deinit();
@@ -431,10 +465,10 @@ test "golden: the contained variant paints the PrimaryContainer circle + the Pri
     // the container: a 48dp circle (primary_container), its corner is background
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(8, 8));
     try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(32, 12)); // inside the circle, above the shape
-    // the indicator (on_primary_container): shape 0 = a 12-gon at radius
-    // 48/2 × 38/48 = 19 centered at (32, 32) — its ink is inside the circle
+    // the indicator (on_primary_container): shape 0 = SoftBurst, its 38dp
+    // box (13..51) centered at (32, 32) — its ink is inside the circle
     try std.testing.expect(f.countColorIn(.{ .x = 13, .y = 13, .w = 38, .h = 38 }, t.colors.on_primary_container) > 0);
-    // the exact center is indicator ink (a filled polygon covers it)
+    // the exact center is indicator ink (a filled shape covers it)
     try std.testing.expectEqual(t.colors.on_primary_container, f.pixelAt(32, 32));
 }
 
@@ -456,42 +490,51 @@ test "golden: the plain variant paints no container — the Primary shape over t
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(10, 32));
     // no container: the corner is background (not primary_container)
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(8, 8));
-    // progress 0.75 → the 12-gon (burst) shape, rotated -135°: ink at the center
+    // progress 0.75 → the Circle -> SoftBurst morph at t = 0.75, rotated
+    // -135°: ink at the center
     sig.set(0.75);
     r.paint(n, 0xFFFFFFFF);
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
     try std.testing.expectEqual(t.colors.primary, f2.pixelAt(32, 32));
-    // a 12-gon has gaps between its points near the bounding radius: the
-    // corner of the 38dp box (13, 13) is outside the polygon (rotated)
-    try std.testing.expect(f2.countColorIn(.{ .x = 13, .y = 13, .w = 6, .h = 6 }, t.colors.primary) == 0);
+    // the shape doesn't fill its box: the extreme corner of the 38dp box
+    // ((13,13) and ~2px in) is outside the rounded shape (rotated)
+    try std.testing.expect(f2.countColorIn(.{ .x = 13, .y = 13, .w = 3, .h = 3 }, t.colors.primary) == 0);
 }
 
-test "golden: the pill rotates with the shape rotation (a rotated capsule)" {
+test "golden: the Pill preset rotates with the shape rotation (asymmetric outline)" {
     const t = theme_mod.light;
     const n = try loadingIndicator(std.testing.allocator, null, .{ .theme = t });
     defer n.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 64, 64);
     defer r.deinit();
     n.layout(.{ .x = 8, .y = 8, .w = 48, .h = 48 });
-    // force the pill shape (index 3) at 0°: a horizontal stadium (38 wide,
-    // 19 tall, centered at (32, 32))
+    // force the pill morph (index 3) at t = 0: the M3E Pill preset fills most
+    // of the 38dp box (13..51) — an asymmetric blob whose bump pair sits on
+    // one diagonal: a top bump offset right, the bottom-left corner cut deep,
+    // the bottom-right moderate.
     stateOf(n).morph_index = 3;
     stateOf(n).morph_rotation = 0;
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    try std.testing.expectEqual(t.colors.primary, f.pixelAt(17, 32)); // the left cap
-    try std.testing.expectEqual(t.colors.primary, f.pixelAt(47, 32)); // the right cap
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(32, 17)); // no ink above (thin)
-    // at 90° the same stadium is vertical: ink moves to the top/bottom caps
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(32, 32)); // the body
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(33, 15)); // the top bump
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(19, 43)); // the bottom-left body
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(23, 15)); // left of the bump
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(16, 16)); // the top-left corner
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(45, 47)); // the bottom-right cut
+    // +90° swings the diagonal: the bottom-left body empties out, the
+    // bottom-right cut fills in
     stateOf(n).morph_rotation = 90;
     r.paint(n, 0xFFFFFFFF);
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
-    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(32, 17)); // the top cap
-    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(32, 47)); // the bottom cap
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f2.pixelAt(17, 32)); // no ink at the side
+    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(32, 32));
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f2.pixelAt(19, 45)); // was ink
+    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(47, 43)); // was background
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f2.pixelAt(41, 15)); // the bump shifted
+    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(43, 45)); // ...into the right-bottom
 }
 
 test "loading_indicator: determinate announces its progress value (a11y); indeterminate announces none" {

@@ -349,7 +349,9 @@ fn computeKeylines(n: *Node, s: *CarouselState) void {
     const content = @as(f32, @floatFromInt(count)) * stride - spacing;
     s.scroll.content = content;
     s.scroll.viewport = viewport;
-    _ = s.scroll.setOffset(s.scroll.offset); // clamp against the new range
+    // Clamp against the new range: if the offset moved, every keyline
+    // position shifts — damage the viewport.
+    if (s.scroll.setOffset(s.scroll.offset)) n.markDirty();
     ks.offset_max = s.scroll.maxOffset();
 
     const left_anchor = switch (s.opts.variant) {
@@ -663,6 +665,9 @@ const carousel_vtable = ui.node.VTable{
     .pre_children_paint = carouselPreChildrenPaint,
     .post_children_paint = carouselPostChildrenPaint,
     .child_clip = carouselChildClip,
+    // auto_retain: the viewport clip bounds the extent — an idle carousel
+    // is one blit; any drag/snap marks the subtree → direct paint.
+    .auto_retain = true,
 };
 
 /// An M3 carousel: a horizontal scrolling strip of item children

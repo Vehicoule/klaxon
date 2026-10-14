@@ -79,7 +79,7 @@ fn isExpanded(s: *EPState) bool {
 fn syncExpanded(n: *Node, s: *EPState) void {
     const expanded = isExpanded(s);
     for (n.children.items) |child| {
-        child.visible = expanded;
+        child.setVisible(expanded);
     }
     // Update a11y value.
     if (n.semantics) |sem| {

@@ -358,7 +358,7 @@ fn fabSyncCb(userdata: ?*anyopaque) void {
     for (n.children.items) |child| {
         const want_visible = (child == s.checked_child) == checked;
         if (child.visible != want_visible) {
-            child.visible = want_visible;
+            child.setVisible(want_visible);
             layout_changed = true;
         }
         icon_w.setColor(child, cc.icon);
@@ -418,7 +418,7 @@ pub fn fab(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_presse
     if (checked_ic) |cn| {
         cn.internal = true;
         cn.exclude_semantics = true;
-        cn.visible = isChecked(s);
+        cn.setVisible(isChecked(s));
         s.checked_child = cn;
         node.add(cn);
     }

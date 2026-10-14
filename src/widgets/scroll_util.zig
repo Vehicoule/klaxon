@@ -136,12 +136,15 @@ pub fn syncItemWindow(
         _ = n.remove(child); // detach then deinit — never the reverse
         child.deinit();
     }
-    // Items entering at the front (scrolled up): prepend.
+    // Items entering at the front (scrolled up): prepend. Route through
+    // insert() — NOT a raw children.insert: the parent pointer, the
+    // dirty/layout marks, and the overlay_subtree propagation must all run
+    // (a prepended item painting over the viewport edge without a damage
+    // mark would tear on a clipped repaint).
     while (first.* > range.first) {
         first.* -= 1;
         const node = factory.fn_ptr(factory.userdata, first.*);
-        n.children.insert(0, node) catch @panic("klaxon: out of memory");
-        node.parent = n;
+        n.insert(0, node); // sets parent + marks dirty/layout + overlay
         layout_item(n, node, first.*);
     }
     // Items entering at the back (scrolled down): append.

@@ -151,17 +151,9 @@ fn avPaint(n: *Node, ctx: *kx.Ctx) void {
         },
         .icon => {
             if (s.opts.icon) |ic| {
-                const cp = icon_w.codepoint(ic);
-                var glyph_buf: [4]u8 = undefined;
-                const glyph_len = std.unicode.utf8Encode(cp, &glyph_buf) catch 0;
-                if (glyph_len > 0) {
-                    const glyph_z: [:0]const u8 = glyph_buf[0..glyph_len :0];
-                    const icon_size = b.w * 0.5;
-                    const metrics = ui.paint.measureText(glyph_z, icon_size, false);
-                    const tx = b.x + (b.w - metrics.width) / 2;
-                    const ty = b.y + (b.h - metrics.height) / 2 + metrics.height * 0.8;
-                    ui.paint.text(ctx, glyph_z, tx, ty, icon_size, false, t.colors.on_primary_container);
-                }
+                const icon_size = b.w * 0.5;
+                icon_w.drawIcon(ctx, ic, b.x + (b.w - icon_size) / 2,
+                    b.y + (b.h - icon_size) / 2, icon_size / 24.0, t.colors.on_primary_container);
             }
         },
         .image => {

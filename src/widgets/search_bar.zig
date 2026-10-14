@@ -165,16 +165,11 @@ fn searchBarLayout(n: *Node, bounds: Rect) void {
     _ = bounds; // leaf: everything is positioned at paint time
 }
 
-/// Paint an icon glyph centered in a 24x24 box.
+/// Paint an icon centered in a 24x24 box — vector geometry (icon.zig), not
+/// a font glyph (emoji-capable codepoints bypass the theme ink).
 fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, color: Color) void {
     if (color & 0xFF == 0) return;
-    var gbuf: [4]u8 = .{ 0, 0, 0, 0 };
-    const glen = std.unicode.utf8Encode(icon_w.codepoint(name), &gbuf) catch return;
-    const glyph: [:0]const u8 = gbuf[0..glen :0];
-    const m = ui.paint.measureText(glyph, icon_size, false);
-    const gx = x + (icon_size - m.width) / 2;
-    const baseline = y + (icon_size - m.height) / 2 + m.ascent;
-    ui.paint.text(ctx, glyph, gx, baseline, icon_size, false, color);
+    icon_w.drawIcon(ctx, name, x, y, icon_size / 24.0, color);
 }
 
 fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {

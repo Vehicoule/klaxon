@@ -262,7 +262,7 @@ fn animateProgress(n: *Node, s: *SnackBarState, to: f32) void {
 
 fn applyProgress(n: *Node, s: *SnackBarState, progress: f32) void {
     s.progress = progress;
-    n.visible = progress > 0.001;
+    n.setVisible(progress > 0.001);
     n.markDirty();
 }
 

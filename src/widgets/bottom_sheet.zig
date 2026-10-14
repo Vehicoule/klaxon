@@ -385,7 +385,7 @@ fn animateProgress(n: *Node, s: *SheetState, to: f32) void {
 fn applyProgress(n: *Node, s: *SheetState, progress: f32, scrim_alpha: f32) void {
     s.progress = progress;
     scrimStateOf(s.scrim).alpha = scrim_alpha;
-    s.scrim.visible = scrim_alpha > 0.001;
+    s.scrim.setVisible(scrim_alpha > 0.001);
     // the panel slides DOWN out of view when closed (bottom-anchored)
     panelStateOf(s.panel).offset_y = s.panel_h * (1 - progress);
     s.panel.markDirty();

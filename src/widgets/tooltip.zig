@@ -137,7 +137,7 @@ fn setShown(n: *Node, s: *TooltipState, shown: bool) void {
     const target: f32 = if (shown) 1 else 0;
     if (target == s.anim_to) return;
     s.anim_to = target;
-    s.bubble.visible = true; // paint while fading (even out)
+    s.bubble.setVisible(true); // paint while fading (even out)
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
             .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, fade_ms, .{ .ease = .standard }),
@@ -148,7 +148,7 @@ fn setShown(n: *Node, s: *TooltipState, shown: bool) void {
         });
     } else {
         s.alpha = target;
-        if (!shown) s.bubble.visible = false;
+        if (!shown) s.bubble.setVisible(false);
         s.bubble.markDirty();
     }
 }
@@ -163,7 +163,7 @@ fn tooltipAlphaCb(userdata: ?*anyopaque, value: anim.Vec4) void {
 fn tooltipAlphaDoneCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
-    if (s.anim_to < 0.5) s.bubble.visible = false; // faded out: skip the paint
+    if (s.anim_to < 0.5) s.bubble.setVisible(false); // faded out: skip the paint
 }
 
 // --- bubble (internal): container + text, faded via a layer alpha ---
@@ -258,7 +258,7 @@ pub fn tooltipShell(allocator: std.mem.Allocator, opts: TooltipOptions) !*Node {
     const bubble = try Node.create(allocator, &bubble_vtable);
     errdefer allocator.destroy(bubble);
     bubble.internal = true; // registry: not document data
-    bubble.visible = false; // hidden until the first hover
+    bubble.setVisible(false); // hidden until the first hover
     const text_w = @import("text.zig");
     const t = opts.theme;
     bubble.add(try text_w.text(allocator, opts.text, .{

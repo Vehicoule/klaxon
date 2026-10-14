@@ -694,14 +694,14 @@ const DropdownState = struct {
 
     fn openBox(s: *DropdownState, n: *Node) void {
         s.open = true;
-        for (n.children.items) |child| child.visible = true;
+        for (n.children.items) |child| child.setVisible(true);
         markMenuDirty(n);
         input.setOpenPopup(n);
     }
 
     fn close(s: *DropdownState, n: *Node) void {
         s.open = false;
-        for (n.children.items) |child| child.visible = false;
+        for (n.children.items) |child| child.setVisible(false);
         markMenuDirty(n);
         input.setOpenPopup(null);
     }
@@ -769,7 +769,7 @@ fn menuItem(allocator: std.mem.Allocator, label: [:0]const u8, index: usize, own
     errdefer allocator.destroy(s);
     s.* = .{ .label = label, .index = index, .owner = owner };
     node.state = s;
-    node.visible = false; // hidden until the dropdown opens
+    node.setVisible(false); // hidden until the dropdown opens
     return node;
 }
 

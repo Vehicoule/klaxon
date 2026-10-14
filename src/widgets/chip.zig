@@ -343,7 +343,7 @@ fn chipSyncCb(userdata: ?*anyopaque) void {
         if (s.lead_child) |lc| {
             const want = isSelected(s);
             if (lc.visible != want) {
-                lc.visible = want;
+                lc.setVisible(want);
                 layout_changed = true;
             }
         }
@@ -405,7 +405,7 @@ pub fn chip(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_click
     const lead_name = if (opts.leading_icon) |i| i else if (opts.variant == .filter) icon_w.IconName.check else null;
     const lead = if (lead_name) |iname| blk: {
         const ic = try icon_w.icon(allocator, iname, .{ .size = icon_size, .color = cc.leading_icon });
-        ic.visible = if (opts.leading_icon != null) true else isSelected(s);
+        ic.setVisible(if (opts.leading_icon != null) true else isSelected(s));
         break :blk ic;
     } else null;
     errdefer if (lead) |ic| ic.deinit();

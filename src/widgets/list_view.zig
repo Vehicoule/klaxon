@@ -77,7 +77,9 @@ fn listLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(ListState, n);
     s.scroll.viewport = bounds.h;
     s.scroll.content = contentHeight(s);
-    _ = s.scroll.setOffset(s.scroll.offset); // re-clamp after a resize
+    // Re-clamp after a resize: if the clamp moved the offset the whole
+    // viewport shifts — damage it (layout must not teleport content).
+    if (s.scroll.setOffset(s.scroll.offset)) n.markDirty();
     if (s.scroll.viewport > 0) {
         const range = scroll_mod.visibleRange(s.opts.item_count, strideOf(s), s.scroll.viewport, s.scroll.offset, s.opts.margin);
         scroll_util.syncItemWindow(n, &s.first, s.opts.factory, range, layoutItem);
@@ -146,6 +148,9 @@ const list_vtable = ui.node.VTable{
     .map_paint_rect = listMapPaintRect,
     .child_clip = listChildClip,
     .pre_children_hit = listPreChildrenHit,
+    // auto_retain: the viewport clip bounds the extent — an idle list is
+    // one blit. Scrolling dirties it → direct paint (cache drops).
+    .auto_retain = true,
 };
 
 pub fn listView(allocator: std.mem.Allocator, opts: ListViewOptions) !*Node {

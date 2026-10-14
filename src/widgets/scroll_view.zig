@@ -59,7 +59,10 @@ fn scrollViewLayout(n: *Node, bounds: Rect) void {
         const cs = n.children.items[0].measure(child_c);
         s.content_h = cs.h;
         s.scroll.content = cs.h;
-        _ = s.scroll.setOffset(s.scroll.offset); // re-clamp after a resize
+        // Re-clamp after a resize: if the clamp moved the offset the whole
+        // viewport shifts — damage it (layout must not teleport content
+        // silently).
+        if (s.scroll.setOffset(s.scroll.offset)) n.markDirty();
         n.children.items[0].layout(.{
             .x = bounds.x,
             .y = bounds.y,
@@ -126,6 +129,11 @@ const scroll_view_vtable = ui.node.VTable{
     .map_paint_rect = scrollViewMapPaintRect,
     .child_clip = scrollViewChildClip,
     .pre_children_hit = scrollViewPreChildrenHit,
+    // auto_retain: the child_clip keeps the paint extent at the viewport —
+    // an idle scroll view replays one blit instead of re-issuing the whole
+    // content column's ops. Scrolling marks the subtree dirty → direct
+    // paint (the cache drops) — it only pays while content is static.
+    .auto_retain = true,
 };
 
 pub fn scrollView(allocator: std.mem.Allocator, opts: ScrollViewOptions) !*Node {
@@ -244,4 +252,4 @@ fn colPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = n;
     _ = ctx;
 }
-const column_vtable = ui.node.VTable{ .measure = colMeasure, .layout = colLayout, .paint = colPaint };
+const column_vtable = ui.node.VTable{ .measure = colMeasure, .layout = colLayout, .paint = colPaint, .auto_retain = true };

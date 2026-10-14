@@ -319,8 +319,8 @@ fn animateAlpha(n: *Node, s: *DialogState, to: f32) void {
 fn applyAlpha(n: *Node, s: *DialogState, alpha: f32, scrim_alpha: f32) void {
     s.alpha = alpha;
     scrimStateOf(s.scrim).alpha = scrim_alpha;
-    s.scrim.visible = scrim_alpha > 0.001;
-    s.panel.visible = alpha > 0.001;
+    s.scrim.setVisible(scrim_alpha > 0.001);
+    s.panel.setVisible(alpha > 0.001);
     s.panel.markDirty();
     s.scrim.markDirty();
     _ = n;

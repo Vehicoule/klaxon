@@ -447,7 +447,7 @@ const NavViewState = struct {
             f.hero.add(f.child); // Hero is single-child: back at index 0
             heroStateOf(f.hero).flight_dst = null;
             f.flight.deinit(); // empty: the child was reparented
-            f.out_hero.visible = true; // the source page may stay in the stack
+            f.out_hero.setVisible(true); // the source page may stay in the stack
         }
         // The exiting page leaves the tree — unless it is still in the stack
         // (an interrupted transition snaps it back into place). pages_ui is
@@ -493,7 +493,7 @@ const NavViewState = struct {
                 s.node.add(f); // topmost: paints above both pages
                 child.layout(.{ .x = 0, .y = 0, .w = dst.w, .h = dst.h });
                 f.layout(.{ .x = 0, .y = 0, .w = dst.w, .h = dst.h });
-                out.hero.visible = false; // the source hero leaves its page
+                out.hero.setVisible(false); // the source hero leaves its page
                 return .{ .hero = h, .flight = f, .child = child, .src = src, .dst = dst, .out_hero = out.hero };
             }
         }

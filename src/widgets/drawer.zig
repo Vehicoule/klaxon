@@ -241,7 +241,7 @@ fn applyProgress(n: *Node, s: *DrawerState, progress: f32, alpha: f32) void {
     s.progress = progress;
     panelStateOf(s.panel).offset_x = hideSign() * (s.panel_w * (1 - progress));
     scrimStateOf(s.scrim).alpha = alpha;
-    s.scrim.visible = progress > 0.01;
+    s.scrim.setVisible(progress > 0.01);
     markInternalsDirty(n, s);
 }
 
@@ -261,7 +261,7 @@ fn drawerAnimUpdateCb(userdata: ?*anyopaque, v: anim.Vec4) void {
     s.progress = v[0];
     panelStateOf(s.panel).offset_x = hideSign() * (s.panel_w * (1 - v[0]));
     scrimStateOf(s.scrim).alpha = v[1];
-    s.scrim.visible = v[0] > 0.01;
+    s.scrim.setVisible(v[0] > 0.01);
     markInternalsDirty(n, s);
 }
 

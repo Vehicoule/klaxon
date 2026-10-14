@@ -85,7 +85,9 @@ fn gridLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(GridState, n);
     s.scroll.viewport = bounds.h;
     s.scroll.content = contentHeight(s);
-    _ = s.scroll.setOffset(s.scroll.offset); // re-clamp after a resize
+    // Re-clamp after a resize: if the clamp moved the offset the whole
+    // viewport shifts — damage it (layout must not teleport content).
+    if (s.scroll.setOffset(s.scroll.offset)) n.markDirty();
     if (s.scroll.viewport > 0 and s.opts.cross_axis_count > 0) {
         // Row-aligned window: convert the row range to an item range.
         const stride = strideOf(s);
@@ -156,6 +158,9 @@ const grid_vtable = ui.node.VTable{
     .map_paint_rect = gridMapPaintRect,
     .child_clip = gridChildClip,
     .pre_children_hit = gridPreChildrenHit,
+    // auto_retain: the viewport clip bounds the extent — an idle grid is
+    // one blit. Scrolling dirties it → direct paint (cache drops).
+    .auto_retain = true,
 };
 
 pub fn gridView(allocator: std.mem.Allocator, opts: GridViewOptions) !*Node {

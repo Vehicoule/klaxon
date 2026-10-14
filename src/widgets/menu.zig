@@ -144,7 +144,7 @@ fn markMenuDirty(n: *Node) void {
 fn applyOpen(n: *Node, s: *MenuState, open: bool) void {
     if (s.open == open) return;
     s.open = open;
-    for (n.children.items[1..]) |child| child.visible = open; // [0] = anchor
+    for (n.children.items[1..]) |child| child.setVisible(open); // [0] = anchor
     s.highlight = -1;
     s.pressed_index = -1;
     markMenuDirty(n);
@@ -230,13 +230,7 @@ fn itemLayout(n: *Node, bounds: Rect) void {
 fn paintIcon(ctx: *kx.Ctx, name: ?icon_w.IconName, x: f32, y: f32, color: Color) void {
     const iname = name orelse return;
     if (color & 0xFF == 0) return;
-    var gbuf: [4]u8 = .{ 0, 0, 0, 0 };
-    const glen = std.unicode.utf8Encode(icon_w.codepoint(iname), &gbuf) catch return;
-    const glyph: [:0]const u8 = gbuf[0..glen :0];
-    const m = ui.paint.measureText(glyph, icon_size, false);
-    const gx = x + (icon_size - m.width) / 2;
-    const baseline = y + (icon_size - m.height) / 2 + m.ascent;
-    ui.paint.text(ctx, glyph, gx, baseline, icon_size, false, color);
+    icon_w.drawIcon(ctx, iname, x, y, icon_size / 24.0, color);
 }
 
 fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -517,7 +511,7 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
         errdefer allocator.destroy(is);
         is.* = .{ .def_index = i, .owner = node };
         item_node.state = is;
-        item_node.visible = false;
+        item_node.setVisible(false);
         item_node.internal = true; // chrome: never serialized
         item_node.exclude_semantics = true; // the menu node carries the semantics
         item_node.defer_paint = true; // the rows paint in the popup overlay pass

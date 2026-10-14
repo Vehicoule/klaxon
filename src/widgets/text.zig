@@ -18,6 +18,82 @@ pub const TextOptions = struct {
     color: Color = 0x000000FF, // opaque black (0xRRGGBBAA)
     bold: bool = false,
     text_align: TextAlign = .left, // named text_align — `align` is a Zig keyword
+    /// Variable-font axes (ABI 0.17.0): OpenType design coordinates, e.g.
+    /// `.{ .axis = ui.paint.axis_wght, .value = 500 }`. A 'wght' axis
+    /// overrides the bold→400/700 derivation on variable fonts. Caller-owned
+    /// slice — copied at construction; animate via setAxisValue/setAxes.
+    variations: []const ui.paint.FontAxis = &.{},
+};
+
+/// Variable-font paint state shared by Text and BoundText: when `axes_n > 0`
+/// the node paints through a retained kx_text_layout (the simple
+/// kx_draw_text_styled path carries no axes) and `m` is filled from that
+/// layout's metrics. `layout_dirty` re-arms on text/style/axis change —
+/// the next measure/paint rebuilds once.
+const VarText = struct {
+    axes: [ui.paint.max_font_variations]ui.paint.FontAxis = undefined,
+    axes_n: u8 = 0,
+    layout: ?*ui.paint.TextLayout = null,
+    layout_dirty: bool = false,
+
+    fn styleOf(self: *const VarText, opts: TextOptions) ui.paint.TextStyle {
+        var st = ui.paint.textStyle(opts.size, if (opts.bold) 700 else 400, 0, 0, opts.color);
+        ui.paint.withVariations(&st, self.axes[0..self.axes_n]);
+        return st;
+    }
+
+    fn ensureLayout(self: *VarText, opts: TextOptions, str: [:0]const u8, m: *ui.paint.TextMetrics) void {
+        if (self.axes_n == 0) return;
+        if (self.layout != null and !self.layout_dirty) return;
+        if (self.layout) |l| ui.paint.textLayoutDestroy(l);
+        self.layout = ui.paint.textLayoutBegin(0);
+        if (self.layout) |l| {
+            ui.paint.textLayoutSpan(l, str, self.styleOf(opts));
+            const baseline = ui.paint.textLayoutBaseline(l);
+            const height = ui.paint.textLayoutHeight(l);
+            m.* = .{ .width = ui.paint.textLayoutWidth(l), .height = height, .ascent = baseline, .descent = height - baseline };
+        }
+        self.layout_dirty = false;
+    }
+
+    fn deinit(self: *VarText) void {
+        if (self.layout) |l| ui.paint.textLayoutDestroy(l);
+        self.layout = null;
+    }
+
+    /// Replace all axes (≤8 kept). No-op when identical — safe per tick.
+    fn setAxes(self: *VarText, n: *Node, axes: []const ui.paint.FontAxis) void {
+        const count: u8 = @intCast(@min(axes.len, ui.paint.max_font_variations));
+        const same = count == self.axes_n and blk: {
+            for (axes[0..count], self.axes[0..count]) |new, old|
+                if (new.axis != old.axis or new.value != old.value) break :blk false;
+            break :blk true;
+        };
+        if (same) return;
+        @memcpy(self.axes[0..count], axes[0..count]);
+        self.axes_n = count;
+        self.layout_dirty = true;
+        n.markLayoutDirty(); // axes move advances — metrics may change
+        n.markDirty();
+    }
+
+    /// Animate one axis (a spring driving 'wght' 400→700). Appends the axis
+    /// when absent and room remains. No-op when the value didn't move.
+    fn setAxisValue(self: *VarText, n: *Node, axis: u32, value: f32) void {
+        for (self.axes[0..self.axes_n]) |*a| {
+            if (a.axis != axis) continue;
+            if (a.value == value) return;
+            a.value = value;
+            break;
+        } else {
+            if (self.axes_n >= ui.paint.max_font_variations) return;
+            self.axes[self.axes_n] = .{ .axis = axis, .value = value };
+            self.axes_n += 1;
+        }
+        self.layout_dirty = true;
+        n.markLayoutDirty();
+        n.markDirty();
+    }
 };
 
 const TextState = struct {
@@ -26,13 +102,16 @@ const TextState = struct {
     /// Metrics measured once at construction: a Text's string and the
     /// metrics-relevant opts (size, bold) are immutable for the node's
     /// lifetime — only the color mutates (setColor, which doesn't affect
-    /// measurement). measure/paint/paintBounds read this instead of
-    /// re-measuring every frame.
+    /// measurement); variable axes refresh it via setAxes/setAxisValue.
+    /// measure/paint/paintBounds read this instead of re-measuring every
+    /// frame.
     m: ui.paint.TextMetrics,
+    vt: VarText = .{},
 };
 
 fn textMeasure(n: *Node, c: Constraints) Size {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.ensureLayout(s.opts, s.text, &s.m); // refresh axes-driven metrics
     return c.constrain(.{ .w = s.m.width, .h = s.m.height });
 }
 fn textLayout(n: *Node, bounds: Rect) void {
@@ -53,12 +132,18 @@ fn textX(n: *Node, m: ui.paint.TextMetrics, text_align: ui.layout.TextAlign) f32
 
 fn textPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.ensureLayout(s.opts, s.text, &s.m);
     const x = textX(n, s.m, s.opts.text_align);
     // Skia draws from the baseline: one ascent below the top.
-    ui.paint.text(ctx, s.text, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+    if (s.vt.layout) |l| {
+        ui.paint.textLayoutPaint(ctx, l, x, n.bounds.y + s.m.ascent);
+    } else {
+        ui.paint.text(ctx, s.text, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+    }
 }
 fn textDeinit(n: *Node) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.deinit();
     n.allocator.free(s.text);
     n.allocator.destroy(s);
 }
@@ -67,6 +152,7 @@ fn textDeinit(n: *Node) void {
 /// damage consult it.
 fn textPaintBounds(n: *Node) Rect {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.ensureLayout(s.opts, s.text, &s.m);
     return .{ .x = textX(n, s.m, s.opts.text_align), .y = n.bounds.y, .w = s.m.width, .h = s.m.height };
 }
 const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds };
@@ -81,6 +167,13 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
     @memcpy(buf[0..str.len], str);
     buf[str.len] = 0;
     s.* = .{ .text = buf[0..str.len :0], .opts = opts, .m = ui.paint.measureText(buf[0..str.len :0], opts.size, opts.bold) };
+    // Seed the axes WITHOUT the dirty marks — setAxes dereferences
+    // n.state for the damage paths and this node isn't attached yet.
+    s.vt.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
+    @memcpy(s.vt.axes[0..s.vt.axes_n], opts.variations[0..s.vt.axes_n]);
+    s.vt.layout_dirty = s.vt.axes_n > 0;
+    if (s.vt.axes_n > 0)
+        s.vt.ensureLayout(s.opts, s.text, &s.m); // seed metrics from the variable-font layout
     node.state = s;
     ui.semantics.attach(node, .{ .role = .text, .label = s.text }); // Phase 2c
     return node;
@@ -91,7 +184,21 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
 pub fn setColor(n: *Node, color: Color) void {
     const s: *TextState = @ptrCast(@alignCast(n.state.?));
     s.opts.color = color;
+    if (s.vt.axes_n > 0) s.vt.layout_dirty = true; // span color is baked at build
     n.markDirty();
+}
+
+/// Replace the variable-font axes (M3E weight/width animation).
+pub fn setAxes(n: *Node, axes: []const ui.paint.FontAxis) void {
+    const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.setAxes(n, axes);
+}
+
+/// Animate one axis in place — e.g. a spring writing 'wght' each tick.
+/// No-op when the value didn't move.
+pub fn setAxisValue(n: *Node, axis: u32, value: f32) void {
+    const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    s.vt.setAxisValue(n, axis, value);
 }
 
 // --- BoundText: a Text whose string follows a signal ---
@@ -128,6 +235,7 @@ pub fn BoundText(comptime T: type) type {
             /// reformat gates the re-measure, so measure()/paint()/
             /// paintBounds() never measure a stale or repeated string.
             m: ui.paint.TextMetrics,
+            vt: VarText = .{},
         };
 
         fn bound(n: *Node) [:0]const u8 {
@@ -168,13 +276,15 @@ pub fn BoundText(comptime T: type) type {
             s.buf.items.len -= 1;
             const str = s.buf.items.ptr[0..s.buf.items.len :0];
             s.m = ui.paint.measureText(str, s.opts.size, s.opts.bold); // reformatted → re-measure once
+            s.vt.layout_dirty = true; // new string → retained paragraph rebuilds on next use
             if (n.semantics) |sem| sem.label = str; // re-point: a grow may have moved the buffer
             return str;
         }
 
         fn measure(n: *Node, c: Constraints) Size {
             const s: *State = @ptrCast(@alignCast(n.state.?));
-            _ = bound(n); // refresh buf + metrics when the signal changed
+            const str = bound(n); // refresh buf + metrics when the signal changed
+            s.vt.ensureLayout(s.opts, str, &s.m);
             return c.constrain(.{ .w = s.m.width, .h = s.m.height });
         }
         fn layout(n: *Node, bounds: Rect) void {
@@ -184,8 +294,13 @@ pub fn BoundText(comptime T: type) type {
         fn paint(n: *Node, ctx: *kx.Ctx) void {
             const s: *State = @ptrCast(@alignCast(n.state.?));
             const str = bound(n);
+            s.vt.ensureLayout(s.opts, str, &s.m);
             const x = textX(n, s.m, s.opts.text_align);
-            ui.paint.text(ctx, str, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+            if (s.vt.layout) |l| {
+                ui.paint.textLayoutPaint(ctx, l, x, n.bounds.y + s.m.ascent);
+            } else {
+                ui.paint.text(ctx, str, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+            }
         }
         fn dirtyCb(userdata: ?*anyopaque) void {
             const n: *Node = @ptrCast(@alignCast(userdata.?));
@@ -198,15 +313,27 @@ pub fn BoundText(comptime T: type) type {
         fn deinit(n: *Node) void {
             const s: *State = @ptrCast(@alignCast(n.state.?));
             s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = dirtyCb, .userdata = n } });
+            s.vt.deinit();
             s.buf.deinit();
             n.allocator.destroy(s);
         }
         fn paintBounds(n: *Node) Rect {
             const s: *State = @ptrCast(@alignCast(n.state.?));
-            _ = bound(n); // keep metrics in step with the current string
+            const str = bound(n); // keep metrics in step with the current string
+            s.vt.ensureLayout(s.opts, str, &s.m);
             return .{ .x = textX(n, s.m, s.opts.text_align), .y = n.bounds.y, .w = s.m.width, .h = s.m.height };
         }
         const vtable = ui.node.VTable{ .measure = measure, .layout = layout, .paint = paint, .deinit = deinit, .paint_bounds = paintBounds };
+
+        /// Variable-font axes — same semantics as text.setAxes/setAxisValue.
+        pub fn setAxes(n: *Node, axes: []const ui.paint.FontAxis) void {
+            const s: *State = @ptrCast(@alignCast(n.state.?));
+            s.vt.setAxes(n, axes);
+        }
+        pub fn setAxisValue(n: *Node, axis: u32, value: f32) void {
+            const s: *State = @ptrCast(@alignCast(n.state.?));
+            s.vt.setAxisValue(n, axis, value);
+        }
 
         pub fn text(allocator: std.mem.Allocator, sig: *SignalFor(T), fmt: *const fn (T, []u8) ?[]const u8, opts: TextOptions) !*Node {
             const node = try Node.create(allocator, &vtable);
@@ -215,6 +342,9 @@ pub fn BoundText(comptime T: type) type {
             errdefer allocator.destroy(s);
             s.* = .{ .sig = sig, .fmt = fmt, .opts = opts, .buf = std.array_list.Managed(u8).init(allocator), .dirty = true, .m = std.mem.zeroes(ui.paint.TextMetrics) };
             errdefer s.buf.deinit();
+            s.vt.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
+            @memcpy(s.vt.axes[0..s.vt.axes_n], opts.variations[0..s.vt.axes_n]);
+            s.vt.layout_dirty = s.vt.axes_n > 0;
             node.state = s;
             // Phase 2c: the label is the initial text — dynamic changes go
             // through live regions (semantics.announce).
@@ -232,31 +362,31 @@ pub const TextSpan = struct {
     size: f32 = 16,
     color: Color = 0x000000FF, // opaque black (0xRRGGBBAA)
     bold: bool = false,
-};
-
-const SpanState = struct {
-    text: [:0]const u8, // owned, null-terminated
-    size: f32,
-    color: Color,
-    bold: bool,
-    /// Metrics measured once at construction — spans are immutable, so
-    /// measure/paint/paintBounds read this instead of re-measuring.
-    m: ui.paint.TextMetrics,
+    /// Full M3E weight axis 100..900 (0 = derive from `bold` → 400/700).
+    weight: u16 = 0,
+    italic: bool = false,
+    letter_spacing: f32 = 0, // px added between glyphs (0 = font default)
+    /// Variable-font axes for this span (0.17.0) — a 'wght' coord overrides
+    /// weight on variable fonts. Caller-owned; copied at build.
+    variations: []const ui.paint.FontAxis = &.{},
 };
 
 const RichTextState = struct {
-    spans: std.array_list.Managed(SpanState),
+    /// Concatenated span strings (owned, for the a11y label — the paragraph
+    /// holds its own copy for rendering).
+    label: [:0]const u8,
+    /// One shaped paragraph for all spans — real rich text (the spans shape
+    /// together: cross-span kerning, bidi-aware ordering, per-span weight/
+    /// italic/letter-spacing/color). Built once at construction.
+    layout: ?*ui.paint.TextLayout,
 };
 
 fn richTextMeasure(n: *Node, c: Constraints) Size {
     const s: *RichTextState = @ptrCast(@alignCast(n.state.?));
-    var w: f32 = 0;
-    var h: f32 = 0;
-    for (s.spans.items) |span| {
-        w += span.m.width;
-        h = @max(h, span.m.height);
+    if (s.layout) |l| {
+        return c.constrain(.{ .w = ui.paint.textLayoutWidth(l), .h = ui.paint.textLayoutHeight(l) });
     }
-    return c.constrain(.{ .w = w, .h = h });
+    return c.constrain(.{ .w = 0, .h = 0 });
 }
 fn richTextLayout(n: *Node, bounds: Rect) void {
     _ = n;
@@ -264,68 +394,60 @@ fn richTextLayout(n: *Node, bounds: Rect) void {
 }
 fn richTextPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *RichTextState = @ptrCast(@alignCast(n.state.?));
-    // Shared baseline: the tallest span's ascent.
-    var ascent: f32 = 0;
-    for (s.spans.items) |span| {
-        ascent = @max(ascent, span.m.ascent);
-    }
-    const baseline = n.bounds.y + ascent;
-    var x = n.bounds.x;
-    for (s.spans.items) |span| {
-        ui.paint.text(ctx, span.text, x, baseline, span.size, span.bold, span.color);
-        x += span.m.width;
+    if (s.layout) |l| {
+        ui.paint.textLayoutPaint(ctx, l, n.bounds.x, n.bounds.y + ui.paint.textLayoutBaseline(l));
     }
 }
 fn richTextDeinit(n: *Node) void {
     const s: *RichTextState = @ptrCast(@alignCast(n.state.?));
-    for (s.spans.items) |span| n.allocator.free(span.text);
-    s.spans.deinit();
+    if (s.layout) |l| ui.paint.textLayoutDestroy(l);
+    n.allocator.free(s.label);
     n.allocator.destroy(s);
 }
-/// The spans' actual extent: they flow from bounds.x without wrapping, so
-/// the glyph run may exceed the bounds' width (and its height when the
-/// bounds are shorter than the tallest span).
+/// The paragraph's actual extent (unconstrained: its longest line may
+/// exceed the bounds' width).
 fn richTextPaintBounds(n: *Node) Rect {
     const s: *RichTextState = @ptrCast(@alignCast(n.state.?));
-    var w: f32 = 0;
-    var h: f32 = 0;
-    for (s.spans.items) |span| {
-        w += span.m.width;
-        h = @max(h, span.m.height);
-    }
+    const w = if (s.layout) |l| ui.paint.textLayoutWidth(l) else 0;
+    const h = if (s.layout) |l| ui.paint.textLayoutHeight(l) else 0;
     return .{ .x = n.bounds.x, .y = n.bounds.y, .w = w, .h = h };
 }
 const rich_text_vtable = ui.node.VTable{ .measure = richTextMeasure, .layout = richTextLayout, .paint = richTextPaint, .deinit = richTextDeinit, .paint_bounds = richTextPaintBounds };
 
-/// RichText — a single line of styled spans. Copies the span strings.
-/// Error-safe: spans are copied first; on failure everything is freed.
+/// RichText — styled spans shaped as ONE paragraph (ABI 0.15.0): per-span
+/// weight/italic/letter-spacing/color, real shaping + bidi + fallback.
+/// Copies the span strings. Error-safe: the label is built first; on
+/// failure everything is freed.
 pub fn richText(allocator: std.mem.Allocator, spans: []const TextSpan) !*Node {
-    var owned = std.array_list.Managed(SpanState).init(allocator);
-    errdefer {
-        for (owned.items) |span| allocator.free(span.text);
-        owned.deinit();
-    }
+    var label = std.array_list.Managed(u8).init(allocator);
+    errdefer label.deinit();
+    for (spans) |span| try label.appendSlice(span.text);
+    const owned_label = try label.toOwnedSliceSentinel(0); // exactly-sized alloc — free(s.label) is a valid pair
+    const l = ui.paint.textLayoutBegin(0); // unconstrained — one line
     for (spans) |span| {
+        const weight: i32 = if (span.weight != 0) @intCast(span.weight) else if (span.bold) 700 else 400;
+        // The paragraph copies the span text at span() time — a Zig-side
+        // temporary sentinel suffices.
         const buf = try allocator.alloc(u8, span.text.len + 1);
+        defer allocator.free(buf);
         @memcpy(buf[0..span.text.len], span.text);
         buf[span.text.len] = 0;
-        owned.append(.{
-            .text = buf[0..span.text.len :0],
-            .size = span.size,
-            .color = span.color,
-            .bold = span.bold,
-            .m = ui.paint.measureText(buf[0..span.text.len :0], span.size, span.bold),
-        }) catch {
-            allocator.free(buf);
-            return error.OutOfMemory;
-        };
+        if (l) |layout| {
+            var st = ui.paint.textStyle(span.size, weight, if (span.italic) 1 else 0, span.letter_spacing, span.color);
+            ui.paint.withVariations(&st, span.variations);
+            ui.paint.textLayoutSpan(layout, buf[0..span.text.len :0], st);
+        }
     }
     const node = try Node.create(allocator, &rich_text_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(RichTextState);
     errdefer allocator.destroy(s);
-    s.* = .{ .spans = owned }; // moves the list (no fallible ops after this)
+    s.* = .{
+        .label = owned_label,
+        .layout = l,
+    };
     node.state = s;
+    ui.semantics.attach(node, .{ .role = .text, .label = s.label });
     return node;
 }
 
@@ -358,8 +480,20 @@ test "rich text measure sums span widths, max height" {
     defer world.deinit();
     const size = rt.measure(.{});
     const expected_w = single.measure(.{}).w + world.measure(.{}).w;
-    try std.testing.expectApproxEqAbs(expected_w, size.w, 0.001);
+    // Real shaping kerns across the span boundary: a multi-span paragraph
+    // accumulates span advances but is not bit-exact against separately
+    // measured strings.
+    try std.testing.expectApproxEqRel(expected_w, size.w, 0.1);
     try std.testing.expectApproxEqAbs(world.measure(.{}).h, size.h, 0.001);
+    // Uniform-style spans must measure identically to the joined string.
+    const joined = try richText(std.testing.allocator, &.{
+        .{ .text = "Hello ", .size = 16 },
+        .{ .text = "world", .size = 16 },
+    });
+    defer joined.deinit();
+    const flat = try text(std.testing.allocator, "Hello world", .{ .size = 16 });
+    defer flat.deinit();
+    try std.testing.expectApproxEqAbs(flat.measure(.{}).w, joined.measure(.{}).w, 0.001);
 }
 
 test "golden: text renders ink inside its bounds, none outside" {
@@ -488,4 +622,60 @@ test "BoundText: the semantic label follows the signal (a11y)" {
     try std.testing.expectEqualStrings("Pressed 1 times", node.semantics.?.label);
     sig.set(42);
     try std.testing.expectEqualStrings("Pressed 42 times", node.semantics.?.label);
+}
+
+test "variable font axes: layout path engages and animates in place" {
+    const wght = ui.paint.axis_wght;
+    const t = try text(std.testing.allocator, "Ag", .{
+        .size = 24,
+        .variations = &.{.{ .axis = wght, .value = 400 }},
+    });
+    defer t.deinit();
+    const s: *TextState = @ptrCast(@alignCast(t.state.?));
+    try std.testing.expect(s.vt.axes_n == 1);
+    try std.testing.expect(s.vt.layout != null); // retained paragraph path
+    const w400 = t.measure(.{}).w;
+    try std.testing.expect(w400 > 0);
+
+    // A spring-style per-tick write: same value is a no-op, a new value
+    // rebuilds the retained paragraph and re-measures. (markLayoutDirty
+    // consults paint_bounds synchronously, which consumes layout_dirty —
+    // assert the metrics respond, not the flag.)
+    setAxisValue(t, wght, 400);
+    try std.testing.expect(s.vt.axes[0].value == 400);
+    setAxisValue(t, wght, 700);
+    try std.testing.expect(s.vt.axes[0].value == 700);
+    const w700 = t.measure(.{}).w;
+    try std.testing.expect(w700 > 0);
+    // wght=700 widens 'Ag' on a variable font; a font without the axis keeps
+    // the same advance — it must never shrink.
+    try std.testing.expect(w700 >= w400 - 0.5);
+
+    // setAxes replaces the whole axis set — 'wght' 700 + 'wdth' 100.
+    setAxes(t, &.{ .{ .axis = wght, .value = 700 }, .{ .axis = ui.paint.axis_wdth, .value = 100 } });
+    try std.testing.expect(s.vt.axes_n == 2);
+    try std.testing.expect(t.measure(.{}).w > 0);
+}
+
+test "golden: variable-font text paints ink inside bounds" {
+    const bg = 0x101010FF;
+    const root = try text(std.testing.allocator, "Ag", .{
+        .size = 24,
+        .color = 0xFFFFFFFF,
+        .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 700 }},
+    });
+    const m = root.measure(.{}); // read before render — golden.render deinits the tree
+    try std.testing.expect(m.w > 0);
+    var frame = try golden.render(std.testing.allocator, root, 128, 64, bg);
+    defer frame.deinit();
+    try std.testing.expect(frame.countNotIn(.{ .x = 0, .y = 0, .w = m.w, .h = 64 }, bg) > 0);
+}
+
+test "rich text span honors a per-span variation axis" {
+    const rt = try richText(std.testing.allocator, &.{
+        .{ .text = "Aa", .size = 24, .color = 0xFFFFFFFF, .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 300 }} },
+        .{ .text = "Bb", .size = 24, .color = 0xFF0000FF, .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 900 }} },
+    });
+    defer rt.deinit();
+    try std.testing.expect(rt.measure(.{}).w > 0);
 }

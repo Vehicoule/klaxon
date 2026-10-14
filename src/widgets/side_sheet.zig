@@ -390,7 +390,7 @@ fn applyProgress(n: *Node, s: *SideSheetState, progress: f32, scrim_alpha: f32) 
     s.progress = progress;
     scrimStateOf(s.scrim).alpha = scrim_alpha;
     // the scrim shows only for a modal sheet (standard sheets are coplanar)
-    s.scrim.visible = s.opts.modal and scrim_alpha > 0.001;
+    s.scrim.setVisible(s.opts.modal and scrim_alpha > 0.001);
     // the panel slides towards its anchored edge when closed
     panelStateOf(s.panel).offset_x = hideSign(s.opts) * (s.panel_w * (1 - progress));
     markInternalsDirty(n, s);

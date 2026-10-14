@@ -244,16 +244,11 @@ fn segLayout(n: *Node, bounds: Rect) void {
     _ = bounds; // leaf: the segments are computed from the bounds at paint/hit
 }
 
-/// Paint an icon glyph centered in a 24x24 box (menu.zig's helper, 18dp here).
+/// Paint an icon centered in a size x size box — vector geometry (icon.zig),
+/// not a font glyph (emoji-capable codepoints bypass the theme ink).
 fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, size: f32, color: Color) void {
     if (color & 0xFF == 0) return;
-    var gbuf: [4]u8 = .{ 0, 0, 0, 0 };
-    const glen = std.unicode.utf8Encode(icon_w.codepoint(name), &gbuf) catch return;
-    const glyph: [:0]const u8 = gbuf[0..glen :0];
-    const m = ui.paint.measureText(glyph, size, false);
-    const gx = x + (size - m.width) / 2;
-    const baseline = y + (size - m.height) / 2 + m.ascent;
-    ui.paint.text(ctx, glyph, gx, baseline, size, false, color);
+    icon_w.drawIcon(ctx, name, x, y, size / 24.0, color);
 }
 
 fn segPaint(n: *Node, ctx: *kx.Ctx) void {

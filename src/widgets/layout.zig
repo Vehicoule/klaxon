@@ -59,7 +59,7 @@ fn flexLayout(n: *Node, bounds: Rect) void {
 fn flexDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(FlexState, n));
 }
-const flex_vtable = ui.node.VTable{ .measure = flexMeasure, .layout = flexLayout, .paint = noopPaint, .deinit = flexDeinit };
+const flex_vtable = ui.node.VTable{ .measure = flexMeasure, .layout = flexLayout, .paint = noopPaint, .deinit = flexDeinit, .auto_retain = true };
 
 fn flex(allocator: std.mem.Allocator, axis: Axis, opts: FlexOptions) !*Node {
     const node = try Node.create(allocator, &flex_vtable);
@@ -126,7 +126,7 @@ fn stackLayout(n: *Node, bounds: Rect) void {
 fn stackDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(StackState, n));
 }
-const stack_vtable = ui.node.VTable{ .measure = stackMeasure, .layout = stackLayout, .paint = noopPaint, .deinit = stackDeinit };
+const stack_vtable = ui.node.VTable{ .measure = stackMeasure, .layout = stackLayout, .paint = noopPaint, .deinit = stackDeinit, .auto_retain = true };
 
 pub fn stack(allocator: std.mem.Allocator, opts: StackOptions) !*Node {
     const node = try Node.create(allocator, &stack_vtable);
@@ -246,7 +246,7 @@ fn gridLayout(n: *Node, bounds: Rect) void {
 fn gridDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(GridState, n));
 }
-const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit };
+const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit, .auto_retain = true };
 
 pub fn grid(allocator: std.mem.Allocator, opts: GridOptions) !*Node {
     const node = try Node.create(allocator, &grid_vtable);
@@ -286,7 +286,7 @@ fn paddingLayout(n: *Node, bounds: Rect) void {
 fn paddingDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(PaddingState, n));
 }
-const padding_vtable = ui.node.VTable{ .measure = paddingMeasure, .layout = paddingLayout, .paint = noopPaint, .deinit = paddingDeinit };
+const padding_vtable = ui.node.VTable{ .measure = paddingMeasure, .layout = paddingLayout, .paint = noopPaint, .deinit = paddingDeinit, .auto_retain = true };
 
 pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets) !*Node {
     const node = try Node.create(allocator, &padding_vtable);
@@ -328,7 +328,7 @@ fn paddingDirLayout(n: *Node, bounds: Rect) void {
 fn paddingDirDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(PaddingDirState, n));
 }
-const padding_dir_vtable = ui.node.VTable{ .measure = paddingDirMeasure, .layout = paddingDirLayout, .paint = noopPaint, .deinit = paddingDirDeinit };
+const padding_dir_vtable = ui.node.VTable{ .measure = paddingDirMeasure, .layout = paddingDirLayout, .paint = noopPaint, .deinit = paddingDirDeinit, .auto_retain = true };
 
 /// Padding with directional insets: start/end resolve against the current
 /// text direction (start = left in LTR, right in RTL). Resolved at every
@@ -371,7 +371,7 @@ fn alignLayout(n: *Node, bounds: Rect) void {
 fn alignDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(AlignState, n));
 }
-const align_vtable = ui.node.VTable{ .measure = alignMeasure, .layout = alignLayout, .paint = noopPaint, .deinit = alignDeinit };
+const align_vtable = ui.node.VTable{ .measure = alignMeasure, .layout = alignLayout, .paint = noopPaint, .deinit = alignDeinit, .auto_retain = true };
 
 /// Align (named alignTo — `align` is a Zig keyword).
 pub fn alignTo(allocator: std.mem.Allocator, opts: AlignOptions) !*Node {
@@ -425,7 +425,7 @@ fn constrainedBoxLayout(n: *Node, bounds: Rect) void {
 fn constrainedBoxDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(ConstrainedBoxState, n));
 }
-const constrained_box_vtable = ui.node.VTable{ .measure = constrainedBoxMeasure, .layout = constrainedBoxLayout, .paint = noopPaint, .deinit = constrainedBoxDeinit };
+const constrained_box_vtable = ui.node.VTable{ .measure = constrainedBoxMeasure, .layout = constrainedBoxLayout, .paint = noopPaint, .deinit = constrainedBoxDeinit, .auto_retain = true };
 
 pub fn constrainedBox(allocator: std.mem.Allocator, opts: ConstrainedBoxOptions) !*Node {
     const node = try Node.create(allocator, &constrained_box_vtable);
@@ -448,7 +448,7 @@ fn expandedLayout(n: *Node, bounds: Rect) void {
     if (n.children.items.len == 0) return;
     n.children.items[0].layout(bounds); // fill semantics
 }
-const expanded_vtable = ui.node.VTable{ .measure = expandedMeasure, .layout = expandedLayout, .paint = noopPaint };
+const expanded_vtable = ui.node.VTable{ .measure = expandedMeasure, .layout = expandedLayout, .paint = noopPaint, .auto_retain = true };
 
 /// Expanded — the child takes a share (weight) of the flex container's
 /// REMAINING main-axis space (after non-flex children, gaps and padding).

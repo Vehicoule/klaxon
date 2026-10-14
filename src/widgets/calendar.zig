@@ -102,12 +102,19 @@ fn calPaint(n: *Node, ctx: *kx.Ctx) void {
     const title_y = b.y + (header_h - ts.line_height) / 2 + ts.line_height * 0.8;
     ui.paint.text(ctx, month_str, title_x, title_y, ts.size, true, t.colors.on_surface);
 
-    // Chevrons (◀ ▶).
+    // Chevrons — vector triangles, not text glyphs: font fallback resolves
+    // U+25C0/U+25B6 through the color-emoji font (a blue emoji button with
+    // a white cutout), which ignores the theme ink color entirely.
     const chev_y = b.y + (header_h - chevron_icon) / 2;
     const chev_prev_x = b.x + b.w - h_pad - 16 - chevron_icon * 2 - 8;
     const chev_next_x = b.x + b.w - h_pad - 16 - chevron_icon;
-    ui.paint.text(ctx, "\u{25C0}", chev_prev_x, chev_y + chevron_icon * 0.8, chevron_icon, false, t.colors.on_surface_variant);
-    ui.paint.text(ctx, "\u{25B6}", chev_next_x, chev_y + chevron_icon * 0.8, chevron_icon, false, t.colors.on_surface_variant);
+    // 24dp icon box, ~10x14 triangle centered.
+    const pxs = [_]f32{ chev_prev_x + 7, chev_prev_x + 17, chev_prev_x + 17 };
+    const pys = [_]f32{ chev_y + 12, chev_y + 5, chev_y + 19 };
+    ui.paint.fillPolygon(ctx, &pxs, &pys, t.colors.on_surface_variant);
+    const nxs = [_]f32{ chev_next_x + 17, chev_next_x + 7, chev_next_x + 7 };
+    const nys = [_]f32{ chev_y + 12, chev_y + 5, chev_y + 19 };
+    ui.paint.fillPolygon(ctx, &nxs, &nys, t.colors.on_surface_variant);
 
     // Weekday row.
     const wd_y = b.y + header_h;
@@ -347,9 +354,9 @@ test "golden: the selected day paints a primary-filled cell with on_primary ink"
     // on_primary ink anywhere in the panel
     r.paint(n, 0xFFFFFFFF);
     var f1 = try r.readback(a);
+    defer f1.deinit();
     const base_primary = f1.countColorIn(panel, t.colors.primary);
     try std.testing.expectEqual(@as(u64, 0), f1.countColorIn(panel, t.colors.on_primary));
-    f1.deinit();
     // select Oct 10 (in the displayed month): a filled primary cell
     sel.set(date_picker_w.daysFromCivil(2026, 10, 10));
     n.layout(.{ .x = 10, .y = 10, .w = 280, .h = total_h });
