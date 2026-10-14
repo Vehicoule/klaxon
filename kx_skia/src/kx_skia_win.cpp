@@ -6,6 +6,14 @@
 //   KX_BACKEND_RASTER          → handled by kx_skia_common (last resort)
 // The Dawn instance is process-global (shared across contexts); device,
 // queue and the HWND swapchain surface are per GpuState.
+//
+// Raster is NOT presented here: the raster ctx never reaches this file
+// (kx_skia_platform.h hooks fire only when ctx->gpu != nullptr). The host
+// (src/host.zig) reads the frame back with kx_readback_rgba and presents
+// it through an SDL streaming texture + SDL_RenderPresent — the same path
+// on every desktop platform. Window proc, event pump, DPI and input are
+// SDL's entirely; the shim attaches to the SDL window's HWND and never
+// subclasses it.
 #include "kx_skia_platform.h"
 
 #include <SDL3/SDL.h>
@@ -39,6 +47,7 @@ static const size_t kKxDefaultFontSize = 0;
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
+#include "include/gpu/graphite/Image.h" // SkImages::TextureFromImage (graphite)
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
 #include "include/gpu/graphite/Surface.h"
@@ -52,6 +61,8 @@ static const size_t kKxDefaultFontSize = 0;
 
 #include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/GrTypes.h" // GrSyncCpu
+#include "include/gpu/ganesh/SkImageGanesh.h" // SkImages::TextureFromImage (ganesh)
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "include/gpu/ganesh/gl/GrGLAssembleInterface.h"
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
@@ -77,6 +88,12 @@ struct GpuState {
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
+    // A frame is in flight (gpu_begin_frame returned a canvas, gpu_end_frame
+    // not yet called). Gates the frame-scoped helpers (gpu_offscreen_surface,
+    // gpu_image_upload): their work must land in the frame's own recording —
+    // an upload recorded outside that window would sit unsubmitted until the
+    // next end_frame, and on Graphite a cross-recorder dependency fails.
+    bool frame_active = false;
 
     // Graphite Dawn (d3d12 / vulkan)
     wgpu::Device device;
@@ -94,6 +111,14 @@ struct GpuState {
     sk_sp<const GrGLInterface> gl_iface;
     sk_sp<GrDirectContext> gr_ctx;
     sk_sp<SkSurface> gl_surface;
+
+    // Warmup pass (Phase 4e.1): the offscreen surface drawn between
+    // gpu_begin_offscreen/gpu_end_offscreen. Dawn records it on a SEPARATE
+    // recorder (like the Metal shim): kx_gpu_warmup runs between frames,
+    // and a snap() on the shared frame recorder could take in-flight frame
+    // draws with it if a caller ever violated that contract.
+    std::unique_ptr<skgpu::graphite::Recorder> warmup_recorder;
+    sk_sp<SkSurface> warmup_surface;
 };
 
 static HWND hwnd_of(void* sdl_window) {
@@ -289,6 +314,8 @@ void gpu_shutdown(GpuState* st) {
     if (st->context) {
         if (st->context->hasUnfinishedGpuWork())
             st->context->submit(skgpu::graphite::SyncToCpu::kYes);
+        st->warmup_surface.reset();
+        st->warmup_recorder.reset();
         st->recorder.reset();
         st->frame_surface.reset();
         st->context.reset();
@@ -300,6 +327,7 @@ void gpu_shutdown(GpuState* st) {
         // Release Skia's GL objects while the context is still current —
         // their teardown frees GPU resources through it.
         wglMakeCurrent(st->hdc, st->glrc);
+        st->warmup_surface.reset();
         st->gl_surface.reset();
         if (st->gr_ctx) st->gr_ctx->flushAndSubmit();
         st->gr_ctx.reset();
@@ -334,7 +362,10 @@ SkCanvas* gpu_begin_frame(GpuState* st) {
     if (!st) return nullptr;
     if (st->glrc) {
         wglMakeCurrent(st->hdc, st->glrc);
-        if (SkSurface* s = gl_surface(st)) return s->getCanvas();
+        if (SkSurface* s = gl_surface(st)) {
+            st->frame_active = true;
+            return s->getCanvas();
+        }
         return nullptr;
     }
     if (st->context) {
@@ -350,6 +381,7 @@ SkCanvas* gpu_begin_frame(GpuState* st) {
             st->recorder.get(), bt, nullptr, nullptr);
         if (!st->frame_surface) return nullptr;
         st->dawn_acquired = true; // end_frame presents only when this was set
+        st->frame_active = true;
         return st->frame_surface->getCanvas();
     }
     return nullptr;
@@ -357,6 +389,7 @@ SkCanvas* gpu_begin_frame(GpuState* st) {
 
 void gpu_end_frame(GpuState* st) {
     if (!st) return;
+    st->frame_active = false;
     if (st->glrc) {
         if (st->gl_surface) st->gr_ctx->flushAndSubmit(st->gl_surface.get());
         SwapBuffers(st->hdc);
@@ -471,27 +504,106 @@ const char* platform_font_family() {
 
 const char* platform_fallback_font_family() { return "Segoe UI Symbol"; }
 
-// Warmup (Phase 4e.1): stubs — per-backend offscreen surfaces (D3D12, Dawn
-// Vulkan, WGL) are future work; warmup is best-effort, so this returns
-// false until then (the host logs it and moves on).
-SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
-    (void)state;
-    (void)width;
-    (void)height;
+// Warmup (Phase 4e.1): a small offscreen render target drawn through the
+// real op set, submitted synchronously — the one-time pipeline/program
+// compiles land HERE, not inside the first real frames. Called OUTSIDE
+// begin/end_frame (the host runs it right after the first present).
+SkCanvas* gpu_begin_offscreen(GpuState* st, int width, int height) {
+    if (!st || width <= 0 || height <= 0) return nullptr;
+    if (st->context) {
+        // Dawn/Graphite: a render-target surface on its OWN recorder (same
+        // pattern as the Metal shim's warmup). BGRA like the onscreen
+        // swapchain (configured BGRA8Unorm): Graphite pipelines are
+        // per-target-format, so an RGBA warmup would not prime the
+        // pipelines onscreen frames use.
+        st->warmup_recorder = st->context->makeRecorder();
+        if (!st->warmup_recorder) return nullptr;
+        st->warmup_surface = SkSurfaces::RenderTarget(
+            st->warmup_recorder.get(),
+            SkImageInfo::Make(width, height, kBGRA_8888_SkColorType,
+                              kPremul_SkAlphaType, nullptr));
+        if (!st->warmup_surface) { st->warmup_recorder.reset(); return nullptr; }
+        return st->warmup_surface->getCanvas();
+    }
+    if (st->gr_ctx) {
+        // Ganesh compiles programs lazily per draw — a render-target surface
+        // on the live context compiles the same programs onscreen frames
+        // use. GL stays current on this thread after init; re-assert so a
+        // foreign context made current between frames can't break the call.
+        wglMakeCurrent(st->hdc, st->glrc);
+        st->warmup_surface = SkSurfaces::RenderTarget(
+            st->gr_ctx.get(), skgpu::Budgeted::kYes,
+            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType,
+                              kPremul_SkAlphaType, nullptr));
+        return st->warmup_surface ? st->warmup_surface->getCanvas() : nullptr;
+    }
     return nullptr;
 }
-bool gpu_end_offscreen(GpuState* state) {
-    (void)state;
+
+bool gpu_end_offscreen(GpuState* st) {
+    if (!st) return false;
+    if (st->context) {
+        if (!st->warmup_recorder) return false;
+        if (std::unique_ptr<skgpu::graphite::Recording> recording =
+                st->warmup_recorder->snap()) {
+            skgpu::graphite::InsertRecordingInfo info{};
+            info.fRecording = recording.get();
+            info.fTargetSurface = st->warmup_surface.get();
+            st->context->insertRecording(info);
+        }
+        // Synchronous submit (same as the frame path): the pipeline compile
+        // must complete inside the warmup call, not leak into the next real
+        // frame. SyncToCpu::kYes is permitted — the DawnBackendContext keeps
+        // the default yielding tick (see dawn_init).
+        st->context->submit(skgpu::graphite::SyncToCpu::kYes);
+        st->warmup_recorder.reset();
+        st->warmup_surface.reset();
+        return true;
+    }
+    if (st->gr_ctx) {
+        wglMakeCurrent(st->hdc, st->glrc);
+        st->gr_ctx->flushAndSubmit(GrSyncCpu::kYes);
+        st->warmup_surface.reset();
+        return true;
+    }
     return false;
 }
 
-sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
-    (void)state; (void)width; (void)height;
-    return nullptr; // no Windows GPU backend yet — raster offscreen fallback
+// Render-to-image target (kx_offscreen_begin): a backend surface so the
+// snapshot stays GPU-resident — Graphite drops non-Graphite images on draw,
+// and a Ganesh texture blits faster than a re-uploaded raster. Frame-scoped
+// by contract: the surface records into the LIVE frame's recorder/context
+// so its draws submit with this frame's recording.
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* st, int width, int height) {
+    if (!st || !st->frame_active || width <= 0 || height <= 0) return nullptr;
+    const SkImageInfo info = SkImageInfo::Make(
+        width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
+    if (st->context && st->recorder) {
+        return SkSurfaces::RenderTarget(st->recorder.get(), info);
+    }
+    if (st->gr_ctx) {
+        wglMakeCurrent(st->hdc, st->glrc);
+        return SkSurfaces::RenderTarget(st->gr_ctx.get(), skgpu::Budgeted::kYes, info);
+    }
+    return nullptr;
 }
 
-sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
-    (void)state;
+// Upload a client-pixel image to the GPU. Frame-scoped like the offscreen
+// path (the Graphite upload records into the live frame recorder); callers
+// retry lazily at first draw, so returning img unchanged outside a frame is
+// correct — a raster SkImage draws fine everywhere, just slower.
+sk_sp<SkImage> gpu_image_upload(GpuState* st, sk_sp<SkImage> img) {
+    if (!st || !img || img->isTextureBacked()) return img;
+    if (!st->frame_active) return img;
+    if (st->context && st->recorder) {
+        if (sk_sp<SkImage> up =
+                SkImages::TextureFromImage(st->recorder.get(), img.get(), {}))
+            return up; // graphite-dawn
+    } else if (st->gr_ctx) {
+        wglMakeCurrent(st->hdc, st->glrc);
+        if (sk_sp<SkImage> up = SkImages::TextureFromImage(st->gr_ctx.get(), img.get()))
+            return up; // ganesh-gl
+    }
     return img;
 }
 

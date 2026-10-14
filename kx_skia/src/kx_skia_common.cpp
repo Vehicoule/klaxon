@@ -9,6 +9,7 @@
 #include "include/core/SkColor.h"
 #include "include/core/SkData.h"
 #include "include/core/SkFont.h"
+#include "include/core/SkFontArguments.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkFontMetrics.h"
 #include "include/core/SkFontStyle.h"
@@ -22,8 +23,25 @@
 #include "include/core/SkTextBlob.h"
 #include "include/core/SkTypeface.h"
 #include "include/effects/SkGradient.h"
+#include "include/effects/SkImageFilters.h"
+#include "include/utils/SkShadowUtils.h"
 #include "src/core/SkStroke.h"
 #include "src/core/SkUTF.h"
+
+// SkParagraph: real shaping (HarfBuzz), ICU bidi + line breaking, and
+// script-aware font fallback — replaces the 1:1 codepoint→glyph text path
+// (no ligatures, no kerning, no combining marks, no bidi — Arabic and mixed
+// scripts rendered wrong).
+#include "modules/skparagraph/include/FontCollection.h"
+#include "modules/skparagraph/include/Paragraph.h"
+#include "modules/skparagraph/include/ParagraphBuilder.h"
+#include "include/core/SkBlurTypes.h"
+#include "include/core/SkMaskFilter.h"
+#include "modules/skparagraph/include/ParagraphPainter.h"
+#include "modules/skparagraph/include/ParagraphStyle.h"
+#include "modules/skparagraph/include/TextStyle.h"
+#include "modules/skunicode/include/SkUnicode.h"
+#include "modules/skunicode/include/SkUnicode_icu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,7 +69,8 @@ struct KxRecOp {
         Save, Restore, Translate, Scale, Rotate, ClipRect, ClipPath,
         Clear, FillRect, FillRRect, FillRRectCorners, StrokeRRect,
         StrokeRRectCorners, StrokePolyline, FillPolygon, FillRRectGradient,
-        Text, ImageDraw, Group,
+        FillPath, StrokePath, ShadowRRect, BackdropBlur,
+        Text, TextLayout, ImageDraw, Group,
     } k;
     float f[8] = {};
     uint32_t color = 0;
@@ -74,6 +93,7 @@ struct KxRecOp {
 // close (see kx_layer_close).
 struct KxRecLayer {
     float alpha = 1.0f;
+    float blur_sigma = 0.0f;  // >0: composite the layer content blurred (0.16.0)
     int depth = 0;            // save/clip opens still unmatched inside
     bool unbounded = false;   // a kx_clear was recorded — bounds unknown
     SkMatrix rel = SkMatrix::I(); // current-local -> push-space transform
@@ -151,6 +171,25 @@ struct kx_ctx {
         uint64_t tick = 0;
     };
     std::unordered_map<uint64_t, KxStrokeEntry> stroke_cache;
+    // Elevation-shadow texture cache (0.16.0): identical (w,h,r,elev,colors)
+    // shadows re-rasterize per call — a 10x10 card grid paid 100 DrawShadow
+    // passes (~25µs each on raster). Rasterize the padded shadow ONCE into
+    // the image registry (GPU-uploaded on first draw) and blit it — the
+    // same cache Qt's RectangularGlow 9-patch performs internally.
+    struct KxShadowEntry {
+        sk_sp<SkImage> img;
+        uint64_t image_id = 0; // registry id (eviction erases it)
+        float pad = 0;         // outset the image extends past the shape
+        uint64_t tick = 0;     // LRU
+    };
+    std::unordered_map<uint64_t, KxShadowEntry> shadow_cache;
+    uint64_t shadow_tick = 0;
+    // Draw-op counter (0.14.0): incremented on the EMIT path of every draw
+    // entry (fills, strokes, text, images, clear, saveLayer emits) — an op
+    // recorded into a layer counts once, when its replay issues it. State
+    // ops (save/restore/transform/clip) don't count: they don't rasterize.
+    uint64_t frame_ops = 0;
+    uint64_t last_frame_ops = 0;
 };
 
 // Font manager is process-global: text metrics are needed at layout time,
@@ -170,6 +209,134 @@ static bool kx_typeface_covers(SkTypeface* tf, const char* utf8) {
         if (tf->unicharToGlyph(u) == 0) return false;
     }
     return true;
+}
+
+// The paragraph font collection: platform manager as the default resolver
+// (pinned to the platform default family when one exists — the same face
+// the legacy path resolved), with font fallback ENABLED so CJK/Arabic/
+// emoji runs resolve through system fallback fonts automatically —
+// replacing the hand-rolled kx_typeface_covers single-fallback guess.
+static sk_sp<skia::textlayout::FontCollection>& kx_font_collection() {
+    static sk_sp<skia::textlayout::FontCollection> fc = [] {
+        auto fc = sk_make_sp<skia::textlayout::FontCollection>();
+        if (kx_fonts()) {
+            if (const char* fam = kx::platform_font_family())
+                fc->setDefaultFontManager(kx_fonts(), fam);
+            else
+                fc->setDefaultFontManager(kx_fonts());
+        }
+        fc->enableFontFallback();
+        return fc;
+    }();
+    return fc;
+}
+
+// The ICU-backed SkUnicode — bidi, line breaking, grapheme clusters. One
+// process-global instance feeds every paragraph build.
+static sk_sp<SkUnicode>& kx_unicode() {
+    static sk_sp<SkUnicode> u = SkUnicodes::ICU::Make();
+    return u;
+}
+
+// Recolorable text paint (0.16.1). TextLine bakes the foreground into its
+// cached text BLOB at first paint — updateForegroundPaint afterwards can't
+// reach it (the blob record holds the OLD paint). Flutter recolors without
+// relayout through PaintID indirection instead: the style's foreground is a
+// PaintID the ParagraphPainter resolves at every draw. Same here: simple
+// (kx_draw_text) paragraphs are built with foreground PaintID kFgId and are
+// ALWAYS painted through this painter — the canvas overload would
+// std::get<SkPaint> a PaintID and assert/crash.
+class KxParagraphPainter : public skia::textlayout::ParagraphPainter {
+public:
+    static SkColor to_skcolor(uint32_t rgba) {
+        return SkColorSetARGB(rgba & 0xFF, (rgba >> 24) & 0xFF,
+                              (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF);
+    }
+    void set(SkCanvas* c, uint32_t kx_rgba) {
+        canvas = c;
+        fg.setColor(to_skcolor(kx_rgba));
+        fg.setAntiAlias(true);
+    }
+    const SkPaint& resolve(const SkPaintOrID& p) const {
+        const SkPaint* sp = std::get_if<SkPaint>(&p);
+        return sp ? *sp : fg; // PaintID → the current draw color
+    }
+    void drawTextBlob(const sk_sp<SkTextBlob>& blob, SkScalar x, SkScalar y,
+                      const SkPaintOrID& paint) override {
+        canvas->drawTextBlob(blob, x, y, resolve(paint));
+    }
+    void drawTextShadow(const sk_sp<SkTextBlob>& blob, SkScalar x, SkScalar y,
+                        SkColor color, SkScalar blurSigma) override {
+        SkPaint p;
+        p.setColor(color);
+        if (blurSigma != 0.0f) {
+            p.setMaskFilter(SkMaskFilter::MakeBlur(kNormal_SkBlurStyle, blurSigma, false));
+        }
+        canvas->drawTextBlob(blob, x, y, p);
+    }
+    void drawRect(const SkRect& rect, const SkPaintOrID& paint) override {
+        canvas->drawRect(rect, resolve(paint));
+    }
+    void drawFilledRect(const SkRect& rect, const DecorationStyle& d) override {
+        canvas->drawRect(rect, d.skPaint());
+    }
+    void drawPath(const SkPath& path, const DecorationStyle& d) override {
+        canvas->drawPath(path, d.skPaint());
+    }
+    void drawLine(SkScalar x0, SkScalar y0, SkScalar x1, SkScalar y1,
+                  const DecorationStyle& d) override {
+        canvas->drawLine(x0, y0, x1, y1, d.skPaint());
+    }
+    void clipRect(const SkRect& rect) override { canvas->clipRect(rect); }
+    void translate(SkScalar dx, SkScalar dy) override { canvas->translate(dx, dy); }
+    void save() override { canvas->save(); }
+    void restore() override { canvas->restore(); }
+
+private:
+    SkCanvas* canvas = nullptr;
+    SkPaint fg;
+};
+
+// Build + lay out a single-style paragraph: the shared miss path for the
+// text cache (0.15.0). Layout is UNCONSTRAINED (huge width): longestLine
+// then equals the intrinsic width and the paragraph still performs real
+// shaping/bidi/fallback — the same work Flutter/Compose/Qt pay per text.
+static std::unique_ptr<skia::textlayout::Paragraph> kx_build_paragraph(
+        const char* text, size_t len, float size, int32_t weight, int32_t slant,
+        float letter_spacing, SkColor color, float max_width = 1e9f) {
+    using namespace skia::textlayout;
+    TextStyle ts;
+    ts.setFontSize(size);
+    ts.setFontStyle(SkFontStyle(
+            std::clamp(weight, 1, 1000), SkFontStyle::kNormal_Width,
+            slant == 1 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
+    // PaintID foreground — recolored at every draw by KxParagraphPainter
+    // (the cached blob holds the ID, not a baked SkPaint — see the painter
+    // above; `color` is unused on this path).
+    (void)color;
+    ts.setForegroundPaintID(0);
+    if (letter_spacing != 0.0f) ts.setLetterSpacing(letter_spacing);
+    ParagraphStyle ps;
+    auto builder = ParagraphBuilder::make(ps, kx_font_collection(), kx_unicode());
+    builder->pushStyle(ts);
+    builder->addText(text, len);
+    auto p = builder->Build();
+    p->layout(max_width);
+    return p;
+}
+
+// UTF-16 code units of a UTF-8 string — the paragraph's text-index space
+// (updateForegroundPaint ranges are in UTF-16 units).
+static size_t kx_utf16_len(const char* text, size_t len) {
+    size_t n = 0;
+    const char* p = text;
+    const char* const end = text + len;
+    while (p < end) {
+        const SkUnichar u = SkUTF::NextUTF8(&p, end);
+        if (u < 0) break;
+        n += (u > 0xFFFF) ? 2 : 1;
+    }
+    return n;
 }
 
 // legacyMakeTypeface goes through the platform font manager (CoreText on
@@ -219,31 +386,31 @@ static SkFont kx_make_font(const char* text, float size, bool bold) {
     return font;
 }
 
-// --- Text shape/metrics cache ------------------------------------------
+// --- Text layout cache -------------------------------------------------
 // kx_draw_text_styled and kx_measure_text each used to pay, on EVERY call:
-// a font-mgr typeface lookup, a per-codepoint coverage scan
-// (kx_typeface_covers), a UTF-8 decode + textToGlyphs, and glyph-run
-// construction. A retained tree repaints the same strings every frame —
-// the bench's gallery scene issued ~400 such font ops per frame before
-// paint culling, and still pays it for every on-screen label.
+// a font-mgr typeface lookup, a per-codepoint coverage scan, a UTF-8
+// decode + textToGlyphs, and glyph-run construction. A retained tree
+// repaints the same strings every frame — the bench's gallery scene issued
+// ~400 such font ops per frame before paint culling.
 //
-// The shaped result depends only on (text bytes, size, bold), so it is
-// cached: the resolved SkFont, an SkTextBlob (glyph ids + positions — the
-// same conversion drawSimpleText performs, paid once), and the measured
-// metrics. A hit is hash + probe + memcmp — no allocation, no font work.
-// Direction is deliberately NOT in the key: drawSimpleText does no bidi —
-// (text,size,bold) fully determines the glyphs (alignment/RTL resolution
-// happens widget-side, in textX).
+// The laid-out result depends only on (text bytes, size, bold), so it is
+// cached: a SkParagraph Paragraph (HarfBuzz shaping + ICU bidi/line-break
+// + script-aware fallback — all performed once at insert) plus the
+// measured metrics. A hit is hash + probe + memcmp + one paragraph->paint
+// — no allocation, no shaping. Color is deliberately NOT in the key: the
+// paragraph is built with a placeholder foreground and recolored per draw
+// through updateForegroundPaint (its fast "immutable update" path — no
+// relayout), so theme flips and color animations hit the cache.
 //
 // Fixed-capacity open addressing (linear probing) with tombstones + LRU
 // eviction: bounded memory, ZERO allocations on the hit path — key copies
-// and blob construction happen only on a miss. Threading: the ABI's
+// and paragraph build+layout happen only on a miss. Threading: the ABI's
 // existing contract — thread-confined (no locking), process-global like
 // the font manager (kx_measure_text takes no ctx, so the cache can't be
 // per-ctx).
 //
-// The cached font/blob bake in the resolved typeface. The font manager is
-// fixed at process start today; if a runtime font-registration API is
+// The cached paragraph bakes in the resolved typefaces. The font manager
+// is fixed at process start today; if a runtime font-registration API is
 // added it MUST call kx_text_cache_reset() or stale glyphs would render.
 namespace {
 
@@ -259,8 +426,8 @@ struct KxTextSlot {
     bool bold = false;
     KxTextSlotState state = KxTextSlotState::kEmpty;
     uint64_t last_used = 0; // LRU tick
-    SkFont font;            // resolved typeface + size (fallback applied)
-    sk_sp<SkTextBlob> blob; // null when the text can't form a blob
+    size_t utf16_len = 0;   // text-index space length (updateForegroundPaint)
+    std::unique_ptr<skia::textlayout::Paragraph> paragraph; // laid out once
     kx_text_metrics metrics = {0, 0, 0, 0};
 };
 
@@ -354,44 +521,22 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     s.size = size;
     s.bold = bold;
     s.last_used = tick;
-    s.font = kx_make_font(text, size, bold);
-    // One shaping pass feeds both consumers: textToGlyphs once, then
-    // getWidthsBounds gives the advances (the metric width MakeFromText +
-    // measureText used to compute through a second decode+map pass) and
-    // allocRunPosH stores the same glyphs+positions in the blob directly.
-    // The blob draws identically to a MakeFromText TextH run — the simple
-    // glyph path applies no GPOS shaping either way.
-    const size_t nglyphs =
-        s.font.getTypeface() ? s.font.countText(text, len, SkTextEncoding::kUTF8) : 0;
-    if (nglyphs > 0) {
-        std::vector<SkGlyphID> glyphs(nglyphs);
-        s.font.textToGlyphs(text, len, SkTextEncoding::kUTF8,
-                            SkSpan<SkGlyphID>(glyphs.data(), nglyphs));
-        std::vector<SkScalar> advances(nglyphs);
-        s.font.getWidthsBounds(SkSpan<const SkGlyphID>(glyphs.data(), nglyphs),
-                               SkSpan<SkScalar>(advances.data(), nglyphs), {}, nullptr);
-        std::vector<SkScalar> xs(nglyphs);
-        SkScalar x = 0;
-        for (size_t i = 0; i < nglyphs; ++i) {
-            xs[i] = x;
-            x += advances[i];
-        }
-        s.metrics.width = x;
-        SkTextBlobBuilder builder;
-        const SkTextBlobBuilder::RunBuffer& run =
-            builder.allocRunPosH(s.font, int(nglyphs), /*constY=*/0);
-        std::memcpy(run.glyphs, glyphs.data(), nglyphs * sizeof(SkGlyphID));
-        std::memcpy(run.pos, xs.data(), nglyphs * sizeof(SkScalar));
-        s.blob = builder.make();
-    } else {
-        s.blob = nullptr;
-        s.metrics.width = 0;
+    s.utf16_len = kx_utf16_len(text, len);
+    // Real paragraph: HarfBuzz shaping + bidi + fallback, laid out once on
+    // the miss and re-painted per hit (the color is set per draw through
+    // updateForegroundPaint, so it stays OUT of the key — theme flips and
+    // color animations hit the cache instead of re-shaping).
+    s.paragraph = kx_build_paragraph(text, len, size,
+                                     bold ? SkFontStyle::kBold_Weight
+                                          : SkFontStyle::kNormal_Weight,
+                                     0 /*upright*/, 0 /*letter-spacing*/,
+                                     SK_ColorBLACK);
+    if (s.paragraph) {
+        s.metrics.width = s.paragraph->getLongestLine();
+        s.metrics.ascent = s.paragraph->getAlphabeticBaseline();
+        s.metrics.height = s.paragraph->getHeight();
+        s.metrics.descent = s.metrics.height - s.metrics.ascent;
     }
-    SkFontMetrics fm;
-    s.font.getMetrics(&fm);
-    s.metrics.ascent = -fm.fAscent; // fAscent is negative (above the baseline)
-    s.metrics.descent = fm.fDescent;
-    s.metrics.height = s.metrics.ascent + s.metrics.descent;
     s.state = KxTextSlotState::kOccupied;
     ++kx_text_cache_used;
     return &s;
@@ -436,6 +581,12 @@ bool kx_recording(const kx_ctx* ctx) {
     // The offscreen pass is a raster target of its own: draws inside it are
     // not part of an open alpha layer's content.
     return !ctx->layers.empty() && !ctx->offscreen_prev_canvas;
+}
+
+// One canvas-op emission. Only counted when NOT inside a recorded layer —
+// a recorded op counts later, when its replay issues the same entry.
+inline void kx_count_op(kx_ctx* ctx) {
+    if (!kx_recording(ctx)) ctx->frame_ops++;
 }
 
 // Fold a 0..1 alpha multiplier into a kx color's alpha channel.
@@ -489,6 +640,7 @@ void kx_emit_folded(kx_ctx* ctx, const KxRecOp& op, float alpha) {
     SkCanvas* c = ctx->canvas;
     SkPaint paint;
     paint.setAntiAlias(true);
+    kx_count_op(ctx); // one folded draw emits below (ImageDraw misses don't reach it)
     switch (op.k) {
         case KxRecOp::K::FillRect:
             paint.setColor(kx_to_skcolor(kx_fold_color(op.color, alpha)));
@@ -550,7 +702,7 @@ void kx_layer_close(kx_ctx* ctx) {
 
     if (L->ops.empty()) return; // an alpha layer with no content is a no-op
 
-    if (L->ops.size() == 1 && kx_op_foldable(L->ops.front())) {
+    if (L->blur_sigma <= 0.0f && L->ops.size() == 1 && kx_op_foldable(L->ops.front())) {
         KxRecOp op = std::move(L->ops.front());
         if (parent) {
             // The folded draw joins the parent's content: its alpha is
@@ -593,8 +745,24 @@ void kx_layer_close(kx_ctx* ctx) {
     // entry points (nested Group ops re-record and re-resolve on close).
     SkRect b = L->bounds;
     b.outset(1.0f, 1.0f); // AA fringe allowance — never clip content edges
-    ctx->canvas->saveLayerAlphaf(L->bounds_valid && !L->unbounded ? &b : nullptr,
-                                 L->alpha);
+    ctx->frame_ops++; // the saveLayer itself is one submitted op (contents count at replay)
+    if (L->blur_sigma > 0.0f) {
+        // Content blur: the layer's composite paint carries the image
+        // filter — contents rasterize once, blur applies at restore. The
+        // bounds grow by the kernel extent (~3σ) or the blur clips visibly.
+        SkPaint paint;
+        paint.setAlphaf(L->alpha);
+        paint.setImageFilter(SkImageFilters::Blur(
+                L->blur_sigma, L->blur_sigma, nullptr, nullptr));
+        SkRect bb = b;
+        if (L->bounds_valid && !L->unbounded) bb.outset(3.0f * L->blur_sigma, 3.0f * L->blur_sigma);
+        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(
+                L->bounds_valid && !L->unbounded ? &bb : nullptr,
+                &paint, nullptr, 0));
+    } else {
+        ctx->canvas->saveLayerAlphaf(L->bounds_valid && !L->unbounded ? &b : nullptr,
+                                     L->alpha);
+    }
     kx_replay_ops(ctx, L->ops);
     ctx->canvas->restore();
     // Ephemeral kx_draw_pixels uploads live only until their layer replays.
@@ -648,9 +816,32 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                                        op.f[4], op.xs[0], op.ys[0], op.xs[1],
                                        op.ys[1], op.cols.data(), op.count);
                 break;
+            case KxRecOp::K::FillPath:
+                kx_fill_path(ctx, op.xs.data(),
+                             reinterpret_cast<const int*>(op.cols.data()),
+                             op.count, op.color, op.flag ? 1 : 0);
+                break;
+            case KxRecOp::K::StrokePath:
+                kx_stroke_path(ctx, op.xs.data(),
+                               reinterpret_cast<const int*>(op.cols.data()),
+                               op.count, op.size, op.color, op.flag ? 1 : 0);
+                break;
+            case KxRecOp::K::ShadowRRect:
+                kx_shadow_rrect(ctx, op.f[0], op.f[1], op.f[2], op.f[3],
+                                op.f[4], op.f[5], op.color,
+                                op.cols.empty() ? op.color : op.cols[0],
+                                op.flag ? 1 : 0);
+                break;
+            case KxRecOp::K::BackdropBlur:
+                kx_backdrop_blur(ctx, op.f[0], op.f[1], op.f[2], op.f[3], op.f[4]);
+                break;
             case KxRecOp::K::Text:
                 kx_draw_text_styled(ctx, op.text.c_str(), op.f[0], op.f[1],
                                     op.size, op.flag, op.color);
+                break;
+            case KxRecOp::K::TextLayout:
+                kx_text_paint_layout(ctx, reinterpret_cast<const kx_text_layout*>(op.image),
+                                     op.f[0], op.f[1]);
                 break;
             case KxRecOp::K::ImageDraw: {
                 // `flag` marks a folded op: `size` then carries the layer
@@ -675,7 +866,10 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
             case KxRecOp::K::Group:
                 // A nested layer replays through the recorder too: its ops
                 // re-record and its close resolves fold-vs-real on its own.
-                kx_layer_alpha(ctx, op.child->alpha);
+                if (op.child->blur_sigma > 0.0f)
+                    kx_layer_blur(ctx, op.child->blur_sigma);
+                else
+                    kx_layer_alpha(ctx, op.child->alpha);
                 kx_replay_ops(ctx, op.child->ops);
                 kx_restore(ctx);
                 break;
@@ -699,7 +893,9 @@ static const kx_backend* kx_platform_chain(size_t* count) {
     // iOS and macOS share the chain: Metal everywhere, raster if it fails.
     static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_METAL };
 #elif defined(_WIN32)
-    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_DAWN, KX_BACKEND_GANESH_GL };
+    // Dawn-D3D12 primary, Dawn-Vulkan fallback (gpu_init dispatches it to
+    // dawn_init(BackendType::Vulkan)), then WGL.
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_DAWN, KX_BACKEND_GRAPHITE_VULKAN, KX_BACKEND_GANESH_GL };
 #elif defined(__linux__)
     static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_VULKAN, KX_BACKEND_GANESH_GL };
 #else
@@ -792,6 +988,7 @@ void kx_begin_frame(kx_ctx* ctx) {
     if (!ctx) return;
     // Unbalanced layer records from a previous frame die with it.
     ctx->layers.clear();
+    ctx->frame_ops = 0;
     if (ctx->raster) {
         ctx->canvas = ctx->raster->getCanvas();
     } else if (ctx->gpu) {
@@ -804,12 +1001,19 @@ void kx_end_frame(kx_ctx* ctx) {
     // Defensive: an unclosed layer still emits its content at frame end so
     // a broken caller loses compositing quality, never pixels.
     while (ctx->canvas && !ctx->layers.empty()) kx_layer_close(ctx);
+    ctx->last_frame_ops = ctx->frame_ops;
     if (ctx->gpu) {
         kx::gpu_end_frame(ctx->gpu);
     }
     // Raster is synchronous — drawing lands in the pixel buffer immediately,
     // nothing to flush (SkSurface::flush no longer exists at this pin).
     ctx->canvas = nullptr;
+}
+
+// Ops submitted to the canvas by the last completed frame (0.14.0) — the
+// real draw-call count, unlike the bench's old node-count proxy.
+uint64_t kx_frame_draw_ops(kx_ctx* ctx) {
+    return ctx ? ctx->last_frame_ops : 0;
 }
 
 void kx_clear(kx_ctx* ctx, uint32_t rgba) {
@@ -821,6 +1025,7 @@ void kx_clear(kx_ctx* ctx, uint32_t rgba) {
         ctx->layers.back()->ops.push_back(std::move(op));
         return;
     }
+    kx_count_op(ctx);
     ctx->canvas->clear(kx_to_skcolor(rgba));
 }
 
@@ -845,6 +1050,7 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     // Degenerate keys bypass the cache: NaN never matches itself (it would
     // re-insert forever), and non-positive sizes draw nothing anyway.
     if (!(size > 0.0f)) {
@@ -856,19 +1062,17 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
         return;
     }
     const KxTextSlot* e = kx_text_entry(text, len, size, bold);
-    SkPaint paint;
-    paint.setColor(kx_to_skcolor(rgba));
-    paint.setAntiAlias(true);
-    if (e->blob) {
-        // The cached glyph run replays at any origin — drawTextBlob(blob,x,y)
-        // is what drawSimpleText computes per call (UTF-8 decode → glyphs →
-        // advances from the origin) — identical output, no re-shaping.
-        ctx->canvas->drawTextBlob(e->blob.get(), x, y, paint);
-    } else {
-        // Unshapeable input (e.g. empty string or no resolvable glyphs):
-        // draw through the stored font — identical to the uncached path.
-        ctx->canvas->drawSimpleText(text, len, SkTextEncoding::kUTF8, x, y, e->font, paint);
+    if (e->paragraph) {
+        // Paint through the PaintID-resolving painter: the blob's foreground
+        // is an ID resolved to THIS draw's color — real recoloring without
+        // relayout (updateForegroundPaint can't reach the baked blob).
+        // (x,y) is the BASELINE — paint takes the paragraph's top.
+        KxParagraphPainter painter;
+        painter.set(ctx->canvas, rgba);
+        e->paragraph->paint(&painter, x, y - e->metrics.ascent);
     }
+    // A null paragraph (build failed — no font collection) draws nothing:
+    // same visible result as the old unshapeable-text fallback.
 }
 
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
@@ -956,6 +1160,7 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
     if (ctx->gpu && !it->second.img->isTextureBacked())
         it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
     const SkImage* img = it->second.img.get();
+    kx_count_op(ctx); // all paths below emit exactly one draw
     if (w == img->width() && h == img->height()) {
         // Opaque same-format blit under an integer translation: peek both
         // buffers and copy the visible rows in 16-byte vectors — the cheapest
@@ -1035,6 +1240,7 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx); // GPU upload+draw or raster borrowed draw: one op
     const SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
     if (ctx->gpu) {
         // GPU path: own the pixels — the backend upload may defer its read
@@ -1042,18 +1248,28 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
         sk_sp<SkData> data = SkData::MakeWithCopy(rgba, static_cast<size_t>(w) * h * 4);
         sk_sp<SkImage> img = SkImages::RasterFromData(info, std::move(data), static_cast<size_t>(w) * 4);
         img = kx::gpu_image_upload(ctx->gpu, std::move(img));
-        ctx->canvas->drawImageRect(img.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
-                                   SkSamplingOptions(), nullptr,
-                                   SkCanvas::kFast_SrcRectConstraint);
+        if (dw == w && dh == h) {
+            // 1:1 blit: an unscaled drawImage skips the sampling/filter
+            // machinery a same-size drawImageRect would still walk.
+            ctx->canvas->drawImage(img.get(), x, y);
+        } else {
+            ctx->canvas->drawImageRect(img.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
+                                       SkSamplingOptions(), nullptr,
+                                       SkCanvas::kFast_SrcRectConstraint);
+        }
         return;
     }
     // Borrowed-pixels draw: RasterFromPixmap wraps the buffer with no copy —
     // a raster canvas consumes it synchronously, so the borrow is safe.
     SkPixmap pixmap(info, rgba, static_cast<size_t>(w) * 4);
-    ctx->canvas->drawImageRect(SkImages::RasterFromPixmap(pixmap, {}, nullptr).get(),
-                               SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
-                               SkSamplingOptions(), nullptr,
-                               SkCanvas::kFast_SrcRectConstraint);
+    auto src = SkImages::RasterFromPixmap(pixmap, {}, nullptr);
+    if (dw == w && dh == h) {
+        ctx->canvas->drawImage(src.get(), x, y);
+    } else {
+        ctx->canvas->drawImageRect(src.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
+                                   SkSamplingOptions(), nullptr,
+                                   SkCanvas::kFast_SrcRectConstraint);
+    }
 }
 
 void kx_fill_rect(kx_ctx* ctx, float x, float y, float w, float h, uint32_t rgba) {
@@ -1066,6 +1282,7 @@ void kx_fill_rect(kx_ctx* ctx, float x, float y, float w, float h, uint32_t rgba
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1082,6 +1299,7 @@ void kx_fill_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1099,6 +1317,7 @@ void kx_fill_rrect_corners(kx_ctx* ctx, float x, float y, float w, float h, floa
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1119,6 +1338,7 @@ void kx_stroke_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1138,6 +1358,7 @@ void kx_stroke_rrect_corners(kx_ctx* ctx, float x, float y, float w, float h, fl
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1240,6 +1461,7 @@ void kx_stroke_polyline(kx_ctx* ctx, const float* xs, const float* ys, int count
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1259,6 +1481,7 @@ void kx_fill_polygon(kx_ctx* ctx, const float* xs, const float* ys, int count, u
         kx_rec_op(ctx, std::move(op));
         return;
     }
+    kx_count_op(ctx);
     SkPaint paint;
     paint.setColor(kx_to_skcolor(rgba));
     paint.setAntiAlias(true);
@@ -1303,6 +1526,7 @@ void kx_fill_rrect_gradient(kx_ctx* ctx, float x, float y, float w, float h, flo
     paint.setAntiAlias(true);
     paint.setShader(SkShaders::LinearGradient(pts, grad));
     if (!paint.getShader()) return;
+    kx_count_op(ctx);
     ctx->canvas->drawRoundRect(SkRect::MakeXYWH(x, y, w, h), radius, radius, paint);
 }
 
@@ -1395,6 +1619,207 @@ void kx_layer_alpha(kx_ctx* ctx, float alpha) {
     auto L = std::make_unique<KxRecLayer>();
     L->alpha = a;
     ctx->layers.push_back(std::move(L));
+}
+
+void kx_layer_blur(kx_ctx* ctx, float sigma) {
+    if (!ctx || !ctx->canvas) return;
+    if (!(sigma > 0.0f)) { kx_layer_alpha(ctx, 1.0f); return; }
+    if (ctx->offscreen_prev_canvas) {
+        // Real saveLayer + blur paint on the offscreen raster (recording is
+        // suspended there — same posture as kx_layer_alpha).
+        SkPaint paint;
+        paint.setImageFilter(SkImageFilters::Blur(sigma, sigma, nullptr, nullptr));
+        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(nullptr, &paint, nullptr, 0));
+        return;
+    }
+    // Record like an alpha layer; the close emits ONE saveLayer whose
+    // composite paint carries the blur filter (no alpha folding — a blur
+    // never folds into a draw's paint).
+    auto L = std::make_unique<KxRecLayer>();
+    L->blur_sigma = sigma;
+    ctx->layers.push_back(std::move(L));
+}
+
+void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sigma) {
+    if (!ctx || !ctx->canvas || !(w > 0.0f) || !(h > 0.0f) || !(sigma > 0.0f)) return;
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::BackdropBlur};
+        op.f[0] = x; op.f[1] = y; op.f[2] = w; op.f[3] = h; op.f[4] = sigma;
+        const float pad = 3.0f * sigma;
+        op.local_bounds = SkRect::MakeLTRB(x - pad, y - pad, x + w + pad, y + h + pad);
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    kx_count_op(ctx);
+    // Backdrop filter: the new layer initializes with the FILTERED previous
+    // contents under the bounds; nothing is drawn inside, so the restore
+    // composites just the blurred backdrop — the glass-panel primitive.
+    SkRect r = SkRect::MakeXYWH(x, y, w, h);
+    auto filter = SkImageFilters::Blur(sigma, sigma, nullptr, nullptr);
+    ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, filter.get(), 0));
+    ctx->canvas->restore();
+}
+
+void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius,
+                     float elevation, uint32_t ambient_rgba, uint32_t spot_rgba, int transparent_occluder) {
+    if (!ctx || !ctx->canvas || !(w > 0.0f) || !(h > 0.0f) || !(elevation > 0.0f)) return;
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::ShadowRRect};
+        op.f[0] = x; op.f[1] = y; op.f[2] = w; op.f[3] = h;
+        op.f[4] = radius; op.f[5] = elevation;
+        op.color = ambient_rgba;
+        op.cols.push_back(spot_rgba);
+        op.flag = transparent_occluder != 0;
+        const float pad = elevation * 2.0f + 24.0f; // M3 shadow reach bound
+        op.local_bounds = SkRect::MakeLTRB(x - pad, y - pad, x + w + pad, y + h + pad);
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    kx_count_op(ctx);
+    // Real Material elevation shadows (SkShadowUtils — the same two-part
+    // ambient+spot model Flutter's PhysicalShape uses). Identical params
+    // rasterize ONCE into the image registry and re-blit — the same
+    // optimization Qt's RectangularGlow performs with its 9-patch texture.
+    const float pad = elevation * 2.0f + 24.0f;
+    uint64_t key = 14695981039346656037ull;
+    for (uint32_t v : {__builtin_bit_cast(uint32_t, w), __builtin_bit_cast(uint32_t, h),
+                       __builtin_bit_cast(uint32_t, radius), __builtin_bit_cast(uint32_t, elevation),
+                       ambient_rgba, spot_rgba, (uint32_t)(transparent_occluder != 0)}) {
+        key ^= v; key *= 1099511628211ull;
+    }
+    const uint64_t tick = ++ctx->shadow_tick;
+    auto it = ctx->shadow_cache.find(key);
+    if (it == ctx->shadow_cache.end()) {
+        // Rasterize the shadow alone into a padded offscreen: the rrect sits
+        // at (pad,pad), the M3 key light above its top-center — a uniform
+        // per-shape light (a global screen-space light would defeat the
+        // cache; Qt's glow is per-shape too).
+        const int iw = (int)std::ceil(w + 2.0f * pad);
+        const int ih = (int)std::ceil(h + 2.0f * pad);
+        if (iw <= 0 || ih <= 0 || iw > 4096 || ih > 4096) return;
+        sk_sp<SkSurface> surf = SkSurfaces::Raster(
+                SkImageInfo::Make(iw, ih, kN32_SkColorType, kPremul_SkAlphaType));
+        if (!surf) return;
+        const SkPath path = SkPath::RRect(
+                SkRect::MakeXYWH(pad, pad, w, h), radius, radius);
+        const SkPoint3 z_plane = SkPoint3::Make(0.0f, 0.0f, elevation);
+        const SkPoint3 light_pos = SkPoint3::Make(pad + w * 0.5f, pad - 600.0f, 600.0f);
+        SkShadowUtils::DrawShadow(surf->getCanvas(), path, z_plane, light_pos,
+                                  800.0f /*light radius, M3 key*/,
+                                  kx_to_skcolor(ambient_rgba), kx_to_skcolor(spot_rgba),
+                                  transparent_occluder
+                                      ? (uint32_t)kTransparentOccluder_ShadowFlag
+                                      : (uint32_t)kNone_ShadowFlag);
+        sk_sp<SkImage> img = surf->makeImageSnapshot();
+        if (!img) return;
+        if (ctx->gpu) img = kx::gpu_image_upload(ctx->gpu, std::move(img));
+        const uint64_t id = ctx->next_image_id++;
+        ctx->images.emplace(id, kx_ctx::KxImg{img, false});
+        // Bound the set: evict the LRU entry (its image leaves the registry).
+        if (ctx->shadow_cache.size() >= 32) {
+            uint64_t oldest_key = 0, oldest_tick = ~0ull;
+            for (auto& [k, e] : ctx->shadow_cache) {
+                if (e.tick < oldest_tick) { oldest_tick = e.tick; oldest_key = k; }
+            }
+            ctx->images.erase(ctx->shadow_cache[oldest_key].image_id);
+            ctx->shadow_cache.erase(oldest_key);
+        }
+        kx_ctx::KxShadowEntry e;
+        e.img = std::move(img); e.image_id = id; e.pad = pad; e.tick = tick;
+        it = ctx->shadow_cache.emplace(key, std::move(e)).first;
+    } else {
+        it->second.tick = tick;
+    }
+    const kx_ctx::KxShadowEntry& e = it->second;
+    // Unscaled 1:1 blit — the fast SrcOver path (no sampling filter pass).
+    ctx->canvas->drawImage(e.img, x - e.pad, y - e.pad, SkSamplingOptions(), nullptr);
+}
+
+// Shared path build for fill/stroke: the verb stream consumes `pts`
+// sequentially — 0 move(2f), 1 line(2f), 2 quad(4f), 3 cubic(6f), 4 close(0f).
+static SkPath kx_build_path(const float* pts, const int* verbs, int n_verbs,
+                            bool* ok, SkRect* ctrl_bounds) {
+    SkPathBuilder b;
+    const float* p = pts;
+    *ok = true;
+    *ctrl_bounds = SkRect::MakeEmpty();
+    for (int i = 0; i < n_verbs && *ok; ++i) {
+        switch (verbs[i]) {
+            case 0: b.moveTo(p[0], p[1]); p += 2; break;
+            case 1: b.lineTo(p[0], p[1]); p += 2; break;
+            case 2: b.quadTo(p[0], p[1], p[2], p[3]); p += 4; break;
+            case 3: b.cubicTo(p[0], p[1], p[2], p[3], p[4], p[5]); p += 6; break;
+            case 4: b.close(); break;
+            default: *ok = false; break;
+        }
+    }
+    const ptrdiff_t n = p - pts;
+    if (n >= 2) {
+        float l = p[0], t = p[1], r = p[0], bo = p[1];
+        for (ptrdiff_t i = 2; i + 1 < n; i += 2) {
+            l = std::min(l, p[i]); r = std::max(r, p[i]);
+            t = std::min(t, p[i + 1]); bo = std::max(bo, p[i + 1]);
+        }
+        *ctrl_bounds = SkRect::MakeLTRB(l, t, r, bo);
+    }
+    return b.detach();
+}
+
+void kx_fill_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
+                  uint32_t rgba, int fill_rule) {
+    if (!ctx || !ctx->canvas || !pts || !verbs || n_verbs <= 0) return;
+    bool ok;
+    SkRect cb;
+    SkPath path = kx_build_path(pts, verbs, n_verbs, &ok, &cb);
+    if (!ok) return;
+    if (fill_rule) path.setFillType(SkPathFillType::kEvenOdd);
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::FillPath};
+        op.color = rgba; op.flag = fill_rule != 0; op.count = n_verbs;
+        int npts = 0;
+        for (int i = 0; i < n_verbs; ++i) npts += (verbs[i] == 0 || verbs[i] == 1) ? 2 : (verbs[i] == 2) ? 4 : (verbs[i] == 3) ? 6 : 0;
+        op.xs.assign(pts, pts + npts);
+        op.cols.assign(verbs, verbs + n_verbs);
+        op.local_bounds = cb;
+        op.local_bounds.outset(1.0f, 1.0f); // AA fringe
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    kx_count_op(ctx);
+    SkPaint paint;
+    paint.setColor(kx_to_skcolor(rgba));
+    paint.setAntiAlias(true);
+    ctx->canvas->drawPath(path, paint);
+}
+
+void kx_stroke_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
+                    float stroke_w, uint32_t rgba, int fill_rule) {
+    if (!ctx || !ctx->canvas || !pts || !verbs || n_verbs <= 0 || !(stroke_w > 0.0f)) return;
+    bool ok;
+    SkRect cb;
+    SkPath path = kx_build_path(pts, verbs, n_verbs, &ok, &cb);
+    if (!ok) return;
+    if (fill_rule) path.setFillType(SkPathFillType::kEvenOdd);
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::StrokePath};
+        op.color = rgba; op.size = stroke_w; op.flag = fill_rule != 0;
+        op.count = n_verbs;
+        int npts = 0;
+        for (int i = 0; i < n_verbs; ++i) npts += (verbs[i] == 0 || verbs[i] == 1) ? 2 : (verbs[i] == 2) ? 4 : (verbs[i] == 3) ? 6 : 0;
+        op.xs.assign(pts, pts + npts);
+        op.cols.assign(verbs, verbs + n_verbs);
+        op.local_bounds = cb;
+        op.local_bounds.outset(stroke_w / 2.0f + 1.0f, stroke_w / 2.0f + 1.0f);
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    kx_count_op(ctx);
+    SkPaint paint;
+    paint.setColor(kx_to_skcolor(rgba));
+    paint.setAntiAlias(true);
+    paint.setStyle(SkPaint::kStroke_Style);
+    paint.setStrokeWidth(stroke_w);
+    ctx->canvas->drawPath(path, paint);
 }
 
 void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h) {
@@ -1527,7 +1952,105 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.13.0";
+    return "0.17.0";
+}
+
+// --- Text layout handle (0.15.0) ----------------------------------------
+// A shaped multi-style paragraph: spans are pushed through
+// kx_text_layout_span; the paragraph is built + laid out lazily on the
+// first metric or paint call. Spans carry their own color (per-span
+// styling — the richText widget's real path).
+struct kx_text_layout {
+    float max_width = 0;
+    std::unique_ptr<skia::textlayout::ParagraphBuilder> builder;
+    std::unique_ptr<skia::textlayout::Paragraph> paragraph;
+};
+
+kx_text_layout* kx_text_layout_begin(float max_width) {
+    if (!(max_width > 0.0f)) max_width = 1e9f; // <=0 = unconstrained
+    auto* l = new kx_text_layout;
+    l->max_width = max_width;
+    skia::textlayout::ParagraphStyle ps;
+    l->builder = skia::textlayout::ParagraphBuilder::make(ps, kx_font_collection(), kx_unicode());
+    if (!l->builder) { delete l; return nullptr; }
+    return l;
+}
+
+void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text_style* style) {
+    if (!layout || !layout->builder || layout->paragraph || !text || !style) return;
+    using namespace skia::textlayout;
+    TextStyle ts;
+    ts.setFontSize(style->size > 0.0f ? style->size : 0.0001f);
+    ts.setFontStyle(SkFontStyle(
+            std::clamp(style->weight, 1, 1000), SkFontStyle::kNormal_Width,
+            style->slant == 1 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
+    ts.setColor(kx_to_skcolor(style->color));
+    if (style->letter_spacing != 0.0f) ts.setLetterSpacing(style->letter_spacing);
+    if (style->variation_count > 0) {
+        // Variable-font axes (0.17.0) — pinned in the design space at build
+        // time; a 'wght' coord overrides fontStyle weight on variable fonts.
+        const uint32_t n = std::min<uint32_t>(style->variation_count, 8);
+        SkFontArguments::VariationPosition::Coordinate coords[8];
+        for (uint32_t i = 0; i < n; ++i)
+            coords[i] = {style->variation_axes[i], style->variation_values[i]};
+        SkFontArguments args;
+        args.setVariationDesignPosition({coords, static_cast<int>(n)});
+        ts.setFontArguments(args); // copied into the TextStyle
+    }
+    layout->builder->pushStyle(ts);
+    layout->builder->addText(text);
+    layout->builder->pop();
+}
+
+// Builds + lays out once; no-op afterwards.
+static skia::textlayout::Paragraph* kx_layout_paragraph(kx_text_layout* layout) {
+    if (!layout) return nullptr;
+    if (!layout->paragraph && layout->builder) {
+        layout->paragraph = layout->builder->Build();
+        layout->builder.reset();
+        if (layout->paragraph) layout->paragraph->layout(layout->max_width);
+    }
+    return layout->paragraph.get();
+}
+
+float kx_text_layout_width(kx_text_layout* layout) {
+    auto* p = kx_layout_paragraph(layout);
+    return p ? p->getLongestLine() : 0;
+}
+
+float kx_text_layout_height(kx_text_layout* layout) {
+    auto* p = kx_layout_paragraph(layout);
+    return p ? p->getHeight() : 0;
+}
+
+float kx_text_layout_baseline(kx_text_layout* layout) {
+    auto* p = kx_layout_paragraph(layout);
+    return p ? p->getAlphabeticBaseline() : 0;
+}
+
+void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y) {
+    if (!ctx || !ctx->canvas || !layout) return;
+    if (kx_recording(ctx)) {
+        // The paragraph pointer rides the op: replay is synchronous inside
+        // the same paint pass, so the handle outlives its replay.
+        KxRecOp op{KxRecOp::K::TextLayout};
+        op.f[0] = x; op.f[1] = y;
+        op.image = reinterpret_cast<uint64_t>(layout);
+        if (layout->paragraph) {
+            auto* p = layout->paragraph.get(); // metric getters are non-const
+            op.local_bounds = SkRect::MakeLTRB(x, y - p->getAlphabeticBaseline(),
+                                               x + p->getLongestLine(), y + p->getHeight() - p->getAlphabeticBaseline());
+        }
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    kx_count_op(ctx);
+    auto* p = kx_layout_paragraph(const_cast<kx_text_layout*>(layout));
+    if (p) p->paint(ctx->canvas, x, y - p->getAlphabeticBaseline());
+}
+
+void kx_text_layout_destroy(kx_text_layout* layout) {
+    delete layout;
 }
 
 const char* kx_backend_name(kx_backend backend) {

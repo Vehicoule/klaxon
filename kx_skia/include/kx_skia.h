@@ -48,6 +48,18 @@
 //           full-coverage opaque blit), + kx_draw_pixels (zero-copy borrowed
 //           pixel draw — the video texture-upload idiom), + aa flag on
 //           kx_clip_path. Purely additive except the kx_clip_path signature.
+//   0.14.0 — + kx_frame_draw_ops (real submitted-op count per frame).
+//   0.15.0 — real text: kx_draw_text/_styled/measure_text now shape through
+//            SkParagraph (HarfBuzz + ICU bidi + fallback); + kx_text_layout
+//            multi-style span API.
+//   0.16.0 — real primitives: kx_layer_blur (content blur via image filter),
+//            kx_backdrop_blur (backdrop filter saveLayer), kx_shadow_rrect
+//            (SkShadowUtils ambient+spot elevation shadows), kx_fill_path/
+//            kx_stroke_path (verb-encoded cubic paths).
+//   0.17.0 — variable fonts: kx_text_style gains variation axes (OpenType
+//            variation design coordinates — SkFontArguments::VariationPosition
+//            via TextStyle::setFontArguments). Struct-append only; existing
+//            zero-initialized callers behave identically (count 0).
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -89,11 +101,67 @@ void kx_end_frame(kx_ctx* ctx); // GPU backends: submit + present. Raster: flush
 
 // Drawing (current frame canvas; call between begin/end_frame).
 void kx_clear(kx_ctx* ctx, uint32_t rgba);
-// Simple unshaped text, y = baseline. Shaped text (SkParagraph) comes later.
+// Fully-shaped text, y = first-line baseline (SkParagraph — HarfBuzz
+// shaping, ICU bidi + line breaking, script-aware fallback since 0.15.0).
 void kx_draw_text(kx_ctx* ctx, const char* text, float x, float y, float size, uint32_t rgba);
 // Bold-aware text variant (added in 0.2.0; kx_draw_text is unchanged for ABI
 // stability — it delegates with bold=false).
 void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float size, bool bold, uint32_t rgba);
+
+// Multi-style shaped text (0.15.0): a paragraph built from styled spans —
+// real rich text (weight 100..900, italic, letter-spacing, per-span color)
+// with full shaping/bidi/fallback. The handle builds + lays out lazily on
+// the first metric or paint call; spans added afterwards are ignored.
+// kx_text_paint_layout's (x,y) is the first-line BASELINE — same
+// convention as kx_draw_text.
+typedef struct kx_text_layout kx_text_layout;
+typedef struct kx_text_style {
+    float size;           // px
+    int32_t weight;       // 100..900 (400 = normal, 700 = bold)
+    int32_t slant;        // 0 = upright, 1 = italic
+    float letter_spacing; // px added between glyphs (0 = font default)
+    uint32_t color;       // 0xRRGGBBAA — baked per span
+    // Variable-font axes (0.17.0): up to 8 OpenType variation design
+    // coordinates — axis is the 4-char tag packed big-endian ('wght' ==
+    // 0x77676874), value in the font's declared axis range. A 'wght'
+    // coordinate overrides `weight` on variable fonts; axes absent from the
+    // resolved font are ignored (fontStyle weight still selects among
+    // static instances). Zero-init count = today's behaviour.
+    uint32_t variation_count;
+    uint32_t variation_axes[8];
+    float    variation_values[8];
+} kx_text_style;
+kx_text_layout* kx_text_layout_begin(float max_width); // <=0 = unconstrained
+void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text_style* style);
+float kx_text_layout_width(kx_text_layout* layout);   // longest laid-out line
+float kx_text_layout_height(kx_text_layout* layout);
+float kx_text_layout_baseline(kx_text_layout* layout); // first line, alphabetic
+void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y);
+void kx_text_layout_destroy(kx_text_layout* layout);
+
+// Real rendering primitives (0.16.0).
+// Push a content-blur layer: ops until the matching kx_restore rasterize
+// once and composite through a Gaussian image filter — glass blur, not an
+// alpha stand-in. sigma <= 0 degenerates to a pass-through layer.
+void kx_layer_blur(kx_ctx* ctx, float sigma);
+// Backdrop blur: blurs what is ALREADY painted within the rect (the
+// backdrop filter path — a saveLayer whose init pixels are the filtered
+// backdrop). Subsequent draws composite over the blur.
+void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sigma);
+// Material elevation shadow (SkShadowUtils ambient+spot, M3 key light):
+// elevation in dp scales z-offset and penumbra. transparent_occluder for
+// glass/translucent fills (shadow shows through the shape).
+void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius,
+                     float elevation, uint32_t ambient_rgba, uint32_t spot_rgba,
+                     int transparent_occluder);
+// Verb-encoded paths (0.16.0): `verbs` consumes `pts` sequentially —
+// 0 = moveTo(2 floats), 1 = lineTo(2), 2 = quadTo(4), 3 = cubicTo(6),
+// 4 = close(0). fill_rule: 0 = winding, 1 = even-odd. Covers arbitrary
+// Bézier fills/strokes (shape morphing emits verb 0 + N×3 + 4).
+void kx_fill_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
+                  uint32_t rgba, int fill_rule);
+void kx_stroke_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
+                  float stroke_w, uint32_t rgba, int fill_rule);
 // Fill an axis-aligned rectangle with a solid color.
 void kx_fill_rect(kx_ctx* ctx, float x, float y, float w, float h, uint32_t rgba);
 // Fill a rounded rectangle with a solid color.
@@ -220,6 +288,9 @@ bool kx_gpu_warmup(kx_ctx* ctx);
 // Introspection.
 kx_backend kx_backend_of(const kx_ctx* ctx);
 const char* kx_backend_name(kx_backend backend);
+// Draw ops submitted to the canvas by the last completed frame (0.14.0):
+// counted on the emit path — a layer-recorded op counts once, at replay.
+uint64_t kx_frame_draw_ops(kx_ctx* ctx);
 // ABI version (semver). Breaking changes bump the major version. (ADR-0009)
 const char* kx_abi_version(void);
 
