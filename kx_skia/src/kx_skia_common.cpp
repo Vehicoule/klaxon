@@ -13,6 +13,7 @@
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkFontMetrics.h"
 #include "include/core/SkFontStyle.h"
+#include "include/core/SkStream.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkPaint.h"
@@ -48,6 +49,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -138,7 +141,7 @@ struct kx_ctx {
     sk_sp<SkSurface> offscreen;
     int offscreen_w = 0;
     int offscreen_h = 0;
-    // Pooled offscreen surface (0.18.0): grow-only — one alloc serves every
+    // Pooled offscreen surface: grow-only — one alloc serves every
     // offscreen pass; a fresh RenderTarget per pass was ~0.2ms on Metal.
     sk_sp<SkSurface> offscreen_pool;
     int offscreen_pool_w = 0;
@@ -199,8 +202,97 @@ struct kx_ctx {
 
 // Font manager is process-global: text metrics are needed at layout time,
 // before/without a kx_ctx. Initialized once (thread-confined afterwards).
+//
+// It is wrapped in a resolution memo: SkParagraph's per-build font-run
+// resolution calls matchFamilyStyle{,Character} once per script cluster —
+// on CoreText that is a full character-coverage probe per call, and a
+// typing field re-resolves the SAME codepoints every commit (bench:
+// ~60 clusters × ~8µs of CTFontForCharacters each frame). Every real text
+// engine memoizes this (QTextEngine's per-script font cache, Minikin's
+// FontCollection cache): the result is keyed by (codepoint, family, style,
+// locale) and stable while the font set is fixed. Null results are memoized
+// too — a codepoint no font covers must not re-probe.
+class KxCachingFontMgr : public SkFontMgr {
+public:
+    explicit KxCachingFontMgr(sk_sp<SkFontMgr> base) : fBase(std::move(base)) {}
+
+protected:
+    int onCountFamilies() const override { return fBase->countFamilies(); }
+    void onGetFamilyName(int index, SkString* familyName) const override {
+        fBase->getFamilyName(index, familyName);
+    }
+    sk_sp<SkFontStyleSet> onCreateStyleSet(int index) const override {
+        return fBase->createStyleSet(index);
+    }
+    sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override {
+        return fBase->matchFamily(familyName);
+    }
+    sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],
+                                         const SkFontStyle& style) const override {
+        const uint64_t k = styleKey(familyName, style);
+        if (auto it = fStyleCache.find(k); it != fStyleCache.end()) return it->second;
+        sk_sp<SkTypeface> tf = fBase->matchFamilyStyle(familyName, style);
+        if (fStyleCache.size() < kCacheCap) fStyleCache.emplace(k, tf);
+        return tf;
+    }
+    sk_sp<SkTypeface> onMatchFamilyStyleCharacter(
+            const char familyName[], const SkFontStyle& style,
+            const char* bcp47[], int bcp47Count, SkUnichar character) const override {
+        uint64_t h = styleKey(familyName, style);
+        for (int i = 0; i < bcp47Count; ++i) {
+            for (const char* s = bcp47[i]; s && *s; ++s) { h ^= (uint8_t)*s; h *= 1099511628211ull; }
+        }
+        h ^= (uint32_t)character;
+        h *= 1099511628211ull;
+        if (fCharMisses.count(h)) return nullptr;
+        if (auto it = fCharCache.find(h); it != fCharCache.end()) return it->second;
+        sk_sp<SkTypeface> tf = fBase->matchFamilyStyleCharacter(
+                familyName, style, bcp47, bcp47Count, character);
+        if (fCharCache.size() + fCharMisses.size() >= kCacheCap) return tf;
+        if (tf) fCharCache.emplace(h, tf);
+        else fCharMisses.insert(h);
+        return tf;
+    }
+    sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData> d, int ttcIndex) const override {
+        return fBase->makeFromData(std::move(d), ttcIndex);
+    }
+    sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset> s,
+                                            int ttcIndex) const override {
+        return fBase->makeFromStream(std::move(s), ttcIndex);
+    }
+    sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset> s,
+                                           const SkFontArguments& a) const override {
+        return fBase->makeFromStream(std::move(s), a);
+    }
+    sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const override {
+        return fBase->makeFromFile(path, ttcIndex);
+    }
+    sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[],
+                                           SkFontStyle style) const override {
+        return fBase->legacyMakeTypeface(familyName, style);
+    }
+
+private:
+    static constexpr size_t kCacheCap = 8192; // codepoints × styles in play at once
+    sk_sp<SkFontMgr> fBase;
+    mutable std::unordered_map<uint64_t, sk_sp<SkTypeface>> fCharCache;
+    mutable std::unordered_set<uint64_t> fCharMisses;
+    mutable std::unordered_map<uint64_t, sk_sp<SkTypeface>> fStyleCache;
+
+    static uint64_t styleKey(const char* familyName, const SkFontStyle& style) {
+        uint64_t h = 14695981039346656037ull;
+        for (const char* s = familyName; s && *s; ++s) { h ^= (uint8_t)*s; h *= 1099511628211ull; }
+        h ^= (uint32_t)style.weight() | ((uint32_t)style.width() << 16) | ((uint32_t)style.slant() << 24);
+        h *= 1099511628211ull;
+        return h;
+    }
+};
+
 static sk_sp<SkFontMgr>& kx_fonts() {
-    static sk_sp<SkFontMgr> mgr = kx::platform_font_mgr();
+    static sk_sp<SkFontMgr> mgr = [] {
+        sk_sp<SkFontMgr> base = kx::platform_font_mgr();
+        return base ? sk_sp<SkFontMgr>(new KxCachingFontMgr(std::move(base))) : base;
+    }();
     return mgr;
 }
 
@@ -1929,8 +2021,11 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     ctx->canvas->save();
     // Clear ONLY the snapshotted corner — the pool may cover far more
     // (clear() on the whole surface measured +48% on resize-heavy scenes).
+    // kSrc + TRANSPARENT: SkPaint defaults to opaque black — an unpainted
+    // corner would blit black, not the backdrop.
     {
         SkPaint clear;
+        clear.setColor(SK_ColorTRANSPARENT);
         clear.setBlendMode(SkBlendMode::kSrc);
         ctx->canvas->drawRect(SkRect::MakeWH(w, h), clear);
     }
