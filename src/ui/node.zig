@@ -142,6 +142,16 @@ pub const VTable = struct {
     /// Effective hit-test rect (defaults to bounds). Transformed widgets
     /// return where their children actually paint.
     hit_bounds: ?*const fn (node: *Node) Rect = null,
+    /// Spatial child index for hit-testing (the same idiom as the paint
+    /// culler): a container whose children occupy DISJOINT, computable
+    /// cells (grid tracks, uniform list rows) answers "which child could
+    /// contain this point" with index math instead of a linear scan —
+    /// browsers/Qt do the same for regular layouts. Returning a child means
+    /// it is the ONLY possible hit (the child still verifies its own
+    /// bounds, so gap hits return null naturally); returning null means no
+    /// child can contain the point. Contract: only valid while every
+    /// child's hit area stays inside its cell (no hit_bounds/overflow).
+    hit_child: ?*const fn (node: *Node, x: f32, y: f32) ?*Node = null,
     /// Map a point from this node's space into its children's coordinate
     /// space (matches the paint transform, inverted). Hit-testing through a
     /// transformed subtree lands on the visual position.
@@ -718,6 +728,12 @@ pub const Node = struct {
             cy = p.y;
         }
         var i = node.children.items.len;
+        if (node.vtable.hit_child) |hc| {
+            if (hc(node, cx, cy)) |child| {
+                if (child.hitTest(cx, cy)) |hit| return hit;
+            }
+            return node;
+        }
         while (i > 0) {
             i -= 1;
             const child = node.children.items[i];
@@ -747,6 +763,12 @@ pub const Node = struct {
             cy = p.y;
         }
         var i = node.children.items.len;
+        if (node.vtable.hit_child) |hc| {
+            if (hc(node, cx, cy)) |child| {
+                if (child.hitTestMapped(cx, cy)) |hit| return hit;
+            }
+            return .{ .node = node, .x = px, .y = py };
+        }
         while (i > 0) {
             i -= 1;
             const child = node.children.items[i];

@@ -41,6 +41,8 @@
 #include "modules/skparagraph/include/ParagraphPainter.h"
 #include "modules/skparagraph/include/ParagraphStyle.h"
 #include "modules/skparagraph/include/TextStyle.h"
+#include "modules/skshaper/include/SkShaper.h"
+#include "modules/skshaper/include/SkShaper_harfbuzz.h"
 #include "modules/skunicode/include/SkUnicode.h"
 #include "modules/skunicode/include/SkUnicode_icu.h"
 
@@ -525,12 +527,121 @@ struct KxTextSlot {
     uint64_t last_used = 0; // LRU tick
     size_t utf16_len = 0;   // text-index space length (updateForegroundPaint)
     std::unique_ptr<skia::textlayout::Paragraph> paragraph; // laid out once
+    sk_sp<SkTextBlob> blob; // simple-path drawable (top-of-line origin)
     kx_text_metrics metrics = {0, 0, 0, 0};
 };
 
 KxTextSlot kx_text_cache[kTextCacheCap];
 int kx_text_cache_used = 0;
 uint64_t kx_text_cache_tick = 0;
+
+// --- Simple-text fast path ----------------------------------------------
+// A full ParagraphBuilder pays for machinery a single-run string never
+// uses: ICU code-unit classification + break-iterator clones, BiDi
+// analysis, run splitting, justification, cluster tables. Pure printable
+// ASCII is provably one LTR run in one typeface — shaping it through the
+// SAME HarfBuzz with trivial iterators yields identical glyphs at
+// identical positions; the skipped work is identity for this input, not
+// correctness. The slot then carries a SkTextBlob instead of a Paragraph.
+// (Honest bound: blob draw == paragraph paint for single-run text; the
+// goldens + KX_TEXT_VERIFY self-check cover equivalence.)
+
+// Printable ASCII, single line — the fast-path domain.
+static bool kx_text_simple(const char* text, size_t len) {
+    if (len == 0 || len > 512) return false;
+    for (size_t i = 0; i < len; ++i) {
+        const uint8_t c = static_cast<uint8_t>(text[i]);
+        if (c < 0x20 || c > 0x7E) return false;
+    }
+    return true;
+}
+
+// Minimal RunHandler: blob builder + run metrics + total advance. Same
+// placement math as SkTextBlobBuilderRunHandler (top-of-line origin).
+class KxSimpleShapeHandler final : public SkShaper::RunHandler {
+public:
+    sk_sp<SkTextBlob> blob() { return fBuilder.make(); }
+    SkPoint advance() const { return fAdvance; }
+    float maxAscent() const { return fMaxAscent; }
+    float maxDescent() const { return fMaxDescent; }
+    float maxLeading() const { return fMaxLeading; }
+
+    void beginLine() override {
+        fPos = {0, 0};
+        fAdvance = {0, 0};
+        fMaxAscent = fMaxDescent = fMaxLeading = 0;
+    }
+    void runInfo(const RunInfo& info) override {
+        SkFontMetrics fm;
+        info.fFont.getMetrics(&fm);
+        fMaxAscent = std::min(fMaxAscent, fm.fAscent);
+        fMaxDescent = std::max(fMaxDescent, fm.fDescent);
+        fMaxLeading = std::max(fMaxLeading, fm.fLeading);
+    }
+    void commitRunInfo() override { fPos.fY -= fMaxAscent; }
+    Buffer runBuffer(const RunInfo& info) override {
+        const auto& b = fBuilder.allocRunPos(info.fFont, static_cast<int>(info.glyphCount));
+        return {b.glyphs, b.points(), nullptr, nullptr, fPos};
+    }
+    void commitRunBuffer(const RunInfo& info) override { fPos += info.fAdvance; fAdvance = fPos; }
+    void commitLine() override {}
+
+private:
+    SkTextBlobBuilder fBuilder;
+    SkPoint fPos{0, 0};
+    SkPoint fAdvance{0, 0};
+    float fMaxAscent = 0;
+    float fMaxDescent = 0;
+    float fMaxLeading = 0;
+};
+
+static std::unique_ptr<SkShaper>& kx_simple_shaper() {
+    static std::unique_ptr<SkShaper> s = [] {
+        return kx_unicode() ? SkShapers::HB::ShapeDontWrapOrReorder(kx_unicode(), kx_fonts())
+                          : nullptr;
+    }();
+    return s;
+}
+
+// Shape a verified-simple string into a blob + metrics. Returns false to
+// fall back to the paragraph path (no font, empty coverage).
+static bool kx_shape_simple(const char* text, size_t len, float size, bool bold,
+                            KxTextSlot& slot) {
+    if (!kx_simple_shaper()) return false;
+    SkFont font = kx_make_font(text, size, bold);
+    if (!font.getTypeface()) return false;
+    // Match the paragraph pipeline's metrics space: linear advances +
+    // subpixel positions (defaults quantize to whole pixels — 'ui'@10
+    // measured 8.00 vs 7.78 and broke parity).
+    font.setSubpixel(true);
+    font.setLinearMetrics(true);
+    // Coverage: every char must map to a real glyph in this typeface —
+    // otherwise the paragraph path's per-cluster fallback is required.
+    std::vector<SkGlyphID> glyphs(len);
+    font.textToGlyphs(text, len, SkTextEncoding::kUTF8, SkSpan<SkGlyphID>(glyphs));
+    for (size_t i = 0; i < len; ++i) {
+        if (glyphs[i] == 0) return false;
+    }
+    SkShaper::TrivialFontRunIterator fonts(font, len);
+    SkShaper::TrivialBiDiRunIterator bidi(0, len);
+    const SkFourByteTag latn = SkSetFourByteTag('L', 'a', 't', 'n');
+    SkShaper::TrivialScriptRunIterator script(latn, len);
+    SkShaper::TrivialLanguageRunIterator lang("en", len);
+    KxSimpleShapeHandler handler;
+    kx_simple_shaper()->shape(text, len, fonts, bidi, script, lang,
+                              nullptr, 0, 1e9f, &handler);
+    slot.blob = handler.blob();
+    if (!slot.blob) return false;
+    const SkPoint adv = handler.advance();
+    slot.metrics.width = adv.fX;
+    slot.metrics.ascent = -handler.maxAscent();
+    slot.metrics.descent = handler.maxDescent();
+    // Paragraph snaps line height to the whole pixel (22.4 -> 22, 9.6 -> 10)
+    // — match it so node sizing is identical on both paths.
+    slot.metrics.height = std::floor(
+        handler.maxDescent() - handler.maxAscent() + handler.maxLeading() + 0.5f);
+    return true;
+}
 
 uint64_t kx_text_key_hash(const char* text, size_t len, float size, bool bold) {
     uint64_t h = 14695981039346656037ull; // FNV-1a over the UTF-8 bytes
@@ -619,20 +730,46 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     s.bold = bold;
     s.last_used = tick;
     s.utf16_len = kx_utf16_len(text, len);
-    // Real paragraph: HarfBuzz shaping + bidi + fallback, laid out once on
-    // the miss and re-painted per hit (the color is set per draw through
-    // updateForegroundPaint, so it stays OUT of the key — theme flips and
-    // color animations hit the cache instead of re-shaping).
-    s.paragraph = kx_build_paragraph(text, len, size,
-                                     bold ? SkFontStyle::kBold_Weight
-                                          : SkFontStyle::kNormal_Weight,
-                                     0 /*upright*/, 0 /*letter-spacing*/,
-                                     SK_ColorBLACK);
-    if (s.paragraph) {
-        s.metrics.width = s.paragraph->getLongestLine();
-        s.metrics.ascent = s.paragraph->getAlphabeticBaseline();
-        s.metrics.height = s.paragraph->getHeight();
-        s.metrics.descent = s.metrics.height - s.metrics.ascent;
+    // Simple single-run strings take the direct shaper (same HarfBuzz,
+    // without the ParagraphBuilder/ICU machinery); everything else gets
+    // the real paragraph — laid out once on the miss, re-painted per hit.
+    static const bool kVerify = std::getenv("KX_TEXT_VERIFY") != nullptr;
+    bool built = kx_text_simple(text, len) &&
+                 kx_shape_simple(text, len, size, bold, s);
+    if (kVerify && built) {
+        auto para = kx_build_paragraph(text, len, size,
+                                       bold ? SkFontStyle::kBold_Weight
+                                            : SkFontStyle::kNormal_Weight,
+                                       0, 0, SK_ColorBLACK);
+        if (para) {
+            kx_text_metrics pm;
+            pm.width = para->getLongestLine();
+            pm.ascent = para->getAlphabeticBaseline();
+            pm.height = para->getHeight();
+            pm.descent = pm.height - pm.ascent;
+            const float dw = std::fabs(pm.width - s.metrics.width);
+            const float da = std::fabs(pm.ascent - s.metrics.ascent);
+            const float dh = std::fabs(pm.height - s.metrics.height);
+            if (dw > 0.05f || da > 0.05f || dh > 0.05f) {
+                std::fprintf(stderr, "KX_TEXT_VERIFY mismatch '%s' s=%g b=%d: "
+                    "blob(w %.2f a %.2f h %.2f) vs para(w %.2f a %.2f h %.2f)\n",
+                    s.text.c_str(), size, bold, s.metrics.width, s.metrics.ascent,
+                    s.metrics.height, pm.width, pm.ascent, pm.height);
+            }
+        }
+    }
+    if (!built) {
+        s.paragraph = kx_build_paragraph(text, len, size,
+                                         bold ? SkFontStyle::kBold_Weight
+                                              : SkFontStyle::kNormal_Weight,
+                                         0 /*upright*/, 0 /*letter-spacing*/,
+                                         SK_ColorBLACK);
+        if (s.paragraph) {
+            s.metrics.width = s.paragraph->getLongestLine();
+            s.metrics.ascent = s.paragraph->getAlphabeticBaseline();
+            s.metrics.height = s.paragraph->getHeight();
+            s.metrics.descent = s.metrics.height - s.metrics.ascent;
+        }
     }
     s.state = KxTextSlotState::kOccupied;
     ++kx_text_cache_used;
@@ -1178,7 +1315,14 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
         return;
     }
     const KxTextSlot* e = kx_text_entry(text, len, size, bold);
-    if (e->paragraph) {
+    if (e->blob) {
+        // Simple path: the blob's glyph origins are top-of-line, so the
+        // draw origin is (x, baseline - ascent) — same as paragraph paint.
+        SkPaint paint;
+        paint.setColor(kx_to_skcolor(rgba));
+        paint.setAntiAlias(true);
+        ctx->canvas->drawTextBlob(e->blob.get(), x, y - e->metrics.ascent, paint);
+    } else if (e->paragraph) {
         // Paint through the PaintID-resolving painter: the blob's foreground
         // is an ID resolved to THIS draw's color — real recoloring without
         // relayout (updateForegroundPaint can't reach the baked blob).

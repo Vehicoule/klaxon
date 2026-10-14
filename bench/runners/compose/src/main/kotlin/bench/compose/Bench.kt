@@ -620,6 +620,7 @@ private fun readRssMb(): Double {
 // --- the JSON report (bench_main.zig formatReport — same shape + formatting) ---
 
 internal fun fmt1(v: Double) = String.format(Locale.ROOT, "%.1f", v)
+internal fun fmt3(v: Double) = String.format(Locale.ROOT, "%.3f", v)
 
 private fun formatReport(
     results: List<Metrics>,
@@ -633,10 +634,10 @@ private fun formatReport(
         if (i > 0) sb.append(",\n")
         sb.append("    {\n")
         sb.append("      \"name\": \"${m.scene.sceneName}\",\n")
-        sb.append("      \"frame_time_avg_ms\": ${fmt1(m.frameTimeAvgMs)},\n")
-        sb.append("      \"frame_time_p50_ms\": ${fmt1(m.frameTimeP50Ms)},\n")
-        sb.append("      \"frame_time_p99_ms\": ${fmt1(m.frameTimeP99Ms)},\n")
-        sb.append("      \"frame_time_p999_ms\": ${fmt1(m.frameTimeP999Ms)},\n")
+        sb.append("      \"frame_time_avg_ms\": ${fmt3(m.frameTimeAvgMs)},\n")
+        sb.append("      \"frame_time_p50_ms\": ${fmt3(m.frameTimeP50Ms)},\n")
+        sb.append("      \"frame_time_p99_ms\": ${fmt3(m.frameTimeP99Ms)},\n")
+        sb.append("      \"frame_time_p999_ms\": ${fmt3(m.frameTimeP999Ms)},\n")
         sb.append("      \"jank_frames\": ${m.jankFrames},\n")
         sb.append("      \"jank_pct\": ${fmt1(m.jankPct)},\n")
         sb.append("      \"fps\": ${fmt1(m.fps)},\n")

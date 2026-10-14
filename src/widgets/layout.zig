@@ -146,7 +146,14 @@ pub const GridOptions = struct {
     padding: f32 = 0,
 };
 
-const GridState = struct { opts: GridOptions };
+const GridState = struct {
+    opts: GridOptions,
+    // Spatial index for hit_child: per-row y start/height plus the uniform
+    // cell pitch — filled by gridLayout, grow-only.
+    row_y: []f32 = &.{},
+    row_h: []f32 = &.{},
+    cell_w: f32 = 0,
+};
 
 // Scratch child sizes: stack buffer for <= 32 children, heap above (keeps
 // allocs_per_frame = 0 for typical trees).
@@ -242,11 +249,55 @@ fn gridLayout(n: *Node, bounds: Rect) void {
         const x = s.opts.padding + @as(f32, @floatFromInt(col_idx)) * (track_w + s.opts.gap);
         child.layout(.{ .x = bounds.x + x, .y = bounds.y + y, .w = track_w, .h = row_h[row_idx] });
     }
+
+    // Spatial index for hit_child: publish per-row geometry (grow-only).
+    if (s.row_y.len < rows) {
+        n.allocator.free(s.row_y);
+        n.allocator.free(s.row_h);
+        s.row_y = n.allocator.alloc(f32, rows) catch @panic("klaxon: out of memory");
+        s.row_h = n.allocator.alloc(f32, rows) catch @panic("klaxon: out of memory");
+    }
+    s.cell_w = track_w;
+    var ry = s.opts.padding;
+    for (0..rows) |ri| {
+        s.row_y[ri] = bounds.y + ry;
+        s.row_h[ri] = row_h[ri];
+        ry += row_h[ri] + s.opts.gap;
+    }
 }
+
+/// O(1) child for hit-testing: uniform columns × cached row starts. The
+/// caller verifies the child's own bounds, so gap hits fall through to the
+/// container — no child contains a gap point by construction.
+fn gridHitChild(n: *Node, x: f32, y: f32) ?*Node {
+    const s = stateOf(GridState, n);
+    const count = n.children.items.len;
+    if (count == 0 or s.row_y.len == 0) return null;
+    const cols: usize = @max(1, s.opts.columns);
+    const pitch = s.cell_w + s.opts.gap;
+    const lx = x - (n.bounds.x + s.opts.padding);
+    if (lx < 0 or pitch <= 0) return null;
+    const col: usize = @intFromFloat(lx / pitch);
+    if (col >= cols) return null;
+    // Binary search the row starts (sorted).
+    var lo: usize = 0;
+    var hi: usize = s.row_y.len;
+    while (lo + 1 < hi) {
+        const mid = (lo + hi) / 2;
+        if (y >= s.row_y[mid]) lo = mid else hi = mid;
+    }
+    const i = lo * cols + col;
+    if (i >= count) return null;
+    return n.children.items[i];
+}
+
 fn gridDeinit(n: *Node) void {
-    n.allocator.destroy(stateOf(GridState, n));
+    const s = stateOf(GridState, n);
+    n.allocator.free(s.row_y);
+    n.allocator.free(s.row_h);
+    n.allocator.destroy(s);
 }
-const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit, .auto_retain = true };
+const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit, .auto_retain = true, .hit_child = gridHitChild };
 
 pub fn grid(allocator: std.mem.Allocator, opts: GridOptions) !*Node {
     const node = try Node.create(allocator, &grid_vtable);
