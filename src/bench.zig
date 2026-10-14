@@ -694,6 +694,14 @@ const SceneRunner = struct {
         defer trace_csv.deinit();
         var layout_passes: u64 = 0;
         var ttff_ms: f64 = 0;
+        // SDL's first event pump does one-time Cocoa setup (~300ms measured:
+        // event taps, window-server connect, IME session). A real app pays it
+        // at startup and pumps continuously — drain once BEFORE the run so
+        // input_latency's in-process span isn't charged OS init.
+        if (opts.windowed) {
+            var ev: sdl.c.SDL_Event = undefined;
+            while (sdl.c.SDL_PollEvent(&ev)) {}
+        }
         const total = opts.warmup_frames + opts.frames;
         // Windowed: wall clock over the measured window → presented_fps —
         // the real presented rate (vsync-paced), vs `fps` = unthrottled
@@ -706,6 +714,16 @@ const SceneRunner = struct {
             if (opts.windowed and i == opts.warmup_frames) {
                 wall_start = sdl.c.SDL_GetTicksNS();
                 presented_at_start = renderer.frames_presented;
+            }
+            // Windowed input_latency: keep the OS queue hot like a real app —
+            // without it the injection-frame poll eats the accumulated
+            // backlog (measured 35ms inside the span). Scene-scoped: pumping
+            // the Cocoa runloop every frame costs real ms on a busy queue —
+            // charging every scene's frame for event plumbing they never
+            // use would inflate the whole suite (~2x measured).
+            if (opts.windowed and r.scene == .input_latency) {
+                var ev: sdl.c.SDL_Event = undefined;
+                while (sdl.c.SDL_PollEvent(&ev)) {}
             }
             const t0 = sdl.c.SDL_GetTicksNS();
             r.tick(renderer, i);
