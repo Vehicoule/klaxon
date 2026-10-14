@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "pointer_storm",
+      "frame_time_avg_ms": 7.5,
+      "frame_time_p50_ms": 6.8,
+      "frame_time_p99_ms": 27.6,
+      "frame_time_p999_ms": 30.7,
+      "jank_frames": 4,
+      "jank_pct": 3.3,
+      "fps": 133.1,
+      "draw_calls_per_frame": 1551,
+      "rss_mb": 258.1,
+      "ttff_ms": 23.2,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:30:41Z"
+}

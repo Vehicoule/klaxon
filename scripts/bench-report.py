@@ -36,6 +36,7 @@ SCENE_ORDER = [
 ]
 METRICS = [
     ("fps", "fps", "{:.1f}"),
+    ("presented_fps", "pres fps", "{:.1f}"),
     ("frame_time_avg_ms", "avg ms", "{:.2f}"),
     ("frame_time_p99_ms", "p99 ms", "{:.2f}"),
     ("frame_time_p999_ms", "p99.9 ms", "{:.2f}"),
@@ -222,7 +223,9 @@ def html_report(configs):
         "</style></head><body>",
         "<h1>Klaxon benchmarks — cross-framework report</h1>",
         f"<p class='meta'>Generated {datetime.now().isoformat(timespec='seconds')} — "
-        f"{len(configs)} configs. fps = 1000/avg frame work time (unpaced).</p>",
+        f"{len(configs)} configs. fps = 1000/avg frame work time (unpaced); "
+        f"pres fps = frames actually presented to the display (0 = headless or "
+        f"fully-static content — clean frames skip present).</p>",
     ]
     for cfg in sorted(configs):
         reports = configs[cfg]

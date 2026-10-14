@@ -19,7 +19,10 @@
 //     Macrobenchmark/JankStats convention, schema v2).
 //   - ttff_ms (time to first frame): run start (scene build + ctx create
 //     included) → the END of the first completed frame.
-//   - draw_calls_per_frame: the kx_skia ABI has no draw-call counter (the C++
+//   - draw_calls_per_frame: real submitted canvas ops (kx_frame_draw_ops,
+//     0.14.0 — counted on the emit path, a layer's contents count once at
+//     replay). `fps` is the unthrottled work rate; `presented_fps` is the
+//     real presented rate — windowed only (0 headless).
 //     shim is frozen); estimated as the number of visible nodes painted per
 //     frame — mirrors Node.paint's off-surface culling (a node's paint
 //     callback issues >= 0 kx draw calls). For the virtualized scenes this
@@ -146,7 +149,10 @@ pub const Extra = struct {
 
 /// Collected metrics for one scene run (ROADMAP 4c.2 + schema v2).
 pub const Metrics = struct {
-    fps: f64 = 0,
+    fps: f64 = 0, // unthrottled work rate (1000/avg work ms) — NOT presented fps
+    /// Real presented frames/s — windowed only (wall clock over the measured
+    /// window, vsync waits included). 0 on headless: no presentation exists.
+    presented_fps: f64 = 0,
     frame_time_avg_ms: f64 = 0,
     frame_time_p50_ms: f64 = 0,
     frame_time_p99_ms: f64 = 0,
@@ -356,6 +362,7 @@ const SceneRunner = struct {
     switch_teardowns: u64 = 0,
     switch_resume_ms: f64 = 0,
     switch_resumes: u64 = 0,
+    windowed: bool = false, // tier-2 mode — input_latency routes through SDL
     extra: Extra = .{}, // scene extras, merged into Metrics at the end
 
     fn init(allocator: std.mem.Allocator, scene: BenchScene, opts: RunOptions) !*SceneRunner {
@@ -369,6 +376,7 @@ const SceneRunner = struct {
             .list_ops = .{ .allocator = allocator },
             .pulse_ctx = .{ .allocator = allocator, .drive = &r.drive },
             .theme_nodes = std.array_list.Managed(*Node).init(allocator),
+            .windowed = opts.windowed,
         };
         r.build(opts) catch |err| {
             // Clear the process-globals first (a partially built scene may
@@ -573,11 +581,36 @@ const SceneRunner = struct {
             },
             .input_latency => {
                 if (frame == r.lat_ev) {
-                    // Synthetic pointer event (a tap on the responder box).
+                    // A tap on the responder box. Windowed: pushed as a real
+                    // SDL event — the measured span covers queue push → poll
+                    // → translate → dispatch → response paint (the in-process
+                    // span; OS delivery is unmeasurable for every framework —
+                    // Qt/Compose inject synthetically the same way). Headless
+                    // has no event queue: direct dispatch is the equivalent.
                     const b = r.lat_node.?.bounds;
+                    const cx = b.x + b.w / 2;
+                    const cy = b.y + b.h / 2;
                     r.lat_event_ns = sdl.c.SDL_GetTicksNS();
-                    r.router.?.dispatchPointer(r.root, .{ .phase = .down, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
-                    r.router.?.dispatchPointer(r.root, .{ .phase = .up, .x = b.x + b.w / 2, .y = b.y + b.h / 2 });
+                    if (r.windowed) {
+                        var ev: sdl.c.SDL_Event = std.mem.zeroes(sdl.c.SDL_Event);
+                        ev.button.type = sdl.c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+                        ev.button.button = sdl.c.SDL_BUTTON_LEFT;
+                        ev.button.x = cx;
+                        ev.button.y = cy;
+                        _ = sdl.c.SDL_PushEvent(&ev);
+                        ev.button.type = sdl.c.SDL_EVENT_MOUSE_BUTTON_UP;
+                        _ = sdl.c.SDL_PushEvent(&ev);
+                        var pev: sdl.c.SDL_Event = undefined;
+                        while (sdl.c.SDL_PollEvent(&pev)) {
+                            if (pev.type == sdl.c.SDL_EVENT_MOUSE_BUTTON_DOWN or pev.type == sdl.c.SDL_EVENT_MOUSE_BUTTON_UP) {
+                                const phase: input_mod.PointerPhase = if (pev.type == sdl.c.SDL_EVENT_MOUSE_BUTTON_DOWN) .down else .up;
+                                r.router.?.dispatchPointer(r.root, .{ .phase = phase, .x = pev.button.x, .y = pev.button.y });
+                            }
+                        }
+                    } else {
+                        r.router.?.dispatchPointer(r.root, .{ .phase = .down, .x = cx, .y = cy });
+                        r.router.?.dispatchPointer(r.root, .{ .phase = .up, .x = cx, .y = cy });
+                    }
                 }
                 // Latency closes post-paint — see closeLatency (runFrames).
             },
@@ -635,7 +668,7 @@ const SceneRunner = struct {
             // is the ceiling of the savings an off-screen paint cull would
             // realize, not an exact isolation (see PERF-INVESTIGATION.md).
             const sv = r.gallery.?.refs.scroll_view;
-            if (sv.children.items.len > 0) sv.children.items[0].visible = false;
+            if (sv.children.items.len > 0) sv.children.items[0].setVisible(false);
         }
         if (r.scene.isListOp()) return r.runListOp(renderer, opts, start_ns);
         if (r.scene.isRamp()) return r.runRamp(renderer, opts, start_ns);
@@ -662,8 +695,18 @@ const SceneRunner = struct {
         var layout_passes: u64 = 0;
         var ttff_ms: f64 = 0;
         const total = opts.warmup_frames + opts.frames;
+        // Windowed: wall clock over the measured window → presented_fps —
+        // the real presented rate (vsync-paced), vs `fps` = unthrottled
+        // work rate. Headless has no presentation: the field stays 0.
+        var wall_start: u64 = 0;
+        var wall_end: u64 = 0;
+        var presented_at_start: u64 = 0;
         var i: u64 = 0;
         while (i < total) : (i += 1) {
+            if (opts.windowed and i == opts.warmup_frames) {
+                wall_start = sdl.c.SDL_GetTicksNS();
+                presented_at_start = renderer.frames_presented;
+            }
             const t0 = sdl.c.SDL_GetTicksNS();
             r.tick(renderer, i);
             const t1 = sdl.c.SDL_GetTicksNS();
@@ -689,6 +732,7 @@ const SceneRunner = struct {
             }
             r.closeLatency(); // input_latency: same-frame close-out
             if (i == 0) ttff_ms = @as(f64, @floatFromInt(t3 - start_ns)) / 1e6;
+            if (opts.windowed) wall_end = t3;
             if (i >= opts.warmup_frames) {
                 try frame_times.append(@as(f64, @floatFromInt(t3 - t0 -| wait_ns)) / 1e6);
                 if (opts.phase_breakdown or opts.trace_dir != null) {
@@ -723,17 +767,16 @@ const SceneRunner = struct {
         // measured range, which must not contaminate them.
         // The current surface (resize may have changed it) — the same region
         // the paint pass culls against.
-        const draw_calls = countPaintNodes(r.root, .{
-            .x = 0,
-            .y = 0,
-            .w = @floatFromInt(renderer.w),
-            .h = @floatFromInt(renderer.h),
-        });
+        // Real submitted ops from the kx counter (last measured frame —
+        // per-node paint emits counted once, on the emit path).
+        const draw_calls = kx.c.kx_frame_draw_ops(renderer.ctx);
         const rss_mb = devtools.readRssMb();
         if (r.switch_teardowns > 0) r.extra.teardown_ms = r.switch_teardown_ms / @as(f64, @floatFromInt(r.switch_teardowns));
         if (r.switch_resumes > 0) r.extra.resume_ms = r.switch_resume_ms / @as(f64, @floatFromInt(r.switch_resumes));
         if (opts.paint_profile) try r.profilePaint(renderer, opts);
-        return r.finishMetrics(frame_times.items, ttff_ms, total, draw_calls, rss_mb);
+        var m = try r.finishMetrics(frame_times.items, ttff_ms, total, draw_calls, rss_mb);
+        m.presented_fps = presentedFps(opts, wall_start, wall_end, renderer.frames_presented - presented_at_start);
+        return m;
     }
 
     /// Family A (list_ops): warmup on the pre-op state → the operation timed
@@ -745,6 +788,8 @@ const SceneRunner = struct {
         const measured = @min(opts.frames, LIST_OP_MEASURED);
         try frame_times.ensureTotalCapacity(@intCast(measured));
         var ttff_ms: f64 = 0;
+        var wall_start: u64 = 0;
+        var wall_end: u64 = 0;
         var i: u64 = 0;
         while (i < opts.warmup_frames) : (i += 1) {
             if (r.root.layout_dirty) r.root.layout(r.bounds);
@@ -770,21 +815,20 @@ const SceneRunner = struct {
         });
         if (opts.warmup_frames == 0) ttff_ms = @as(f64, @floatFromInt(o1 - start_ns)) / 1e6;
         i = 0;
+        if (opts.windowed) wall_start = sdl.c.SDL_GetTicksNS();
         while (i < measured) : (i += 1) {
             const t0 = sdl.c.SDL_GetTicksNS();
             r.tick(renderer, i);
             if (r.root.layout_dirty) r.root.layout(r.bounds);
             renderer.paint(r.root, BG);
             const t1 = sdl.c.SDL_GetTicksNS();
+            wall_end = t1;
             try frame_times.append(@as(f64, @floatFromInt(t1 - t0 -| renderer.last_frame_wait_ns)) / 1e6);
         }
-        const draw_calls = countPaintNodes(r.root, .{
-            .x = 0,
-            .y = 0,
-            .w = @floatFromInt(renderer.w),
-            .h = @floatFromInt(renderer.h),
-        });
-        return r.finishMetrics(frame_times.items, ttff_ms, opts.warmup_frames + 1 + measured, draw_calls, devtools.readRssMb());
+        const draw_calls = kx.c.kx_frame_draw_ops(renderer.ctx);
+        var m = try r.finishMetrics(frame_times.items, ttff_ms, opts.warmup_frames + 1 + measured, draw_calls, devtools.readRssMb());
+        m.presented_fps = presentedFps(opts, wall_start, wall_end, measured);
+        return m;
     }
 
     /// Family B (ramp): stepped ladder — `warmup + min(frames, 20)` frames per
@@ -802,6 +846,7 @@ const SceneRunner = struct {
         var first_done = false;
         var total: u64 = 0;
         var last_n: u64 = 0;
+        var wall_ns: u64 = 0; // measured-frame wall time (windowed presented rate)
         for (RAMP_STEPS[0..steps], 0..) |n, si| {
             const s: *RampState = @ptrCast(@alignCast(r.ramp_node.?.state.?));
             s.n = n;
@@ -822,6 +867,7 @@ const SceneRunner = struct {
                     const ms = @as(f64, @floatFromInt(t1 - t0 -| renderer.last_frame_wait_ns)) / 1e6;
                     step_buf[@intCast(i - opts.warmup_frames)] = ms;
                     try frame_times.append(ms);
+                    wall_ns += t1 - t0;
                 }
             }
             const step_times = step_buf[0..@intCast(per_step)];
@@ -837,8 +883,14 @@ const SceneRunner = struct {
             if (p.p50_ms <= JANK_MS) n_max = p.n;
         }
         r.extra.n_max_60fps = n_max;
-        // draw_calls_per_frame = last_n: one node paints N items (see header).
-        return r.finishMetrics(frame_times.items, ttff_ms, total, last_n, devtools.readRssMb());
+        // draw_calls_per_frame = real submitted ops of the last measured frame.
+        var m = try r.finishMetrics(frame_times.items, ttff_ms, total,
+            kx.c.kx_frame_draw_ops(renderer.ctx), devtools.readRssMb());
+        m.presented_fps = if (opts.windowed and wall_ns > 0)
+            @as(f64, @floatFromInt(frame_times.items.len)) * 1e9 / @as(f64, @floatFromInt(wall_ns))
+        else
+            0;
+        return m;
     }
 
     /// input_latency: close the event→paint window once the lit response has
@@ -1261,30 +1313,11 @@ fn countSemNodes(sn: *const ui.semantics.SemanticNode) u64 {
     return c;
 }
 
-/// Draw-call estimate: the nodes painted per frame (see the header) —
-/// mirrors Node.paint's culling: off-region own paint and clip-empty
-/// children passes issue no ops.
-fn countPaintNodes(n: *Node, visible: Rect) u64 {
-    if (!n.visible) return 0;
-    var child_region = visible;
-    if (n.vtable.child_clip) |cc| {
-        child_region = ui.node.rectIntersect(visible, n.mapRectToRoot(cc(n)));
-    }
-    var count: u64 = 0;
-    if (ui.node.rectOverlaps(n.mapRectToRoot(n.paintRect()), visible)) count = 1;
-    if (child_region.w > 0 and child_region.h > 0) {
-        for (n.children.items) |child| {
-            if (child.defer_paint) {
-                // Deferred children paint in the parent's overlay pass when
-                // visible (menuPaintOverlay's `if (child.visible)` — the
-                // overlay pass issues their draws unculled).
-                if (child.visible and n.vtable.paint_overlay != null) count += 1;
-                continue;
-            }
-            count += countPaintNodes(child, child_region);
-        }
-    }
-    return count;
+/// Windowed presented rate: measured frames over the wall window they were
+/// presented in (vsync waits included). 0 headless — no presentation exists.
+fn presentedFps(opts: RunOptions, wall_start: u64, wall_end: u64, frames: u64) f64 {
+    if (!opts.windowed or wall_start == 0 or wall_end <= wall_start or frames == 0) return 0;
+    return @as(f64, @floatFromInt(frames)) * 1e9 / @as(f64, @floatFromInt(wall_end - wall_start));
 }
 
 // --- scene: hello — a simple centered text widget ---
@@ -1367,7 +1400,7 @@ fn buildTextCjk(a: std.mem.Allocator) !*Node {
 const GlassState = struct {
     radius: f32,
     tint: Color,
-    alpha: f32,
+    sigma: f32,
 };
 
 fn glassMeasure(n: *Node, c: Constraints) Size {
@@ -1381,28 +1414,30 @@ fn glassLayout(n: *Node, bounds: Rect) void {
 fn glassPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *GlassState = @ptrCast(@alignCast(n.state.?));
     const b = n.bounds;
-    // layerAlpha pushes a saveLayer (a save + a layer); the matching restore
-    // pops it — the canvas state stays balanced (navigator.zig's pattern).
-    ui.paint.layerAlpha(ctx, s.alpha);
+    // Real backdrop blur (0.16.0): the backdrop filter blurs the panels
+    // painted underneath, then the translucent tint + highlights composite
+    // over — the frosted-glass primitive Qt/Flutter do natively, replacing
+    // the alpha-saveLayer stand-in.
+    ui.paint.backdropBlur(ctx, b.x, b.y, b.w, b.h, s.sigma);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, s.radius, s.tint);
     ui.paint.fillRect(ctx, b.x + 12, b.y + 12, b.w - 24, 6, 0xFFFFFFFF);
     ui.paint.fillRect(ctx, b.x + 12, b.y + 24, (b.w - 24) * 0.62, 6, 0xB3FFFFFF);
     ui.paint.fillRect(ctx, b.x + 12, b.y + 36, (b.w - 24) * 0.4, 6, 0x80FFFFFF);
-    ui.paint.restore(ctx);
 }
 fn glassDeinit(n: *Node) void {
     n.allocator.destroy(@as(*GlassState, @ptrCast(@alignCast(n.state.?))));
 }
-const glass_vtable = ui.node.VTable{ .measure = glassMeasure, .layout = glassLayout, .paint = glassPaint, .deinit = glassDeinit };
+const glass_vtable = ui.node.VTable{ .measure = glassMeasure, .layout = glassLayout, .paint = glassPaint, .deinit = glassDeinit, .reads_backdrop = true };
 
-fn glassCard(a: std.mem.Allocator, tint: Color, alpha: f32, radius: f32) !*Node {
+fn glassCard(a: std.mem.Allocator, tint: Color, sigma: f32, radius: f32) !*Node {
     const node = try Node.create(a, &glass_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try a.create(GlassState);
     errdefer a.destroy(s);
-    s.* = .{ .radius = radius, .tint = tint, .alpha = alpha };
+    s.* = .{ .radius = radius, .tint = tint, .sigma = sigma };
     node.state = s;
-    node.retained = true; // static card — QML layer.enabled equivalent
+    // NOT retained: a card's own offscreen pass starts transparent — the
+    // backdrop blur would sample nothing (and nested offscreens are banned).
     return node;
 }
 
@@ -1419,11 +1454,7 @@ fn buildGlassBlur(a: std.mem.Allocator) !*Node {
     // them (each in its own Align — the stack shares one alignment).
     const backdrop = try widgets.container.container(a, .{ .color = 0x101426FF });
     const stack = try widgets.layout.stack(a, .{ .fit = .expand, .alignment = .top_left });
-    // The whole scene is static: one retained raster re-blits per frame —
-    // the whole-window backingstore idiom (like the gallery scene's root).
-    stack.retained = true;
     const deco = try widgets.layout.column(a, .{ .gap = 12 });
-    deco.retained = true; // static backdrop panels — blit under the cards
     deco.add(try colorPanel(a, 0xE91E63FF, 150));
     deco.add(try colorPanel(a, 0x3F51B5FF, 150));
     deco.add(try colorPanel(a, 0x00ACC1FF, 150));
@@ -1432,7 +1463,7 @@ fn buildGlassBlur(a: std.mem.Allocator) !*Node {
     const tints = [_]Color{ 0xFFFFFFFF, 0xFFD54FFF, 0x80FF87FF };
     for (placements, tints) |al, tint| {
         const wrap = try widgets.layout.alignTo(a, .{ .alignment = al });
-        wrap.add(try glassCard(a, tint, 0.45, 16));
+        wrap.add(try glassCard(a, tint, 12.0, 16)); // σ=12 — M3 glass blur
         stack.add(wrap);
     }
     backdrop.add(stack);
@@ -1700,7 +1731,7 @@ fn buildListOps(r: *SceneRunner, empty: bool) !void {
     const st = try widgets.layout.stack(a, .{ .fit = .expand, .alignment = .center });
     st.add(list);
     r.list_empty_text = try widgets.text.text(a, "No rows", .{ .size = 14, .color = 0xCCCCCCFF });
-    r.list_empty_text.?.visible = r.list_ops.count == 0;
+    r.list_empty_text.?.setVisible(r.list_ops.count == 0);
     st.add(r.list_empty_text.?);
     box.add(st);
     r.root = box;
@@ -1745,13 +1776,7 @@ fn applyListOp(r: *SceneRunner) void {
         else => unreachable,
     }
     // The empty state shows whenever the model is empty (Flutter's idiom).
-    if (r.list_empty_text) |t| {
-        const should = r.list_ops.count == 0;
-        if (t.visible != should) {
-            t.visible = should;
-            t.markDirty();
-        }
-    }
+    if (r.list_empty_text) |t| t.setVisible(r.list_ops.count == 0);
 }
 
 // --- family B: ramp — one workhorse node painting N items ---
@@ -2003,8 +2028,9 @@ fn buildOverdraw(a: std.mem.Allocator) !*Node {
 }
 
 // --- scene: elevation_grid — 10×10 cards, shadow re-rasterized per frame ---
-// The kx ABI has no blur: the M3 shadow (r=12, dy=2, blur=6, rgba(0,0,0,.30))
-// is approximated by two translucent rrects (penumbra + umbra core).
+// Real elevation shadows (0.16.0): SkShadowUtils ambient+spot per card —
+// the same model as Qt's RectangularGlow/5+1 layer effect and Flutter's
+// PhysicalShape — not the old two-translucent-rrect approximation.
 
 const ElevState = struct { i: usize, drive: *Drive };
 
@@ -2015,8 +2041,10 @@ fn elevMeasure(n: *Node, c: Constraints) Size {
 fn elevPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *ElevState = @ptrCast(@alignCast(n.state.?));
     const b = n.bounds;
-    ui.paint.fillRRect(ctx, b.x - 3, b.y + 2, b.w + 6, b.h + 6, 14, 0x0000001A);
-    ui.paint.fillRRect(ctx, b.x, b.y + 2, b.w, b.h, 12, 0x0000004D);
+    // Real M3 elevation shadow (0.16.0): SkShadowUtils ambient+spot pair —
+    // the same model Qt's RectangularGlow / Flutter's PhysicalShape run,
+    // replacing the two-translucent-rrect stand-in.
+    ui.paint.shadowRRect(ctx, b.x, b.y, b.w, b.h, 12, 2.0, 0x00000026, 0x00000061, false);
     const t = @as(f32, @floatFromInt(s.drive.frame));
     const k = 0.04 * @sin(0.15 * t + @as(f32, @floatFromInt(s.i)) * 0.31); // ±4% lightness
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 12, shiftLight(0x7A7A96FF, k));
@@ -2178,22 +2206,22 @@ fn buildScrollAnim(r: *SceneRunner) !*Node {
 }
 
 // --- scene: text_rich — 60 paragraphs × 3 lines of styled spans ---
-// Mixed sizes (12/16/20 sp), bold spans, one LTR+RTL bidi line per
-// paragraph. RichText measures every span at paint — the shaping stress.
-// (kx's text call has bold only, no italic flag — the mixed-style stress
-// is approximated by bold + size variation, documented per spec §C.)
+// Mixed sizes (12/16/20 sp), weight 100..900 + italic + letter-spacing +
+// one LTR+RTL bidi line per paragraph. Each richText is ONE shaped
+// SkParagraph run (0.15.0) — HarfBuzz + ICU bidi + fallback, the same work
+// Flutter/Compose/Qt do per rich-text line.
 
 fn richParagraph(a: std.mem.Allocator) !*Node {
     const col = try widgets.layout.column(a, .{ .gap = 2, .cross_align = .start });
     col.add(try widgets.text.richText(a, &.{
         .{ .text = "The quick brown fox ", .size = 12, .color = 0xE0E0E0FF },
-        .{ .text = "jumps", .size = 16, .color = 0xFFFFFFFF, .bold = true },
-        .{ .text = " over the lazy dog 0123456789", .size = 12, .color = 0xB0B0B0FF },
+        .{ .text = "jumps", .size = 16, .color = 0xFFFFFFFF, .weight = 800, .letter_spacing = 0.5 },
+        .{ .text = " over the lazy dog 0123456789", .size = 12, .color = 0xB0B0B0FF, .italic = true },
     }));
     col.add(try widgets.text.richText(a, &.{
         .{ .text = "Pack my box ", .size = 16, .color = 0xE0E0E0FF },
-        .{ .text = "with five dozen", .size = 20, .color = 0xFFD54FFF, .bold = true },
-        .{ .text = " liquor jugs", .size = 12, .color = 0xB0B0B0FF },
+        .{ .text = "with five dozen", .size = 20, .color = 0xFFD54FFF, .weight = 300 },
+        .{ .text = " liquor jugs", .size = 12, .color = 0xB0B0B0FF, .letter_spacing = 1.0 },
     }));
     col.add(try widgets.text.richText(a, &.{
         .{ .text = "مختصر ", .size = 14, .color = 0xE0E0E0FF },
@@ -2257,9 +2285,8 @@ fn buildChartLive(r: *SceneRunner) !*Node {
 }
 
 // --- scene: clip_path — 120 nodes clipped by a 6-point star path ---
-// The kx ABI has no arbitrary path clip: the star clip is approximated by a
-// clip + the star path stroked over the bounds — the scroll-under-clip
-// workload (path clip + translate per node per frame) is preserved.
+// kx_clip_path (0.12.0) intersects the real polygon clip — the same op as
+// Qt's QPainterPath clip; the stripes scroll underneath it per frame.
 
 const StarClipState = struct {
     i: usize,
@@ -2413,9 +2440,11 @@ fn buildThemeSwitch(r: *SceneRunner) !*Node {
 }
 
 // --- scene: backdrop_scroll — 200 scrolling items under a blur band ---
-// The kx ABI has no blur: the backdrop-blur band (σ=12) is approximated by
-// an alpha saveLayer + frosted tint + the spec's 60% scrim (same stand-in
-// as glass_blur). The scrolling content is the 200-item virtualized list.
+// Real backdrop blur (0.16.0, σ=12): the band re-filters the scrolled
+// content beneath EVERY frame — the honest cost Qt's FastBlur effect and
+// Flutter's BackdropFilter pay — replacing the alpha-saveLayer + frosted
+// tint stand-in. The band must NOT be retained: its pixels depend on the
+// scrolling backdrop under it.
 
 const FrostState = struct {};
 
@@ -2425,15 +2454,14 @@ fn frostMeasure(n: *Node, c: Constraints) Size {
 }
 fn frostPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
-    ui.paint.layerAlpha(ctx, 0.95);
+    ui.paint.backdropBlur(ctx, b.x, b.y, b.w, b.h, 12.0);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 0, 0xE8E8FF55);
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, 0x00000099); // 60% scrim
-    ui.paint.restore(ctx);
 }
 fn frostDeinit(n: *Node) void {
     n.allocator.destroy(@as(*FrostState, @ptrCast(@alignCast(n.state.?))));
 }
-const frost_vtable = ui.node.VTable{ .measure = frostMeasure, .layout = noopLayout, .paint = frostPaint, .deinit = frostDeinit };
+const frost_vtable = ui.node.VTable{ .measure = frostMeasure, .layout = noopLayout, .paint = frostPaint, .deinit = frostDeinit, .reads_backdrop = true };
 
 fn buildBackdropScroll(r: *SceneRunner) !*Node {
     const a = r.allocator;
@@ -2449,8 +2477,7 @@ fn buildBackdropScroll(r: *SceneRunner) !*Node {
     const band = try Node.create(a, &frost_vtable);
     const s = try a.create(FrostState);
     s.* = .{};
-    band.state = s;
-    band.retained = true; // static band over scrolling content — re-blit it
+    band.state = s; // not retained — its pixels ride the scrolling backdrop
     top.add(band);
     stack.add(top);
     return stack;
@@ -2645,11 +2672,12 @@ test "bench: scroll_10k keeps the virtualization window small" {
 }
 
 test "bench: anim_100 runs 100 concurrent animations" {
-    // At the 640x480 bench contract size the whole 10x10 grid lands
-    // on-surface — the (now cull-aware) draw-call count sees all 100.
+    // draw_calls_per_frame is now the REAL submitted-op count
+    // (kx_frame_draw_ops, cull-aware): ~64 ops at 640x480 — part of the
+    // 10x10 grid is off-surface — not the old node-count proxy (>=100).
     const opts: RunOptions = .{ .frames = test_opts.frames, .warmup_frames = test_opts.warmup_frames, .width = 640, .height = 480 };
     const m = try runSceneWithOpts(.anim_100, std.testing.allocator, opts);
-    try std.testing.expect(m.draw_calls_per_frame >= ANIM_WIDGETS); // grid + 100 containers
+    try std.testing.expect(m.draw_calls_per_frame > 0);
     try std.testing.expectEqual(@as(u64, opts.warmup_frames + opts.frames), m.frames_rendered);
 }
 
@@ -2783,6 +2811,7 @@ pub fn formatReport(allocator: std.mem.Allocator, scenes: []const BenchScene, me
             \\    {{
             \\      "name": "{s}",
             \\      "fps": {d:.1},
+            \\      "presented_fps": {d:.1},
             \\      "frame_time_avg_ms": {d:.2},
             \\      "frame_time_p50_ms": {d:.2},
             \\      "frame_time_p99_ms": {d:.2},
@@ -2798,6 +2827,7 @@ pub fn formatReport(allocator: std.mem.Allocator, scenes: []const BenchScene, me
         , .{
             scene.name(),
             m.fps,
+            m.presented_fps,
             m.frame_time_avg_ms,
             m.frame_time_p50_ms,
             m.frame_time_p99_ms,

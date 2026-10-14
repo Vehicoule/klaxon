@@ -21,9 +21,16 @@ TS="$(date -u +%Y%m%d-%H%M%S)"
 # matrix per resource config. Env envelopes go to /results/_env/.
 
 echo "[run-one] $FW cfg=$CFG — staging repo" >&2
-rsync -a --exclude deps --exclude .git --exclude bench/results \
+# deps/ holds platform binaries on the host — all excluded EXCEPT deps/mcu,
+# the vendored material-color-utilities source the build now needs. The
+# image's /opt/klaxon-deps supplies the linux binaries via per-entry links.
+rsync -a --include='deps/' --include='deps/mcu/***' --exclude='deps/*' \
+      --exclude .git --exclude bench/results \
       --exclude 'bench/runners/*/build' /repo/ /work/
-ln -sfn /opt/klaxon-deps /work/deps
+mkdir -p /work/deps
+for d in /opt/klaxon-deps/*; do
+  [ -e "/work/deps/$(basename "$d")" ] || ln -sfn "$d" "/work/deps/$(basename "$d")"
+done
 mkdir -p "/work/bench/results/$FW" "/work/bench/results/_env" "/results/_env" 2>/dev/null || true
 
 dump_env() {

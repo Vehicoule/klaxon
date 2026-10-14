@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "theme_switch",
+      "frame_time_avg_ms": 6.5,
+      "frame_time_p50_ms": 6.5,
+      "frame_time_p99_ms": 11.2,
+      "frame_time_p999_ms": 11.5,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 153.2,
+      "draw_calls_per_frame": 963,
+      "rss_mb": 253.6,
+      "ttff_ms": 34.9,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:45:58Z"
+}

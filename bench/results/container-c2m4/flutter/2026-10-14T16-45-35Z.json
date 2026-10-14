@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "elevation_grid",
+      "frame_time_avg_ms": 6.9,
+      "frame_time_p50_ms": 6.9,
+      "frame_time_p99_ms": 9.0,
+      "frame_time_p999_ms": 10.3,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 144.6,
+      "draw_calls_per_frame": 412,
+      "rss_mb": 241.6,
+      "ttff_ms": 25.7,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:45:35Z"
+}

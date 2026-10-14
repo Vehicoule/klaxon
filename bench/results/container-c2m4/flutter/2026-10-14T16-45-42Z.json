@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "mount_churn",
+      "frame_time_avg_ms": 15.3,
+      "frame_time_p50_ms": 15.1,
+      "frame_time_p99_ms": 24.7,
+      "frame_time_p999_ms": 34.3,
+      "jank_frames": 24,
+      "jank_pct": 20.0,
+      "fps": 65.3,
+      "draw_calls_per_frame": 5515,
+      "rss_mb": 322.0,
+      "ttff_ms": 68.5,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:45:42Z"
+}

@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "hello",
+      "frame_time_avg_ms": 1.7,
+      "frame_time_p50_ms": 1.7,
+      "frame_time_p99_ms": 3.1,
+      "frame_time_p999_ms": 3.4,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 574.2,
+      "draw_calls_per_frame": 28,
+      "rss_mb": 305.0,
+      "ttff_ms": 440.6,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:43:57Z"
+}

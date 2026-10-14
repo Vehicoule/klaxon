@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "scroll_10k",
+      "frame_time_avg_ms": 5.5,
+      "frame_time_p50_ms": 5.6,
+      "frame_time_p99_ms": 8.9,
+      "frame_time_p999_ms": 19.3,
+      "jank_frames": 1,
+      "jank_pct": 0.8,
+      "fps": 180.6,
+      "draw_calls_per_frame": 153,
+      "rss_mb": 241.2,
+      "ttff_ms": 37.1,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:44:00Z"
+}

@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "gallery",
+      "frame_time_avg_ms": 5.1,
+      "frame_time_p50_ms": 4.8,
+      "frame_time_p99_ms": 11.7,
+      "frame_time_p999_ms": 11.8,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 197.8,
+      "draw_calls_per_frame": 152,
+      "rss_mb": 247.1,
+      "ttff_ms": 47.1,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:28:59Z"
+}

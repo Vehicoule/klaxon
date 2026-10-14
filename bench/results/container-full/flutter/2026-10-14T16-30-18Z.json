@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "scroll_anim",
+      "frame_time_avg_ms": 6.5,
+      "frame_time_p50_ms": 6.6,
+      "frame_time_p99_ms": 8.1,
+      "frame_time_p999_ms": 8.4,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 154.2,
+      "draw_calls_per_frame": 220,
+      "rss_mb": 243.9,
+      "ttff_ms": 23.1,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 74648,
+  "timestamp": "2026-10-14T16:30:18Z"
+}
