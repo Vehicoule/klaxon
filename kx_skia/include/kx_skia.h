@@ -257,6 +257,27 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
 // 1 when every pixel of the image is fully opaque — lets callers skip the
 // destination clear under a full-coverage Src blit.
 uint8_t kx_image_is_opaque(kx_ctx* ctx, uint64_t image);
+// Batched sprite draw (added in 0.18.0): ONE draw submission for `count`
+// sprites of the SAME image — SkCanvas::drawAtlas underneath, the sprite-
+// batch idiom scene graphs use internally (QSG batches quads the same way).
+// Each sprite's similarity transform maps the source rect into place:
+//   dst = src * [[scos, -ssin], [ssin, scos]] + (tx, ty)
+// i.e. rotate+scale then translate; for a plain (x, y, w, h) blit use
+// scos=w/iw, ssin=0, tx=x, ty=y. tex_xywh = optional per-sprite source
+// rects (4 floats each); NULL samples the full image.
+typedef struct { float scos, ssin, tx, ty; } kx_sprite_xform;
+void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image,
+                         const kx_sprite_xform* xforms, const float* tex_xywh,
+                         int32_t count);
+// Batched distinct-image draw (same batch): SkCanvas::DrawEdgeAAImageSet —
+// one submission for N quads that may sample DIFFERENT registered images
+// (the retained-row scroll idiom). dst rects only (axis-aligned, no rotate).
+typedef struct {
+    uint64_t image;
+    float sx, sy, sw, sh; // source rect in the image (sw/sh <= 0 = full)
+    float dx, dy, dw, dh; // destination rect in device space
+} kx_image_quad;
+void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count);
 // Zero-copy draw (added in 0.12.0): draw raw RGBA pixels stretched into the
 // rect WITHOUT the registry round-trip — the pixel buffer is borrowed for
 // the synchronous raster draw (no memcpy, no image object). The video

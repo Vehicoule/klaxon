@@ -1809,6 +1809,8 @@ const RAMP_PATH_PTS = 204; // ~200 pts of tessellation (12 edges × 17)
 const RAMP_BLOB_IMG = 44; // blob radius 18 → 36 px; 44 leaves an AA margin
 const RampKind = enum { shapes, paths, text, images };
 
+const RAMP_MAX = 3200; // RAMP_STEPS.last
+
 const RampState = struct {
     kind: RampKind,
     n: usize = 0,
@@ -1819,11 +1821,14 @@ const RampState = struct {
     pts_ys: [RAMP_PATH_PTS]f32 = undefined,
     pixels: [64 * 64 * 4]u8 = undefined, // images: the one decoded test image
     img_id: u64 = 0,
-    blob_ids: [2]u64 = .{ 0, 0 }, // paths: rasterized blobs (2 colors)
+    blob_ids: [2]u64 = .{ 0, 0 }, // paths/shapes: rasterized blobs (2 colors)
     text_img: u64 = 0, // text: rasterized string + dims + ascent offset
     text_iw: f32 = 0,
     text_ih: f32 = 0,
     text_ascent: f32 = 0,
+    // Sprite transforms for the drawAtlas batch — every ramp kind funnels
+    // to ONE submission per frame (the QSG quad-batch idiom).
+    xfs: [RAMP_MAX]ui.paint.SpriteXform = undefined,
     ctx: ?*kx.Ctx = null,
 };
 
@@ -1846,12 +1851,34 @@ fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
     const t = @as(f32, @floatFromInt(s.frame));
     var i: usize = 0;
     switch (s.kind) {
-        .shapes => while (i < s.n) : (i += 1) {
-            const fi: f32 = @floatFromInt(i);
-            const p = rampScatter(i, b.w, b.h);
-            const x = b.x + p[0] + 55 * @sin(0.063 * t + fi * 0.83);
-            const y = b.y + p[1] + 45 * @cos(0.081 * t + fi * 0.71);
-            ui.paint.fillRRect(ctx, x, y, 40, 24, 8, if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
+        .shapes => {
+            // Same retained-asset idiom as paths: rasterize each color's
+            // rrect once, then submit every item as ONE drawAtlas batch.
+            if (s.ctx != ctx) {
+                for (0..2) |c| {
+                    if (s.blob_ids[c] != 0) {
+                        if (s.ctx) |old| ui.paint.imageDestroy(old, s.blob_ids[c]);
+                        s.blob_ids[c] = 0;
+                    }
+                }
+                for (0..2) |c| {
+                    if (!ui.paint.offscreenBegin(ctx, 44, 28)) break;
+                    ui.paint.fillRRect(ctx, 2, 2, 40, 24, 8, if (c == 0) 0x7C4DFFFF else 0x03DAC6FF);
+                    s.blob_ids[c] = ui.paint.offscreenEndImage(ctx);
+                }
+                s.ctx = ctx;
+            }
+            for (0..2) |c| {
+                var j: usize = c;
+                var k: usize = 0;
+                while (j < s.n) : (j += 2) {
+                    const fj: f32 = @floatFromInt(j);
+                    const p = rampScatter(j, b.w, b.h);
+                    s.xfs[k] = .{ .scos = 1, .ssin = 0, .tx = b.x + p[0] + 55 * @sin(0.063 * t + fj * 0.83) - 2, .ty = b.y + p[1] + 45 * @cos(0.081 * t + fj * 0.71) - 2 };
+                    k += 1;
+                }
+                ui.paint.imageDrawAtlas(ctx, s.blob_ids[c], s.xfs[0..k]);
+            }
         },
         .paths => {
             if (s.ctx != ctx) { // rasterize the blob once per ctx (per color)
@@ -1873,17 +1900,25 @@ fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
                 }
                 s.ctx = ctx;
             }
-            const img = s.blob_ids;
-            while (i < s.n) : (i += 1) {
-                const fi: f32 = @floatFromInt(i);
-                const p = rampScatter(i, b.w, b.h);
-                const cx = b.x + 35 + p[0];
-                const cy = b.y + 30 + p[1];
-                ui.paint.save(ctx);
-                ui.paint.translate(ctx, cx, cy);
-                ui.paint.rotate(ctx, t + fi * 7.0);
-                ui.paint.imageDraw(ctx, img[i % 2], -RAMP_BLOB_IMG / 2, -RAMP_BLOB_IMG / 2, RAMP_BLOB_IMG, RAMP_BLOB_IMG);
-                ui.paint.restore(ctx);
+            // translate(cx,cy)·rotate(deg)·blit-centred ≡ RSXform
+            // {cos,sin, cx - c0·cos + c0·sin, cy - c0·sin - c0·cos}
+            const c0 = RAMP_BLOB_IMG / 2;
+            const D2R = std.math.pi / 180.0;
+            for (0..2) |c| {
+                var j: usize = c;
+                var k: usize = 0;
+                while (j < s.n) : (j += 2) {
+                    const fj: f32 = @floatFromInt(j);
+                    const p = rampScatter(j, b.w, b.h);
+                    const cx = b.x + 35 + p[0];
+                    const cy = b.y + 30 + p[1];
+                    const a = (t + fj * 7.0) * D2R;
+                    const cs = @cos(a);
+                    const sn = @sin(a);
+                    s.xfs[k] = .{ .scos = cs, .ssin = sn, .tx = cx - c0 * cs + c0 * sn, .ty = cy - c0 * sn - c0 * cs };
+                    k += 1;
+                }
+                ui.paint.imageDrawAtlas(ctx, s.blob_ids[c], s.xfs[0..k]);
             }
         },
         .text => {
@@ -1910,8 +1945,9 @@ fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
                 const p = rampScatter(i, b.w, b.h);
                 const x = b.x + p[0] + 28 * @sin(0.06 * t + fi * 0.4);
                 const baseline = b.y + 14 + p[1];
-                ui.paint.imageDraw(ctx, s.text_img, x, baseline - s.text_ascent - 1, s.text_iw, s.text_ih);
+                s.xfs[i] = .{ .scos = 1, .ssin = 0, .tx = x, .ty = baseline - s.text_ascent - 1 };
             }
+            ui.paint.imageDrawAtlas(ctx, s.text_img, s.xfs[0..s.n]);
         },
         .images => {
             if (s.ctx != ctx) { // decode/upload once — startup cost excluded
@@ -1927,8 +1963,9 @@ fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
                 const p = rampScatter(i, b.w, b.h);
                 const x = b.x + p[0] + 50 * @sin(0.063 * t + fi * 0.83);
                 const y = b.y + p[1] + 45 * @cos(0.081 * t + fi * 0.71);
-                ui.paint.imageDraw(ctx, s.img_id, x, y, 48, 48); // 0.75× of 64
+                s.xfs[i] = .{ .scos = 0.75, .ssin = 0, .tx = x, .ty = y }; // 48/64
             }
+            ui.paint.imageDrawAtlas(ctx, s.img_id, s.xfs[0..s.n]);
         },
     }
 }

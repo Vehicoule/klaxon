@@ -252,6 +252,31 @@ pub fn imageDraw(ctx: *kx.Ctx, id: u64, x: f32, y: f32, w: f32, h: f32) void {
     kx.c.kx_draw_image(ctx, id, x, y, w, h);
 }
 
+/// Batched sprite draw (ABI 0.18.0): one submission for N sprites of the
+/// same image — SkCanvas::drawAtlas underneath (QSG's quad-batch idiom).
+/// xforms map the image rect: rotate+scale columns [scos,ssin], then
+/// translate. Plain blit at (x,y) size w×h of an iw×ih image:
+/// { .scos = w/iw, .ssin = 0, .tx = x, .ty = y }.
+pub const SpriteXform = extern struct { scos: f32, ssin: f32, tx: f32, ty: f32 };
+
+pub fn imageDrawAtlas(ctx: *kx.Ctx, id: u64, xforms: []const SpriteXform) void {
+    if (xforms.len == 0) return;
+    kx.c.kx_draw_image_atlas(ctx, id, @ptrCast(xforms.ptr), null, @intCast(xforms.len));
+}
+
+/// Batched distinct-image draw (ABI 0.18.0): one submission for N quads
+/// that may each sample a different registered image (retained-row scroll).
+pub const ImageQuad = extern struct {
+    image: u64,
+    sx: f32, sy: f32, sw: f32, sh: f32, // source rect (sw/sh <= 0 = full image)
+    dx: f32, dy: f32, dw: f32, dh: f32, // destination rect
+};
+
+pub fn imageDrawSet(ctx: *kx.Ctx, quads: []const ImageQuad) void {
+    if (quads.len == 0) return;
+    kx.c.kx_draw_image_set(ctx, @ptrCast(quads.ptr), @intCast(quads.len));
+}
+
 /// True when every pixel of the image is fully opaque (ABI 0.13.0) — a
 /// full-coverage opaque blit lets the caller skip the destination clear.
 pub fn imageIsOpaque(ctx: *kx.Ctx, id: u64) bool {

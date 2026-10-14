@@ -23,6 +23,7 @@
 #include "include/core/SkSurface.h"
 #include "include/core/SkTextBlob.h"
 #include "include/core/SkTypeface.h"
+#include "include/core/SkVertices.h"
 #include "include/effects/SkGradient.h"
 #include "include/effects/SkImageFilters.h"
 #include "include/utils/SkShadowUtils.h"
@@ -75,7 +76,7 @@ struct KxRecOp {
         Clear, FillRect, FillRRect, FillRRectCorners, StrokeRRect,
         StrokeRRectCorners, StrokePolyline, FillPolygon, FillRRectGradient,
         FillPath, StrokePath, ShadowRRect, BackdropBlur,
-        Text, TextLayout, ImageDraw, Group,
+        Text, TextLayout, ImageDraw, ImageAtlas, ImageSet, Group,
     } k;
     float f[8] = {};
     uint32_t color = 0;
@@ -86,6 +87,7 @@ struct KxRecOp {
     std::string text;
     std::vector<float> xs, ys;
     std::vector<uint32_t> cols;
+    std::vector<uint64_t> imgs; // ImageSet: one image id per entry
     std::unique_ptr<KxRecLayer> child;
     // The draw's extent in the coordinate space CURRENT when it was recorded
     // (pre-transform ops in this layer have not been applied to it yet —
@@ -1097,6 +1099,28 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 }
                 break;
             }
+            case KxRecOp::K::ImageAtlas: {
+                std::vector<kx_sprite_xform> xf(op.count);
+                for (int i = 0; i < op.count; ++i) {
+                    xf[i] = {op.xs[4 * i], op.xs[4 * i + 1],
+                             op.xs[4 * i + 2], op.xs[4 * i + 3]};
+                }
+                kx_draw_image_atlas(ctx, op.image, xf.data(),
+                                    op.ys.empty() ? nullptr : op.ys.data(), op.count);
+                break;
+            }
+            case KxRecOp::K::ImageSet: {
+                std::vector<kx_image_quad> quads(op.count);
+                for (int i = 0; i < op.count; ++i) {
+                    quads[i] = {op.imgs[i],
+                                op.xs[4 * i], op.xs[4 * i + 1],
+                                op.xs[4 * i + 2], op.xs[4 * i + 3],
+                                op.ys[4 * i], op.ys[4 * i + 1],
+                                op.ys[4 * i + 2], op.ys[4 * i + 3]};
+                }
+                kx_draw_image_set(ctx, quads.data(), op.count);
+                break;
+            }
             case KxRecOp::K::Group:
                 // A nested layer replays through the recorder too: its ops
                 // re-record and its close resolves fold-vs-real on its own.
@@ -1481,6 +1505,147 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
                                SkRect::MakeXYWH(x, y, w, h),
                                SkSamplingOptions(), nullptr,
                                SkCanvas::kFast_SrcRectConstraint);
+}
+
+// Union of the device-space quad an RSXform maps a sw×sh src rect to.
+static SkRect kx_sprite_bounds(const kx_sprite_xform& xf, float sw, float sh) {
+    const float x1 = xf.scos * sw, y1 = xf.ssin * sw;   // src (w,0) corner
+    const float x2 = -xf.ssin * sh, y2 = xf.scos * sh;  // src (0,h) corner
+    const float l = std::min({xf.tx, xf.tx + x1, xf.tx + x2, xf.tx + x1 + x2});
+    const float t = std::min({xf.ty, xf.ty + y1, xf.ty + y2, xf.ty + y1 + y2});
+    const float r = std::max({xf.tx, xf.tx + x1, xf.tx + x2, xf.tx + x1 + x2});
+    const float b = std::max({xf.ty, xf.ty + y1, xf.ty + y2, xf.ty + y1 + y2});
+    return SkRect::MakeLTRB(l, t, r, b);
+}
+
+void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xforms,
+                         const float* tex_xywh, int32_t count) {
+    if (!ctx || !ctx->canvas || !image || !xforms || count <= 0) return;
+    auto it = ctx->images.find(image);
+    if (it == ctx->images.end()) return;
+    const int iw = it->second.img->width(), ih = it->second.img->height();
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::ImageAtlas};
+        op.image = image;
+        op.count = count;
+        op.xs.assign(reinterpret_cast<const float*>(xforms),
+                     reinterpret_cast<const float*>(xforms) + 4 * count);
+        if (tex_xywh) op.ys.assign(tex_xywh, tex_xywh + 4 * count);
+        SkRect b = SkRect::MakeEmpty();
+        for (int i = 0; i < count; ++i) {
+            const float sw = tex_xywh ? tex_xywh[4 * i + 2] : (float)iw;
+            const float sh = tex_xywh ? tex_xywh[4 * i + 3] : (float)ih;
+            b.join(kx_sprite_bounds(xforms[i], sw, sh));
+        }
+        op.local_bounds = b;
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    if (ctx->gpu && !it->second.img->isTextureBacked())
+        it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+    const SkImage* img = it->second.img.get();
+    // Backend split (measured): on raster the direct blits win (drawVertices
+    // is per-vertex interpolated triangles there — ~20x slower); on GPU
+    // drawAtlas/DrawEdgeAAImageSet still fan out per sprite inside
+    // Graphite's Device, while drawVertices stays ONE drawGeometry end to
+    // end — the batch goes through a textured triangle mesh (the default
+    // non-GPU SkDevice::drawAtlas does exactly this).
+    if (!ctx->gpu) {
+        for (int i = 0; i < count; ++i) {
+            const kx_sprite_xform& x = xforms[i];
+            const SkRect src = tex_xywh
+                ? SkRect::MakeXYWH(tex_xywh[4 * i], tex_xywh[4 * i + 1],
+                                   tex_xywh[4 * i + 2], tex_xywh[4 * i + 3])
+                : SkRect::MakeIWH(iw, ih);
+            kx_count_op(ctx);
+            if (x.ssin == 0.0f) { // axis-aligned scale+translate
+                ctx->canvas->drawImageRect(img, src,
+                    SkRect::MakeXYWH(x.tx, x.ty, x.scos * src.width(), x.scos * src.height()),
+                    SkSamplingOptions(), nullptr, SkCanvas::kFast_SrcRectConstraint);
+            } else {
+                ctx->canvas->save();
+                SkMatrix m;
+                m.setAll(x.scos, -x.ssin, x.tx, x.ssin, x.scos, x.ty, 0, 0, 1);
+                ctx->canvas->concat(m);
+                ctx->canvas->drawImageRect(img, src,
+                    SkRect::MakeXYWH(0, 0, src.width(), src.height()),
+                    SkSamplingOptions(), nullptr, SkCanvas::kFast_SrcRectConstraint);
+                ctx->canvas->restore();
+            }
+        }
+        return;
+    }
+    SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * count, 6 * count,
+                          SkVertices::kHasTexCoords_BuilderFlag);
+    SkPoint* pos = b.positions();
+    SkPoint* tc = b.texCoords();
+    uint16_t* idx = b.indices();
+    for (int i = 0; i < count; ++i) {
+        const SkRect src = tex_xywh
+            ? SkRect::MakeXYWH(tex_xywh[4 * i], tex_xywh[4 * i + 1],
+                               tex_xywh[4 * i + 2], tex_xywh[4 * i + 3])
+            : SkRect::MakeIWH(iw, ih);
+        const kx_sprite_xform& x = xforms[i];
+        const float sw = src.width(), sh = src.height();
+        pos[4 * i + 0] = {x.tx, x.ty};
+        pos[4 * i + 1] = {x.tx + x.scos * sw, x.ty + x.ssin * sw};
+        pos[4 * i + 2] = {x.tx + x.scos * sw - x.ssin * sh, x.ty + x.ssin * sw + x.scos * sh};
+        pos[4 * i + 3] = {x.tx - x.ssin * sh, x.ty + x.scos * sh};
+        tc[4 * i + 0] = {src.fLeft, src.fTop};
+        tc[4 * i + 1] = {src.fRight, src.fTop};
+        tc[4 * i + 2] = {src.fRight, src.fBottom};
+        tc[4 * i + 3] = {src.fLeft, src.fBottom};
+        const uint16_t v = (uint16_t)(4 * i);
+        idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
+        idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
+    }
+    SkPaint paint;
+    paint.setShader(img->makeShader(SkSamplingOptions()));
+    kx_count_op(ctx); // the whole set is ONE draw
+    ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
+}
+
+void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
+    if (!ctx || !ctx->canvas || !quads || count <= 0) return;
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::ImageSet};
+        op.count = count;
+        op.imgs.reserve(count);
+        op.xs.reserve(4 * count);
+        op.ys.reserve(4 * count);
+        SkRect b = SkRect::MakeEmpty();
+        for (int i = 0; i < count; ++i) {
+            const kx_image_quad& q = quads[i];
+            op.imgs.push_back(q.image);
+            op.xs.insert(op.xs.end(), {q.sx, q.sy, q.sw, q.sh});
+            op.ys.insert(op.ys.end(), {q.dx, q.dy, q.dw, q.dh});
+            b.join(kx_xywh(q.dx, q.dy, q.dw, q.dh, 0.5f));
+        }
+        op.local_bounds = b;
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    std::vector<SkCanvas::ImageSetEntry> entries;
+    entries.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        const kx_image_quad& q = quads[i];
+        auto it = ctx->images.find(q.image);
+        if (it == ctx->images.end()) continue;
+        if (ctx->gpu && !it->second.img->isTextureBacked())
+            it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+        const SkImage* img = it->second.img.get();
+        const SkRect src = q.sw > 0 && q.sh > 0
+            ? SkRect::MakeXYWH(q.sx, q.sy, q.sw, q.sh)
+            : SkRect::MakeIWH(img->width(), img->height());
+        entries.emplace_back(it->second.img, src,
+                             SkRect::MakeXYWH(q.dx, q.dy, q.dw, q.dh),
+                             1.0f, SkCanvas::kNone_QuadAAFlags);
+    }
+    if (entries.empty()) return;
+    kx_count_op(ctx); // the whole set is ONE submission
+    ctx->canvas->experimental_DrawEdgeAAImageSet(
+        entries.data(), (int)entries.size(), nullptr, nullptr,
+        SkSamplingOptions(), nullptr, SkCanvas::kFast_SrcRectConstraint);
 }
 
 void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
