@@ -51,9 +51,10 @@ Result naming follows the other tiers: `graphite-metal` →
 
 ## Known divergences / caveats
 
-- `rss_mb` is always `0.0` — `devtools.readRssMb` (`src/devtools.zig`)
-  only handles `.linux`/`.macos`; iOS needs a one-line `switch` arm to the
-  mach path (`mach_task_basic_info` works on iOS). src/ change required.
+- `rss_mb` reads via `mach_task_basic_info` — `devtools.readRssMb`
+  (`src/devtools.zig`) covers every Darwin target (the `task_info` ABI is
+  identical on iOS). Older tier-2-ios reports show `0.0` — they predate the
+  iOS arm.
 - `simctl launch` returns when the app *launches*, not when it exits; the
   script parses the host pid from its output (`<bundle>: <pid>` — sim apps
   are host processes) and polls the report file + `kill -0`. `launchctl

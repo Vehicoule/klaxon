@@ -556,12 +556,13 @@ pub fn fpsFromMs(frame_time_ms: f32) f32 {
 }
 
 /// Resident set size in MB. Linux: the VmRSS line of /proc/self/status
-/// (kB). macOS: mach_task_basic_info's resident_size (bytes). Any other
-/// target (emscripten, …): 0.0 — unsupported.
+/// (kB). Darwin (macOS, iOS, tvOS, watchOS, visionOS): mach_task_basic_info's
+/// resident_size (bytes) — the same task_info ABI on every Apple target. Any
+/// other target (emscripten, Windows, Android…): 0.0 — unsupported.
 pub fn readRssMb() f32 {
     return switch (builtin.os.tag) {
         .linux => readRssMbLinux(),
-        .macos => readRssMbMac(),
+        .macos, .ios, .tvos, .watchos, .visionos => readRssMbMac(),
         else => 0.0,
     };
 }
@@ -589,7 +590,8 @@ fn readRssMbLinux() f32 {
 // info"): resident_size is the RSS in bytes. mach_task_self() is a macro
 // over the mach_task_self_ global, hence the extern var. The declarations
 // are portable (plain integer types) — the function is only ever CALLED on
-// macOS (readRssMb's switch), so no mach symbol is referenced elsewhere.
+// Darwin targets (readRssMb's switch), so no mach symbol is referenced
+// elsewhere. task_info lives in libSystem on macOS/iOS/tvOS/watchOS alike.
 const mach = struct {
     const mach_port_t = c_uint; // natural_t
     const kern_return_t = c_int;
