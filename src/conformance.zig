@@ -564,7 +564,7 @@ fn applyNodeProps(h: *Harness, node: *Node, tv: Value, id: []const u8) !void {
     const props = propsOf(tv);
     if (props == .object) {
         if (getProp(props, "flex")) |f| node.flex = @intFromFloat(@max(0, num(f, 1)));
-        if (getProp(props, "visible")) |v| node.visible = boolean(v, true);
+        if (getProp(props, "visible")) |v| node.setVisible(boolean(v, true));
         if (parseRect(getProp(props, "damage_overflow"))) |r| {
             node.damage_overflow = .{ .left = r.x, .top = r.y, .right = r.w, .bottom = r.h };
         }

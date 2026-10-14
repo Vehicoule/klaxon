@@ -138,10 +138,39 @@ pub const VTable = struct {
     /// space (matches the paint transform, inverted). Hit-testing through a
     /// transformed subtree lands on the visual position.
     pre_children_hit: ?*const fn (node: *Node, px: f32, py: f32) HitPoint = null,
+    /// Automatic retained-subtree eligibility (Phase 4e/dirty-region): when
+    /// set, a paint pass that finds this subtree CLEAN may rasterize it into
+    /// a cached image once and re-blit while it stays clean — the same
+    /// per-item texture idiom as `retained`, driven by the traversal instead
+    /// of the app. Only safe for nodes whose whole subtree obeys the
+    /// paint-extent contract (everything it draws is reachable through
+    /// paintRect + child_clip + map_paint_rect): layout containers, simple
+    /// decorative wrappers, and scroll viewports qualify; nodes whose paint
+    /// can change without a dirty mark, or whose extent is unbounded, must
+    /// not set it. A dirty frame drops the cache and repaints directly —
+    /// auto-retention pays only where the subtree changes RARELY relative
+    /// to the frame rate.
+    auto_retain: bool = false,
+    /// This node's paint SAMPLES the pixels behind it (ui.paint.backdropBlur
+    /// — a backdrop filter). Inside a retained offscreen pass those pixels
+    /// don't exist (the image starts transparent), so a subtree containing
+    /// one must never be auto-retained — propagated up the parent chain as
+    /// `backdrop_subtree`. Opt-in `retained` is unaffected: an app that
+    /// retains a node whose subtree includes its own backdrop content gets
+    /// a self-contained image either way.
+    reads_backdrop: bool = false,
 };
 
 /// A point in a transformed coordinate space (hit-testing, Phase 1e).
 pub const HitPoint = struct { x: f32, y: f32 };
+
+/// Auto-retain image cap (auto_retain vtables only — opt-in `retained`
+/// nodes are explicitly sized by the app). Above this, the rasterized
+/// image costs more memory + blit time than the draw ops it replaces
+/// (a 10k-row content column: ~64 MB for a blit slower than re-issuing
+/// the cheap op stream). 2 MP ≈ 8 MB RGBA — comfortably covers a
+/// 1280×800 viewport; a virtualized content column lands far above.
+pub const AUTO_RETAIN_MAX_PX: u64 = 2 * 1024 * 1024;
 
 pub const Node = struct {
     allocator: std.mem.Allocator,
@@ -179,23 +208,41 @@ pub const Node = struct {
     /// pass prunes subtrees that can't contain one — a tree without popups
     /// costs O(1) instead of a full walk every frame.
     overlay_subtree: bool = false,
+    /// Subtree contains a reads_backdrop paint hook (a backdrop filter): its
+    /// pixels depend on content drawn OUTSIDE the subtree, so the subtree
+    /// can never be auto-retained into a transparent-start image. Mirrors
+    /// overlay_subtree's upward propagation; sticky like it (removal keeps
+    /// the flag — an over-blocked subtree is always safe).
+    backdrop_subtree: bool = false,
     // Dirty-rect (Phase 1e): the root accumulates the damaged region — the
     // union of every dirty mark's rect — and the host repaints the tree
     // clipped to it (the surface is retained between frames).
     damage: Rect = .{},
     damage_valid: bool = false,
-    // Retained-subtree cache (Phase 4e.2): opt-in per node. When set, the
-    // subtree's paint is rasterized once into a ctx image and re-blit while
-    // the subtree stays clean — the per-item texture idiom every retained
-    // framework applies (QSG item textures, Compose layers). Any dirty mark
-    // in the subtree or a paintRect size change re-rasterizes on next paint.
-    // Paint outside paintRect is already a damage-contract violation, so the
-    // image covers paintRect exactly.
+    // Retained-subtree cache (Phase 4e.2): opt-in via `retained`, or managed
+    // by the traversal when the vtable declares `auto_retain`. The subtree's
+    // paint is rasterized once into a ctx image and re-blit while the
+    // subtree stays clean — the per-item texture idiom every retained
+    // framework applies (QSG item textures, Compose layers). The image
+    // covers the subtree's PAINT EXTENT (paintExtent) snapped out to integer
+    // pixels: the blit lands on a pixel boundary, so cached output is a
+    // bit-exact copy of a direct paint — no subpixel sampling shift. Any
+    // dirty mark in the subtree or a paintRect size change re-rasterizes.
     retained: bool = false,
     retained_image: u64 = 0,
     retained_ctx: ?*kx.Ctx = null,
-    retained_w: i32 = 0,
+    retained_w: i32 = 0, // image pixel size (= the snapped extent)
     retained_h: i32 = 0,
+    retained_ix: f32 = 0, // image origin in this node's parent space (integer)
+    retained_iy: f32 = 0,
+    /// The paintRect at rasterize time: a rigid move (same size) re-blit the
+    /// image at the shifted origin; a size change re-rasterizes.
+    retained_pr: Rect = .{},
+    /// Auto-retain bail-out: the snapped extent exceeded AUTO_RETAIN_MAX_PX
+    /// (a giant subtree would rasterize megabytes for a blit pricier than
+    /// the draw ops it replaces). Stays set while the subtree is clean —
+    /// re-evaluated after the next dirty frame.
+    retained_blocked: bool = false,
     /// Optional solid backdrop composited INTO the retained raster before the
     /// subtree paints: the cached image becomes fully opaque, so its blit can
     /// use Src (no destination read) and a full-coverage root blit lets the
@@ -225,6 +272,7 @@ pub const Node = struct {
             .children = std.array_list.Managed(*Node).init(allocator),
             .vtable = vtable,
             .overlay_subtree = vtable.paint_overlay != null,
+            .backdrop_subtree = vtable.reads_backdrop,
         };
         return node;
     }
@@ -237,6 +285,7 @@ pub const Node = struct {
         child.parent = node;
         node.children.append(child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
+        if (child.backdrop_subtree) node.markBackdropUp();
         node.markLayoutDirty();
         node.markDirty();
     }
@@ -250,6 +299,7 @@ pub const Node = struct {
         const i = @min(index, node.children.items.len);
         node.children.insert(i, child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
+        if (child.backdrop_subtree) node.markBackdropUp();
         node.markLayoutDirty();
         node.markDirty();
     }
@@ -287,6 +337,18 @@ pub const Node = struct {
         while (true) {
             if (n.overlay_subtree) return;
             n.overlay_subtree = true;
+            const p = n.parent orelse return;
+            n = p;
+        }
+    }
+
+    /// Same propagation for backdrop-reading subtrees (auto-retain must not
+    /// cache them — their pixels depend on content outside the image).
+    fn markBackdropUp(node: *Node) void {
+        var n = node;
+        while (true) {
+            if (n.backdrop_subtree) return;
+            n.backdrop_subtree = true;
             const p = n.parent orelse return;
             n = p;
         }
@@ -344,8 +406,25 @@ pub const Node = struct {
     }
 
     pub fn layout(node: *Node, bounds: Rect) void {
-        node.bounds = bounds;
-        node.layout_dirty = false;
+        // A bounds change is a visual mutation: damage old ∪ new paint rect
+        // so the next frame repaints the moved/resized region — without
+        // this a relayout could shift content with zero damage (a clean
+        // retained subtree would even replay stale pixels at the old spot).
+        if (node.bounds.x != bounds.x or node.bounds.y != bounds.y or
+            node.bounds.w != bounds.w or node.bounds.h != bounds.h)
+        {
+            const old = node.paintRect();
+            node.bounds = bounds;
+            node.layout_dirty = false;
+            // rectUnion with an empty operand anchors at its (x, y) — a fresh
+            // node's (0,0,0,0) would poison the union — so union only when
+            // both sides carry area.
+            const new = node.paintRect();
+            node.markDirtyRect(if (old.w <= 0 or old.h <= 0) new else if (new.w <= 0 or new.h <= 0) old else rectUnion(old, new));
+        } else {
+            node.bounds = bounds;
+            node.layout_dirty = false;
+        }
         node.vtable.layout(node, bounds);
     }
 
@@ -363,6 +442,59 @@ pub const Node = struct {
             .w = node.bounds.w + o.left + o.right,
             .h = node.bounds.h + o.top + o.bottom,
         };
+    }
+
+    /// The region this node's whole subtree can paint into, in the node's
+    /// PARENT space — the union of every visible descendant's paintRect,
+    /// mapped through the intermediate paint transforms and tightened by
+    /// each child's declared clip. It mirrors the cull rules in paint():
+    /// a descendant's extent under a scroll viewport is intersected with
+    /// child_clip, and a transformed wrapper's children contribute their
+    /// mapped rect. Paint outside this box already violates the damage
+    /// contract, so the retained raster can cover it exactly.
+    /// `include_deferred`: defer_paint children paint in the popup overlay
+    /// pass, not inside paintContent — the damage contract still covers
+    /// their pixels (a show/hide must repaint where they appeared), but a
+    /// retained image never contains them.
+    pub fn paintExtent(node: *Node, include_deferred: bool) Rect {
+        var ext: Rect = .{};
+        var seeded = false;
+        unionExtent(&ext, &seeded, node.paintRect());
+        node.extendSubtreeExtent(&ext, &seeded, include_deferred);
+        return ext;
+    }
+
+    /// rectUnion that ignores empty operands: they paint no pixels, and an
+    /// empty rect's origin would otherwise anchor (inflate) the union — a
+    /// zero-size node at (0,0) must not stretch a distant child's extent.
+    fn unionExtent(ext: *Rect, seeded: *bool, r: Rect) void {
+        if (r.w <= 0 or r.h <= 0) return;
+        ext.* = if (seeded.*) rectUnion(ext.*, r) else r;
+        seeded.* = true;
+    }
+
+    fn extendSubtreeExtent(node: *Node, ext: *Rect, seeded: *bool, include_deferred: bool) void {
+        for (node.children.items) |child| {
+            if (!child.visible or child.zombie) continue;
+            if (child.defer_paint and !include_deferred) continue;
+            // Child's extent lives in this node's child space → map into
+            // parent space, then apply this node's clip (it bounds what
+            // any descendant can reach — same as paint()'s child_region).
+            var r = child.paintExtent(include_deferred);
+            if (node.vtable.map_paint_rect) |m| r = rectNormalize(m(node, r));
+            if (node.vtable.child_clip) |cc| r = rectIntersect(r, cc(node));
+            unionExtent(ext, seeded, r);
+        }
+    }
+
+    /// Toggle visibility — a visual mutation of the whole subtree. Damage
+    /// the subtree's paint extent: hiding must repaint where it WAS drawn,
+    /// showing where it WILL be. A hidden descendant contributes nothing
+    /// (it painted nothing), matching the traversal's skip.
+    pub fn setVisible(node: *Node, v: bool) void {
+        if (node.visible == v) return;
+        node.visible = v;
+        node.markDirtyRect(node.paintExtent(true));
     }
 
     /// Paint the subtree and clear dirty flags. `visible` is the region the
@@ -398,7 +530,25 @@ pub const Node = struct {
         // the next frame — a tail clear would wipe it.
         const subtree_dirty = node.dirty;
         node.dirty = false;
-        if (node.retained and node.paintRetained(ctx, subtree_dirty)) return;
+        // Retained-subtree replay. Opt-in (`retained`) rasterizes on dirty
+        // frames and re-blits clean ones; vtable-declared `auto_retain`
+        // engages ONLY on a clean frame — a dirty auto subtree drops its
+        // cache and paints directly (its content changes too often to
+        // re-rasterize every frame). Either way the node must honour the
+        // paint-extent contract — the image holds exactly what the subtree
+        // draws, so a cached blit is indistinguishable from a repaint.
+        if (node.retained) {
+            if (node.paintRetained(ctx, subtree_dirty, false)) return;
+        } else if (node.vtable.auto_retain and !node.backdrop_subtree) {
+            if (subtree_dirty) {
+                node.retained_blocked = false; // re-evaluate on the next clean pass
+                node.clearRetained(); // the stale image can never blit again
+            } else if (!node.retained_blocked and
+                node.paintRetained(ctx, false, true))
+            {
+                return;
+            }
+        }
         node.paintContent(ctx, own_hit, child_region, children_hit);
     }
 
@@ -418,43 +568,72 @@ pub const Node = struct {
 
     /// Retained-subtree paint: re-blit the cached raster while the subtree
     /// stays clean; re-rasterize through an offscreen pass when dirty or
-    /// resized. Returns false when the node must paint directly instead
-    /// (zero-size image, or the offscreen pass is unavailable — e.g. nested
-    /// inside another retained rasterization).
-    fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool) bool {
+    /// resized. `auto` = the vtable-declared auto-retain path (extent-capped;
+    /// sets retained_blocked when the image would be too big to be a win).
+    /// Returns false when the node must paint directly instead (zero-size
+    /// image, over-cap auto extent, or the offscreen pass is unavailable —
+    /// e.g. nested inside another retained rasterization).
+    fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool, auto: bool) bool {
         const pr = node.paintRect(); // parent space — the damage-contract rect
-        const iw: i32 = @intFromFloat(@ceil(@max(0, pr.w)));
-        const ih: i32 = @intFromFloat(@ceil(@max(0, pr.h)));
-        if (iw <= 0 or ih <= 0) return true; // nothing reachable — painted
         if (node.retained_ctx != ctx and node.retained_image != 0) {
             node.clearRetained(); // image belongs to another ctx — drop it
         }
+        // A clean subtree is rigid: the cached image re-blits at its
+        // rasterized origin shifted by the node's move — but only on an
+        // exact pixel boundary (a fractional blit would sample-shift the
+        // cached content off the direct-paint pixels).
         if (!subtree_dirty and node.retained_image != 0 and
-            node.retained_w == iw and node.retained_h == ih)
+            node.retained_pr.w == pr.w and node.retained_pr.h == pr.h)
         {
-            kx.c.kx_draw_image(ctx, node.retained_image, pr.x, pr.y,
-                @floatFromInt(iw), @floatFromInt(ih));
-            return true;
+            const bx = node.retained_ix + (pr.x - node.retained_pr.x);
+            const by = node.retained_iy + (pr.y - node.retained_pr.y);
+            if (bx == @floor(bx) and by == @floor(by)) {
+                kx.c.kx_draw_image(ctx, node.retained_image, bx, by,
+                    @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
+                return true;
+            }
         }
-        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: dirty={} img={} {d}x{d} vs {d}x{d}\n", .{ subtree_dirty, node.retained_image, node.retained_w, node.retained_h, iw, ih });
-        // (Re)rasterize: drop the stale image first so a failed pass can't
-        // resurrect a stale blit on a later frame.
+        // (Re)rasterize. The image covers the subtree's PAINT EXTENT — the
+        // union of every descendant's paintRect, transform-mapped and
+        // clip-tightened exactly like the paint traversal — snapped OUT to
+        // integer pixels so the blit origin sits on a pixel boundary (the
+        // cached output is then a bit-exact copy of a direct paint; a
+        // fractional origin would shift AA edges ±1). An opaque backdrop
+        // (retained_bg) pins the image to the paintRect instead: clearing
+        // the whole overflow extent opaque would paint over neighbours.
+        const ext = if (node.retained_bg != null) pr else node.paintExtent(false);
+        const ix = @floor(ext.x);
+        const iy = @floor(ext.y);
+        const iw: i32 = @intFromFloat(@ceil(ext.x + ext.w) - ix);
+        const ih: i32 = @intFromFloat(@ceil(ext.y + ext.h) - iy);
+        if (iw <= 0 or ih <= 0) return true; // nothing reachable — painted
+        if (auto and @as(u64, @intCast(iw)) * @as(u64, @intCast(ih)) > AUTO_RETAIN_MAX_PX) {
+            node.retained_blocked = true; // too big to be a win — stay direct
+            node.clearRetained(); // drop any stale image (smaller extent before)
+            return false;
+        }
+        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: dirty={} img={} {d}x{d} ext={d:.0}x{d:.0}\n", .{ subtree_dirty, node.retained_image, iw, ih, ext.w, ext.h });
+        // Drop the stale image first so a failed pass can't resurrect a
+        // stale blit on a later frame.
         node.clearRetained();
         if (!kx.c.kx_offscreen_begin(ctx, iw, ih)) {
             return false; // nested offscreen pass — paint directly this frame
         }
         if (node.retained_bg) |bg| kx.c.kx_clear(ctx, bg);
-        kx.c.kx_translate(ctx, -pr.x, -pr.y);
+        kx.c.kx_translate(ctx, -ix, -iy);
         // The cache must hold EVERYTHING the subtree draws: cull only
-        // against the mapped paintRect (the damage-contract bound).
-        const mapped = node.mapRectToRoot(pr);
+        // against the mapped paint extent (the damage-contract bound).
+        const mapped = node.mapRectToRoot(ext);
         node.paintContent(ctx, true, mapped, true);
         node.retained_image = kx.c.kx_offscreen_end_image(ctx);
         if (node.retained_image == 0) return false; // pass failed — direct paint
         node.retained_ctx = ctx;
         node.retained_w = iw;
         node.retained_h = ih;
-        kx.c.kx_draw_image(ctx, node.retained_image, pr.x, pr.y,
+        node.retained_ix = ix;
+        node.retained_iy = iy;
+        node.retained_pr = pr;
+        kx.c.kx_draw_image(ctx, node.retained_image, ix, iy,
             @floatFromInt(iw), @floatFromInt(ih));
         return true;
     }
@@ -479,6 +658,8 @@ pub const Node = struct {
     }
 
     /// Drop the cached raster (the image lives in retained_ctx's registry).
+    /// retained_blocked is NOT cleared here — it belongs to the auto-retain
+    /// policy, which resets it on the next dirty frame.
     fn clearRetained(node: *Node) void {
         if (node.retained_image != 0) {
             if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
@@ -487,6 +668,9 @@ pub const Node = struct {
         node.retained_ctx = null;
         node.retained_w = 0;
         node.retained_h = 0;
+        node.retained_ix = 0;
+        node.retained_iy = 0;
+        node.retained_pr = .{};
     }
 
     /// Deepest visible node containing the point (children are painted last,
@@ -1399,4 +1583,200 @@ test "paint: a markDirty raised during paint survives to the next frame" {
     root.paint(ctx, .{ .x = 0, .y = 0, .w = 64, .h = 64 });
     kx.c.kx_end_frame(ctx);
     try std.testing.expect(root.dirty); // cleared BEFORE paint — the in-paint mark survives
+}
+
+// --- dirty-region / auto-retain coverage ---
+
+test "layout() damages old∪new paint rect on a bounds change; a no-op layout stays clean" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const child = try testNode(10, 10);
+    root.add(child);
+    root.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    child.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    // A clean tree (as if a frame just painted).
+    root.clearDamage();
+    root.dirty = false;
+    child.dirty = false;
+    // Moving the child marks it + damages old ∪ new.
+    child.layout(.{ .x = 20, .y = 5, .w = 10, .h = 10 });
+    try std.testing.expect(child.dirty);
+    try std.testing.expect(root.dirty);
+    try std.testing.expect(root.damage_valid);
+    const want = rectUnion(
+        .{ .x = 0, .y = 0, .w = 10, .h = 10 },
+        .{ .x = 20, .y = 5, .w = 10, .h = 10 },
+    );
+    try std.testing.expectEqual(want.x, root.damage.x);
+    try std.testing.expectEqual(want.y, root.damage.y);
+    try std.testing.expectEqual(want.w, root.damage.w);
+    try std.testing.expectEqual(want.h, root.damage.h);
+    // Re-laying out at the same bounds is a visual no-op: zero new damage.
+    root.clearDamage();
+    root.dirty = false;
+    child.dirty = false;
+    child.layout(.{ .x = 20, .y = 5, .w = 10, .h = 10 });
+    try std.testing.expect(!child.dirty);
+    try std.testing.expect(!root.dirty);
+    try std.testing.expect(!root.damage_valid);
+}
+
+test "paintExtent unions descendants through child_clip and map_paint_rect" {
+    const root = try testNode(64, 64);
+    defer root.deinit();
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    // A clipper (5,5,20,20) whose clip is (5,5,10,10); a huge child clipped
+    // to it contributes only the clipped region.
+    const clipper = try recPaintNodeVtable(&log, "clipper", &paint_rec_clip_vtable);
+    clipper.bounds = .{ .x = 5, .y = 5, .w = 20, .h = 20 };
+    (@as(*PaintRec, @ptrCast(@alignCast(clipper.state.?)))).clip = .{ .x = 5, .y = 5, .w = 10, .h = 10 };
+    const big = try recPaintNode(&log, "big");
+    big.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 100 };
+    clipper.add(big);
+    root.add(clipper);
+    const ext = clipper.paintExtent(false);
+    try std.testing.expectEqual(@as(f32, 5), ext.x);
+    try std.testing.expectEqual(@as(f32, 5), ext.y);
+    try std.testing.expectEqual(@as(f32, 20), ext.w); // own pr wins over the clipped child
+    try std.testing.expectEqual(@as(f32, 20), ext.h);
+    // A transform maps the child's extent to its visual position.
+    const shifted = try recPaintNodeVtable(&log, "shifted", &paint_rec_shift_vtable);
+    shifted.bounds = .{ .x = 0, .y = 0, .w = 50, .h = 50 };
+    const child = try recPaintNode(&log, "child");
+    child.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    shifted.add(child);
+    root.add(shifted);
+    const ext2 = shifted.paintExtent(false);
+    // own (0,0,50,50) ∪ child mapped to (100,50,10,10) → (0,0,110,60)
+    try std.testing.expectEqual(@as(f32, 0), ext2.x);
+    try std.testing.expectEqual(@as(f32, 0), ext2.y);
+    try std.testing.expectEqual(@as(f32, 110), ext2.w);
+    try std.testing.expectEqual(@as(f32, 60), ext2.h);
+}
+
+test "setVisible damages the subtree extent — hide covers overflow, show covers the new region" {
+    const root = try testNode(64, 64);
+    defer root.deinit();
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const wrapper = try recPaintNode(&log, "wrapper");
+    wrapper.bounds = .{ .x = 0, .y = 0, .w = 10, .h = 10 };
+    const overflow = try recPaintNode(&log, "overflow");
+    overflow.bounds = .{ .x = 0, .y = 0, .w = 40, .h = 40 }; // paints past the wrapper
+    wrapper.add(overflow);
+    root.add(wrapper);
+    root.clearDamage();
+    root.dirty = false;
+    wrapper.dirty = false;
+    overflow.dirty = false;
+    // Hide: damage covers the wrapper AND the overflowing child.
+    wrapper.setVisible(false);
+    try std.testing.expect(root.damage_valid);
+    try std.testing.expectEqual(@as(f32, 0), root.damage.x);
+    try std.testing.expectEqual(@as(f32, 0), root.damage.y);
+    try std.testing.expectEqual(@as(f32, 40), root.damage.w);
+    try std.testing.expectEqual(@as(f32, 40), root.damage.h);
+    // A repeated hide is a no-op.
+    root.clearDamage();
+    root.dirty = false;
+    wrapper.setVisible(false);
+    try std.testing.expect(!root.damage_valid);
+    // Show: the reappearing subtree's extent is damaged again.
+    wrapper.setVisible(true);
+    try std.testing.expect(root.damage_valid);
+    try std.testing.expectEqual(@as(f32, 40), root.damage.w);
+}
+
+const paint_rec_retain_vtable = blk: {
+    var vt = paint_rec_vtable;
+    vt.auto_retain = true;
+    break :blk vt;
+};
+
+test "auto-retained subtree rasterizes once, re-blits while clean, drops on dirty" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    const box = try recPaintNodeVtable(&log, "box", &paint_rec_retain_vtable);
+    const leaf = try recPaintNode(&log, "leaf");
+    box.add(leaf);
+    root.add(box);
+    root.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    box.bounds = .{ .x = 10, .y = 10, .w = 30, .h = 30 };
+    leaf.bounds = .{ .x = 10, .y = 10, .w = 10, .h = 10 };
+    const whole = Rect{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    // Frame 1 (dirty): direct paint — every hook runs.
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, whole);
+    kx.c.kx_end_frame(ctx);
+    const f1 = log.items.len;
+    try std.testing.expectEqual(@as(usize, 9), f1);
+    try std.testing.expect(box.retained_image == 0);
+    // Frame 2 (clean): the auto subtree rasterizes into its image — hooks
+    // run once more (into the offscreen), then a single blit lands.
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, whole);
+    kx.c.kx_end_frame(ctx);
+    try std.testing.expectEqual(f1 + 9, log.items.len);
+    try std.testing.expect(box.retained_image != 0);
+    // Frame 3 (clean): pure blit — neither the box's nor the leaf's hooks run.
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, whole);
+    kx.c.kx_end_frame(ctx);
+    try std.testing.expectEqual(f1 + 12, log.items.len); // root + pre:root + post:root only
+    // A dirty leaf drops the cache: the next paint repaints the box directly.
+    leaf.markDirty();
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, whole);
+    kx.c.kx_end_frame(ctx);
+    try std.testing.expectEqual(f1 + 12 + 9, log.items.len);
+    try std.testing.expect(box.retained_image == 0);
+    // Frame 5 (clean): the subtree is clean again — re-rasterized and blitted.
+    kx.c.kx_begin_frame(ctx);
+    root.paint(ctx, whole);
+    kx.c.kx_end_frame(ctx);
+    try std.testing.expectEqual(f1 + 12 + 9 + 9, log.items.len);
+    try std.testing.expect(box.retained_image != 0);
+}
+
+const paint_rec_backdrop_vtable = blk: {
+    var vt = paint_rec_vtable;
+    vt.reads_backdrop = true;
+    break :blk vt;
+};
+
+test "backdrop_subtree propagates up and blocks auto-retain" {
+    const ctx = kx.create(null, 64, 64, kx.c.KX_BACKEND_RASTER) orelse return error.TestUnexpectedResult;
+    defer kx.c.kx_destroy(ctx);
+    var log = std.array_list.Managed([]const u8).init(std.testing.allocator);
+    defer log.deinit();
+    const root = try recPaintNode(&log, "root");
+    defer root.deinit();
+    const box = try recPaintNodeVtable(&log, "box", &paint_rec_retain_vtable);
+    const blur = try recPaintNodeVtable(&log, "blur", &paint_rec_backdrop_vtable);
+    box.add(blur);
+    root.add(box);
+    // The flag walked up at add() time — every ancestor knows.
+    try std.testing.expect(blur.backdrop_subtree);
+    try std.testing.expect(box.backdrop_subtree);
+    try std.testing.expect(root.backdrop_subtree);
+    root.bounds = .{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    box.bounds = .{ .x = 10, .y = 10, .w = 30, .h = 30 };
+    blur.bounds = .{ .x = 10, .y = 10, .w = 10, .h = 10 };
+    const whole = Rect{ .x = 0, .y = 0, .w = 64, .h = 64 };
+    for (0..3) |_| {
+        kx.c.kx_begin_frame(ctx);
+        root.paint(ctx, whole);
+        kx.c.kx_end_frame(ctx);
+    }
+    // Three clean frames in, the auto-eligible box must STILL paint
+    // directly: its blur child reads the backdrop and a cached image would
+    // bake a transparent-beneath sample.
+    try std.testing.expect(box.retained_image == 0);
+    // Every frame ran the hooks (9 entries/frame: root+box+blur chain).
+    try std.testing.expectEqual(@as(usize, 27), log.items.len);
 }

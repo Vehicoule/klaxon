@@ -524,7 +524,7 @@ test "invisible subtrees are skipped" {
     const child = try testNode(10, 10);
     root.add(hidden);
     hidden.add(child);
-    hidden.visible = false;
+    hidden.setVisible(false);
     insp.rebuildRows(root);
     try std.testing.expectEqual(@as(usize, 1), insp.rows.items.len);
     try std.testing.expectEqual(root, insp.rows.items[0].node);

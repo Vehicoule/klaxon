@@ -100,9 +100,20 @@ pub const SemanticNode = struct {
     focusable: bool,
     actions: Actions,
     live: LiveRegion,
-    children: []SemanticNode, // owned
+    children: []SemanticNode, // owned (flat builds: a sub-slice of `backing`)
+    /// The single allocation every `children` slice in the tree is cut
+    /// from — buildSemanticTree's flat layout. Set on the ROOT only:
+    /// deinit frees it once instead of walking the tree freeing per-node
+    /// slices. Sub-slices must never be freed individually, so always
+    /// deinit the root, not a detached child.
+    backing: ?[]SemanticNode = null,
 
     pub fn deinit(self: *SemanticNode, allocator: std.mem.Allocator) void {
+        if (self.backing) |b| {
+            allocator.free(b);
+            self.backing = null;
+            return;
+        }
         for (self.children) |*c| c.deinit(allocator);
         allocator.free(self.children);
     }
@@ -121,56 +132,120 @@ fn firstDescendantLabel(n: *Node) ?[]const u8 {
     return null;
 }
 
-fn flattenInto(allocator: std.mem.Allocator, n: *Node, list: *std.array_list.Managed(SemanticNode)) !void {
-    if (n.exclude_semantics or !n.visible) return;
-    // A subtree that cannot be hit-tested is not interactive (e.g. the
-    // navigator's background pages during a transition) — skip it.
+/// The flatten predicate: the subtree contributes nothing when excluded,
+/// invisible, or not hit-testable (a zero-size hit_bounds — e.g. a
+/// navigator background page mid-transition).
+fn semanticSkipped(n: *Node) bool {
+    if (n.exclude_semantics or !n.visible) return true;
     if (n.vtable.hit_bounds) |hb| {
         const b = hb(n);
-        if (b.w <= 0 or b.h <= 0) return;
+        if (b.w <= 0 or b.h <= 0) return true;
     }
-    if (n.semantics) |sem| {
-        var child_list = std.array_list.Managed(SemanticNode).init(allocator);
-        errdefer {
-            for (child_list.items) |*c| c.deinit(allocator);
-            child_list.deinit();
-        }
-        for (n.children.items) |c| try flattenInto(allocator, c, &child_list);
-        var sn = SemanticNode{
-            .node = n,
-            .role = sem.role,
-            .label = if (sem.label.len > 0) sem.label else firstDescendantLabel(n) orelse "",
-            .hint = sem.hint,
-            .value = sem.value,
-            .checked = sem.checked,
-            .disabled = sem.disabled,
-            .focusable = sem.focusable,
-            .actions = sem.actions,
-            .live = sem.live,
-            .children = try child_list.toOwnedSlice(),
-        };
-        errdefer sn.deinit(allocator);
-        try list.append(sn);
-    } else {
-        // Transparent container: lift its children into the current list.
-        for (n.children.items) |c| try flattenInto(allocator, c, list);
+    return false;
+}
+
+/// The number of semantic nodes `n`'s subtree contributes — the emit pass
+/// below writes exactly this many: every non-skipped node with a
+/// descriptor lands somewhere in the tree (transparent ones lift their
+/// descendants instead).
+fn countEmitted(n: *Node) usize {
+    if (semanticSkipped(n)) return 0;
+    var s: usize = if (n.semantics != null) 1 else 0;
+    for (n.children.items) |c| s += countEmitted(c);
+    return s;
+}
+
+/// The SemanticNode value for `n` (children are patched in by the fill
+/// pass once their buffer range is known). inline: the ~100-byte return
+/// does NOT get inlined under ReleaseSmall — an sret call + memcpy per
+/// node dominated the per-frame rebuild (≈30µs/1000 nodes).
+inline fn semanticValue(n: *Node, sem: *const Semantics) SemanticNode {
+    return .{
+        .node = n,
+        .role = sem.role,
+        .label = if (sem.label.len > 0) sem.label else firstDescendantLabel(n) orelse "",
+        .hint = sem.hint,
+        .value = sem.value,
+        .checked = sem.checked,
+        .disabled = sem.disabled,
+        .focusable = sem.focusable,
+        .actions = sem.actions,
+        .live = sem.live,
+        .children = &.{},
+    };
+}
+
+/// Emit `n`'s semantic frontier — the semantic descendants with no other
+/// semantic ancestor between them and `n` — into buf[w..]. `n` itself is
+/// assumed emitted/skipped by the caller. error.Overflow = buf is full
+/// (the caller retries with an exact-size buffer).
+fn emitFrontier(n: *Node, buf: []SemanticNode, w: *usize) error{Overflow}!void {
+    for (n.children.items) |c| {
+        if (semanticSkipped(c)) continue;
+        if (c.semantics) |sem| {
+            if (w.* == buf.len) return error.Overflow;
+            buf[w.*] = semanticValue(c, sem);
+            w.* += 1;
+        } else try emitFrontier(c, buf, w); // transparent: children lift
     }
 }
 
+const FillResult = struct { top: usize, total: usize };
+
+/// The breadth fill: `root`'s frontier first, then parents in buffer
+/// order claiming the next contiguous range for their own frontier —
+/// every node's children stay contiguous.
+fn fillTree(root: *Node, buf: []SemanticNode) error{Overflow}!FillResult {
+    var w: usize = 0;
+    if (!semanticSkipped(root)) {
+        if (root.semantics) |sem| {
+            if (w == buf.len) return error.Overflow;
+            buf[0] = semanticValue(root, sem);
+            w = 1;
+        } else {
+            try emitFrontier(root, buf, &w);
+        }
+    }
+    const top = w; // the top-level frontier — the group wrapper's children
+    var r: usize = 0;
+    while (r < w) : (r += 1) {
+        const start = w;
+        try emitFrontier(buf[r].node, buf, &w);
+        buf[r].children = buf[start..w];
+    }
+    return .{ .top = top, .total = w };
+}
+
+/// The last build's node count — a capacity hint so a stable tree (the
+/// common case: bridges rebuild the whole tree on every tree_dirty)
+/// sizes its single buffer exactly on the first try. A bigger tree
+/// overflows the guess mid-fill and falls back to an exact count.
+var sem_size_hint: usize = 0;
+
 /// Build the semantic tree. When the root itself has no descriptor, the
 /// result is a .group wrapper around the top-level semantic nodes. The
-/// caller owns the tree (deinit).
+/// caller owns the tree (deinit the root once — it frees the flat
+/// backing buffer the whole tree is cut from).
 pub fn buildSemanticTree(allocator: std.mem.Allocator, root: *Node) !SemanticNode {
-    var list = std.array_list.Managed(SemanticNode).init(allocator);
-    errdefer {
-        for (list.items) |*sn| sn.deinit(allocator);
-        list.deinit();
-    }
-    try flattenInto(allocator, root, &list);
-    const items = try list.toOwnedSlice(); // exact-size owned slice
-    if (items.len == 1) {
-        const sn = items[0];
-        allocator.free(items);
+    // One allocation for the whole tree (per-node ArrayLists + their
+    // growth/frees dominated the per-frame rebuild cost). The buffer is
+    // sized by the previous build's count first; on overflow the subtree
+    // is counted exactly and the fill restarts.
+    var buf = try allocator.alloc(SemanticNode, @max(sem_size_hint, 8));
+    errdefer allocator.free(buf);
+    const res = fillTree(root, buf) catch |err| switch (err) {
+        error.Overflow => blk: {
+            allocator.free(buf);
+            buf = &.{}; // released — keep errdefer from freeing it twice
+            buf = try allocator.alloc(SemanticNode, countEmitted(root));
+            break :blk fillTree(root, buf) catch unreachable; // exact size cannot overflow
+        },
+    };
+    sem_size_hint = res.total;
+    const top = res.top;
+    if (top == 1) {
+        var sn = buf[0];
+        sn.backing = buf;
         return sn;
     }
     return .{
@@ -184,7 +259,8 @@ pub fn buildSemanticTree(allocator: std.mem.Allocator, root: *Node) !SemanticNod
         .focusable = false,
         .actions = .{},
         .live = .off,
-        .children = items,
+        .children = buf[0..top],
+        .backing = buf,
     };
 }
 

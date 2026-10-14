@@ -145,6 +145,91 @@ pub fn measureText(str: [:0]const u8, size: f32, bold: bool) TextMetrics {
     return kx.c.kx_measure_text(str, size, bold);
 }
 
+// --- Multi-style shaped text (ABI 0.15.0) ---
+// A Paragraph laid out once from styled spans — real rich text: per-span
+// weight (100..900), italic, letter-spacing and color, with HarfBuzz
+// shaping, ICU bidi + line breaking and font fallback inside the run.
+
+pub const TextStyle = kx.c.kx_text_style;
+pub const TextLayout = kx.c.kx_text_layout;
+
+// --- Variable fonts (ABI 0.17.0) ---
+// OpenType variation design coordinates on a TextStyle: a 'wght' coordinate
+// overrides `weight` on variable fonts (M3E animates weight per state —
+// the axis is what makes a 400→700 transition smooth rather than a jump).
+// Axes absent from the resolved font are ignored.
+
+/// One variation coordinate: an OpenType axis tag + a design-space value.
+pub const FontAxis = struct { axis: u32, value: f32 };
+
+/// Common registered axis tags (big-endian packed 4-char tags).
+pub const axis_wght: u32 = axisTag("wght");
+pub const axis_wdth: u32 = axisTag("wdth");
+pub const axis_slnt: u32 = axisTag("slnt");
+pub const axis_ital: u32 = axisTag("ital");
+pub const axis_opsz: u32 = axisTag("opsz");
+
+/// Pack a 4-char axis tag ("wght") into its big-endian u32 form.
+pub fn axisTag(comptime tag: *const [4]u8) u32 {
+    return std.mem.readInt(u32, tag, .big);
+}
+
+/// Maximum variation coordinates a TextStyle carries (ABI-fixed array).
+pub const max_font_variations = 8;
+
+/// Base style for a span: zero-initialized (variation_count 0) with the
+/// scalar fields set. Callers add axes via `withVariations`.
+pub fn textStyle(size: f32, weight: i32, slant: i32, letter_spacing: f32, color: Color) TextStyle {
+    var s = std.mem.zeroes(TextStyle);
+    s.size = size;
+    s.weight = weight;
+    s.slant = slant;
+    s.letter_spacing = letter_spacing;
+    s.color = color;
+    return s;
+}
+
+/// Copy `axes` (clamped to the ABI capacity) into the style's variation slots.
+pub fn withVariations(s: *TextStyle, axes: []const FontAxis) void {
+    const n: usize = @min(axes.len, max_font_variations);
+    for (axes[0..n], 0..) |a, i| {
+        s.variation_axes[i] = a.axis;
+        s.variation_values[i] = a.value;
+    }
+    s.variation_count = @intCast(n);
+}
+
+/// Begin a layout. `max_width <= 0` lays out unconstrained (longest line =
+/// intrinsic width). Returns null when the paragraph backend is missing.
+pub fn textLayoutBegin(max_width: f32) ?*TextLayout {
+    return kx.c.kx_text_layout_begin(max_width);
+}
+
+/// Push one styled span. Spans after the first metric/paint call are ignored
+/// (the paragraph is already built).
+pub fn textLayoutSpan(l: *TextLayout, str: [:0]const u8, style: TextStyle) void {
+    kx.c.kx_text_layout_span(l, str, &style);
+}
+
+/// Longest laid-out line width — builds + lays out on first call.
+pub fn textLayoutWidth(l: *TextLayout) f32 {
+    return kx.c.kx_text_layout_width(l);
+}
+pub fn textLayoutHeight(l: *TextLayout) f32 {
+    return kx.c.kx_text_layout_height(l);
+}
+/// First line's alphabetic baseline (distance from the paragraph's top).
+pub fn textLayoutBaseline(l: *TextLayout) f32 {
+    return kx.c.kx_text_layout_baseline(l);
+}
+/// Paint; `baseline_y` is the first-line BASELINE — same convention as text().
+pub fn textLayoutPaint(ctx: *kx.Ctx, l: *const TextLayout, x: f32, baseline_y: f32) void {
+    kx.c.kx_text_paint_layout(ctx, l, x, baseline_y);
+}
+pub fn textLayoutDestroy(l: *TextLayout) void {
+    kx.c.kx_text_layout_destroy(l);
+}
+
 // --- Images (per-ctx registry; create once, draw many) ---
 
 pub fn imageCreate(ctx: *kx.Ctx, rgba: [*]const u8, w: i32, h: i32) u64 {
@@ -182,14 +267,103 @@ pub fn offscreenBegin(ctx: *kx.Ctx, w: i32, h: i32) bool {
     return kx.c.kx_offscreen_begin(ctx, w, h);
 }
 
+// --- Real primitives (ABI 0.16.0) ---
+
+/// Push a content-blur layer: draws until layerClose() rasterize once and
+/// composite through a Gaussian image filter — real glass blur, not an
+/// alpha stand-in. Balanced by the same layerClose as layerAlpha.
+pub fn layerBlur(ctx: *kx.Ctx, sigma: f32) void {
+    kx.c.kx_layer_blur(ctx, sigma);
+}
+
+/// Blur what's already painted within the rect (the backdrop filter path —
+/// the glass-over-content primitive).
+pub fn backdropBlur(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, sigma: f32) void {
+    kx.c.kx_backdrop_blur(ctx, x, y, w, h, sigma);
+}
+
+/// Material elevation shadow (SkShadowUtils ambient+spot, M3 key light).
+/// `transparent_occluder` for glass/translucent fills.
+pub fn shadowRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, elevation: f32, ambient: Color, spot: Color, transparent_occluder: bool) void {
+    kx.c.kx_shadow_rrect(ctx, x, y, w, h, radius, elevation, ambient, spot, @intFromBool(transparent_occluder));
+}
+
+/// Path verbs for fillPath/strokePath — pts consumed per verb.
+pub const PathVerb = enum(i32) { move = 0, line = 1, quad = 2, cubic = 3, close = 4 };
+
+/// Fill an arbitrary path (verbs: move/line/quad/cubic/close). fill_rule:
+/// 0 winding, 1 even-odd.
+pub fn fillPath(ctx: *kx.Ctx, pts: []const f32, verbs: []const i32, color: Color, fill_rule: bool) void {
+    kx.c.kx_fill_path(ctx, pts.ptr, verbs.ptr, @intCast(verbs.len), color, @intFromBool(fill_rule));
+}
+/// Stroke an arbitrary path.
+pub fn strokePath(ctx: *kx.Ctx, pts: []const f32, verbs: []const i32, stroke_w: f32, color: Color, fill_rule: bool) void {
+    kx.c.kx_stroke_path(ctx, pts.ptr, verbs.ptr, @intCast(verbs.len), stroke_w, color, @intFromBool(fill_rule));
+}
+
 pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
     return kx.c.kx_offscreen_end_image(ctx);
 }
 
 // --- tests ---
 
-test "kx ABI version reports 0.13.0 (draw_pixels, image_is_opaque)" {
-    try std.testing.expectEqualStrings("0.13.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.17.0 (variable-font axes)" {
+    try std.testing.expectEqualStrings("0.17.0", std.mem.span(kx.c.kx_abi_version()));
+}
+
+test "shaped text paints ink inside the measured box" {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 200, 100);
+    defer r.deinit();
+    // Reproduce the widget path: measure first (cache miss builds the
+    // paragraph), then draw hits the SAME cached entry.
+    _ = kx.c.kx_measure_text("AB", 22.4, true);
+    r.beginFrame();
+    kx.c.kx_clear(r.ctx, 0xFFFFFFFF);
+    kx.c.kx_draw_text_styled(r.ctx, "AB", 20, 60, 22.4, true, 0x21005DFF);
+    r.endFrame();
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    try std.testing.expect(f.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 100 }, 0x21005DFF) > 0);
+}
+
+test "cached paragraph recolors across draws (white then dark)" {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 100, 80);
+    defer r.deinit();
+    r.beginFrame();
+    kx.c.kx_clear(r.ctx, 0xFF00FFFF);
+    // First draw in WHITE on a colored bg — an earlier user of the cached
+    // paragraph must not pin its foreground (the PaintID indirection).
+    kx.c.kx_draw_text_styled(r.ctx, "AB", 10, 40, 22.4, true, 0xFFFFFFFF);
+    kx.c.kx_draw_text_styled(r.ctx, "AB", 10, 70, 22.4, true, 0x21005DFF);
+    r.endFrame();
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    try std.testing.expect(f.countColorIn(.{ .x = 0, .y = 15, .w = 100, .h = 30 }, 0xFFFFFFFF) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = 0, .y = 50, .w = 100, .h = 30 }, 0x21005DFF) > 0);
+}
+
+test "CJK + Arabic resolve through font fallback (nonzero ink + real advances)" {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 400, 80);
+    defer r.deinit();
+    r.beginFrame();
+    kx.c.kx_clear(r.ctx, 0xFFFFFFFF);
+    kx.c.kx_draw_text(r.ctx, "你好世界", 10, 40, 20, 0x000000FF);
+    kx.c.kx_draw_text(r.ctx, "مرحبا", 200, 40, 20, 0x000000FF);
+    r.endFrame();
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const mc = kx.c.kx_measure_text("你好世界", 20, false);
+    const ma = kx.c.kx_measure_text("مرحبا", 20, false);
+    // Both scripts produce real shaped advances and ink on the surface.
+    try std.testing.expect(mc.width > 30); // 4 CJK glyphs ≈ 4×20px
+    try std.testing.expect(ma.width > 20);
+    try std.testing.expect(f.countNotIn(.{ .x = 0, .y = 0, .w = 400, .h = 80 }, 0xFFFFFFFF) > 0);
+    // Shaped Arabic is NARROWER than its codepoint count × advance — the
+    // contextual ligature/combining actually ran (5 codepoints ≪ 100px).
+    try std.testing.expect(ma.width < 100);
 }
 
 test "paint constructors: fill keeps the defaults, stroke carries color + width" {

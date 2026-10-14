@@ -762,6 +762,29 @@ pub const Host = struct {
         } else {
             host.stats.layout_time_ms = 0;
         }
+        // NO-DAMAGE NO-OP: the tick/layout marked nothing and no damage
+        // accumulated — the previous present already shows the current
+        // state. Skip begin_frame/end_frame/present entirely: on Metal and
+        // GLES the swapchain keeps the last drawable (not presenting an
+        // unchanged frame is legal and correct); on raster the retained
+        // surface already holds the pixels. The frame still COUNTS — an
+        // on_frame app ticking without changes keeps its frame clock (and
+        // max_frames keeps terminating) — only the GPU/paint work is
+        // elided. The first frame never reaches here (the tree starts
+        // dirty). Overlays (devtools/inspector) paint dynamic content every
+        // frame, so they keep the full path alive.
+        if (!root.dirty and !root.damage_valid and
+            !host.devtools.enabled and !host.inspector.enabled)
+        {
+            host.stats.frames += 1;
+            host.stats.frame_time_ms = 0;
+            host.stats.paint_time_ms = 0;
+            host.stats.record_time_ms = 0;
+            host.stats.submit_time_ms = 0;
+            host.stats.present_time_ms = 0;
+            host.timeline.frame_overrun = false;
+            return;
+        }
         host.frame_start_ns = sdl.c.SDL_GetTicksNS();
         kx.c.kx_begin_frame(host.ctx);
         // Mobile (Phase 3d/3e): the canvas is pixel-sized (kx_create got
