@@ -47,7 +47,23 @@ const ListState = struct {
     scroll: scroll_mod.ScrollState = .{},
     input: scroll_util.ScrollInput = .{},
     first: usize = 0, // item index of children[0]
+    // Backing store for the scroll-copy fast path: the composited viewport
+    // image plus the offset/window/size it was rendered at.
+    backing: u64 = 0,
+    backing_ctx: ?*kx.Ctx = null,
+    backing_offset: f32 = 0,
+    backing_first: usize = 0,
+    backing_w: i32 = 0,
+    backing_h: i32 = 0,
 };
+
+fn dropBacking(s: *ListState) void {
+    if (s.backing != 0) {
+        if (s.backing_ctx) |c| ui.paint.imageDestroy(c, s.backing);
+    }
+    s.backing = 0;
+    s.backing_ctx = null;
+}
 
 fn strideOf(s: *const ListState) f32 {
     return s.opts.item_height + s.opts.gap;
@@ -99,6 +115,102 @@ fn listPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = ctx; // children paint via the transform hooks below
 }
 
+/// Scroll-copy — the backing-store idiom (QBackingStore, composited
+/// scroller layers): the previous frame's composited viewport shifts by the
+/// scroll delta, one blit carries every unchanged row, and only the
+/// newly-exposed strip plus dirty rows repaint into a fresh backing image.
+/// Fractional deltas resample the shifted image — identical semantics to a
+/// compositor translating a layer. Returns false → the normal per-child
+/// pass runs (first paint, a slid virtualization window, a stale backing,
+/// or a nested offscreen pass where none is available).
+fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
+    const s = stateOf(ListState, n);
+    const b = n.bounds;
+    const ix = @floor(b.x);
+    const iy = @floor(b.y);
+    const iw: i32 = @intFromFloat(@ceil(b.x + b.w) - ix);
+    const ih: i32 = @intFromFloat(@ceil(b.y + b.h) - iy);
+    if (iw <= 0 or ih <= 0) return true; // nothing to composite — consumed
+    const w: f32 = @floatFromInt(iw);
+    const h: f32 = @floatFromInt(ih);
+
+    const dy = s.scroll.offset - s.backing_offset;
+    const usable = s.backing != 0 and s.backing_ctx == ctx and
+        s.backing_w == iw and s.backing_h == ih;
+    if (usable and @abs(dy) >= h) dropBacking(s); // a full page: no shared pixels
+    const have = usable and @abs(dy) < h;
+
+    // The repaint band in image space: the strip the shift uncovered, union
+    // every dirty child (a fresh virtualization-window row is dirty, so a
+    // sliding window still paints the entering row here — backing_first is
+    // deliberately NOT part of the check).
+    var repaint = Rect{ .x = 0, .y = 0, .w = w, .h = h };
+    var any_dirty = false;
+    if (have) {
+        repaint = if (dy > 0)
+            .{ .x = 0, .y = h - dy, .w = w, .h = dy }
+        else if (dy < 0)
+            .{ .x = 0, .y = 0, .w = w, .h = -dy }
+        else
+            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        for (n.children.items) |c| {
+            if (c.defer_paint or c.zombie) continue;
+            if (!(c.dirty or c.layout_dirty)) continue;
+            any_dirty = true;
+            repaint = ui.node.rectUnion(repaint, .{
+                .x = c.bounds.x - ix, .y = c.bounds.y - s.scroll.offset - iy,
+                .w = c.bounds.w, .h = c.bounds.h,
+            });
+        }
+        // Churning content (animated rows each frame): the offscreen pass +
+        // two blits costs more than repainting the rows directly — stay on
+        // the normal path. The backing stays valid; dy keeps tracking it.
+        if (repaint.w * repaint.h > w * h * 0.7) return false;
+    } else {
+        for (n.children.items) |c| {
+            if (!(c.defer_paint or c.zombie) and (c.dirty or c.layout_dirty)) {
+                any_dirty = true;
+                break;
+            }
+        }
+        // No backing AND churning rows: building one costs an offscreen pass
+        // the copy path can never amortize — stay direct.
+        if (any_dirty) return false;
+    }
+    if (!ui.paint.offscreenBegin(ctx, iw, ih)) {
+        dropBacking(s);
+        return false;
+    }
+    if (have) ui.paint.imageDraw(ctx, s.backing, 0, -dy, w, h);
+    if (repaint.w > 0 and repaint.h > 0) {
+        ui.paint.clipRect(ctx, repaint.x, repaint.y, repaint.w, repaint.h);
+        // Image space → content space: a child's own bounds place it at
+        // bounds.y - offset on screen; the image's top-left is (ix, iy).
+        ui.paint.translate(ctx, -ix, -iy - s.scroll.offset);
+        // Cull in the same screen space the normal pass uses (children map
+        // their paint rects through the list's map_paint_rect).
+        const band_screen = ui.node.rectIntersect(child_region, .{
+            .x = ix, .y = iy + repaint.y, .w = repaint.w, .h = repaint.h,
+        });
+        for (n.children.items) |c| {
+            if (c.defer_paint or c.zombie) continue;
+            c.paint(ctx, band_screen);
+        }
+        ui.paint.clipReset(ctx);
+    }
+    const img = ui.paint.offscreenEndImage(ctx);
+    dropBacking(s);
+    if (img != 0) {
+        s.backing = img;
+        s.backing_ctx = ctx;
+        s.backing_offset = s.scroll.offset;
+        s.backing_w = iw;
+        s.backing_h = ih;
+        ui.paint.imageDraw(ctx, img, ix, iy, w, h);
+    }
+    return true;
+}
+
 /// Clip to the viewport, then translate the content by -offset.
 fn listPreChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(ListState, n);
@@ -137,8 +249,10 @@ fn listScrollSetOffset(n: *Node, value: f32) void {
     _ = setScrollOffset(n, value);
 }
 fn listDeinit(n: *Node) void {
+    const s = stateOf(ListState, n);
+    dropBacking(s);
     input.releaseNode(n);
-    n.allocator.destroy(stateOf(ListState, n));
+    n.allocator.destroy(s);
 }
 const list_vtable = ui.node.VTable{
     .measure = listMeasure,
@@ -149,6 +263,7 @@ const list_vtable = ui.node.VTable{
     .on_scroll = listOnScroll,
     .scroll_info = listScrollInfo,
     .scroll_set_offset = listScrollSetOffset,
+    .scroll_children_paint = listScrollChildrenPaint,
     .pre_children_paint = listPreChildrenPaint,
     .post_children_paint = listPostChildrenPaint,
     .map_paint_rect = listMapPaintRect,

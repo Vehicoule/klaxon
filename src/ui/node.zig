@@ -131,6 +131,14 @@ pub const VTable = struct {
     /// its parent's edge and takes no layout space (its bounds are ~empty).
     /// Paint culling and markDirty consult it.
     paint_bounds: ?*const fn (node: *Node) Rect = null,
+    /// Scroll-copy fast path (backing-store idiom — the same one
+    /// QBackingStore/Flutter's viewport layers use): the hook OWNS the
+    /// children pass — it may blit the previous frame's composited viewport
+    /// shifted by the scroll delta and repaint only the newly-exposed strip.
+    /// Return false to fall back to the normal children pass (dirty rows,
+    /// window shifts, first paint). `child_region` is the pre-tightened
+    /// visible rect — the same one the normal pass would cull against.
+    scroll_children_paint: ?*const fn (node: *Node, ctx: *kx.Ctx, child_region: Rect) bool = null,
     /// Effective hit-test rect (defaults to bounds). Transformed widgets
     /// return where their children actually paint.
     hit_bounds: ?*const fn (node: *Node) Rect = null,
@@ -575,6 +583,9 @@ pub const Node = struct {
     fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
         if (own_hit) node.vtable.paint(node, ctx);
         if (children_hit) {
+            if (node.vtable.scroll_children_paint) |sc| {
+                if (sc(node, ctx, child_region)) return;
+            }
             if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
             for (node.children.items) |child| {
                 if (child.defer_paint or child.zombie) continue; // defer_paint → popup overlay; zombie → swept
