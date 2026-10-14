@@ -41,6 +41,7 @@
 #include "include/gpu/ganesh/GrBackendSurface.h"
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/GrTypes.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"
 #include "include/gpu/ganesh/gl/GrGLAssembleInterface.h"
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h"
@@ -51,6 +52,7 @@
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
+#include "include/gpu/graphite/Image.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
 #include "include/gpu/graphite/Surface.h"
@@ -865,6 +867,29 @@ bool gpu_end_offscreen(GpuState* state) {
     state->dctx->flushAndSubmit(GrSyncCpu::kYes);
     state->warmup_surface = nullptr;
     return true;
+}
+
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
+    if (!state) return nullptr;
+    const SkImageInfo info =
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr);
+    if (state->gcontext && state->grecorder)
+        return SkSurfaces::RenderTarget(state->grecorder.get(), info); // graphite-vulkan
+    if (state->dctx)
+        return SkSurfaces::RenderTarget(state->dctx.get(), skgpu::Budgeted::kYes, info); // ganesh-gl
+    return nullptr;
+}
+
+sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
+    if (!state || !img || img->isTextureBacked()) return img;
+    if (state->gcontext && state->grecorder) {
+        if (sk_sp<SkImage> up = SkImages::TextureFromImage(state->grecorder.get(), img.get(), {}))
+            return up; // graphite-vulkan
+    } else if (state->dctx) {
+        if (sk_sp<SkImage> up = SkImages::TextureFromImage(state->dctx.get(), img.get()))
+            return up; // ganesh-gl
+    }
+    return img;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "clip_path",
+      "frame_time_avg_ms": 1.3,
+      "frame_time_p50_ms": 1.3,
+      "frame_time_p99_ms": 1.6,
+      "frame_time_p999_ms": 1.6,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 764.0,
+      "draw_calls_per_frame": 3371,
+      "rss_mb": 123.9,
+      "ttff_ms": 10.3,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 132816,
+  "timestamp": "2026-10-14T01:09:53Z"
+}

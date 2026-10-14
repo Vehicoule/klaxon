@@ -77,7 +77,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.skia.Bitmap
 import org.jetbrains.skia.Surface
+import org.jetbrains.skiko.GraphicsApi
+import org.jetbrains.skiko.SkiaLayer
+import org.jetbrains.skiko.SkiaLayerProperties
+import org.jetbrains.skiko.SkikoRenderDelegate
+import java.awt.Dimension
 import java.io.File
+import javax.swing.JFrame
+import javax.swing.SwingUtilities
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -111,6 +118,18 @@ const val APP_SWITCH_PERIOD = 60L
 
 /** bench.zig BG (0x14141CFF, RRGGBBAA) as a Skia ARGB clear color. */
 private val BG_ARGB = 0xFF14141C.toInt()
+
+/** Tier-2 windowed mode (run.sh --windowed / KLAXON_BENCH_WINDOWED=1): the
+ *  same scenes render into a REAL JFrame + org.jetbrains.skiko.SkiaLayer on
+ *  Metal instead of the headless raster surface. Each frame is driven by
+ *  SkiaLayer.paint() — a synchronous onRender + flush + present on the caller
+ *  thread — timed wall-to-wall. Skiko vsync is disabled so the present call
+ *  does not block on the display clock: the contract is work-per-frame, the
+ *  same span Klaxon (last_frame_wait_ns subtracted), the Qt RHI runner
+ *  (beforeRenderPassRecording -> afterRendering) and Flutter's FrameTiming
+ *  work spans measure.
+ *  The report's "backend" field records the resolved path. */
+private val WINDOWED = System.getenv("KLAXON_BENCH_WINDOWED") == "1"
 
 /// How a scene's frames are scheduled (docs/specs/bench-scenes.md).
 enum class SceneKind {
@@ -206,10 +225,26 @@ class Harness(private val scene: BenchScene) {
     // init order) — Klaxon's ttff covers scene build, and list_ops /
     // mount_churn populate hundreds of rows in SceneState's init.
     private val runStartNs = System.nanoTime()
-    private var surface: Surface = Surface.makeRasterN32Premul(WIDTH, HEIGHT)
+    private var surface: Surface? = if (WINDOWED) null else Surface.makeRasterN32Premul(WIDTH, HEIGHT)
     private lateinit var composeScene: ComposeScene
     private lateinit var platformContext: PlatformContext
     private val state = SceneState(scene)
+
+    // Windowed tier-2: the real JFrame + SkiaLayer the scene renders into
+    // (null headless). contentScale = the display's pixel scale (2.0 on
+    // Retina — the scene's logical size stays 640x480 dp like every runner).
+    private var jframe: JFrame? = null
+    private var layer: SkiaLayer? = null
+    private var contentScale = 1f
+    // The delegate's onRender span (BG clear + ComposeScene.render — the
+    // CPU-side build/layout/draw work, the same span Klaxon's paint()
+    // measures). paint() wraps it in Skiko machinery (drawable acquire +
+    // flush + present) that stays paced by the WindowServer commit cadence
+    // (~8.3 ms on this 120 Hz panel) even with vsync off — that machinery
+    // is wall overhead, not frame work, and is subtracted like Klaxon's
+    // last_frame_wait_ns.
+    private var lastOnRenderNs = 0L
+    private var lastPaintMachineryNs = 0L
 
     private var ttffMs = 0.0
     private var framesRendered = 0L
@@ -226,8 +261,26 @@ class Harness(private val scene: BenchScene) {
         platformContext = object : PlatformContext by PlatformContext.Empty {
             override val windowInfo: WindowInfo get() = windowInfo
         }
+        if (WINDOWED) createWindow()
         composeScene = buildScene()
         composeScene.setContent { state.Content() }
+        if (WINDOWED) {
+            // The delegate owns the BG clear + scene render; Skiko's flush +
+            // present run inside the same paint() call (vsync disabled).
+            layer!!.renderDelegate = object : SkikoRenderDelegate {
+                override fun onRender(
+                    canvas: org.jetbrains.skia.Canvas,
+                    width: Int,
+                    height: Int,
+                    nanoTime: Long,
+                ) {
+                    val rt0 = System.nanoTime()
+                    canvas.clear(BG_ARGB)
+                    composeScene.render(canvas.asComposeCanvas(), nanoTime)
+                    lastOnRenderNs = System.nanoTime() - rt0
+                }
+            }
+        }
 
         val frameTimesMs = when (scene.kind) {
             SceneKind.RAMP -> runRamp(runStartNs)
@@ -237,7 +290,13 @@ class Harness(private val scene: BenchScene) {
         val drawCalls = countLayoutNodes(composeScene)
         val rssMb = readRssMb()
         composeScene.close()
-        surface.close()
+        surface?.close()
+        if (WINDOWED) {
+            layer?.detach()
+            jframe?.dispose()
+            jframe = null
+            layer = null
+        }
         state.finalizeExtras()
 
         val avg = frameTimesMs.average()
@@ -264,12 +323,43 @@ class Harness(private val scene: BenchScene) {
         )
     }
 
+    /// The windowed JFrame + SkiaLayer (Metal, vsync off — see WINDOWED).
+    /// Runs on the EDT like the rest of the windowed harness.
+    private fun createWindow() {
+        val frame = JFrame("klaxon-bench-compose")
+        frame.defaultCloseOperation = JFrame.DO_NOTHING_ON_CLOSE
+        val skiaLayer = SkiaLayer(
+            properties = SkiaLayerProperties(
+                isVsyncEnabled = false,
+                // TRIPLE: with DOUBLE the CAMetalLayer drawable pool is
+                // exhausted after two in-flight presents, so nextDrawable
+                // inside paint() blocks on the OS compositor's 120 Hz
+                // release cadence — an ~8.3 ms floor unrelated to scene
+                // work. A deeper pool lets presents overlap so the acquire
+                // returns immediately on an unpaced run.
+                frameBuffering = org.jetbrains.skiko.FrameBuffering.TRIPLE,
+                renderApi = GraphicsApi.METAL,
+            ),
+        )
+        skiaLayer.preferredSize = Dimension(WIDTH, HEIGHT)
+        frame.contentPane.add(skiaLayer)
+        frame.pack()
+        frame.isVisible = true
+        contentScale = skiaLayer.contentScale
+        jframe = frame
+        layer = skiaLayer
+        System.err.println(
+            "klaxon bench compose: windowed — ${skiaLayer.renderApi} layer," +
+                " contentScale=$contentScale, vsync off"
+        )
+    }
+
     /// The headless scene (the same construction for the first composition and
     /// every app_switch resume).
     private fun buildScene() = CanvasLayersComposeScene(
-        density = Density(1f),
+        density = Density(contentScale),
         layoutDirection = LayoutDirection.Ltr,
-        size = IntSize(WIDTH, HEIGHT),
+        size = IntSize((WIDTH * contentScale).toInt(), (HEIGHT * contentScale).toInt()),
         coroutineContext = Dispatchers.Unconfined,
         platformContext = platformContext,
         invalidate = {}, // the harness renders every frame itself; nothing to schedule
@@ -285,28 +375,56 @@ class Harness(private val scene: BenchScene) {
             injectT0Ns = System.nanoTime()
             awaitingResponse = true
             framesSinceInject = 0
-            composeScene.sendPointerEvent(PointerEventType.Press, Offset(WIDTH / 2f, HEIGHT / 2f))
+            composeScene.sendPointerEvent(
+                PointerEventType.Press,
+                Offset(WIDTH / 2f * contentScale, HEIGHT / 2f * contentScale),
+            )
         }
         // A response paints on the first render that runs with the response
         // state already set — check BEFORE this render (a response delivered
         // during a render is painted by the next one).
         val responseWasSet = awaitingResponse && state.responseArrived
-        surface.canvas.clear(BG_ARGB) // Klaxon's paint(root, BG) clear
-        // recomposition + measure/layout + draw, synchronously
-        composeScene.render(surface.canvas.asComposeCanvas(), System.nanoTime())
+        drawFrame() // BG clear + recomposition + measure/layout + draw, synchronously
         state.postRender(frame, this) // timed post-render work (semantics walk)
         val t1 = System.nanoTime()
+        // tWork: end instant in "work time" (Skiko's paced acquire/flush/
+        // present machinery subtracted — see lastPaintMachineryNs). ttff
+        // stays wall-to-wall like Klaxon's ttff_ms.
+        val tWork = t1 - lastPaintMachineryNs
         if (framesRendered == 0L) ttffMs = (t1 - runStartNs) / 1e6
         framesRendered++
         if (awaitingResponse) {
             framesSinceInject++
             if (responseWasSet) {
                 state.putExtra("latency_frames", framesSinceInject.toString())
-                state.putExtra("latency_ms", fmt1((t1 - injectT0Ns) / 1e6))
+                state.putExtra("latency_ms", fmt1((tWork - injectT0Ns) / 1e6))
                 awaitingResponse = false
             }
         }
-        return (t1 - t0) / 1e6
+        return (tWork - t0) / 1e6
+    }
+
+    /// One rendered frame. Headless: clear the raster surface + scene.render
+    /// (recomposition + measure/layout + draw, synchronously). Windowed: a
+    /// synchronous SkiaLayer.paint() — the render delegate clears + calls
+    /// scene.render, then Skiko flushes and presents (vsync off, so the
+    /// present call returns without waiting) — the timed span covers the
+    /// same work Klaxon measures inside begin->end frame.
+    private fun drawFrame() {
+        val l = layer
+        if (l != null) {
+            val p0 = System.nanoTime()
+            l.paint(l.graphics)
+            val p1 = System.nanoTime()
+            // paint() wall = acquire + onRender + flush + present. The
+            // delegate records its own span; the rest is Skiko's paced
+            // machinery, excluded from the frame's work time.
+            lastPaintMachineryNs = (p1 - p0) - lastOnRenderNs
+        } else {
+            val s = surface!!
+            s.canvas.clear(BG_ARGB) // Klaxon's paint(root, BG) clear
+            composeScene.render(s.canvas.asComposeCanvas(), System.nanoTime())
+        }
     }
 
     /// NORMAL + LIST_OP: 10 warmup frames, then (list_ops only) one timed op
@@ -360,16 +478,28 @@ class Harness(private val scene: BenchScene) {
 
     /// resize scene: cycle the viewport (Klaxon's kx_resize + full relayout).
     fun resizeScene(width: Int, height: Int) {
-        composeScene.size = IntSize(width, height)
-        surface.close()
-        surface = Surface.makeRasterN32Premul(width, height)
+        if (WINDOWED) {
+            // The real window + the scene's pixel extent follow the logical
+            // size (Klaxon resizes its real window/surface the same way).
+            composeScene.size =
+                IntSize((width * contentScale).toInt(), (height * contentScale).toInt())
+            layer?.preferredSize = Dimension(width, height)
+            jframe?.pack()
+        } else {
+            composeScene.size = IntSize(width, height)
+            surface?.close()
+            surface = Surface.makeRasterN32Premul(width, height)
+        }
     }
 
     /// pointer_storm: one synthetic hit-test query (a move event does a full
     /// hit-test dispatch; no paint change — the tree has no move handlers that
     /// mutate state).
     fun sendPointerMove(x: Float, y: Float) {
-        composeScene.sendPointerEvent(PointerEventType.Move, Offset(x, y))
+        composeScene.sendPointerEvent(
+            PointerEventType.Move,
+            Offset(x * contentScale, y * contentScale),
+        )
     }
 
     /// app_switch: the pause->resume cycle. Headless Compose has no lifecycle,
@@ -384,7 +514,7 @@ class Harness(private val scene: BenchScene) {
         val t1 = System.nanoTime()
         composeScene = buildScene()
         composeScene.setContent { state.Content() }
-        composeScene.render(surface.canvas.asComposeCanvas(), System.nanoTime())
+        drawFrame()
         // The resume render is a real drawn frame — count it so
         // frames_rendered reflects actual work (130 ticks → 132 draws
         // for app_switch, which pauses/resumes at frames 60 and 120).
@@ -491,7 +621,12 @@ private fun readRssMb(): Double {
 
 internal fun fmt1(v: Double) = String.format(Locale.ROOT, "%.1f", v)
 
-private fun formatReport(results: List<Metrics>, binarySizeBytes: Long, timestamp: String): String {
+private fun formatReport(
+    results: List<Metrics>,
+    binarySizeBytes: Long,
+    timestamp: String,
+    backend: String = "raster",
+): String {
     val sb = StringBuilder()
     sb.append("{\n  \"scenes\": [\n")
     results.forEachIndexed { i, m ->
@@ -520,6 +655,7 @@ private fun formatReport(results: List<Metrics>, binarySizeBytes: Long, timestam
     }
     sb.append("\n  ],\n")
     sb.append("  \"binary_size_bytes\": $binarySizeBytes,\n")
+    sb.append("  \"backend\": \"$backend\",\n")
     sb.append("  \"timestamp\": \"$timestamp\"\n")
     sb.append("}\n")
     return sb.toString()
@@ -573,10 +709,21 @@ fun main(args: Array<String>) {
     }
     val results = scenes.mapIndexed { idx, scene ->
         System.err.println("klaxon bench compose: ${scene.sceneName} (${idx + 1}/${scenes.size})...")
-        Harness(scene).run()
+        if (WINDOWED) {
+            // Swing/AWT requires the EDT for the frame + layer; the harness
+            // drives paint() synchronously, so the whole run lives there.
+            var metrics: Metrics? = null
+            SwingUtilities.invokeAndWait { metrics = Harness(scene).run() }
+            metrics!!
+        } else {
+            Harness(scene).run()
+        }
     }
     val now = Instant.now()
-    val json = formatReport(results, binarySizeBytes(), isoTimestamp(now))
+    val json = formatReport(
+        results, binarySizeBytes(), isoTimestamp(now),
+        if (WINDOWED) "skiko-metal" else "raster",
+    )
     System.out.print(json)
     System.out.flush()
     writeReportFile(json, now)

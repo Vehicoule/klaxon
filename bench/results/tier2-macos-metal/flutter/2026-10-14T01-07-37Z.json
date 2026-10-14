@@ -1,0 +1,17 @@
+{
+  "scenes": [
+    {
+      "name": "glass_blur",
+      "fps": 2066.0,
+      "frame_time_avg_ms": 0.5,
+      "frame_time_p50_ms": 0.5,
+      "frame_time_p99_ms": 0.6,
+      "draw_calls_per_frame": 71,
+      "rss_mb": 123.9,
+      "ttff_ms": 4.8,
+      "frames_rendered": 610
+    }
+  ],
+  "binary_size_bytes": 132816,
+  "timestamp": "2026-10-14T01:07:37Z"
+}

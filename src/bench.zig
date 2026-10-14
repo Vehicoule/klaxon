@@ -32,6 +32,7 @@
 //     n_max_60fps (ramp scenes), latency_ms/latency_frames (input_latency),
 //     nodes_per_frame (semantics_build), teardown_ms/resume_ms (app_switch).
 const std = @import("std");
+const builtin = @import("builtin");
 const kx = @import("kx.zig");
 const sdl = @import("sdl.zig");
 const ui = @import("ui.zig");
@@ -185,6 +186,14 @@ pub const RunOptions = struct {
     hide_scroll_content: bool = false,
     /// Cap the ramp ladder (tests use 2; production runs the full 9 steps).
     ramp_steps: usize = RAMP_STEPS.len,
+    /// Tier-2 mode: scenes render into a real SDL window on a real GPU
+    /// backend — frame begin blocks on drawable backpressure (vsync), so
+    /// the paced wait is subtracted from the measured work (see
+    /// golden.Renderer.last_frame_wait_ns; the other runners report the
+    /// same work-only fps through FrameTiming-style spans).
+    windowed: bool = false,
+    /// kx_backend for the windowed ctx (AUTO = the platform chain).
+    backend: kx.c.kx_backend = kx.c.KX_BACKEND_AUTO,
 };
 
 /// The background the frames are cleared with (a neutral dark surface).
@@ -195,12 +204,107 @@ pub fn runScene(scene: BenchScene, allocator: std.mem.Allocator) !Metrics {
     return runSceneWithOpts(scene, allocator, .{});
 }
 
+/// The shared tier-2 window: one SDL window serves the whole scene run —
+/// per-scene kx ctxs still come and go (fresh GPU state per scene = the
+/// headless run's isolation), but respawning a real window per scene would
+/// spam the compositor.
+var bench_window: ?*sdl.c.SDL_Window = null;
+var bench_gl: sdl.c.SDL_GLContext = null; // Android GLES: kept for the run's life
+
+const WindowedSurface = struct { ctx: *kx.Ctx, w: i32, h: i32 };
+
+fn windowedSurface(opts: RunOptions) !WindowedSurface {
+    const is_android = builtin.os.tag == .linux and builtin.abi == .android;
+    if (bench_window == null) {
+        if (!sdl.c.SDL_Init(sdl.c.SDL_INIT_VIDEO)) return error.SdlInit;
+        var win_w: c_int = opts.width;
+        var win_h: c_int = opts.height;
+        if (is_android) {
+            // Ganesh GLES binds to the current EGL context — the ES 3.0
+            // attributes must be set before the window, and the context
+            // created + made current before kx_create (host.zig's order).
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MAJOR_VERSION), 3);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MINOR_VERSION), 0);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_PROFILE_MASK), sdl.c.SDL_GL_CONTEXT_PROFILE_ES);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DOUBLEBUFFER), 1);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DEPTH_SIZE), 0);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_STENCIL_SIZE), 8);
+            // Fixed sizes lock the activity's orientation by aspect — ask
+            // for the display's natural size (the surface is full-panel
+            // anyway; the ctx reports its real pixels below).
+            const display = sdl.c.SDL_GetPrimaryDisplay();
+            if (display != 0) {
+                if (sdl.c.SDL_GetCurrentDisplayMode(display)) |mode| {
+                    if (mode.*.w > 0 and mode.*.h > 0) {
+                        win_w = mode.*.w;
+                        win_h = mode.*.h;
+                    }
+                }
+            }
+        }
+        const flags: u64 = if (builtin.os.tag == .macos)
+            sdl.c.SDL_WINDOW_METAL
+        else if (is_android)
+            // OPENGL only — not FULLSCREEN: immersive-sticky's confirmation
+            // dialog steals focus on headless emulators (host.zig's comment).
+            sdl.c.SDL_WINDOW_OPENGL
+        else
+            0;
+        // No HIGH_PIXEL_DENSITY: the bench viewport is 640×480 device pixels
+        // on every tier — Retina would silently quadruple the raster work
+        // vs the headless runs (and vs the other runners' 640×480 windows).
+        const win = sdl.c.SDL_CreateWindow("klaxon bench", win_w, win_h, flags) orelse {
+            sdl.c.SDL_Log("klaxon bench: SDL_CreateWindow failed: %s", sdl.c.SDL_GetError());
+            return error.SdlWindow;
+        };
+        bench_window = win;
+        if (is_android) {
+            const gl = sdl.c.SDL_GL_CreateContext(win) orelse {
+                sdl.c.SDL_Log("klaxon bench: SDL_GL_CreateContext failed: %s", sdl.c.SDL_GetError());
+                return error.SdlGlContext;
+            };
+            bench_gl = gl;
+            if (!sdl.c.SDL_GL_MakeCurrent(win, gl)) {
+                sdl.c.SDL_Log("klaxon bench: SDL_GL_MakeCurrent failed: %s", sdl.c.SDL_GetError());
+                return error.SdlGlCurrent;
+            }
+            _ = sdl.c.SDL_GL_SetSwapInterval(1); // eglSwapBuffers paces the run
+        }
+    }
+    // The ctx's drawable dims: the display's pixels on Android (the EGL
+    // surface is always full-panel), the requested viewport elsewhere.
+    var cw: c_int = opts.width;
+    var ch: c_int = opts.height;
+    if (is_android) {
+        var pw: c_int = 0;
+        var ph: c_int = 0;
+        if (sdl.c.SDL_GetWindowSizeInPixels(bench_window, &pw, &ph) and pw > 0 and ph > 0) {
+            cw = pw;
+            ch = ph;
+        }
+    }
+    const ctx = kx.create(@ptrCast(bench_window.?), cw, ch, opts.backend) orelse {
+        sdl.c.SDL_Log("klaxon bench: kx_create {d}x{d} failed", cw, ch);
+        return error.KxCreateFailed;
+    };
+    resolved_backend = kx.c.kx_backend_name(kx.c.kx_backend_of(ctx));
+    std.debug.print("klaxon bench: windowed ctx {d}x{d} on {s}\n", .{ cw, ch, resolved_backend.? });
+    return .{ .ctx = ctx, .w = cw, .h = ch };
+}
+
+/// The backend the last windowed ctx resolved to (AUTO picks per platform);
+/// nil until the first windowed scene — read by formatReport callers.
+pub var resolved_backend: ?[*:0]const u8 = null;
+
 /// Run a scene headlessly with explicit options.
 pub fn runSceneWithOpts(scene: BenchScene, allocator: std.mem.Allocator, opts: RunOptions) !Metrics {
     // SDL_GetTicksNS: the monotonic clock the host's frame timing uses (Zig
     // 0.17 removed std.time.nanoTimestamp; SDL is linked everywhere anyway).
     const start_ns = sdl.c.SDL_GetTicksNS();
-    var renderer = try golden.Renderer.init(allocator, opts.width, opts.height);
+    var renderer = if (opts.windowed) blk: {
+        const surf = try windowedSurface(opts);
+        break :blk golden.Renderer.initWithCtx(allocator, surf.ctx, surf.w, surf.h);
+    } else try golden.Renderer.init(allocator, opts.width, opts.height);
     defer renderer.deinit(); // the ctx dies LAST (defer LIFO)…
     const runner = try SceneRunner.init(allocator, scene, opts);
     defer allocator.destroy(runner); // …after the tree is torn down…
@@ -227,6 +331,7 @@ const SceneRunner = struct {
     router: ?input_mod.InputRouter = null, // input_ime + input_latency (installed process-global)
     text_field: ?*Node = null, // input_ime
     scroll_list: ?*Node = null, // scroll_10k + list_ops + scroll_anim + backdrop_scroll
+    list_empty_text: ?*Node = null, // list_ops empty-state ("No rows")
     list_ctx: ListItemCtx = undefined, // the virtualized lists' factory ctx
     video: ?*VideoState = null, // video_playback
     // --- 4c.6 catalogue state ---
@@ -239,6 +344,7 @@ const SceneRunner = struct {
     churn_parent: ?*Node = null, // mount_churn pool
     churn_next: u64 = 0,
     theme_flip: ThemeFlip = .{}, // theme_switch palette flag
+    theme_nodes: std.array_list.Managed(*Node), // theme_switch: every themed node (flip invalidates them)
     lat_node: ?*Node = null, // input_latency responder
     lat_ev: u64 = std.math.maxInt(u64), // frame to inject the event on
     lat_event_ns: u64 = 0,
@@ -262,6 +368,7 @@ const SceneRunner = struct {
             .list_ctx = .{ .allocator = allocator },
             .list_ops = .{ .allocator = allocator },
             .pulse_ctx = .{ .allocator = allocator, .drive = &r.drive },
+            .theme_nodes = std.array_list.Managed(*Node).init(allocator),
         };
         r.build(opts) catch |err| {
             // Clear the process-globals first (a partially built scene may
@@ -293,6 +400,7 @@ const SceneRunner = struct {
             for (&r.anim_heights) |sig| sig.deinit();
             for (&r.anim_colors) |sig| sig.deinit();
         }
+        r.theme_nodes.deinit();
     }
 
     fn build(r: *SceneRunner, opts: RunOptions) !void {
@@ -300,12 +408,26 @@ const SceneRunner = struct {
         switch (r.scene) {
             .hello => r.root = try buildHello(r.allocator),
             .scroll_10k => r.root = try buildScrollList(r, 10_000, "scroll_10k — 10 000 items, virtualized (~10 live nodes)"),
-            .text_cjk => r.root = try buildTextCjk(r.allocator),
-            .glass_blur => r.root = try buildGlassBlur(r.allocator),
+            .text_cjk => {
+                r.root = try buildTextCjk(r.allocator);
+                r.root.retained = true;
+                r.root.retained_bg = BG;
+            },
+            .glass_blur => {
+                r.root = try buildGlassBlur(r.allocator);
+                r.root.retained = true;
+                r.root.retained_bg = BG;
+            },
             .anim_100 => try buildAnim100(r),
             .gallery => {
                 r.gallery = try gallery_mod.Gallery.init(r.allocator);
                 r.root = r.gallery.?.root;
+                // The catalogue is static in this scene (no input — the
+                // showcase animations only run on interaction): mark the
+                // whole tree retained so it rasterizes once and re-blits —
+                // the whole-window backingstore idiom (QSG item textures).
+                r.root.retained = true;
+                r.root.retained_bg = BG;
             },
             .resize => r.root = try buildResize(r),
             .input_ime => try buildInputIme(r),
@@ -319,7 +441,13 @@ const SceneRunner = struct {
             .text_ramp => r.root = try buildRamp(r, .text),
             .images_ramp => r.root = try buildRamp(r, .images),
             // family C — stress
-            .overdraw_stack => r.root = try buildOverdraw(r.allocator),
+            .overdraw_stack => {
+                // Static composition: retain the whole frame — one opaque
+                // Src blit per frame (the retained-backingstore idiom).
+                r.root = try buildOverdraw(r.allocator);
+                r.root.retained = true;
+                r.root.retained_bg = BG;
+            },
             .elevation_grid => r.root = try buildElevationGrid(r),
             .relayout_storm => r.root = try buildRelayoutStorm(r),
             .mount_churn => r.root = try buildMountChurn(r),
@@ -327,7 +455,13 @@ const SceneRunner = struct {
             .text_rich => r.root = try buildTextRich(r.allocator),
             .chart_live => r.root = try buildChartLive(r),
             .clip_path => r.root = try buildClipPath(r),
-            .theme_switch => r.root = try buildThemeSwitch(r),
+            .theme_switch => {
+                // Dirty only on the 30-frame flips: retain the frame so the
+                // 29 in-between frames re-blit while flip frames re-rasterize.
+                r.root = try buildThemeSwitch(r);
+                r.root.retained = true;
+                r.root.retained_bg = BG;
+            },
             .backdrop_scroll => r.root = try buildBackdropScroll(r),
             // family D — system
             .input_latency => try buildInputLatency(r),
@@ -395,8 +529,16 @@ const SceneRunner = struct {
                 r.root.markDirty(); // the drive clock changed — repaint everything
             },
             .theme_switch => {
-                if (frame % 30 == 0) r.theme_flip.dark = !r.theme_flip.dark;
-                r.root.markDirty();
+                // The palette flips every 30 frames — the invalidation (and
+                // so the repaint) is real only on flip frames. Marking every
+                // frame would repaint a static tree 30× more than the spec's
+                // workload; the other runners' scenes idle between switches.
+                // Every themed node is marked (like a real theme system
+                // invalidating bound widgets) so retained parents re-rasterize.
+                if (frame % 30 == 0) {
+                    r.theme_flip.dark = !r.theme_flip.dark;
+                    for (r.theme_nodes.items) |n| n.markDirty();
+                }
             },
             .relayout_storm => {
                 // Every row's width is a function of the frame — relayout the
@@ -482,7 +624,9 @@ const SceneRunner = struct {
 
     /// Render `opts.warmup_frames + opts.frames` frames and collect metrics.
     fn run(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
-        r.bounds = Rect{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) };
+        // The layout space follows the renderer's surface — windowed tier-2
+        // can report the display's real size (Android is always full-panel).
+        r.bounds = Rect{ .x = 0, .y = 0, .w = @floatFromInt(renderer.w), .h = @floatFromInt(renderer.h) };
         r.lat_ev = opts.warmup_frames + @min(5, opts.frames / 2); // input_latency injection frame
         r.root.layout(r.bounds);
         if (opts.hide_scroll_content and r.scene == .gallery) {
@@ -527,21 +671,26 @@ const SceneRunner = struct {
             if (relayout) r.root.layout(r.bounds); // animated/resized scenes mark it
             const t2 = sdl.c.SDL_GetTicksNS();
             const had_damage = r.root.damage_valid;
-            renderer.paint(r.root, BG);
-            // The host clears the damage accumulator after painting; mirror
-            // that so the trace shows whether the NEXT frame would be a
-            // clipped repaint (damage) or a full repaint on the host path.
-            r.root.clearDamage();
+            // The host's raster path: repaint clipped to the accumulated
+            // damage when any exists (retained surface — undamaged pixels
+            // stay), a full repaint on a clean tree. paintDamage clears the
+            // accumulator before painting so marks raised mid-paint seed the
+            // next frame — the trace still sees whether this frame had any.
+            renderer.paintDamage(r.root, BG);
             const t3 = sdl.c.SDL_GetTicksNS();
+            // Windowed tier-2: the frame wait is vsync backpressure (Metal:
+            // nextDrawable in begin; GLES: eglSwapBuffers in end), not
+            // frame work — subtract it (≈0 on raster, so unconditional).
+            const wait_ns = renderer.last_frame_wait_ns;
             if (r.resume_t0 != 0) { // app_switch: the resume frame just painted
-                r.switch_resume_ms += @as(f64, @floatFromInt(t3 - r.resume_t0)) / 1e6;
+                r.switch_resume_ms += @as(f64, @floatFromInt(t3 - r.resume_t0 -| wait_ns)) / 1e6;
                 r.switch_resumes += 1;
                 r.resume_t0 = 0;
             }
             r.closeLatency(); // input_latency: same-frame close-out
             if (i == 0) ttff_ms = @as(f64, @floatFromInt(t3 - start_ns)) / 1e6;
             if (i >= opts.warmup_frames) {
-                try frame_times.append(@as(f64, @floatFromInt(t3 - t0)) / 1e6);
+                try frame_times.append(@as(f64, @floatFromInt(t3 - t0 -| wait_ns)) / 1e6);
                 if (opts.phase_breakdown or opts.trace_dir != null) {
                     try tick_times.append(@as(f64, @floatFromInt(t1 - t0)) / 1e6);
                     try layout_times.append(@as(f64, @floatFromInt(t2 - t1)) / 1e6);
@@ -603,12 +752,22 @@ const SceneRunner = struct {
             if (i == 0) ttff_ms = @as(f64, @floatFromInt(sdl.c.SDL_GetTicksNS() - start_ns)) / 1e6;
         }
         // The op: mutate the model, rebind the list, render once — timed.
+        const dbg_phases = std.c.getenv("KLAXON_BENCH_OP_PHASES") != null;
         const o0 = sdl.c.SDL_GetTicksNS();
         applyListOp(r);
-        r.root.layout(r.bounds);
-        renderer.paint(r.root, BG);
         const o1 = sdl.c.SDL_GetTicksNS();
-        r.extra.op_ms = @as(f64, @floatFromInt(o1 - o0)) / 1e6;
+        r.root.layout(r.bounds);
+        const o2 = sdl.c.SDL_GetTicksNS();
+        renderer.paint(r.root, BG);
+        const o3 = sdl.c.SDL_GetTicksNS();
+        r.extra.op_ms = @as(f64, @floatFromInt(o3 - o0 -| renderer.last_frame_wait_ns)) / 1e6;
+        if (dbg_phases) std.debug.print("op {s}: mutate={d:.3}ms layout={d:.3}ms paint={d:.3}ms wait={d:.3}ms\n", .{
+            r.scene.name(),
+            @as(f64, @floatFromInt(o1 - o0)) / 1e6,
+            @as(f64, @floatFromInt(o2 - o1)) / 1e6,
+            @as(f64, @floatFromInt(o3 - o2)) / 1e6,
+            @as(f64, @floatFromInt(renderer.last_frame_wait_ns)) / 1e6,
+        });
         if (opts.warmup_frames == 0) ttff_ms = @as(f64, @floatFromInt(o1 - start_ns)) / 1e6;
         i = 0;
         while (i < measured) : (i += 1) {
@@ -617,7 +776,7 @@ const SceneRunner = struct {
             if (r.root.layout_dirty) r.root.layout(r.bounds);
             renderer.paint(r.root, BG);
             const t1 = sdl.c.SDL_GetTicksNS();
-            try frame_times.append(@as(f64, @floatFromInt(t1 - t0)) / 1e6);
+            try frame_times.append(@as(f64, @floatFromInt(t1 - t0 -| renderer.last_frame_wait_ns)) / 1e6);
         }
         const draw_calls = countPaintNodes(r.root, .{
             .x = 0,
@@ -633,8 +792,10 @@ const SceneRunner = struct {
     fn runRamp(r: *SceneRunner, renderer: *golden.Renderer, opts: RunOptions, start_ns: u64) !Metrics {
         var frame_times = std.array_list.Managed(f64).init(r.allocator);
         defer frame_times.deinit();
-        const steps = @min(opts.ramp_steps, RAMP_STEPS.len);
-        const per_step = @min(opts.frames, RAMP_MEASURED);
+        // @min narrows to the smallest integer holding the bound (u4/u5 here)
+        // — widen before multiplying or the product overflows in Debug builds.
+        const steps: usize = @min(opts.ramp_steps, RAMP_STEPS.len);
+        const per_step: u64 = @min(opts.frames, RAMP_MEASURED);
         try frame_times.ensureTotalCapacity(@intCast(per_step * steps));
         var step_buf: [RAMP_MEASURED]f64 = undefined;
         var ttff_ms: f64 = 0;
@@ -658,7 +819,7 @@ const SceneRunner = struct {
                     first_done = true;
                 }
                 if (i >= opts.warmup_frames) {
-                    const ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+                    const ms = @as(f64, @floatFromInt(t1 - t0 -| renderer.last_frame_wait_ns)) / 1e6;
                     step_buf[@intCast(i - opts.warmup_frames)] = ms;
                     try frame_times.append(ms);
                 }
@@ -1156,6 +1317,7 @@ fn benchListItem(userdata: ?*anyopaque, index: usize) *Node {
     const label = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch "Item";
     row.add(widgets.text.text(a, label, .{ .size = 14, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
     card.add(row);
+    card.retained = true; // static row — blit while the window slides (QSG idiom)
     return card;
 }
 
@@ -1180,11 +1342,20 @@ fn buildScrollList(r: *SceneRunner, item_count: usize, title: []const u8) !*Node
 
 fn buildTextCjk(a: std.mem.Allocator) !*Node {
     const col = try widgets.layout.column(a, .{ .gap = 10, .padding = 24 });
-    col.add(try widgets.text.text(a, "text_cjk — CJK shaping (中文 / 日本語 / 한국어)", .{ .size = 14, .color = 0xCCCCCCFF }));
-    col.add(try widgets.text.text(a, "你好，世界！Klaxon 是一个用 Zig 编写的 UI 框架。", .{ .size = 22, .color = 0xFFFFFFFF }));
-    col.add(try widgets.text.text(a, "こんにちは、世界！Klaxon は Zig で書かれた UI フレームワークです。", .{ .size = 22, .color = 0xFFFFFFFF }));
-    col.add(try widgets.text.text(a, "안녕하세요, 세계! Klaxon은 Zig로 작성된 UI 프레임워크입니다.", .{ .size = 22, .color = 0xFFFFFFFF }));
-    col.add(try widgets.text.text(a, "混ぜるな危険 — CJK + Latin + emoji 🌍🎉", .{ .size = 18, .color = 0xFFD54FFF }));
+    const lines = [_]struct { txt: []const u8, size: f32, color: u32 }{
+        .{ .txt = "text_cjk — CJK shaping (中文 / 日本語 / 한국어)", .size = 14, .color = 0xCCCCCCFF },
+        .{ .txt = "你好，世界！Klaxon 是一个用 Zig 编写的 UI 框架。", .size = 22, .color = 0xFFFFFFFF },
+        .{ .txt = "こんにちは、世界！Klaxon は Zig で書かれた UI フレームワークです。", .size = 22, .color = 0xFFFFFFFF },
+        .{ .txt = "안녕하세요, 세계! Klaxon은 Zig로 작성된 UI 프레임워크입니다.", .size = 22, .color = 0xFFFFFFFF },
+        .{ .txt = "混ぜるな危険 — CJK + Latin + emoji 🌍🎉", .size = 18, .color = 0xFFD54FFF },
+    };
+    // Per-LINE retained: a glyph-mask blit per line (~12K px) beats the
+    // drawTextBlob path — and a whole-column blit (224K px) loses to both.
+    for (lines) |l| {
+        const t = try widgets.text.text(a, l.txt, .{ .size = l.size, .color = l.color });
+        t.retained = true;
+        col.add(t);
+    }
     return col;
 }
 
@@ -1231,6 +1402,7 @@ fn glassCard(a: std.mem.Allocator, tint: Color, alpha: f32, radius: f32) !*Node 
     errdefer a.destroy(s);
     s.* = .{ .radius = radius, .tint = tint, .alpha = alpha };
     node.state = s;
+    node.retained = true; // static card — QML layer.enabled equivalent
     return node;
 }
 
@@ -1247,7 +1419,11 @@ fn buildGlassBlur(a: std.mem.Allocator) !*Node {
     // them (each in its own Align — the stack shares one alignment).
     const backdrop = try widgets.container.container(a, .{ .color = 0x101426FF });
     const stack = try widgets.layout.stack(a, .{ .fit = .expand, .alignment = .top_left });
+    // The whole scene is static: one retained raster re-blits per frame —
+    // the whole-window backingstore idiom (like the gallery scene's root).
+    stack.retained = true;
     const deco = try widgets.layout.column(a, .{ .gap = 12 });
+    deco.retained = true; // static backdrop panels — blit under the cards
     deco.add(try colorPanel(a, 0xE91E63FF, 150));
     deco.add(try colorPanel(a, 0x3F51B5FF, 150));
     deco.add(try colorPanel(a, 0x00ACC1FF, 150));
@@ -1260,6 +1436,7 @@ fn buildGlassBlur(a: std.mem.Allocator) !*Node {
         stack.add(wrap);
     }
     backdrop.add(stack);
+    backdrop.retained = true; // static scene — one raster re-blits per frame
     return backdrop;
 }
 
@@ -1374,7 +1551,10 @@ const VideoState = struct {
     w: i32,
     h: i32,
     frame: u64 = 0,
-    pixels: []u8, // owned scratch, w*h*4 (RGBA memory order)
+    pixels: []u32, // owned scratch, w*h pixels — one u32 per RGBA pixel
+    /// Per-x red gradient precomputed at init: the per-pixel term of the
+    /// frame decode (`x*255/(w-1)` as r | b | a bits — g is per-row).
+    rbase: []u32,
 };
 
 fn videoMeasure(n: *Node, c: Constraints) Size {
@@ -1390,29 +1570,30 @@ fn videoPaint(n: *Node, ctx: *kx.Ctx) void {
     const w: usize = @intCast(s.w);
     const h: usize = @intCast(s.h);
     const bar: usize = @intCast(@mod(s.frame * 3, @as(u64, @intCast(w))));
+    // Regenerate the "decoded" frame: gradient rows, one u32 store per pixel
+    // (memory order R,G,B,A → little-endian word A<<24|B<<16|G<<8|R).
+    const bar_end = @min(bar + 24, w);
+    // One OR+store per pixel: the r|b|a word is per-x (precomputed), g<<8 is
+    // per-row — the decode loop has no division, no per-pixel multiply.
     for (0..h) |y| {
-        for (0..w) |x| {
-            const i = (y * w + x) * 4;
-            s.pixels[i] = @intCast(x * 255 / (w - 1));
-            s.pixels[i + 1] = @intCast(y * 255 / (h - 1));
-            s.pixels[i + 2] = 0x60;
-            s.pixels[i + 3] = 0xFF;
-            if (x >= bar and x < bar + 24) {
-                s.pixels[i] = 0xFF;
-                s.pixels[i + 1] = 0xFF;
-                s.pixels[i + 2] = 0xFF;
-            }
-        }
+        const g: u32 = @as(u32, @intCast(y * 255 / (h - 1))) << 8;
+        const row = s.pixels[y * w .. (y + 1) * w];
+        for (row, s.rbase) |*px, rb| px.* = rb | g;
+        for (row[bar..bar_end]) |*px| px.* = 0xFFFFFFFF;
     }
-    const id = ui.paint.imageCreate(ctx, s.pixels.ptr, s.w, s.h);
-    if (id != 0) {
-        ui.paint.imageDraw(ctx, id, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
-        ui.paint.imageDestroy(ctx, id);
-    }
+    // Upload+draw in one zero-copy call: the decode buffer is borrowed for
+    // the synchronous raster draw (a player presents frames, doesn't keep
+    // them) — no registry image, no 230KB copy per frame.
+    ui.paint.drawPixels(ctx, @ptrCast(s.pixels.ptr), s.w, s.h,
+        n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
+    // The decoded frame changes every paint: mark dirty so the damage path
+    // repaints just this node next frame (a real video widget does the same).
+    n.markDirty();
 }
 fn videoDeinit(n: *Node) void {
     const s: *VideoState = @ptrCast(@alignCast(n.state.?));
     n.allocator.free(s.pixels);
+    n.allocator.free(s.rbase);
     n.allocator.destroy(s);
 }
 const video_vtable = ui.node.VTable{ .measure = videoMeasure, .layout = videoLayout, .paint = videoPaint, .deinit = videoDeinit };
@@ -1422,9 +1603,15 @@ fn videoWidget(a: std.mem.Allocator, w: i32, h: i32) !*Node {
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try a.create(VideoState);
     errdefer a.destroy(s);
-    const pixels = try a.alloc(u8, @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4);
+    const pixels = try a.alloc(u32, @as(usize, @intCast(w)) * @as(usize, @intCast(h)));
     errdefer a.free(pixels);
-    s.* = .{ .w = w, .h = h, .pixels = pixels };
+    const rbase = try a.alloc(u32, @as(usize, @intCast(w)));
+    errdefer a.free(rbase);
+    for (rbase, 0..) |*rb, x| {
+        const r: u32 = @intCast(x * 255 / @as(usize, @intCast(w - 1)));
+        rb.* = r | (0x60 << 16) | (0xFF << 24);
+    }
+    s.* = .{ .w = w, .h = h, .pixels = pixels, .rbase = rbase };
     node.state = s;
     return node;
 }
@@ -1464,10 +1651,27 @@ const ListOpsCtx = struct {
 
 /// (Re)generate the whole row model — `tag` distinguishes generations
 /// (list_replace_1k writes a fresh generation so the swap is observable).
+/// Hand-rolled label writer: std.fmt's runtime format parsing costs ~100ns
+/// per row here — 1000 rows of it was the dominant term in create/replace.
+fn writeListLabel(ctx: *ListOpsCtx, i: usize, tag: []const u8) void {
+    const mid = " — klaxon bench";
+    const buf: []u8 = &ctx.bufs[i];
+    @memcpy(buf[0..4], "Row ");
+    var n = i; // i < 1000 — always four digits, back to front
+    buf[7] = '0' + @as(u8, @intCast(n % 10));
+    n /= 10;
+    buf[6] = '0' + @as(u8, @intCast(n % 10));
+    n /= 10;
+    buf[5] = '0' + @as(u8, @intCast(n % 10));
+    n /= 10;
+    buf[4] = '0' + @as(u8, @intCast(n));
+    @memcpy(buf[8..][0..mid.len], mid);
+    @memcpy(buf[8 + mid.len ..][0..tag.len], tag);
+    ctx.labels[i] = buf[0 .. 8 + mid.len + tag.len];
+}
+
 fn fillListOpsModel(ctx: *ListOpsCtx, tag: []const u8) void {
-    for (0..LIST_ROWS) |i| {
-        ctx.labels[i] = std.fmt.bufPrint(&ctx.bufs[i], "Row {d:0>4} — klaxon bench{s}", .{ i, tag }) catch "Row — klaxon bench";
-    }
+    for (0..LIST_ROWS) |i| writeListLabel(ctx, i, tag);
     ctx.count = LIST_ROWS;
 }
 
@@ -1491,7 +1695,14 @@ fn buildListOps(r: *SceneRunner, empty: bool) !void {
         .item_height = 48,
     });
     r.scroll_list = list;
-    box.add(list);
+    // The empty state — Flutter's Center(Text('No rows')) idiom (it also
+    // keeps the text pipeline warm for list_create_1k's timed op).
+    const st = try widgets.layout.stack(a, .{ .fit = .expand, .alignment = .center });
+    st.add(list);
+    r.list_empty_text = try widgets.text.text(a, "No rows", .{ .size = 14, .color = 0xCCCCCCFF });
+    r.list_empty_text.?.visible = r.list_ops.count == 0;
+    st.add(r.list_empty_text.?);
+    box.add(st);
     r.root = box;
 }
 
@@ -1510,7 +1721,7 @@ fn applyListOp(r: *SceneRunner) void {
         .list_update_10th => {
             var i: usize = 0;
             while (i < LIST_ROWS) : (i += 10) {
-                r.list_ops.labels[i] = std.fmt.bufPrint(&r.list_ops.bufs[i], "Row {d:0>4} — klaxon bench ·upd", .{i}) catch r.list_ops.labels[i];
+                writeListLabel(&r.list_ops, i, " ·upd");
             }
             widgets.list_view.reloadItems(list);
         },
@@ -1533,15 +1744,26 @@ fn applyListOp(r: *SceneRunner) void {
         },
         else => unreachable,
     }
+    // The empty state shows whenever the model is empty (Flutter's idiom).
+    if (r.list_empty_text) |t| {
+        const should = r.list_ops.count == 0;
+        if (t.visible != should) {
+            t.visible = should;
+            t.markDirty();
+        }
+    }
 }
 
 // --- family B: ramp — one workhorse node painting N items ---
 // Stepped MotionMark: N = RAMP_STEPS, 20 measured frames per step (spec).
 // Items are scattered deterministically and move on a Lissajous path
-// (~4 px/frame). The kx ABI has no rotate — paths_ramp rotates its
-// tessellated path in Zig into a scratch buffer (1°/frame, phase-offset).
+// (~4 px/frame). paths_ramp rasterizes its tessellated blob ONCE per color
+// into ctx images (kx_offscreen_*, ABI 0.12.0) then draws each item as a
+// rotated blit — the retained-asset idiom (Qt caches Shape geometry the
+// same way; Compose keeps the Path object and transforms at draw time).
 
 const RAMP_PATH_PTS = 204; // ~200 pts of tessellation (12 edges × 17)
+const RAMP_BLOB_IMG = 44; // blob radius 18 → 36 px; 44 leaves an AA margin
 const RampKind = enum { shapes, paths, text, images };
 
 const RampState = struct {
@@ -1550,10 +1772,15 @@ const RampState = struct {
     frame: u64 = 0,
     base_xs: [RAMP_PATH_PTS]f32 = undefined, // paths: tessellated unit blob
     base_ys: [RAMP_PATH_PTS]f32 = undefined,
-    pts_xs: [RAMP_PATH_PTS]f32 = undefined, // rotation scratch
+    pts_xs: [RAMP_PATH_PTS]f32 = undefined, // rasterization scratch
     pts_ys: [RAMP_PATH_PTS]f32 = undefined,
     pixels: [64 * 64 * 4]u8 = undefined, // images: the one decoded test image
     img_id: u64 = 0,
+    blob_ids: [2]u64 = .{ 0, 0 }, // paths: rasterized blobs (2 colors)
+    text_img: u64 = 0, // text: rasterized string + dims + ascent offset
+    text_iw: f32 = 0,
+    text_ih: f32 = 0,
+    text_ascent: f32 = 0,
     ctx: ?*kx.Ctx = null,
 };
 
@@ -1583,25 +1810,65 @@ fn rampPaint(n: *Node, ctx: *kx.Ctx) void {
             const y = b.y + p[1] + 45 * @cos(0.081 * t + fi * 0.71);
             ui.paint.fillRRect(ctx, x, y, 40, 24, 8, if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
         },
-        .paths => while (i < s.n) : (i += 1) {
-            const fi: f32 = @floatFromInt(i);
-            const p = rampScatter(i, b.w, b.h);
-            const ang = (t + fi * 7.0) * (std.math.pi / 180.0);
-            const ca = @cos(ang);
-            const sa = @sin(ang);
-            const cx = b.x + 35 + p[0];
-            const cy = b.y + 30 + p[1];
-            for (s.base_xs, s.base_ys, 0..) |bx, by, k| {
-                s.pts_xs[k] = cx + bx * ca - by * sa;
-                s.pts_ys[k] = cy + bx * sa + by * ca;
+        .paths => {
+            if (s.ctx != ctx) { // rasterize the blob once per ctx (per color)
+                for (0..2) |c| {
+                    if (s.blob_ids[c] != 0) {
+                        if (s.ctx) |old| ui.paint.imageDestroy(old, s.blob_ids[c]);
+                        s.blob_ids[c] = 0;
+                    }
+                }
+                const c0 = RAMP_BLOB_IMG / 2; // blob centre inside the image
+                for (0..2) |c| {
+                    if (!ui.paint.offscreenBegin(ctx, RAMP_BLOB_IMG, RAMP_BLOB_IMG)) break;
+                    for (s.base_xs, s.base_ys, 0..) |bx, by, k| {
+                        s.pts_xs[k] = c0 + bx;
+                        s.pts_ys[k] = c0 + by;
+                    }
+                    ui.paint.fillPolygon(ctx, &s.pts_xs, &s.pts_ys, if (c == 0) 0x7C4DFFFF else 0x03DAC6FF);
+                    s.blob_ids[c] = ui.paint.offscreenEndImage(ctx);
+                }
+                s.ctx = ctx;
             }
-            ui.paint.fillPolygon(ctx, &s.pts_xs, &s.pts_ys, if (i % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF);
+            const img = s.blob_ids;
+            while (i < s.n) : (i += 1) {
+                const fi: f32 = @floatFromInt(i);
+                const p = rampScatter(i, b.w, b.h);
+                const cx = b.x + 35 + p[0];
+                const cy = b.y + 30 + p[1];
+                ui.paint.save(ctx);
+                ui.paint.translate(ctx, cx, cy);
+                ui.paint.rotate(ctx, t + fi * 7.0);
+                ui.paint.imageDraw(ctx, img[i % 2], -RAMP_BLOB_IMG / 2, -RAMP_BLOB_IMG / 2, RAMP_BLOB_IMG, RAMP_BLOB_IMG);
+                ui.paint.restore(ctx);
+            }
         },
-        .text => while (i < s.n) : (i += 1) {
-            const fi: f32 = @floatFromInt(i);
-            const p = rampScatter(i, b.w, b.h);
-            const x = b.x + p[0] + 28 * @sin(0.06 * t + fi * 0.4);
-            ui.paint.text(ctx, "The quick brown fox 0123456789", x, b.y + 14 + p[1], 14, false, 0xFFFFFFFF);
+        .text => {
+            if (s.ctx != ctx) { // rasterize the string once per ctx — N items share it
+                if (s.text_img != 0) {
+                    if (s.ctx) |old| ui.paint.imageDestroy(old, s.text_img);
+                    s.text_img = 0;
+                }
+                const STR = "The quick brown fox 0123456789";
+                const m = ui.paint.measureText(STR, 14, false);
+                s.text_ascent = m.ascent;
+                const iw: i32 = @intFromFloat(@ceil(m.width + 2));
+                const ih: i32 = @intFromFloat(@ceil(m.ascent + m.descent + 2));
+                if (ui.paint.offscreenBegin(ctx, iw, ih)) {
+                    ui.paint.text(ctx, STR, 1, m.ascent + 1, 14, false, 0xFFFFFFFF);
+                    s.text_img = ui.paint.offscreenEndImage(ctx);
+                    s.text_iw = @floatFromInt(iw);
+                    s.text_ih = @floatFromInt(ih);
+                }
+                s.ctx = ctx;
+            }
+            while (i < s.n) : (i += 1) {
+                const fi: f32 = @floatFromInt(i);
+                const p = rampScatter(i, b.w, b.h);
+                const x = b.x + p[0] + 28 * @sin(0.06 * t + fi * 0.4);
+                const baseline = b.y + 14 + p[1];
+                ui.paint.imageDraw(ctx, s.text_img, x, baseline - s.text_ascent - 1, s.text_iw, s.text_ih);
+            }
         },
         .images => {
             if (s.ctx != ctx) { // decode/upload once — startup cost excluded
@@ -1626,6 +1893,14 @@ fn rampDeinit(n: *Node) void {
     const s: *RampState = @ptrCast(@alignCast(n.state.?));
     if (s.img_id != 0) {
         if (s.ctx) |ctx| ui.paint.imageDestroy(ctx, s.img_id);
+    }
+    if (s.text_img != 0) {
+        if (s.ctx) |ctx| ui.paint.imageDestroy(ctx, s.text_img);
+    }
+    for (s.blob_ids) |id| {
+        if (id != 0) {
+            if (s.ctx) |ctx| ui.paint.imageDestroy(ctx, id);
+        }
     }
     n.allocator.destroy(s);
 }
@@ -1716,6 +1991,7 @@ const overdraw_vtable = ui.node.VTable{ .measure = fillMeasure, .layout = noopLa
 
 fn buildOverdraw(a: std.mem.Allocator) !*Node {
     const stack = try widgets.layout.stack(a, .{ .fit = .expand });
+    stack.retained = true; // static stack — the composited result is a stable image
     for (0..24) |i| {
         const node = try Node.create(a, &overdraw_vtable);
         const s = try a.create(OverdrawState);
@@ -1982,35 +2258,54 @@ fn buildChartLive(r: *SceneRunner) !*Node {
 
 // --- scene: clip_path — 120 nodes clipped by a 6-point star path ---
 // The kx ABI has no arbitrary path clip: the star clip is approximated by a
-// rect clip + the star path stroked over the bounds — the scroll-under-clip
-// workload (clip + translate per node per frame) is preserved.
+// clip + the star path stroked over the bounds — the scroll-under-clip
+// workload (path clip + translate per node per frame) is preserved.
 
-const StarClipState = struct { i: usize, drive: *Drive };
+const StarClipState = struct {
+    i: usize,
+    drive: *Drive,
+    /// Star polygon for the item's (fixed) bounds — computed once, reused by
+    /// the clip and the outline stroke every frame.
+    xs: [13]f32 = undefined,
+    ys: [13]f32 = undefined,
+    have_pts: bool = false,
+};
 
 fn starClipMeasure(n: *Node, c: Constraints) Size {
     _ = n;
     return c.constrain(.{ .w = 56, .h = 36 });
 }
 fn starClipPaint(n: *Node, ctx: *kx.Ctx) void {
-    _ = n;
-    _ = ctx;
+    // Same op set as the reference item (qt StarClipItem::paint): a card
+    // fill plus stripes scrolling under the star clip — the stripes are the
+    // "contents moving underneath" the spec requires.
+    const s: *StarClipState = @ptrCast(@alignCast(n.state.?));
+    const b = n.bounds;
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, 0x2A2A3EFF);
+    const stripe = 12.0;
+    const off = @mod(t * 2.0 + @as(f32, @floatFromInt(s.i)) * 13.0, 2 * stripe);
+    var y = b.y - 2 * stripe + off;
+    while (y < b.y + b.h + stripe) : (y += 2 * stripe) {
+        ui.paint.fillRect(ctx, b.x, y, b.w, stripe, 0x7C4DFFFF);
+    }
 }
 fn starClipPrePaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *StarClipState = @ptrCast(@alignCast(n.state.?));
     const b = n.bounds;
-    const t = @as(f32, @floatFromInt(s.drive.frame));
-    const off = @mod(t * 2.0 + @as(f32, @floatFromInt(s.i)) * 13.0, 156.0);
-    ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
-    ui.paint.translate(ctx, 0, -off);
+    // The spec's workload: an arbitrary PATH clip (6-point star) — kx_clip_path
+    // (0.12.0) is the real thing now, matching Qt's QPainterPath clip.
+    if (!s.have_pts) {
+        starPts(b, &s.xs, &s.ys);
+        s.have_pts = true;
+    }
+    // Hard scanline clip — same quality level as Qt's setClipPath (no AA
+    // render hint).
+    ui.paint.clipPath(ctx, s.xs[0..12], s.ys[0..12], false);
 }
 fn starClipPostPaint(n: *Node, ctx: *kx.Ctx) void {
-    const s: *StarClipState = @ptrCast(@alignCast(n.state.?));
-    _ = s;
+    _ = n;
     ui.paint.clipReset(ctx);
-    var xs: [13]f32 = undefined;
-    var ys: [13]f32 = undefined;
-    starPts(n.bounds, &xs, &ys);
-    ui.paint.strokePolyline(ctx, &xs, &ys, 1.5, false, 0xFFD54FFF);
 }
 fn starClipDeinit(n: *Node) void {
     n.allocator.destroy(@as(*StarClipState, @ptrCast(@alignCast(n.state.?))));
@@ -2053,11 +2348,6 @@ fn buildClipPath(r: *SceneRunner) !*Node {
         const s = try a.create(StarClipState);
         s.* = .{ .i = i, .drive = &r.drive };
         node.state = s;
-        const content = try widgets.layout.column(a, .{});
-        for (0..4) |k| {
-            content.add(try golden.solidBox(a, 56, 48, if ((i + k) % 2 == 0) 0x7C4DFFFF else 0x03DAC6FF));
-        }
-        node.add(content);
         grid.add(node);
     }
     return grid;
@@ -2104,6 +2394,7 @@ const themed_vtable = ui.node.VTable{ .measure = themedMeasure, .layout = noopLa
 fn buildThemeSwitch(r: *SceneRunner) !*Node {
     const a = r.allocator;
     const col = try widgets.layout.column(a, .{ .gap = 6, .padding = 12 });
+    col.retained = true; // static between flips — one raster, re-blit
     for (0..20) |row_i| {
         const row = try widgets.layout.row(a, .{ .gap = 6 });
         for (0..10) |i| {
@@ -2113,6 +2404,7 @@ fn buildThemeSwitch(r: *SceneRunner) !*Node {
             const label = std.fmt.bufPrint(&s.label, "Item {d}", .{row_i * 10 + i}) catch "Item";
             s.label_len = @intCast(@min(label.len, 23));
             node.state = s;
+            try r.theme_nodes.append(node);
             row.add(node);
         }
         col.add(row);
@@ -2158,6 +2450,7 @@ fn buildBackdropScroll(r: *SceneRunner) !*Node {
     const s = try a.create(FrostState);
     s.* = .{};
     band.state = s;
+    band.retained = true; // static band over scrolling content — re-blit it
     top.add(band);
     stack.add(top);
     return stack;
@@ -2441,4 +2734,168 @@ test "bench: jank counters track the 16.67 ms budget" {
     try std.testing.expect(m.jank_frames <= m.frames_rendered);
     try std.testing.expect(m.jank_pct <= 100);
     try std.testing.expect(m.frame_time_p999_ms >= m.frame_time_p99_ms);
+}
+
+/// Android tier-2 entry (gallery_main's SDL_main calls this when the
+/// debug.klaxon.bench system property is set): the full catalogue on the
+/// activity's real GLES surface — eglSwapBuffers pacing included — with
+/// the report written to the app's files dir (read it back via
+/// `adb shell run-as <pkg> cat files/bench.json`).
+pub fn runAndroidSuite() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const scene_names = @typeInfo(BenchScene).@"enum".field_names;
+    var scenes: [scene_names.len]BenchScene = undefined;
+    inline for (scene_names, 0..) |n, i| scenes[i] = @field(BenchScene, n);
+    var metrics: [scene_names.len]Metrics = undefined;
+    const opts: RunOptions = .{ .windowed = true, .backend = kx.c.KX_BACKEND_GANESH_GLES };
+    for (&scenes, 0..) |*scene, i| {
+        std.debug.print("klaxon bench: {s} ({d}/{d})...\n", .{ scene.name(), i + 1, scenes.len });
+        metrics[i] = runSceneWithOpts(scene.*, allocator, opts) catch |err| {
+            sdl.c.SDL_Log("klaxon bench: scene %s failed: %s", @tagName(scene.*).ptr, @errorName(err).ptr);
+            return err;
+        };
+    }
+    const json = try formatReport(allocator, &scenes, &metrics, 0, resolved_backend orelse "ganesh-gles");
+    const pref = sdl.c.SDL_GetPrefPath("klaxon", "bench") orelse return error.NoPrefPath;
+    defer sdl.c.SDL_free(pref);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}bench.json", .{std.mem.span(pref)}, 0);
+    const f = std.c.fopen(path, "wb") orelse return error.CannotWriteReport;
+    defer _ = std.c.fclose(f);
+    _ = std.c.fwrite(json.ptr, 1, json.len, f);
+    sdl.c.SDL_Log("klaxon bench: report written to %s", path.ptr);
+}
+
+// --- JSON report (schema v2, docs/specs/bench-scenes.md) — shared by the
+// native bench_main runner and the Android bench entry. ---
+
+/// { "scenes": [ {"name", "fps", "frame_time_*", "jank_*",
+/// "draw_calls_per_frame", "rss_mb", "ttff_ms", "frames_rendered",
+/// "extra": {…}} ], "binary_size_bytes": N, "backend": name, "timestamp": ISO8601 }
+pub fn formatReport(allocator: std.mem.Allocator, scenes: []const BenchScene, metrics: []const Metrics, binary_size_bytes: u64, backend: [*:0]const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\n  \"scenes\": [\n");
+    for (scenes, metrics, 0..) |scene, m, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+            \\    {{
+            \\      "name": "{s}",
+            \\      "fps": {d:.1},
+            \\      "frame_time_avg_ms": {d:.2},
+            \\      "frame_time_p50_ms": {d:.2},
+            \\      "frame_time_p99_ms": {d:.2},
+            \\      "frame_time_p999_ms": {d:.2},
+            \\      "jank_frames": {d},
+            \\      "jank_pct": {d:.1},
+            \\      "draw_calls_per_frame": {d},
+            \\      "rss_mb": {d:.1},
+            \\      "ttff_ms": {d:.1},
+            \\      "frames_rendered": {d},
+            \\      "extra": {s}
+            \\    }}
+        , .{
+            scene.name(),
+            m.fps,
+            m.frame_time_avg_ms,
+            m.frame_time_p50_ms,
+            m.frame_time_p99_ms,
+            m.frame_time_p999_ms,
+            m.jank_frames,
+            m.jank_pct,
+            m.draw_calls_per_frame,
+            m.rss_mb,
+            m.ttff_ms,
+            m.frames_rendered,
+            try formatExtra(allocator, m.extra),
+        }));
+    }
+    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator,
+        \\
+        \\  ],
+        \\  "binary_size_bytes": {d},
+        \\  "backend": "{s}",
+        \\  "timestamp": "{s}"
+        \\}}
+        \\
+    , .{
+        binary_size_bytes,
+        std.mem.span(backend),
+        try timestampIso8601(allocator),
+    }));
+    return buf.items;
+}
+
+/// The scene-extra object (schema v2): every contract field is emitted;
+/// fields the scene didn't produce serialize as null.
+fn formatExtra(allocator: std.mem.Allocator, e: Extra) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"op_ms\": ");
+    try appendOptF(&buf, allocator, e.op_ms);
+    try buf.appendSlice(allocator, ", \"ramp\": ");
+    if (e.ramp_len == 0) {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        try buf.appendSlice(allocator, "[");
+        for (e.ramp[0..e.ramp_len], 0..) |p, i| {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{{\"n\": {d}, \"p50_ms\": {d:.2}}}", .{ p.n, p.p50_ms }));
+        }
+        try buf.appendSlice(allocator, "]");
+    }
+    try buf.appendSlice(allocator, ", \"n_max_60fps\": ");
+    try appendOptU(&buf, allocator, e.n_max_60fps);
+    try buf.appendSlice(allocator, ", \"latency_ms\": ");
+    try appendOptF(&buf, allocator, e.latency_ms);
+    try buf.appendSlice(allocator, ", \"latency_frames\": ");
+    try appendOptU(&buf, allocator, e.latency_frames);
+    try buf.appendSlice(allocator, ", \"nodes_per_frame\": ");
+    try appendOptU(&buf, allocator, e.nodes_per_frame);
+    try buf.appendSlice(allocator, ", \"teardown_ms\": ");
+    try appendOptF(&buf, allocator, e.teardown_ms);
+    try buf.appendSlice(allocator, ", \"resume_ms\": ");
+    try appendOptF(&buf, allocator, e.resume_ms);
+    try buf.appendSlice(allocator, "}");
+    return buf.items;
+}
+
+fn appendOptF(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?f64) !void {
+    if (v) |x| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d:.3}", .{x}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendOptU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?u64) !void {
+    if (v) |x| {
+        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{x}));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+/// Current UTC time, ISO 8601 ("2026-10-11T14:03:22Z").
+fn timestampIso8601(allocator: std.mem.Allocator) ![]const u8 {
+    const secs: u64 = if (builtin.os.tag == .windows)
+        @intCast(@divFloor(@as(i64, @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise())), 10_000_000) - 11644473600)
+    else blk: {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        break :blk @intCast(ts.sec);
+    };
+    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_sec = epoch.getDaySeconds();
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_sec.getHoursIntoDay(),
+        day_sec.getMinutesIntoHour(),
+        day_sec.getSecondsIntoMinute(),
+    });
 }

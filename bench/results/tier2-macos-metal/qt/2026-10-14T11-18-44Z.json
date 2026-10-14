@@ -1,0 +1,23 @@
+{
+  "scenes": [
+    {
+      "name": "hello",
+      "fps": 127.8,
+      "frame_time_avg_ms": 7.8,
+      "frame_time_p50_ms": 8.2,
+      "frame_time_p99_ms": 13.9,
+      "frame_time_p999_ms": 14.6,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "draw_calls_per_frame": 2,
+      "rss_mb": 124.2,
+      "ttff_ms": 59.8,
+      "frames_rendered": 130,
+      "extra": null
+    }
+  ],
+  "schema_version": 2,
+  "binary_size_bytes": 178464,
+  "backend": "rhi-metal",
+  "timestamp": "2026-10-14T11:18:44Z"
+}

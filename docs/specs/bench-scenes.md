@@ -106,9 +106,42 @@ Canvas; Klaxon = image widget/atlas path.
 `BenchScene` enum names are the contract — `kebab_case` in JSON/CLI,
 `snake_case` in code. Unknown scene name = runner exits non-zero (fail loud).
 
+## Tier-2 native (windowed GPU)
+
+The same 33 scenes + schema run on a real window/GPU backend:
+
+- `KX_BENCH_WINDOWED=1 zig build bench` — macOS SDL window on Graphite
+  Metal (CAMetalLayer); `KX_BENCH_BACKEND=<name>` forces the backend.
+- Android: `adb shell setprop debug.klaxon.bench 1` then launch the
+  gallery APK — the suite runs on the activity's real GLES surface
+  (1080x2274 on the emulator) and writes `files/bench.json`.
+- The report's top-level `backend` field records the resolved backend
+  (`raster`, `graphite-metal`, `ganesh-gles`, ...).
+- Timing contract is unchanged — fps = 1000/avg(frame work): the
+  vsync/presentation wait (`nextDrawable` on Metal, `eglSwapBuffers` on
+  GLES) is measured by the renderer (`last_frame_wait_ns`) and subtracted
+  from each frame's work, matching the other runners' FrameTiming-style
+  work spans.
+- `bench/runners/qt/run.sh --windowed` — a real Cocoa window on the Qt
+  Quick RHI Metal backend with the threaded render loop. Frames are
+  driven by `update()` + `frameSwapped`; frame work = the GUI span
+  (tick → before/afterSynchronizing) + the render span
+  (beforeRenderPassRecording → afterRendering), so the swapchain acquire
+  (vsync) and the render-loop pickup latency stay out — the same spans
+  Klaxon subtracts. For op frames the runner lets the op's own dirty
+  items schedule the frame and latches the first post-t0 swap.
+- `bench/runners/compose/run.sh --windowed` — a real `JFrame` +
+  `SkiaLayer` on `GraphicsApi.METAL` (`isVsyncEnabled = false`), rendered
+  synchronously via `SkiaLayer.paint()`. Skiko's paint wraps the scene
+  render in paced machinery (drawable acquire + flush + present follows
+  the WindowServer commit cadence, ~8.3 ms on a 120 Hz panel); the
+  delegate times `onRender` (clear + `ComposeScene.render`) and the
+  harness subtracts the machinery, leaving the same CPU-side work span
+  the other runners report.
+- The report's top-level `backend` field is `rhi-metal` (Qt) and
+  `skiko-metal` (Compose) in windowed mode.
+
 ## Out of scope (documented, not implemented)
 
-- GPU-vs-raster per scene (all runners render raster for determinism —
-  GPU comparison is a separate device-lab effort).
 - Multi-window, video decode (video_playback already approximates),
   real network images.

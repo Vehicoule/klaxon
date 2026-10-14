@@ -91,7 +91,7 @@ def load_reports():
 
     # Flat files = Klaxon's own runner (legacy macOS layout).
     for path in glob.glob(os.path.join(RESULTS, "*.json")):
-        ingest("macos", "klaxon", path)
+        ingest("macos-legacy", "klaxon", path)
     for first in sorted(glob.glob(os.path.join(RESULTS, "*"))):
         if not os.path.isdir(first) or os.path.basename(first).startswith("_"):
             continue
@@ -99,13 +99,14 @@ def load_reports():
         if glob.glob(os.path.join(first, "*.json")):
             # Legacy framework dir → macOS config.
             for path in glob.glob(os.path.join(first, "*.json")):
-                ingest("macos", name, path)
+                ingest("macos-legacy", name, path)
         else:
-            # Config dir → framework subdirs.
+            # Config dir → framework subdirs (_env holds machine envelopes,
+            # not a framework).
             for fw_dir in sorted(glob.glob(os.path.join(first, "*"))):
-                if not os.path.isdir(fw_dir):
-                    continue
                 fw = os.path.basename(fw_dir)
+                if not os.path.isdir(fw_dir) or fw.startswith("_"):
+                    continue
                 for path in glob.glob(os.path.join(fw_dir, "*.json")):
                     ingest(name, fw, path)
     out = {}
@@ -152,6 +153,37 @@ def fmt(v, spec):
         return "-"
 
 
+def primary_value(sc):
+    """The metric the scene exists to measure, normalized to higher-better
+    for the bar scale: op_ms → 1/ms, latency_ms → 1/ms, n_max → n, else fps."""
+    if not sc:
+        return 0.0
+    extra = sc.get("extra") or {}
+    for key in ("op_ms", "latency_ms"):
+        v = extra.get(key)
+        if v:
+            return 1.0 / float(v)
+    v = extra.get("n_max_60fps")
+    if v:
+        return float(v)
+    return float(sc.get("fps") or 0.0)
+
+
+def primary_cell(sc):
+    """Summary-table cell: the scene's own metric — ms/op for list ops, item
+    count for ramps, latency for input_latency — fps only where it's primary."""
+    if not sc:
+        return "-"
+    extra = sc.get("extra") or {}
+    if extra.get("op_ms") is not None:
+        return f"{extra['op_ms']:.3f}ms"
+    if extra.get("n_max_60fps") is not None:
+        return f"n={extra['n_max_60fps']}"
+    if extra.get("latency_ms") is not None:
+        return f"{extra['latency_ms']:.3f}ms"
+    return fmt(sc.get("fps"), "{:.1f}")
+
+
 def console_table(reports, scenes):
     fw_names = sorted(reports)
     lines = []
@@ -162,7 +194,7 @@ def console_table(reports, scenes):
         row = s.ljust(15)
         for fw in fw_names:
             sc = reports[fw]["scenes"].get(s)
-            row += (fmt(sc["fps"], "{:.1f}") if sc else "-").rjust(12)
+            row += primary_cell(sc).rjust(12)
         lines.append(row)
     lines.append("")
     lines.append("binary size".ljust(15) + "".join(
@@ -213,15 +245,14 @@ def config_section(reports, scenes, fw_names):
     parts.append("</tr>")
     for s in scenes:
         parts.append(f"<tr><td>{esc(s)}</td>")
-        fps_vals = []
-        for fw in fw_names:
-            sc = reports[fw]["scenes"].get(s)
-            fps_vals.append(float(sc["fps"]) if sc and sc.get("fps") else 0.0)
-        best = max(fps_vals) if fps_vals else 0.0
-        for fw, fps in zip(fw_names, fps_vals):
-            if fps > 0:
-                w = max(2, int(100 * fps / best)) if best else 2
-                cell = f"{fps:.1f} <span class='bar' style='width:{w}px'></span>"
+        # The bar scale uses the PRIMARY metric (normalized higher-better):
+        # fps for paint scenes, n for ramps, 1/ms for ops and latency.
+        vals = [primary_value(reports[fw]["scenes"].get(s)) for fw in fw_names]
+        best = max(vals) if vals else 0.0
+        for fw, v in zip(fw_names, vals):
+            if v > 0:
+                w = max(2, int(100 * v / best)) if best else 2
+                cell = f"{primary_cell(reports[fw]['scenes'].get(s))} <span class='bar' style='width:{w}px'></span>"
             else:
                 cell = "-"
             parts.append(f"<td>{cell}</td>")

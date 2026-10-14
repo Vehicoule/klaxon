@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "chart_live",
+      "frame_time_avg_ms": 0.3,
+      "frame_time_p50_ms": 0.3,
+      "frame_time_p99_ms": 0.5,
+      "frame_time_p999_ms": 0.6,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 3245.9,
+      "draw_calls_per_frame": 1,
+      "rss_mb": 112.9,
+      "ttff_ms": 2.8,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 132816,
+  "timestamp": "2026-10-14T01:09:51Z"
+}

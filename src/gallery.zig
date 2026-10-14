@@ -1741,6 +1741,7 @@ fn buildScrollSection(g: *Gallery, theme: Theme) !*Node {
 /// A section: dim bold title + a bordered surface card around the body.
 fn section(a: std.mem.Allocator, theme: Theme, title: []const u8, body: *Node) !*Node {
     const col = try layout.column(a, .{ .gap = 8 });
+    col.retained = true; // stable section — the retained-item raster idiom
     col.add(try text_w.text(a, title, .{ .size = 15, .bold = true, .color = theme.colors.on_surface_variant }));
     const card = try container_w.container(a, .{
         .color = theme.colors.surface_container,

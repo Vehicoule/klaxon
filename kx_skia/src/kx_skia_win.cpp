@@ -485,4 +485,14 @@ bool gpu_end_offscreen(GpuState* state) {
     return false;
 }
 
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
+    (void)state; (void)width; (void)height;
+    return nullptr; // no Windows GPU backend yet — raster offscreen fallback
+}
+
+sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
+    (void)state;
+    return img;
+}
+
 } // namespace kx

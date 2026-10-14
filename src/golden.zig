@@ -8,6 +8,7 @@
 // font-dependent and differ per platform). Never assert glyph bitmaps.
 const std = @import("std");
 const kx = @import("kx.zig");
+const sdl = @import("sdl.zig");
 const ui = @import("ui.zig");
 
 const Node = ui.node.Node;
@@ -119,14 +120,41 @@ pub const Renderer = struct {
     w: i32,
     h: i32,
     allocator: std.mem.Allocator,
+    /// True while the ctx was created by `init`/`initWithCtx` — deinit
+    /// destroys it. The windowed bench shares one SDL window across scenes
+    /// but each scene still owns its ctx, so this stays true there too.
+    owns_ctx: bool = true,
+    /// The raster surface keeps its pixels between frames (damage-clip
+    /// repaints are valid). GPU backends acquire a fresh drawable per frame
+    /// — the previous pixels are gone, so damage repaints would drop
+    /// content: those renderers always full-repaint (the host makes the
+    /// same backend check per frame).
+    retained_surface: bool = true,
+    /// Set by paint/paintDamage: ns spent inside kx_begin_frame + kx_end_frame.
+    /// On a vsync-paced GPU backend these are the presentation backpressure:
+    /// Metal blocks in nextDrawable (begin), GLES blocks in eglSwapBuffers
+    /// (end). Bench callers subtract it from frame work; raster → ~0.
+    last_frame_wait_ns: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, w: i32, h: i32) !Renderer {
         const ctx = kx.create(null, w, h, kx.c.KX_BACKEND_RASTER) orelse return error.KxCreateFailed;
         return .{ .ctx = ctx, .w = w, .h = h, .allocator = allocator };
     }
 
+    /// Wrap an existing ctx (the caller's backend choice — a windowed GPU
+    /// ctx for the tier-2 bench). The Renderer still owns the ctx.
+    pub fn initWithCtx(allocator: std.mem.Allocator, ctx: *kx.Ctx, w: i32, h: i32) Renderer {
+        return .{
+            .ctx = ctx,
+            .w = w,
+            .h = h,
+            .allocator = allocator,
+            .retained_surface = kx.c.kx_backend_of(ctx) == kx.c.KX_BACKEND_RASTER,
+        };
+    }
+
     pub fn deinit(r: *Renderer) void {
-        kx.c.kx_destroy(r.ctx);
+        if (r.owns_ctx) kx.c.kx_destroy(r.ctx);
     }
 
     /// Resize the surface (and the tracked size — paint culls against it).
@@ -136,21 +164,75 @@ pub const Renderer = struct {
         r.h = h;
     }
 
+    /// Frame begin/end split out so paced (vsync) drivers can measure the
+    /// presentation wait separately — see last_frame_wait_ns.
+    pub fn beginFrame(r: *Renderer) void {
+        const t0 = sdl.c.SDL_GetTicksNS();
+        kx.c.kx_begin_frame(r.ctx);
+        r.last_frame_wait_ns = sdl.c.SDL_GetTicksNS() - t0;
+    }
+
+    pub fn endFrame(r: *Renderer) void {
+        const t0 = sdl.c.SDL_GetTicksNS();
+        kx.c.kx_end_frame(r.ctx);
+        r.last_frame_wait_ns += sdl.c.SDL_GetTicksNS() - t0;
+    }
+
     /// Paint one frame of `root` on a cleared `bg`.
     pub fn paint(r: *Renderer, root: *Node, bg: Color) void {
-        kx.c.kx_begin_frame(r.ctx);
+        r.beginFrame();
         kx.c.kx_clear(r.ctx, bg);
         // Full repaint: the visible region is the whole surface.
         const surface = Rect{ .x = 0, .y = 0, .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
         root.paint(r.ctx, surface);
         paintOverlayPass(root, r.ctx); // the popup overlay, above the tree (like the host)
-        kx.c.kx_end_frame(r.ctx);
+        r.endFrame();
+    }
+
+    /// Paint one frame exactly like the host's raster path: when the root
+    /// accumulated damage, the tree repaints clipped to the damaged region
+    /// (the surface is retained between frames — undamaged pixels stay);
+    /// otherwise a full repaint. The damage accumulator clears BEFORE the
+    /// paint so marks raised mid-paint seed the next frame's region.
+    pub fn paintDamage(r: *Renderer, root: *Node, bg: Color) void {
+        r.beginFrame();
+        r.paintDamageInner(root, bg);
+        r.endFrame();
+    }
+
+    /// paintDamage minus the frame begin/end — callers that pace or
+    /// instrument begin/end themselves (the windowed bench measures the
+    /// vsync wait inside begin) drive the pieces directly.
+    pub fn paintDamageInner(r: *Renderer, root: *Node, bg: Color) void {
+        const surface = Rect{ .x = 0, .y = 0, .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
+        // An opaque full-coverage retained-root blit rewrites every pixel —
+        // the pre-paint clear would be dead work (Qt's backingstore skips it
+        // the same way for fully-opaque dirty regions).
+        const skip_clear = root.retainedBlitCoversSurface(r.ctx, surface);
+        if (r.retained_surface and root.damage_valid) {
+            const d = ui.node.rectIntersect(root.damage, surface);
+            root.clearDamage();
+            if (d.w > 0 and d.h > 0) {
+                kx.c.kx_clip_rect(r.ctx, d.x, d.y, d.w, d.h);
+                if (!skip_clear) kx.c.kx_clear(r.ctx, bg); // SkCanvas::clear is clip-aware
+                root.paint(r.ctx, d);
+                paintOverlayPass(root, r.ctx);
+                kx.c.kx_clip_reset(r.ctx);
+            } // else: damage entirely off-surface — nothing to repaint
+        } else {
+            root.clearDamage(); // GPU drawable: stale damage must not leak forward
+            if (!skip_clear) kx.c.kx_clear(r.ctx, bg);
+            root.paint(r.ctx, surface);
+            paintOverlayPass(root, r.ctx);
+        }
     }
 
     /// The popup overlay pass: every node with a paint_overlay hook paints
     /// after the whole tree (the host paints the open popup's hook; goldens
-    /// have no router, so the hook is found by walking the tree).
+    /// have no router, so the hook is found by walking the tree — pruned by
+    /// the overlay_subtree flag, O(1) on trees without popups).
     fn paintOverlayPass(n: *Node, ctx: *kx.Ctx) void {
+        if (!n.overlay_subtree) return;
         if (n.vtable.paint_overlay) |po| po(n, ctx);
         for (n.children.items) |child| paintOverlayPass(child, ctx);
     }

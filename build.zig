@@ -159,7 +159,8 @@ pub fn build(b: *std.Build) void {
     bench_options.addOption([]const u8, "bench_exe_path", "zig-out/bin/bench");
 
     const kx_skia_bench = addKxSkia(b, target, .ReleaseSmall, "kx_skia_bench", is_macos);
-    const bench_exe = addApp(b, target, .ReleaseSmall, "bench", "src/bench_main.zig", translate_sdl, translate_kx, kx_skia_bench, is_macos, tag);
+    const bench_opt = b.option(std.builtin.OptimizeMode, "bench-optimize", "bench executable optimize mode (default ReleaseSmall)") orelse .small;
+    const bench_exe = addApp(b, target, bench_opt, "bench", "src/bench_main.zig", translate_sdl, translate_kx, kx_skia_bench, is_macos, tag);
     bench_exe.root_module.addOptions("build_options", bench_options);
     b.installArtifact(bench_exe);
 

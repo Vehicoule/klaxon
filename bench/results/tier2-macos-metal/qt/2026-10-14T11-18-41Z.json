@@ -1,0 +1,23 @@
+{
+  "scenes": [
+    {
+      "name": "chart_live",
+      "fps": 79.2,
+      "frame_time_avg_ms": 12.6,
+      "frame_time_p50_ms": 12.4,
+      "frame_time_p99_ms": 20.4,
+      "frame_time_p999_ms": 29.0,
+      "jank_frames": 14,
+      "jank_pct": 11.7,
+      "draw_calls_per_frame": 2,
+      "rss_mb": 131.5,
+      "ttff_ms": 58.8,
+      "frames_rendered": 130,
+      "extra": null
+    }
+  ],
+  "schema_version": 2,
+  "binary_size_bytes": 178464,
+  "backend": "rhi-metal",
+  "timestamp": "2026-10-14T11:18:41Z"
+}

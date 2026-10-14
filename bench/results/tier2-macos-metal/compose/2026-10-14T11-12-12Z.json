@@ -1,0 +1,22 @@
+{
+  "scenes": [
+    {
+      "name": "hello",
+      "frame_time_avg_ms": 8.3,
+      "frame_time_p50_ms": 8.3,
+      "frame_time_p99_ms": 10.8,
+      "frame_time_p999_ms": 20.2,
+      "jank_frames": 1,
+      "jank_pct": 0.8,
+      "fps": 120.4,
+      "draw_calls_per_frame": 3,
+      "rss_mb": 197.7,
+      "ttff_ms": 517.2,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 40847535,
+  "backend": "skiko-metal",
+  "timestamp": "2026-10-14T11:12:12Z"
+}

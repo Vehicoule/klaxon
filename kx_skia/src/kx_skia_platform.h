@@ -6,7 +6,9 @@
 #include "kx_skia.h"
 #include "include/core/SkCanvas.h"
 #include "include/core/SkFontMgr.h"
+#include "include/core/SkImage.h"
 #include "include/core/SkRefCnt.h"
+#include "include/core/SkSurface.h"
 
 namespace kx {
 
@@ -32,6 +34,19 @@ SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height);
 // Submit the offscreen work (synchronously — the compile cost must land in
 // the warmup call, not the next real frame) and release the surface.
 bool gpu_end_offscreen(GpuState* state);
+
+// kx_offscreen_begin on a GPU ctx: a backend render-target surface so the
+// snapshot image is GPU-backed (Graphite drops non-Graphite draws; Ganesh
+// textures blit faster than re-uploaded rasters). Uses the LIVE frame
+// recorder/context — nullptr outside a frame or on raster → the caller
+// falls back to a raster offscreen surface.
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height);
+
+// Upload a client-pixel image to the GPU (Graphite: TextureFromImage on the
+// live frame recorder; Ganesh: a texture image). Returns img unchanged when
+// the backend has no upload path, no recorder is live, or the image is
+// already GPU-backed — so it is safe to call lazily at first draw.
+sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img);
 
 // Platform font manager (macOS: CoreText, Linux: custom directory, ...).
 sk_sp<SkFontMgr> platform_font_mgr();

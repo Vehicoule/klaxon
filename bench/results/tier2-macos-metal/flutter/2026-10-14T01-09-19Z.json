@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "video_playback",
+      "frame_time_avg_ms": 0.5,
+      "frame_time_p50_ms": 0.5,
+      "frame_time_p99_ms": 0.7,
+      "frame_time_p999_ms": 0.7,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 2179.4,
+      "draw_calls_per_frame": 6,
+      "rss_mb": 139.6,
+      "ttff_ms": 9.1,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 132816,
+  "timestamp": "2026-10-14T01:09:19Z"
+}

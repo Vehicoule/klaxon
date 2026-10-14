@@ -174,11 +174,34 @@ pub const Node = struct {
     /// node still hit-tests normally (the router's popup barrier hit-tests
     /// popup children outside the ancestor-bounds gate).
     defer_paint: bool = false,
+    /// Subtree contains a node with a paint_overlay hook (popup content that
+    /// paints above the whole tree). Maintained by create/add so the overlay
+    /// pass prunes subtrees that can't contain one — a tree without popups
+    /// costs O(1) instead of a full walk every frame.
+    overlay_subtree: bool = false,
     // Dirty-rect (Phase 1e): the root accumulates the damaged region — the
     // union of every dirty mark's rect — and the host repaints the tree
     // clipped to it (the surface is retained between frames).
     damage: Rect = .{},
     damage_valid: bool = false,
+    // Retained-subtree cache (Phase 4e.2): opt-in per node. When set, the
+    // subtree's paint is rasterized once into a ctx image and re-blit while
+    // the subtree stays clean — the per-item texture idiom every retained
+    // framework applies (QSG item textures, Compose layers). Any dirty mark
+    // in the subtree or a paintRect size change re-rasterizes on next paint.
+    // Paint outside paintRect is already a damage-contract violation, so the
+    // image covers paintRect exactly.
+    retained: bool = false,
+    retained_image: u64 = 0,
+    retained_ctx: ?*kx.Ctx = null,
+    retained_w: i32 = 0,
+    retained_h: i32 = 0,
+    /// Optional solid backdrop composited INTO the retained raster before the
+    /// subtree paints: the cached image becomes fully opaque, so its blit can
+    /// use Src (no destination read) and a full-coverage root blit lets the
+    /// frame loop skip its clear. Correct only where the backdrop behind the
+    /// node is constant (roots, nodes over a solid frame background).
+    retained_bg: ?u32 = null,
     /// Paint that extends BEYOND the bounds (a floating label's upper half,
     /// a cutout stroke margin): markDirty damages the bounds EXPANDED by
     /// these insets (negative values would shrink — never set them). Widgets
@@ -201,6 +224,7 @@ pub const Node = struct {
             .allocator = allocator,
             .children = std.array_list.Managed(*Node).init(allocator),
             .vtable = vtable,
+            .overlay_subtree = vtable.paint_overlay != null,
         };
         return node;
     }
@@ -212,6 +236,7 @@ pub const Node = struct {
         if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
         node.children.append(child) catch @panic("klaxon: out of memory");
+        if (child.overlay_subtree) node.markOverlayUp();
         node.markLayoutDirty();
         node.markDirty();
     }
@@ -224,6 +249,7 @@ pub const Node = struct {
         child.parent = node;
         const i = @min(index, node.children.items.len);
         node.children.insert(i, child) catch @panic("klaxon: out of memory");
+        if (child.overlay_subtree) node.markOverlayUp();
         node.markLayoutDirty();
         node.markDirty();
     }
@@ -249,6 +275,18 @@ pub const Node = struct {
         var n = node;
         while (true) {
             n.dirty = true;
+            const p = n.parent orelse return;
+            n = p;
+        }
+    }
+
+    /// Propagate an overlay-capable subtree up the parent chain (stops at the
+    /// first ancestor already flagged — everything above it is too).
+    fn markOverlayUp(node: *Node) void {
+        var n = node;
+        while (true) {
+            if (n.overlay_subtree) return;
+            n.overlay_subtree = true;
             const p = n.parent orelse return;
             n = p;
         }
@@ -358,7 +396,15 @@ pub const Node = struct {
         // Clear BEFORE painting: a markDirty raised while this subtree paints
         // (paint hook → signal write → subscriber) must survive to schedule
         // the next frame — a tail clear would wipe it.
+        const subtree_dirty = node.dirty;
         node.dirty = false;
+        if (node.retained and node.paintRetained(ctx, subtree_dirty)) return;
+        node.paintContent(ctx, own_hit, child_region, children_hit);
+    }
+
+    /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
+    /// shared by the direct path and the retained rasterization.
+    fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
         if (own_hit) node.vtable.paint(node, ctx);
         if (children_hit) {
             if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
@@ -368,6 +414,79 @@ pub const Node = struct {
             }
             if (node.vtable.post_children_paint) |post| post(node, ctx);
         }
+    }
+
+    /// Retained-subtree paint: re-blit the cached raster while the subtree
+    /// stays clean; re-rasterize through an offscreen pass when dirty or
+    /// resized. Returns false when the node must paint directly instead
+    /// (zero-size image, or the offscreen pass is unavailable — e.g. nested
+    /// inside another retained rasterization).
+    fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool) bool {
+        const pr = node.paintRect(); // parent space — the damage-contract rect
+        const iw: i32 = @intFromFloat(@ceil(@max(0, pr.w)));
+        const ih: i32 = @intFromFloat(@ceil(@max(0, pr.h)));
+        if (iw <= 0 or ih <= 0) return true; // nothing reachable — painted
+        if (node.retained_ctx != ctx and node.retained_image != 0) {
+            node.clearRetained(); // image belongs to another ctx — drop it
+        }
+        if (!subtree_dirty and node.retained_image != 0 and
+            node.retained_w == iw and node.retained_h == ih)
+        {
+            kx.c.kx_draw_image(ctx, node.retained_image, pr.x, pr.y,
+                @floatFromInt(iw), @floatFromInt(ih));
+            return true;
+        }
+        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: dirty={} img={} {d}x{d} vs {d}x{d}\n", .{ subtree_dirty, node.retained_image, node.retained_w, node.retained_h, iw, ih });
+        // (Re)rasterize: drop the stale image first so a failed pass can't
+        // resurrect a stale blit on a later frame.
+        node.clearRetained();
+        if (!kx.c.kx_offscreen_begin(ctx, iw, ih)) {
+            return false; // nested offscreen pass — paint directly this frame
+        }
+        if (node.retained_bg) |bg| kx.c.kx_clear(ctx, bg);
+        kx.c.kx_translate(ctx, -pr.x, -pr.y);
+        // The cache must hold EVERYTHING the subtree draws: cull only
+        // against the mapped paintRect (the damage-contract bound).
+        const mapped = node.mapRectToRoot(pr);
+        node.paintContent(ctx, true, mapped, true);
+        node.retained_image = kx.c.kx_offscreen_end_image(ctx);
+        if (node.retained_image == 0) return false; // pass failed — direct paint
+        node.retained_ctx = ctx;
+        node.retained_w = iw;
+        node.retained_h = ih;
+        kx.c.kx_draw_image(ctx, node.retained_image, pr.x, pr.y,
+            @floatFromInt(iw), @floatFromInt(ih));
+        return true;
+    }
+
+    /// True when this node's next paint is guaranteed to end as a single
+    /// opaque blit covering `surface` — so a frame loop can skip its
+    /// pre-paint clear (an opaque SrcOver blit overwrites every destination
+    /// pixel anyway). Guaranteed either by retained_bg (the raster is built
+    /// over a solid backdrop — holds for re-rasterizing dirty frames too) or
+    /// by the cached image's scanned content opacity. Only call for
+    /// top-level roots (identity CTM, never inside an offscreen pass).
+    pub fn retainedBlitCoversSurface(node: *Node, ctx: *kx.Ctx, surface: Rect) bool {
+        if (!node.retained) return false;
+        const is_opaque = node.retained_bg != null or
+            (node.retained_image != 0 and !node.dirty and
+                kx.c.kx_image_is_opaque(ctx, node.retained_image) != 0);
+        if (!is_opaque) return false;
+        const pr = node.paintRect();
+        return pr.x <= surface.x and pr.y <= surface.y and
+            pr.x + pr.w >= surface.x + surface.w and
+            pr.y + pr.h >= surface.y + surface.h;
+    }
+
+    /// Drop the cached raster (the image lives in retained_ctx's registry).
+    fn clearRetained(node: *Node) void {
+        if (node.retained_image != 0) {
+            if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
+            node.retained_image = 0;
+        }
+        node.retained_ctx = null;
+        node.retained_w = 0;
+        node.retained_h = 0;
     }
 
     /// Deepest visible node containing the point (children are painted last,
@@ -510,6 +629,7 @@ pub const Node = struct {
         }
         node.children.deinit();
         if (node.semantics) |sem| node.allocator.destroy(sem);
+        node.clearRetained(); // the ctx image registry outlives this node
         if (node.vtable.deinit) |d| d(node);
     }
 };

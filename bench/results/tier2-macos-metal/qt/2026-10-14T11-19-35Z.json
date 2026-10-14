@@ -1,0 +1,23 @@
+{
+  "scenes": [
+    {
+      "name": "list_remove_row",
+      "fps": 22705.4,
+      "frame_time_avg_ms": 0.0,
+      "frame_time_p50_ms": 0.0,
+      "frame_time_p99_ms": 0.5,
+      "frame_time_p999_ms": 0.5,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "draw_calls_per_frame": 37,
+      "rss_mb": 125.6,
+      "ttff_ms": 60.9,
+      "frames_rendered": 71,
+      "extra": {"op_ms": 0.07}
+    }
+  ],
+  "schema_version": 2,
+  "binary_size_bytes": 178544,
+  "backend": "rhi-metal",
+  "timestamp": "2026-10-14T11:19:35Z"
+}

@@ -16,6 +16,15 @@
 # (QT_QPA_PLATFORM=offscreen + QT_QUICK_BACKEND=software — CPU raster, no
 # window, no vsync; the closest Qt analog of Klaxon's headless bench).
 #
+# Tier-2 windowed mode: `run.sh --windowed [scene]` runs on a REAL cocoa
+# window with the default RHI backend (Metal) and the threaded render loop.
+# Frames are driven by update()+frameSwapped; timed work = the GUI span
+# (tick -> afterSynchronizing) + the render span (beforeRenderPassRecording
+# -> afterRendering — record + submit + present call), so the vsync wait
+# inside the drawable acquire stays out of frame_ms, matching Klaxon's
+# last_frame_wait_ns subtraction and Flutter's FrameTiming work spans.
+# Report goes to bench/results/tier2-macos-metal/qt/ with "backend" tagged.
+#
 # The runner prints the JSON report to stdout and writes it to
 # bench/results/qt/<ISO8601-timestamp>.json (same schema as `klaxon bench`).
 # Per-scene render verification (pixel hashes, IME text, list state) goes to
@@ -26,16 +35,28 @@ set -euo pipefail
 cd "$(dirname "$0")"
 REPO_ROOT="$(cd ../../.. && pwd)"
 
+WINDOWED=0
+if [ "${1:-}" = "--windowed" ]; then
+  WINDOWED=1
+  shift
+fi
+
 export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-/opt/homebrew}"
 
 # Build chatter goes to stderr so the JSON report on stdout stays clean.
 cmake -B build -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" -DCMAKE_BUILD_TYPE=Release >&2
 cmake --build build -j >&2
 
-export QT_QPA_PLATFORM=offscreen
-export QT_QUICK_BACKEND=software
-export QSG_RENDER_LOOP=basic
-export KLAXON_BENCH_OUT_DIR="${REPO_ROOT}/bench/results/qt"
+if [ "$WINDOWED" = "1" ]; then
+  unset QT_QPA_PLATFORM QT_QUICK_BACKEND QSG_RENDER_LOOP
+  export KLAXON_BENCH_WINDOWED=1
+  export KLAXON_BENCH_OUT_DIR="${REPO_ROOT}/bench/results/tier2-macos-metal/qt"
+else
+  export QT_QPA_PLATFORM=offscreen
+  export QT_QUICK_BACKEND=software
+  export QSG_RENDER_LOOP=basic
+  export KLAXON_BENCH_OUT_DIR="${REPO_ROOT}/bench/results/qt"
+fi
 mkdir -p "${KLAXON_BENCH_OUT_DIR}"
 
 "${REPO_ROOT}/bench/runners/qt/build/klaxon_bench_qt" "$@"

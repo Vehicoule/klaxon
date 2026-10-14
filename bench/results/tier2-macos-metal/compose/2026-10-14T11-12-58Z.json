@@ -1,0 +1,22 @@
+{
+  "scenes": [
+    {
+      "name": "list_replace_1k",
+      "frame_time_avg_ms": 0.1,
+      "frame_time_p50_ms": 0.1,
+      "frame_time_p99_ms": 0.9,
+      "frame_time_p999_ms": 0.9,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 10276.2,
+      "draw_calls_per_frame": 32,
+      "rss_mb": 282.5,
+      "ttff_ms": 397.6,
+      "frames_rendered": 71,
+      "extra": { "op_ms": 30.9 }
+    }
+  ],
+  "binary_size_bytes": 40847777,
+  "backend": "skiko-metal",
+  "timestamp": "2026-10-14T11:12:58Z"
+}

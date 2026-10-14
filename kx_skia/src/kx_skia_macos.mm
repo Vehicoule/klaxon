@@ -13,6 +13,7 @@
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/GraphiteTypes.h"
+#include "include/gpu/graphite/Image.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Recording.h"
 #include "include/gpu/graphite/Surface.h"
@@ -162,6 +163,20 @@ bool gpu_end_offscreen(GpuState* state) {
     state->context->submit(skgpu::graphite::SyncToCpu::kYes);
     state->warmup_surface = nullptr;
     return true;
+}
+
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
+    if (!state || !state->context || !state->recorder) return nullptr;
+    return SkSurfaces::RenderTarget(
+        state->recorder.get(),
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+}
+
+sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
+    if (!state || !state->recorder || !img || img->isTextureBacked()) return img;
+    if (sk_sp<SkImage> up = SkImages::TextureFromImage(state->recorder.get(), img.get(), {}))
+        return up;
+    return img;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

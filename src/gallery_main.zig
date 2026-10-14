@@ -8,6 +8,7 @@ const ui = @import("ui.zig");
 const input_mod = @import("ui/input.zig");
 const host_mod = @import("host.zig");
 const gallery_mod = @import("gallery.zig");
+const bench = @import("bench.zig");
 const sdl = @import("sdl.zig");
 
 // Phase 3d Android: the app is built as a static lib (build.zig android-lib)
@@ -22,11 +23,26 @@ comptime {
 /// Android entry point (called by SDLActivity through libSDL3.so). No argv
 /// parsing on device — Ganesh GLES is the floor backend (raster unavailable
 /// on Android). Runs indefinitely (mobile apps don't exit after N frames).
+///
+/// Bench mode: `adb shell setprop debug.klaxon.bench 1` turns the launch
+/// into the tier-2 suite run — the full scene catalogue on the activity's
+/// real GLES surface, JSON report written into the app's files dir.
 fn SDL_main(argc: c_int, argv: [*:null]?[*:0]u8) callconv(.c) c_int {
     _ = argc;
     _ = argv;
+    if (androidProp("debug.klaxon.bench")) {
+        bench.runAndroidSuite() catch return 1;
+        return 0;
+    }
     galleryMain(.{ .backend = kx.c.KX_BACKEND_GANESH_GLES, .max_frames = 0 }) catch return 1;
     return 0;
+}
+
+extern "c" fn __system_property_get(name: [*:0]const u8, value: [*:0]u8) c_int;
+
+fn androidProp(name: [*:0]const u8) bool {
+    var buf: [92]u8 = @splat(0);
+    return __system_property_get(name, @ptrCast(&buf)) > 0 and buf[0] == '1';
 }
 
 const width: c_int = gallery_mod.WINDOW_W;

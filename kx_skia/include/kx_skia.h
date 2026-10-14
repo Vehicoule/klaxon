@@ -38,6 +38,16 @@
 //           frames do not pay one-time program compilation — retail frame
 //           p99 was dominated by first-frames shader-compile jank). Purely
 //           additive: no existing entry point changed.
+//   0.12.0 — Phase 4e.2: + kx_rotate (the last rigid transform the canvas
+//           lacked), + kx_clip_path (arbitrary polygon clip — star masks,
+//           avatar cutouts; no path type crosses the boundary), +
+//           kx_offscreen_begin/kx_offscreen_end_image (render-to-image: a
+//           vector asset rasterized once, then drawn like any registered
+//           image — the retained-cache idiom). Purely additive.
+//   0.13.0 — + kx_image_is_opaque (skip the destination clear under a
+//           full-coverage opaque blit), + kx_draw_pixels (zero-copy borrowed
+//           pixel draw — the video texture-upload idiom), + aa flag on
+//           kx_clip_path. Purely additive except the kx_clip_path signature.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -107,15 +117,27 @@ void kx_save(kx_ctx* ctx);
 void kx_restore(kx_ctx* ctx);
 void kx_translate(kx_ctx* ctx, float dx, float dy);
 void kx_scale(kx_ctx* ctx, float sx, float sy);
+// Rotate the canvas clockwise by `degrees` around the current origin
+// (added in 0.12.0). Pair with kx_translate to rotate about a point.
+void kx_rotate(kx_ctx* ctx, float degrees);
 // Clip the current frame to a rect (intersect with the existing clip).
 // kx_clip_rect saves the canvas state; kx_clip_reset restores it. The surface
 // is retained between frames: repainting the tree clipped to the damaged
 // region is the dirty-rect path (Phase 1e).
 void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h);
 void kx_clip_reset(kx_ctx* ctx);
+// Clip the current frame to the CLOSED polygon through (xs, ys) (added in
+// 0.12.0): anti-aliased intersect clip, balanced by kx_clip_reset like
+// kx_clip_rect. Star masks and avatar cutouts are polygons generated in
+// Zig — no path type crosses this boundary.
+void kx_clip_path(kx_ctx* ctx, const float* xs, const float* ys, int count, int aa);
 // Push an alpha layer: everything drawn until the matching kx_restore
 // composites at `alpha` opacity (fade transitions, Phase 2a). Alpha is
-// clamped to [0,1].
+// clamped to [0,1]. The implementation records the layer's ops and elides
+// or bounds the layer automatically (0.12.0): a layer holding a single
+// non-self-overlapping draw folds the alpha into the draw — identical
+// pixels, no offscreen pass; multi-op layers get a saveLayer bounded to
+// their content instead of the whole clip.
 void kx_layer_alpha(kx_ctx* ctx, float alpha);
 // Stroke a polyline (added in 0.5.0): moveTo/lineTo through the `count`
 // points with a solid color. round_cap selects round line caps (progress
@@ -156,6 +178,28 @@ uint64_t kx_image_create(kx_ctx* ctx, const uint8_t* rgba, int32_t width, int32_
 void kx_image_destroy(kx_ctx* ctx, uint64_t image);
 // Draw an image stretched into the destination rect (nearest sampling).
 void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float h);
+// 1 when every pixel of the image is fully opaque — lets callers skip the
+// destination clear under a full-coverage Src blit.
+uint8_t kx_image_is_opaque(kx_ctx* ctx, uint64_t image);
+// Zero-copy draw (added in 0.12.0): draw raw RGBA pixels stretched into the
+// rect WITHOUT the registry round-trip — the pixel buffer is borrowed for
+// the synchronous raster draw (no memcpy, no image object). The video
+// texture-upload idiom: a decoded frame is drawn, not retained. `rgba` must
+// stay valid only for the call's duration — raster draws consume it
+// immediately (GPU backends must still copy to upload — same semantics).
+void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
+                    float x, float y, float dw, float dh);
+
+// Render-to-image (added in 0.12.0): kx_offscreen_begin switches the ctx's
+// draw target to a fresh w×h transparent raster surface; everything drawn
+// until kx_offscreen_end_image lands there, the canvas is restored, and the
+// result is registered like a kx_image_create image (returns the id, 0 on
+// failure). Rasterizes a vector asset once so it can be drawn many times —
+// the retained-cache idiom (Compose's graphicsLayer / QML layer.enabled).
+// Call between begin/end_frame; may NOT nest inside kx_layer_alpha regions
+// or other offscreen passes.
+bool kx_offscreen_begin(kx_ctx* ctx, int width, int height);
+uint64_t kx_offscreen_end_image(kx_ctx* ctx);
 
 // Readback — raster backend only. Copies the frame as RGBA (memory order R,G,B,A)
 // into dst. dst_size must be >= width*height*4. Returns false on GPU backends

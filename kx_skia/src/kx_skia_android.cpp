@@ -37,6 +37,7 @@
 #include "include/core/SkSurface.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"    // GrBackendRenderTarget (complete type; GrGLBackendSurface.h only fwd-declares it)
 #include "include/gpu/ganesh/GrDirectContext.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"        // SkImages::TextureFromImage (Ganesh)
 #include "include/gpu/ganesh/GrTypes.h"              // kBottomLeft_GrSurfaceOrigin, k*_GrGLBackendState, GrSyncCpu
 #include "include/gpu/ganesh/SkSurfaceGanesh.h"      // SkSurfaces::WrapBackendRenderTarget
 #include "include/gpu/ganesh/gl/GrGLBackendSurface.h" // GrBackendRenderTargets::MakeGL
@@ -167,6 +168,20 @@ bool gpu_end_offscreen(GpuState* state) {
     state->dctx->flushAndSubmit(GrSyncCpu::kYes);
     state->warmup_surface = nullptr;
     return true;
+}
+
+sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
+    if (!state || !state->dctx) return nullptr;
+    return SkSurfaces::RenderTarget(
+        state->dctx.get(), skgpu::Budgeted::kYes,
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+}
+
+sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
+    if (!state || !state->dctx || !img || img->isTextureBacked()) return img;
+    if (sk_sp<SkImage> up = SkImages::TextureFromImage(state->dctx.get(), img.get()))
+        return up;
+    return img;
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

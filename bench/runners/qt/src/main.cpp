@@ -68,6 +68,7 @@
 #include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickView>
+#include <QSGRendererInterface>
 #include <QTextStream>
 
 #if defined(__APPLE__)
@@ -75,10 +76,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #include "BenchDriver.h"
@@ -273,14 +276,137 @@ void loadScene(QQuickView &view, const QString &path) {
     }
 }
 
+// --- tier-2 windowed drive ---
+// KLAXON_BENCH_WINDOWED=1 (run.sh --windowed) runs the same scenes on a real
+// cocoa window with the default RHI backend (Metal) and the threaded render
+// loop. Timed work per frame = the GUI span (tick -> afterSynchronizing)
+// plus the render-thread span (beforeRenderPassRecording -> afterRendering,
+// i.e. record + submit + the present call). The vsync/queue wait — the
+// drawable acquire inside beginFrame — sits between beforeRendering and
+// beforeRenderPassRecording, outside the measured span, matching Klaxon's
+// last_frame_wait_ns subtraction and Flutter's FrameTiming work spans.
+bool g_windowed = false;
+
+struct FramePump {
+    // Timestamps captured on the emitting threads (Clock::now is the shared
+    // monotonic timebase, so cross-thread deltas are valid).
+    std::atomic<Clock::time_point> animStart{Clock::time_point{}};
+    std::atomic<Clock::time_point> syncStart{Clock::time_point{}};
+    std::atomic<Clock::time_point> syncEnd{Clock::time_point{}};
+    std::atomic<Clock::time_point> rpStart{Clock::time_point{}};
+    std::atomic<Clock::time_point> rpEnd{Clock::time_point{}};
+    std::atomic<quint64> swaps{0};
+    std::atomic<bool> sawSync{false}, sawRp{false};
+
+    void attach(QQuickView *view) {
+        // afterAnimating opens the polish step on the render loop's GUI
+        // slot: item polish (QML Canvas onPaint) runs between it and
+        // beforeSynchronizing — with no dedicated polish signal,
+        // (afterAnimating -> afterSynchronizing) is the narrowest bracket
+        // covering polish+sync without the vsync-paced pickup wait.
+        QObject::connect(view, &QQuickWindow::afterAnimating, view, [this]() {
+            animStart = Clock::now();
+        }, Qt::DirectConnection);
+        QObject::connect(view, &QQuickWindow::beforeSynchronizing, view, [this]() {
+            syncStart = Clock::now();
+        }, Qt::DirectConnection);
+        QObject::connect(view, &QQuickWindow::afterSynchronizing, view, [this]() {
+            syncEnd = Clock::now();
+            sawSync = true;
+        }, Qt::DirectConnection);
+        QObject::connect(view, &QQuickWindow::beforeRenderPassRecording, view, [this]() {
+            rpStart = Clock::now();
+            sawRp = true;
+        }, Qt::DirectConnection);
+        QObject::connect(view, &QQuickWindow::afterRendering, view, [this]() {
+            rpEnd = Clock::now();
+        }, Qt::DirectConnection);
+        QObject::connect(view, &QQuickWindow::frameSwapped, view, [this]() {
+            ++swaps;
+        });
+    }
+
+    // One windowed frame: tick + extra work (optional) -> update() -> wait
+    // for the swap that answers it. Work ms = GUI span + render span.
+    // The swap target is captured at t0 (before the tick/extra run): the op
+    // or the tick can mark items dirty, which schedules a frame through
+    // QQuickItem::update() — possibly rendering+swapping entirely inside
+    // extra(), before our own view.update() call. Taking the target early
+    // guarantees we latch onto the first post-t0 frame (the one that
+    // actually contains the op's mutations) instead of a later clean frame
+    // our redundant update() may schedule.
+    double drive(QQuickView &view, BenchDriver &driver, int frame,
+                 const std::function<void()> &extra = nullptr,
+                 Clock::time_point *endOut = nullptr) {
+        sawSync = sawRp = false;
+        const auto t0 = Clock::now();
+        const quint64 target = swaps.load() + 1;
+        driver.tickFrame(frame);
+        if (extra)
+            extra();
+        // Op frames (extra != null) schedule their own frame through the
+        // dirty items the op produces; calling update() unconditionally
+        // could queue a SECOND clean frame that would leak into the next
+        // drive() and poison its stamps. Only kick the render loop as a
+        // fallback when nothing surfaced within a short grace period —
+        // for ordinary frames tickFrame alone rarely dirties, so update()
+        // below remains the driver.
+        const auto deadline = t0 + std::chrono::seconds(10);
+        const auto kickAt = t0 + std::chrono::milliseconds(extra ? 50 : 0);
+        if (!extra)
+            view.update();
+        const auto guiEnd = Clock::now();
+        bool kicked = !extra;
+        while (swaps.load() < target) {
+            if (extra && !kicked && Clock::now() > kickAt) {
+                view.update();
+                kicked = true;
+            }
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            if (Clock::now() > deadline) {
+                qWarning() << "klaxon-bench-qt: timed out waiting for frameSwapped —"
+                              " is the window exposed?";
+                std::exit(1);
+            }
+        }
+        const Clock::time_point end =
+            sawRp ? rpEnd.load() : (sawSync ? syncEnd.load() : guiEnd);
+        if (endOut)
+            *endOut = end;
+        // Work, not wall latency: GUI span (tick + op + update scheduling)
+        // + loop-side polish/sync (afterAnimating -> afterSynchronizing —
+        // covers the QML Canvas repaint, which no signal brackets alone)
+        // + render record/submit. The render loop's pickup latency and the
+        // swapchain acquire (vsync) sit between these stamps and stay out —
+        // Klaxon measures the same spans synchronously.
+        const double guiMs = std::chrono::duration<double, std::milli>(guiEnd - t0).count();
+        const double loopMs = sawSync
+            ? std::chrono::duration<double, std::milli>(syncEnd.load() - animStart.load()).count() : 0;
+        const double renderMs = sawRp
+            ? std::chrono::duration<double, std::milli>(rpEnd.load() - rpStart.load()).count() : 0;
+        // Untimed drain (deferred deletions, resize events) — same as the
+        // headless path.
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+        return guiMs + loopMs + renderMs;
+    }
+};
+
 // One driven frame: the scene tick plus the frame's work (polish + sync +
 // render via grabWindow), then an untimed event drain. Klaxon's loop repaints
 // every frame unconditionally; grabWindow() drives exactly that (see the
 // header comment). Returns the frame's work time in ms and the frame image;
 // `endOut` (optional) receives the completion instant of the render itself —
 // the point ttff_ms is sampled at (before the untimed drain).
+// Windowed mode: the update()+swap drive above; `imgOut` gets a one-off
+// grabWindow readback (used by the hash probes — untimed verification).
 double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgOut,
-                  Clock::time_point *endOut = nullptr) {
+                  Clock::time_point *endOut = nullptr, FramePump *pump = nullptr) {
+    if (g_windowed) {
+        const double ms = pump->drive(view, driver, frame, nullptr, endOut);
+        if (imgOut)
+            *imgOut = view.grabWindow();
+        return ms;
+    }
     const auto t0 = Clock::now();
     driver.tickFrame(frame); // the scene's tick (QML Connections handler)
     const QImage img = view.grabWindow(); // the frame's work
@@ -295,6 +421,8 @@ double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgO
         *endOut = t1;
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
+
+FramePump g_pump;
 
 // Stats over the measured frames (bench.zig run() + schema v2).
 void computeStats(std::vector<double> &times, Metrics &m) {
@@ -402,7 +530,10 @@ SceneResult runStandard(QQuickView &view, BenchDriver &driver, const QString &sc
     for (int i = 0; i < total; ++i) {
         QImage img;
         Clock::time_point frameEnd;
-        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
+        const bool probe = i == 30 || i == total - 1;
+        const double ms = driveFrame(view, driver, i,
+                                     (g_windowed && !probe) ? nullptr : &img,
+                                     &frameEnd, &g_pump);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
@@ -468,18 +599,27 @@ SceneResult runListOp(QQuickView &view, BenchDriver &driver, const QString &scen
             // The op: mutate the model (runBenchOp in QML) + one full render
             // pass — timed as extra.op_ms. Its frame is painted (it counts in
             // frames_rendered) but not in the measured frame stats.
-            const auto t0 = Clock::now();
-            driver.tickFrame(i);
-            QMetaObject::invokeMethod(view.rootObject(), "runBenchOp");
-            const QImage img = view.grabWindow(); // the op's render pass
-            const auto t1 = Clock::now();
-            opMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+            if (g_windowed) {
+                opMs = g_pump.drive(view, driver, i, [&view]() {
+                    QMetaObject::invokeMethod(view.rootObject(), "runBenchOp");
+                });
+            } else {
+                const auto t0 = Clock::now();
+                driver.tickFrame(i);
+                QMetaObject::invokeMethod(view.rootObject(), "runBenchOp");
+                const QImage img = view.grabWindow(); // the op's render pass
+                const auto t1 = Clock::now();
+                opMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+            }
             continue;
         }
         QImage img;
         Clock::time_point frameEnd;
-        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
+        const bool probe = i == 30 || i == total - 1;
+        const double ms = driveFrame(view, driver, i,
+                                     (g_windowed && !probe) ? nullptr : &img,
+                                     &frameEnd, &g_pump);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i > kWarmupFrames)
@@ -537,7 +677,9 @@ SceneResult runRamp(QQuickView &view, BenchDriver &driver, const QString &scene)
         for (int i = 0; i < kWarmupFrames + kRampStepFrames; ++i, ++frame) {
             QImage img;
             Clock::time_point frameEnd;
-            const double ms = driveFrame(view, driver, frame, &img, &frameEnd);
+            const double ms = driveFrame(view, driver, frame,
+                                         frame == 30 ? &img : nullptr,
+                                         &frameEnd, &g_pump);
             if (frame == 0)
                 m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
             if (i >= kWarmupFrames) {
@@ -615,6 +757,7 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
     times.reserve(kMeasuredFrames);
     quint64 hashA = 0, hashB = 0;
     QRgb baseline = 0;
+    QString baselineColor; // windowed probe: the box's color property
     int latencyFrames = -1;
     double latencyMs = 0;
     Clock::time_point injectedAt{};
@@ -626,14 +769,21 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
             // subsequent frame, so latency counts real event->paint frames.
             // injectedAt precedes pressAt so latency_ms covers the whole
             // event dispatch + handling + paint span.
-            const QImage probe = view.grabWindow();
-            baseline = probe.pixel(px);
+            if (g_windowed) {
+                baselineColor = target->property("color").toString();
+            } else {
+                const QImage probe = view.grabWindow();
+                baseline = probe.pixel(px);
+            }
             injectedAt = Clock::now();
             driver.pressAt(center.x(), center.y());
         }
         QImage img;
         Clock::time_point frameEnd;
-        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
+        const bool probe = i == 30 || i == total - 1;
+        const double ms = driveFrame(view, driver, i,
+                                     (g_windowed && !probe) ? nullptr : &img,
+                                     &frameEnd, &g_pump);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
@@ -642,7 +792,13 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
             hashA = imageHash(img);
         if (i == total - 1)
             hashB = imageHash(img);
-        if (i >= injectFrame && latencyFrames < 0 && img.pixel(px) != baseline) {
+        // The response probe: headless samples the grabbed pixels; windowed
+        // reads the box's color property — the frame that just swapped
+        // painted the state the property reported when it rendered.
+        const bool responded = g_windowed
+            ? target->property("color").toString() != baselineColor
+            : img.pixel(px) != baseline;
+        if (i >= injectFrame && latencyFrames < 0 && responded) {
             latencyFrames = i - injectFrame + 1;
             latencyMs = std::chrono::duration<double, std::milli>(Clock::now() - injectedAt).count();
         }
@@ -709,22 +865,36 @@ SceneResult runAppSwitch(QQuickView &view, BenchDriver &driver, const QString &s
                 qWarning() << "klaxon-bench-qt: cannot reload" << path << "-" << view.errors();
                 std::exit(1);
             }
-            driver.tickFrame(i);
-            const QImage img = view.grabWindow();
-            const auto t3 = Clock::now();
+            QImage img;
+            Clock::time_point t3;
+            if (g_windowed) {
+                // resume_ms spans reconstruction to the end of the first
+                // completed frame (work only — the swap wait is excluded).
+                g_pump.drive(view, driver, i, nullptr, &t3);
+            } else {
+                driver.tickFrame(i);
+                img = view.grabWindow();
+                t3 = Clock::now();
+            }
+            const double ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
             teardownSum += std::chrono::duration<double, std::milli>(t1 - t0).count();
             resumeSum += std::chrono::duration<double, std::milli>(t3 - t2).count();
             ++cycles;
-            const double ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
             if (i >= kWarmupFrames)
                 times.push_back(ms);
-            if (i == total - 1)
+            if (i == total - 1) {
+                if (g_windowed && img.isNull())
+                    img = view.grabWindow();
                 hashB = imageHash(img);
+            }
             continue;
         }
         QImage img;
         Clock::time_point frameEnd;
-        const double ms = driveFrame(view, driver, i, &img, &frameEnd);
+        const bool probe = i == 30 || i == total - 1;
+        const double ms = driveFrame(view, driver, i,
+                                     (g_windowed && !probe) ? nullptr : &img,
+                                     &frameEnd, &g_pump);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
@@ -811,6 +981,13 @@ int main(int argc, char *argv[]) {
             scenes.emplace_back(QLatin1String(def.name));
     }
 
+    // Tier-2 windowed mode (run.sh --windowed / KLAXON_BENCH_WINDOWED=1):
+    // a real cocoa window + the default RHI backend (Metal) + the threaded
+    // render loop; frames are driven by update()+frameSwapped, timed via the
+    // GUI/render signal spans (vsync acquire excluded — see FramePump).
+    g_windowed = qEnvironmentVariableIsSet("KLAXON_BENCH_WINDOWED")
+                 && qgetenv("KLAXON_BENCH_WINDOWED") == "1";
+
     QQuickView view;
     view.setResizeMode(QQuickView::SizeRootObjectToView);
     view.setColor(QColor("#14141C")); // the bench BG clear (#14141CFF)
@@ -820,7 +997,11 @@ int main(int argc, char *argv[]) {
     view.rootContext()->setContextProperty(QStringLiteral("bench"), &driver);
     int frameSwapped = 0;
     QObject::connect(&view, &QQuickView::frameSwapped, &app, [&]() { ++frameSwapped; });
+    if (g_windowed)
+        g_pump.attach(&view);
     view.show(); // offscreen: no real window; makes the scene graph live
+    if (g_windowed)
+        qInfo() << "klaxon-bench-qt: windowed mode — real window, RHI backend, threaded render loop";
 
     std::vector<SceneResult> results;
     results.reserve(scenes.size());
@@ -875,9 +1056,26 @@ int main(int argc, char *argv[]) {
           << "\n"
           << "    }";
     }
+    // The resolved backend — "rhi-metal" in windowed mode, the software
+    // raster identifier headless (the backend field the klaxon report added).
+    QString backend = QStringLiteral("offscreen-software");
+    if (g_windowed) {
+        if (auto *ri = view.rendererInterface()) {
+            switch (ri->graphicsApi()) {
+            case QSGRendererInterface::Metal: backend = QStringLiteral("rhi-metal"); break;
+            case QSGRendererInterface::Vulkan: backend = QStringLiteral("rhi-vulkan"); break;
+            case QSGRendererInterface::Direct3D11: backend = QStringLiteral("rhi-d3d11"); break;
+            case QSGRendererInterface::OpenGL: backend = QStringLiteral("rhi-opengl"); break;
+            case QSGRendererInterface::Software: backend = QStringLiteral("software"); break;
+            default: backend = QStringLiteral("unknown"); break;
+            }
+        }
+    }
+
     s << "\n  ],\n"
       << "  \"schema_version\": 2,\n"
       << "  \"binary_size_bytes\": " << binarySize << ",\n"
+      << "  \"backend\": \"" << backend << "\",\n"
       << "  \"timestamp\": \"" << tsIso << "\"\n"
       << "}\n";
 

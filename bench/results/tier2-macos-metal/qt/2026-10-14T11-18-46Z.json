@@ -1,0 +1,23 @@
+{
+  "scenes": [
+    {
+      "name": "list_create_1k",
+      "fps": 134.7,
+      "frame_time_avg_ms": 7.4,
+      "frame_time_p50_ms": 7.9,
+      "frame_time_p99_ms": 11.8,
+      "frame_time_p999_ms": 11.8,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "draw_calls_per_frame": 37,
+      "rss_mb": 125.6,
+      "ttff_ms": 20.9,
+      "frames_rendered": 71,
+      "extra": {"op_ms": 162.26}
+    }
+  ],
+  "schema_version": 2,
+  "binary_size_bytes": 178464,
+  "backend": "rhi-metal",
+  "timestamp": "2026-10-14T11:18:46Z"
+}

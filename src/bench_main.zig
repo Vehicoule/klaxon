@@ -57,6 +57,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (std.c.getenv("KLAXON_BENCH_PHASES") != null) opts.phase_breakdown = true;
     if (std.c.getenv("KLAXON_BENCH_PROFILE") != null) opts.paint_profile = true;
     if (std.c.getenv("KLAXON_BENCH_HIDE_SCROLL_CONTENT") != null) opts.hide_scroll_content = true;
+    // Tier-2: KX_BENCH_WINDOWED=1 renders every scene into a real SDL window
+    // on a real backend (Metal/Vulkan/GLES via KX_BENCH_BACKEND, AUTO chain
+    // by default) — frame work still excludes the vsync wait, matching the
+    // other runners' FrameTiming-style measurement.
+    if (std.c.getenv("KX_BENCH_WINDOWED") != null) opts.windowed = true;
+    if (std.c.getenv("KX_BENCH_BACKEND")) |b| {
+        const name = std.mem.span(b);
+        const kx = @import("kx.zig");
+        const backends = .{
+            .{ "raster", kx.c.KX_BACKEND_RASTER },
+            .{ "graphite-metal", kx.c.KX_BACKEND_GRAPHITE_METAL },
+            .{ "graphite-vulkan", kx.c.KX_BACKEND_GRAPHITE_VULKAN },
+            .{ "ganesh-gles", kx.c.KX_BACKEND_GANESH_GLES },
+            .{ "ganesh-gl", kx.c.KX_BACKEND_GANESH_GL },
+            .{ "graphite-dawn", kx.c.KX_BACKEND_GRAPHITE_DAWN },
+            .{ "auto", kx.c.KX_BACKEND_AUTO },
+        };
+        inline for (backends) |be| {
+            if (std.mem.eql(u8, name, be[0])) opts.backend = be[1];
+        }
+    }
 
     // Run each scene headlessly (bench.zig renders through golden.Renderer on
     // the raster backend — no window) and collect its metrics. Progress goes
@@ -67,122 +88,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         metrics[i] = try bench.runSceneWithOpts(scene, allocator, opts);
     }
 
-    const json = try formatReport(allocator, scenes[0..count], metrics[0..count]);
+    const json = try bench.formatReport(allocator, scenes[0..count], metrics[0..count], binarySizeBytes(allocator), bench.resolved_backend orelse "raster");
     writeStdout(json);
     if (build_options.bench_output) |path| {
         writeFile(allocator, path, json) catch |err| {
             std.debug.print("klaxon bench: cannot write report to '{s}': {t}\n", .{ path, err });
             return err;
         };
-    }
-}
-
-/// JSON report — the 4c.3 output contract, schema version 2 (spec
-/// docs/specs/bench-scenes.md), keep the shape stable:
-/// { "scenes": [ { "name", "fps", "frame_time_avg_ms", "frame_time_p50_ms",
-///                 "frame_time_p99_ms", "frame_time_p999_ms", "jank_frames",
-///                 "jank_pct", "draw_calls_per_frame", "rss_mb", "ttff_ms",
-///                 "frames_rendered", "extra": {…} } ],
-///   "binary_size_bytes": N, "timestamp": "YYYY-MM-DDTHH:MM:SSZ" }
-fn formatReport(allocator: std.mem.Allocator, scenes: []const bench.BenchScene, metrics: []const bench.Metrics) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\n  \"scenes\": [\n");
-    for (scenes, metrics, 0..) |scene, m, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",\n");
-        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-            \\    {{
-            \\      "name": "{s}",
-            \\      "fps": {d:.1},
-            \\      "frame_time_avg_ms": {d:.2},
-            \\      "frame_time_p50_ms": {d:.2},
-            \\      "frame_time_p99_ms": {d:.2},
-            \\      "frame_time_p999_ms": {d:.2},
-            \\      "jank_frames": {d},
-            \\      "jank_pct": {d:.1},
-            \\      "draw_calls_per_frame": {d},
-            \\      "rss_mb": {d:.1},
-            \\      "ttff_ms": {d:.1},
-            \\      "frames_rendered": {d},
-            \\      "extra": {s}
-            \\    }}
-        , .{
-            scene.name(),
-            m.fps,
-            m.frame_time_avg_ms,
-            m.frame_time_p50_ms,
-            m.frame_time_p99_ms,
-            m.frame_time_p999_ms,
-            m.jank_frames,
-            m.jank_pct,
-            m.draw_calls_per_frame,
-            m.rss_mb,
-            m.ttff_ms,
-            m.frames_rendered,
-            try formatExtra(allocator, m.extra),
-        }));
-    }
-    try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator,
-        \\
-        \\  ],
-        \\  "binary_size_bytes": {d},
-        \\  "timestamp": "{s}"
-        \\}}
-        \\
-    , .{
-        binarySizeBytes(allocator),
-        try timestampIso8601(allocator),
-    }));
-    return buf.items;
-}
-
-/// The scene-extra object (schema v2): every contract field is emitted;
-/// fields the scene didn't produce serialize as null.
-fn formatExtra(allocator: std.mem.Allocator, e: bench.Extra) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"op_ms\": ");
-    try appendOptF(&buf, allocator, e.op_ms);
-    try buf.appendSlice(allocator, ", \"ramp\": ");
-    if (e.ramp_len == 0) {
-        try buf.appendSlice(allocator, "null");
-    } else {
-        try buf.appendSlice(allocator, "[");
-        for (e.ramp[0..e.ramp_len], 0..) |p, i| {
-            if (i > 0) try buf.appendSlice(allocator, ", ");
-            try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{{\"n\": {d}, \"p50_ms\": {d:.2}}}", .{ p.n, p.p50_ms }));
-        }
-        try buf.appendSlice(allocator, "]");
-    }
-    try buf.appendSlice(allocator, ", \"n_max_60fps\": ");
-    try appendOptU(&buf, allocator, e.n_max_60fps);
-    try buf.appendSlice(allocator, ", \"latency_ms\": ");
-    try appendOptF(&buf, allocator, e.latency_ms);
-    try buf.appendSlice(allocator, ", \"latency_frames\": ");
-    try appendOptU(&buf, allocator, e.latency_frames);
-    try buf.appendSlice(allocator, ", \"nodes_per_frame\": ");
-    try appendOptU(&buf, allocator, e.nodes_per_frame);
-    try buf.appendSlice(allocator, ", \"teardown_ms\": ");
-    try appendOptF(&buf, allocator, e.teardown_ms);
-    try buf.appendSlice(allocator, ", \"resume_ms\": ");
-    try appendOptF(&buf, allocator, e.resume_ms);
-    try buf.appendSlice(allocator, "}");
-    return buf.items;
-}
-
-fn appendOptF(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?f64) !void {
-    if (v) |x| {
-        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d:.3}", .{x}));
-    } else {
-        try buf.appendSlice(allocator, "null");
-    }
-}
-
-fn appendOptU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: ?u64) !void {
-    if (v) |x| {
-        try buf.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}", .{x}));
-    } else {
-        try buf.appendSlice(allocator, "null");
     }
 }
 
@@ -202,29 +114,6 @@ fn binarySizeBytes(allocator: std.mem.Allocator) u64 {
     return if (size > 0) @intCast(size) else 0;
 }
 
-/// Current UTC time, ISO 8601 ("2026-10-11T14:03:22Z").
-fn timestampIso8601(allocator: std.mem.Allocator) ![]const u8 {
-    const builtin = @import("builtin");
-    const secs: u64 = if (builtin.os.tag == .windows)
-        @intCast(@divFloor(@as(i64, @intCast(std.os.windows.ntdll.RtlGetSystemTimePrecise())), 10_000_000) - 11644473600)
-    else blk: {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-        break :blk @intCast(ts.sec);
-    };
-    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
-    const year_day = epoch.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_sec = epoch.getDaySeconds();
-    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        day_sec.getHoursIntoDay(),
-        day_sec.getMinutesIntoHour(),
-        day_sec.getSecondsIntoMinute(),
-    });
-}
 
 /// Write the report to stdout. C stdio, same pattern as host.zig's dumpPpm:
 /// std.debug.print writes to stderr and must not pollute the JSON stream.

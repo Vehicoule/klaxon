@@ -43,6 +43,12 @@ pub fn scale(ctx: *kx.Ctx, sx: f32, sy: f32) void {
     kx.c.kx_scale(ctx, sx, sy);
 }
 
+/// Rotate the canvas clockwise by `degrees` around the current origin
+/// (ABI 0.12.0). Pair with translate() to rotate about a point.
+pub fn rotate(ctx: *kx.Ctx, degrees: f32) void {
+    kx.c.kx_rotate(ctx, degrees);
+}
+
 /// Clip the current frame to a rect (save + intersect clip).
 /// Balanced with clipReset (restores the canvas state).
 pub fn clipRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32) void {
@@ -51,6 +57,15 @@ pub fn clipRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32) void {
 
 pub fn clipReset(ctx: *kx.Ctx) void {
     kx.c.kx_clip_reset(ctx);
+}
+
+/// Clip the current frame to the closed polygon through (xs, ys) (ABI
+/// 0.12.0) — intersect clip, balanced with clipReset() like clipRect.
+/// `aa` picks the anti-aliased mask (smooth edges, slower raster); pass
+/// false for the hard scanline clip (matches Qt's default setClipPath).
+/// Star masks and avatar cutouts are polygons generated in Zig.
+pub fn clipPath(ctx: *kx.Ctx, xs: []const f32, ys: []const f32, aa: bool) void {
+    kx.c.kx_clip_path(ctx, xs.ptr, ys.ptr, @intCast(xs.len), @intFromBool(aa));
 }
 
 /// Push an alpha layer (saveLayer with alpha, ABI 0.4.0): everything painted
@@ -144,10 +159,37 @@ pub fn imageDraw(ctx: *kx.Ctx, id: u64, x: f32, y: f32, w: f32, h: f32) void {
     kx.c.kx_draw_image(ctx, id, x, y, w, h);
 }
 
+/// True when every pixel of the image is fully opaque (ABI 0.13.0) — a
+/// full-coverage opaque blit lets the caller skip the destination clear.
+pub fn imageIsOpaque(ctx: *kx.Ctx, id: u64) bool {
+    return kx.c.kx_image_is_opaque(ctx, id) != 0;
+}
+
+/// Zero-copy draw (ABI 0.12.0): draw raw RGBA pixels into the rect without
+/// the registry round-trip — the buffer is borrowed for the synchronous
+/// draw (video texture-upload idiom: decoded frames are drawn, not kept).
+pub fn drawPixels(ctx: *kx.Ctx, rgba: [*]const u8, w: i32, h: i32, x: f32, y: f32, dw: f32, dh: f32) void {
+    kx.c.kx_draw_pixels(ctx, rgba, w, h, x, y, dw, dh);
+}
+
+/// Render-to-image (ABI 0.12.0): offscreenBegin switches the ctx's draw
+/// target to a fresh w×h transparent raster surface; everything drawn until
+/// offscreenEndImage lands there and registers like an imageCreate image.
+/// The retained-cache idiom: rasterize a stable subtree once, blit it while
+/// it stays clean (Compose's graphicsLayer / QML layer.enabled). May NOT
+/// nest inside layerAlpha regions or other offscreen passes.
+pub fn offscreenBegin(ctx: *kx.Ctx, w: i32, h: i32) bool {
+    return kx.c.kx_offscreen_begin(ctx, w, h);
+}
+
+pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
+    return kx.c.kx_offscreen_end_image(ctx);
+}
+
 // --- tests ---
 
-test "kx ABI version reports 0.11.0 (the gpu_warmup entry)" {
-    try std.testing.expectEqualStrings("0.11.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.13.0 (draw_pixels, image_is_opaque)" {
+    try std.testing.expectEqualStrings("0.13.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "paint constructors: fill keeps the defaults, stroke carries color + width" {
