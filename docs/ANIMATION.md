@@ -88,6 +88,23 @@ Both transform widgets wrap the children's paint via the vtable's
 `pre_children_paint` / `post_children_paint` hooks — no layout invalidation,
 so dirty-rect repaints only the swept region.
 
+## Variable fonts (ABI 0.17.0)
+
+M3E animates the `wght`/`wdth` OpenType axes rather than swapping between
+static weights. `TextOptions.variations` (and `TextSpan.variations` on
+richText) seed the axes; `text.setAxisValue(node, ui.paint.axis_wght, v)` /
+`text.setAxes(node, axes)` write them per tick — a spring's `value` maps
+straight in, e.g. `text.setAxisValue(label, ui.paint.axis_wght, spring.value)`
+on a 400→700 emphasis spring.
+
+A text with axes paints through a retained `kx_text_layout` paragraph that
+rebuilds on axis/text/style change (re-shaping per animated frame is the
+honest cost — identical to Compose's FontVariation path) and repaints free
+when static. Axes absent from the resolved font are ignored; `wght` only
+takes effect on variable fonts, so shipping an M3E variable family requires
+a font-family selection API (not yet in `kx_text_style` — the paragraph path
+uses the platform default typeface today).
+
 ## Dirty-rect (1e.6)
 
 The surface is **retained** between frames (the host never clears). Every

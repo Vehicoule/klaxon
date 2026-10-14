@@ -18,8 +18,12 @@ the gap in `bench/runners/<fw>/README.md` — never silently substitutes.
     **`frame_time_p999_ms` (new)**,
     **`jank_frames` + `jank_pct` (new)** — a frame is jank if
     `frame_ms > 16.67` (60 Hz budget, Macrobenchmark/JankStats convention),
-  - `fps` (= 1000/avg), `draw_calls_per_frame`, `rss_mb`, `ttff_ms`,
-    `frames_rendered`,
+  - `fps` (= 1000/avg — the work-rate; `presented_fps` on windowed runs is
+    the wall-clock presentation rate over frames that actually presented —
+    a fully static scene reports ~0: clean frames never touch the swapchain),
+    `draw_calls_per_frame` (draw ops issued to the canvas, counted in the
+    backend — recorded/replayed ops count once at emission), `rss_mb`,
+    `ttff_ms`, `frames_rendered`,
   - scene-extra fields (below) under `extra: {}`.
 - Runners may add fields; they may NOT rename or drop contract fields.
   Missing optional fields serialize as `null`.
@@ -73,15 +77,15 @@ Canvas; Klaxon = image widget/atlas path.
 | scene | construction + per-frame work |
 |---|---|
 | `overdraw_stack` | 24 full-screen rects, each `alpha=0x1F` over the last, alternating `#7C4DFF`/`#03DAC6` — forces saveLayer/compositing cost; static (the cost is in paint, not anim) |
-| `elevation_grid` | 10×10 grid of 48×40 cards, M3 elevation shadow (r=12, dy=2, blur=6, `rgba(0,0,0,0.30)`) — every shadow re-rasterized per frame while card fill color oscillates ±4% lightness |
+| `elevation_grid` | 10×10 grid of 48×40 cards, M3 elevation shadow (r=12, dy=2, blur=6, `rgba(0,0,0,0.30)`) — real `SkShadowUtils::DrawShadow` ambient+spot shadows; the shadow bitmap is cached per (geometry, elevation, colors) and re-blit while the card fill oscillates ±4% lightness (same strategy as Qt's cached glow) |
 | `relayout_storm` | 200 rows each animating width 200↔440 dp (2s loop) — forces per-frame measure+layout of the subtree (NOT a compositable transform) |
 | `mount_churn` | every frame: destroy 50 widgets, create 50 new ones (label+icon card, random id), steady-state pool 500 — the GC/allocator pressure test |
 | `scroll_anim` | scroll_10k list scrolling at 600 dp/s WHILE 30 embedded row icons pulse opacity — mixed scroll+anim jank |
-| `text_rich` | 60 paragraphs × 3 lines, mixed: bold/italic spans, 3 font sizes (12/16/20sp), one LTR+RTL bidi line per paragraph (`"مختصر Klaxon عربي test اختبار"`) — shaping stress |
+| `text_rich` | 60 paragraphs × 3 lines, mixed: bold/italic spans, 3 font sizes (12/16/20sp), one LTR+RTL bidi line per paragraph (`"مختصر Klaxon عربي test اختبار"`) — shaping stress; all text goes through SkParagraph (HarfBuzz shaping + ICU bidi/line-break + script-aware fallback), layouts cached by (text, style, width) |
 | `chart_live` | line chart, 1000 points, polyline rebuilt fully every frame + axes/grid (10×8) — the real dashboard case |
 | `clip_path` | 120 nodes each clipped by a 6-point star path, contents scrolling under the clip |
 | `theme_switch` | full gallery-like tree (200+ nodes), alternate light/dark theme every 30 frames — global invalidation cost |
-| `backdrop_scroll` | scrolling content (200 items) under a fixed 640×160 backdrop-blur band (σ=12) + 60% scrim — mobile's worst case |
+| `backdrop_scroll` | scrolling content (200 items) under a fixed 640×160 backdrop-blur band (σ=12) + 60% scrim — mobile's worst case; the blur is a real `SaveLayerRec` backdrop image-filter re-evaluated per frame (CPU raster: expensive; GPU backends filter in hardware) |
 
 ## Family D — `system` (non-paint paths)
 
