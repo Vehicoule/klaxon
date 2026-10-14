@@ -218,6 +218,26 @@ pub fn build(b: *std.Build) void {
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
 
+    // --- dynamic color tests (deps/mcu) ---
+    // src/dynamic_color.zig is deliberately self-contained (std only — it
+    // cannot import theme.zig without dragging the kx_c module into a bare
+    // `zig test`), so it needs its own test step rather than riding the
+    // main.zig-rooted suite. linkRuntime supplies libkx_skia.a, which now
+    // archives the mcu objects; the linker pulls only kx_mcu.cpp's TU.
+    const dc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dynamic_color.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = !is_windows_local(target),
+        }),
+    });
+    linkRuntime(b, dc_tests.root_module, kx_skia, target, is_macos, tag);
+    const run_dc_tests = b.addRunArtifact(dc_tests);
+    const dc_test_step = b.step("test-dynamic-color", "Run dynamic-color (material-color-utilities) tests");
+    dc_test_step.dependOn(&run_dc_tests.step);
+
     // --- klaxon CLI (Phase 5a) ---
     // The `klaxon` launcher — a plain Zig exe, no SDL/skia linkage.
     const cli = b.addExecutable(.{
@@ -299,6 +319,42 @@ fn addExternalApp(
     b.installArtifact(app);
 }
 
+/// material-color-utilities (deps/mcu, vendored Apache-2.0 — UPSTREAM.md
+/// pins the upstream commit): dynamic color — HCT, tonal palettes, M3E schemes,
+/// Celebi/Wu quantize + Score ranking. Pure-stdlib C++, no Skia/SDL headers;
+/// deps/mcu/kx_mcu.cpp is the extern "C" POD seam (see kx_mcu.h). Upstream
+/// *_test.cc files are vendored but never compiled.
+const mcu_sources = [_][]const u8{
+    "deps/mcu/kx_mcu.cpp",
+    "deps/mcu/cpp/blend/blend.cc",
+    "deps/mcu/cpp/cam/cam.cc",
+    "deps/mcu/cpp/cam/hct.cc",
+    "deps/mcu/cpp/cam/hct_solver.cc",
+    "deps/mcu/cpp/cam/viewing_conditions.cc",
+    "deps/mcu/cpp/contrast/contrast.cc",
+    "deps/mcu/cpp/dislike/dislike.cc",
+    "deps/mcu/cpp/dynamiccolor/dynamic_color.cc",
+    "deps/mcu/cpp/dynamiccolor/dynamic_scheme.cc",
+    "deps/mcu/cpp/dynamiccolor/material_dynamic_colors.cc",
+    "deps/mcu/cpp/palettes/tones.cc",
+    "deps/mcu/cpp/quantize/celebi.cc",
+    "deps/mcu/cpp/quantize/lab.cc",
+    "deps/mcu/cpp/quantize/wsmeans.cc",
+    "deps/mcu/cpp/quantize/wu.cc",
+    "deps/mcu/cpp/scheme/scheme_content.cc",
+    "deps/mcu/cpp/scheme/scheme_expressive.cc",
+    "deps/mcu/cpp/scheme/scheme_fidelity.cc",
+    "deps/mcu/cpp/scheme/scheme_fruit_salad.cc",
+    "deps/mcu/cpp/scheme/scheme_monochrome.cc",
+    "deps/mcu/cpp/scheme/scheme_neutral.cc",
+    "deps/mcu/cpp/scheme/scheme_rainbow.cc",
+    "deps/mcu/cpp/scheme/scheme_tonal_spot.cc",
+    "deps/mcu/cpp/scheme/scheme_vibrant.cc",
+    "deps/mcu/cpp/score/score.cc",
+    "deps/mcu/cpp/temperature/temperature_cache.cc",
+    "deps/mcu/cpp/utils/utils.cc",
+};
+
 /// Create the kx_skia C++/ObjC++ shim as a static library. The native graph
 /// builds it twice: at the user's optimize (hello/gallery/tests) and at
 /// ReleaseSmall for the bench runner — the shim must match the bench binary's
@@ -379,10 +435,23 @@ fn addKxSkia(
             // (std::vector<Adapter>, wgpu::StringView) — a zig-libc++ shim
             // would ABI-mismatch. Objects come from compileMsvcShims and are
             // archived into libkx_skia like the other platforms' objects.
+            // mcu sources go through cl.exe there too (std::map/vector/...
+            // instantiate the MSVC STL; they must not pick up zig's libc++).
             const objects = compileMsvcShims(b, target);
             for (objects) |obj| kx_skia.root_module.addObjectFile(obj);
         },
         else => @panic("no kx_skia platform impl for this OS yet (add kx_skia/src/kx_skia_<os>)"),
+    }
+    // material-color-utilities: compile into the shim lib on every platform
+    // the zig clang driver builds (all but Windows — see above). deps/mcu is
+    // the include root: the sources include "cpp/<dir>/<file>.h".
+    if (target.result.os.tag != .windows) {
+        kx_skia.root_module.addCSourceFiles(.{
+            .files = &mcu_sources,
+            .flags = shim_flags,
+            .language = .cpp,
+        });
+        kx_skia.root_module.addIncludePath(b.path("deps/mcu"));
     }
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
@@ -1042,12 +1111,20 @@ fn msvcEnvCapture(b: *std.Build, vcvars: []const u8) ?MsvcEnv {
 fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std.Build.LazyPath {
     const tag: []const u8 = if (target.result.cpu.arch == .x86_64) "windows-x64" else "windows-arm64";
     const Shim = struct { src: []const u8, lean: bool };
+    // material-color-utilities TUs — compiled by cl like the rest of the shim
+    // (the whole libkx_skia archive must share one STL ABI; these instantiate
+    // MSVC std::map/vector/etc.). All lean — no Windows headers at all.
+    const mcu_shims = blk: {
+        var list: [mcu_sources.len]Shim = undefined;
+        for (mcu_sources, 0..) |src, i| list[i] = .{ .src = src, .lean = true };
+        break :blk list;
+    };
     const sources = [_]Shim{
         .{ .src = "kx_skia/src/kx_skia_common.cpp", .lean = true },
         .{ .src = "kx_skia/src/kx_skia_win.cpp", .lean = true },
         // UIAutomationCore.h needs the ole2 types — no WIN32_LEAN_AND_MEAN.
         .{ .src = "kx_skia/src/kx_a11y_win.cpp", .lean = false },
-    };
+    } ++ mcu_shims;
     const vcvars = msvcVcvarsPath(b, target);
     // Wrapper .bat: `cmd /c wrapper.bat <args>` forwards args via %* —
     // args appended after a quoted `cmd /c "..."` string are ignored by cmd.
@@ -1103,7 +1180,7 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         if (s.lean) run.addArg("/DWIN32_LEAN_AND_MEAN");
         run.addArg("/DSK_GANESH");
         run.addArg("/DSK_GRAPHITE");
-        inline for (.{ "kx_skia/include", "deps/skia", "deps/skia/include", "deps/SDL/include" }) |inc| {
+        inline for (.{ "kx_skia/include", "deps/skia", "deps/skia/include", "deps/SDL/include", "deps/mcu" }) |inc| {
             run.addArg("/I" ++ inc);
         }
         // Dawn's checked-in headers + the cmake-generated webgpu_cpp.h.

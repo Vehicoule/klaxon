@@ -7,14 +7,19 @@
 // branding lands (see docs/DESIGN-SYSTEM.md).
 //
 // Colors are 0xRRGGBBAA (see ui/paint.zig). Color values are Google's M3
-// baseline schemes. Dynamic color (HCT palettes from a seed/wallpaper) is a
-// later addition — the ColorScheme struct isolates it.
+// baseline schemes. Dynamic color (HCT palettes from a seed/wallpaper) comes
+// from material-color-utilities via src/dynamic_color.zig — see
+// Theme.fromSeedColor / Theme.fromImage.
 //
 // Decision record: docs/adr/ADR-0010-design-system-m3e.md.
 
 const std = @import("std");
 const ui = @import("ui.zig");
 const anim = @import("ui/anim.zig");
+// Dynamic color engine (material-color-utilities). The dependency runs this
+// way only: theme.zig -> dynamic_color.zig, never the reverse — the engine
+// stays std-only so `zig test src/dynamic_color.zig` compiles standalone.
+const dynamic_color = @import("dynamic_color.zig");
 
 pub const Color = ui.paint.Color;
 
@@ -89,6 +94,13 @@ pub const ColorScheme = struct {
     scrim: Color,
     shadow: Color,
 };
+
+/// M3E dynamic-scheme variant — which DynamicScheme algorithm generates the
+/// color roles in Theme.fromSeedColor / Theme.fromImage. Re-export of
+/// dynamic_color.Variant (enum over the nine schemes deps/mcu/kx_mcu.h
+/// exposes) so theme consumers need a single import. `tonal_spot` is the M3
+/// baseline: low-chroma pastels, the Android 12+ default.
+pub const Scheme = dynamic_color.Variant;
 
 /// One M3 type style: font size, line height (px at scale 1), weight
 /// (400/500), letter spacing (px at scale 1 — the M3 tracking values).
@@ -344,6 +356,78 @@ pub const Theme = struct {
     state: StateLayers = state_layers,
     spacing: Spacing = spacing,
     platform: PlatformTokens = platform_mobile,
+
+    /// Dynamic theme (Phase 2d): resolve every color role from a seed color
+    /// through material-color-utilities (src/dynamic_color.zig → deps/mcu)
+    /// at the M3 baseline — the `tonal_spot` variant (Android 12+ default)
+    /// at default contrast. `seed` is a 0xRRGGBBAA Color like every other
+    /// here (its alpha is ignored — generated roles are opaque); `dark_mode`
+    /// selects the dark scheme.
+    ///
+    /// Only colors are generated: the non-color tokens (type, shape,
+    /// elevation, motion, state, spacing, platform) come from the matching
+    /// baseline preset. The role mapping is exact — Scheme.toColorScheme
+    /// copies all 38 roles by field name and fails to compile if the two
+    /// structs ever drift apart.
+    pub fn fromSeedColor(seed: Color, dark_mode: bool) Theme {
+        return fromSeedColorScheme(seed, dark_mode, .tonal_spot, 0);
+    }
+
+    /// fromSeedColor with the full DynamicScheme controls: `scheme` picks
+    /// the M3E variant (tonal_spot/expressive/vibrant/... — all nine schemes
+    /// deps/mcu exposes) and `contrast_level` is [-1, 1] — 0 is the WCAG AA
+    /// default, >0 pushes text-on-color pairs further apart.
+    pub fn fromSeedColorScheme(seed: Color, dark_mode: bool, scheme: Scheme, contrast_level: f64) Theme {
+        var t: Theme = if (dark_mode) dark else light;
+        t.name = if (dark_mode) "dynamic dark" else "dynamic light";
+        t.colors = dynamic_color.scheme(seed, scheme, dark_mode, contrast_level).toColorScheme(ColorScheme);
+        return t;
+    }
+
+    /// Dynamic theme from an image (Phase 2d): quantize `rgba_pixels`
+    /// (Celebi/Wu), rank the palette by MCU Score suitability — the same
+    /// pipeline Android uses for wallpaper "Material You" themes — then
+    /// build the scheme from the winning seed, at the M3 baseline
+    /// (tonal_spot, default contrast, Google Blue fallback). `rgba_pixels`
+    /// holds at least `width * height * 4` bytes in straight R,G,B,A order;
+    /// fully transparent pixels are ignored.
+    pub fn fromImage(rgba_pixels: []const u8, width: u32, height: u32, dark_mode: bool) Theme {
+        return fromImageScheme(rgba_pixels, width, height, dark_mode, .tonal_spot, 0, 0x4285F4FF);
+    }
+
+    /// fromImage with the full controls — `scheme`/`contrast_level` as in
+    /// fromSeedColorScheme; `fallback_seed` applies when the buffer is empty
+    /// or contains no visible pixel (every alpha == 0 — the quantizer's own
+    /// filter, mirrored here so the caller's fallback wins over MCU's
+    /// built-in Google Blue).
+    pub fn fromImageScheme(
+        rgba_pixels: []const u8,
+        width: u32,
+        height: u32,
+        dark_mode: bool,
+        scheme: Scheme,
+        contrast_level: f64,
+        fallback_seed: Color,
+    ) Theme {
+        const byte_len = @as(u64, width) * height * 4;
+        std.debug.assert(rgba_pixels.len >= byte_len);
+        const pixels = rgba_pixels[0..@intCast(byte_len)];
+        // Early-exit scan matching the quantizer's skip rule (alpha == 0):
+        // typical images exit after a few pixels; only all-transparent
+        // buffers pay the full pass — and they take the fallback anyway.
+        var any_visible = false;
+        for (0..pixels.len / 4) |i| {
+            if (pixels[i * 4 + 3] != 0) {
+                any_visible = true;
+                break;
+            }
+        }
+        const seed = if (any_visible)
+            dynamic_color.dominantColor(pixels, fallback_seed)
+        else
+            fallback_seed;
+        return fromSeedColorScheme(seed, dark_mode, scheme, contrast_level);
+    }
 };
 
 /// M3 baseline light scheme.
@@ -594,4 +678,108 @@ test "theme: platform tokens — mobile defaults, desktop presets" {
     try std.testing.expectEqual(light.colors.primary, desktop_light.colors.primary);
     try std.testing.expectEqual(dark.colors.primary, desktop_dark.colors.primary);
     try std.testing.expect(desktop_light.colors.primary != desktop_dark.colors.primary);
+}
+
+test "theme: fromSeedColor — Google Blue seed reproduces the MCU tonal_spot roles" {
+    // Anchors are the vendored MCU's exact output (deps/mcu, pinned to
+    // material-foundation 5b3618b): seed 0x4285F4 (Google Blue) through the
+    // tonal_spot DynamicScheme — known-good upstream values, not
+    // approximations.
+    const lt = Theme.fromSeedColor(0x4285F4FF, false);
+    try std.testing.expectEqual(@as(Color, 0x445E91FF), lt.colors.primary);
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), lt.colors.on_primary);
+    try std.testing.expectEqual(@as(Color, 0xD8E2FFFF), lt.colors.primary_container);
+    try std.testing.expectEqual(@as(Color, 0x2B4678FF), lt.colors.on_primary_container);
+    try std.testing.expectEqual(@as(Color, 0xBA1A1AFF), lt.colors.@"error");
+    try std.testing.expectEqual(@as(Color, 0xF9F9FFFF), lt.colors.surface);
+
+    const dk = Theme.fromSeedColor(0x4285F4FF, true);
+    try std.testing.expectEqual(@as(Color, 0xADC6FFFF), dk.colors.primary);
+    try std.testing.expectEqual(@as(Color, 0x102F60FF), dk.colors.on_primary);
+    try std.testing.expectEqual(@as(Color, 0xFFB4ABFF), dk.colors.@"error");
+    // The dark scheme's inverse_primary IS the light scheme's primary.
+    try std.testing.expectEqual(lt.colors.primary, dk.colors.inverse_primary);
+
+    // light vs dark are genuinely different schemes, and both are named.
+    try std.testing.expect(lt.colors.primary != dk.colors.primary);
+    try std.testing.expect(lt.colors.surface != dk.colors.surface);
+    try std.testing.expectEqualStrings("dynamic light", lt.name);
+    try std.testing.expectEqualStrings("dynamic dark", dk.name);
+}
+
+test "theme: fromSeedColor fills every color role — opaque, no sentinel leftovers" {
+    inline for (.{ false, true }) |dark_mode| {
+        const t = Theme.fromSeedColor(0x6750A4FF, dark_mode);
+        inline for (@typeInfo(ColorScheme).@"struct".field_names) |name| {
+            const c: Color = @field(t.colors, name);
+            // 0x00000000 would mean the MCU write never landed (a leftover
+            // sentinel); every M3 role is emitted opaque.
+            try std.testing.expect(c != 0);
+            try std.testing.expectEqual(@as(u8, 0xFF), @as(u8, @truncate(c)));
+        }
+        // Non-color tokens ride the baseline presets, untouched by the seed.
+        try std.testing.expectEqual(light.type_scale.display_large.size, t.type_scale.display_large.size);
+        try std.testing.expectEqual(light.shape.medium, t.shape.medium);
+        try std.testing.expectEqual(light.motion.durations.medium2, t.motion.durations.medium2);
+        try std.testing.expectEqual(light.state.hover, t.state.hover);
+        try std.testing.expectEqual(light.platform.control_height, t.platform.control_height);
+    }
+    // surface_tint aliases primary — the M3 rule, verified end-to-end.
+    const t = Theme.fromSeedColor(0x6750A4FF, false);
+    try std.testing.expectEqual(t.colors.primary, t.colors.surface_tint);
+}
+
+test "theme: fromSeedColorScheme — all nine M3E variants hold WCAG pairs" {
+    inline for (@typeInfo(Scheme).@"enum".field_values) |v| {
+        const cs = Theme.fromSeedColorScheme(0x4285F4FF, false, @enumFromInt(v), 0).colors;
+        try std.testing.expectEqual(@as(u8, 0xFF), @as(u8, @truncate(cs.primary)));
+        // M3 guarantees >= 4.5:1 on the flagship pairs at default contrast.
+        try std.testing.expect(contrastRatio(cs.primary, cs.on_primary) >= 4.5);
+        try std.testing.expect(contrastRatio(cs.surface, cs.on_surface) >= 4.5);
+        try std.testing.expect(contrastRatio(cs.@"error", cs.on_error) >= 4.5);
+    }
+    // `scheme` actually selects the variant — expressive rotates the hues.
+    try std.testing.expect(
+        Theme.fromSeedColorScheme(0x4285F4FF, false, .expressive, 0).colors.primary !=
+            Theme.fromSeedColorScheme(0x4285F4FF, false, .tonal_spot, 0).colors.primary,
+    );
+    // fromSeedColor is the tonal_spot baseline (M3 default).
+    try std.testing.expectEqual(
+        Theme.fromSeedColorScheme(0x4285F4FF, false, .tonal_spot, 0).colors,
+        Theme.fromSeedColor(0x4285F4FF, false).colors,
+    );
+}
+
+test "theme: fromImage — quantize+score extracts a seed, full scheme built" {
+    // 32x32 RGBA8: ~87% Google Blue, rest dark speckle.
+    var px: [32 * 32 * 4]u8 = undefined;
+    for (0..32 * 32) |i| {
+        const blue = i % 8 != 0;
+        px[i * 4 + 0] = if (blue) 0x42 else 0x20;
+        px[i * 4 + 1] = if (blue) 0x85 else 0x20;
+        px[i * 4 + 2] = if (blue) 0xF4 else 0x30;
+        px[i * 4 + 3] = 0xFF;
+    }
+    const t = Theme.fromImage(&px, 32, 32, false);
+    // Every role populated — same populated-token invariant as fromSeedColor.
+    inline for (@typeInfo(ColorScheme).@"struct".field_names) |name| {
+        const c: Color = @field(t.colors, name);
+        try std.testing.expect(c != 0);
+        try std.testing.expectEqual(@as(u8, 0xFF), @as(u8, @truncate(c)));
+    }
+    // No drift between the two entry points: fromImage is exactly
+    // quantize+score -> fromSeedColor over the winning seed.
+    const seed = dynamic_color.dominantColor(&px, 0x4285F4FF);
+    try std.testing.expectEqual(Theme.fromSeedColor(seed, false).colors, t.colors);
+    // A blue-dominated image yields a blue-leaning primary (B above R).
+    try std.testing.expect(t.colors.primary >> 8 & 0xFF > t.colors.primary >> 24 & 0xFF);
+}
+
+test "theme: fromImage — empty or fully transparent buffer uses the fallback seed" {
+    const reference = Theme.fromSeedColor(0x6750A4FF, false).colors;
+    const empty = Theme.fromImageScheme(&.{}, 0, 0, false, .tonal_spot, 0, 0x6750A4FF);
+    try std.testing.expectEqual(reference, empty.colors);
+    const transparent: [64]u8 = @splat(0); // 16 fully transparent pixels
+    const t2 = Theme.fromImageScheme(&transparent, 4, 4, false, .tonal_spot, 0, 0x6750A4FF);
+    try std.testing.expectEqual(reference, t2.colors);
 }
