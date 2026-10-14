@@ -138,6 +138,11 @@ struct kx_ctx {
     sk_sp<SkSurface> offscreen;
     int offscreen_w = 0;
     int offscreen_h = 0;
+    // Pooled offscreen surface (0.18.0): grow-only — one alloc serves every
+    // offscreen pass; a fresh RenderTarget per pass was ~0.2ms on Metal.
+    sk_sp<SkSurface> offscreen_pool;
+    int offscreen_pool_w = 0;
+    int offscreen_pool_h = 0;
     // Ephemeral images registered by kx_draw_pixels inside an alpha layer —
     // destroyed right after the top-level layer's replay (they exist only
     // so the recorded ImageDraw op resolves at replay time).
@@ -984,8 +989,27 @@ void kx_resize(kx_ctx* ctx, int width, int height) {
     }
 }
 
+// A Graphite surface's Device is snapped into the recording at frame
+// flush — pooled offscreen surfaces must not outlive the frame that drew
+// them (the device is dead next frame — measured: crash in drawPaint on
+// reuse). The pool resets here; passes within the frame still share one
+// surface, which is the win that matters (a scene rasterizing N retained
+// subtrees pays ONE surface alloc per frame, not N).
 void kx_begin_frame(kx_ctx* ctx) {
     if (!ctx) return;
+    // Only Graphite surfaces die at frame flush — Ganesh render targets and
+    // raster surfaces are persistent, so they keep the pool across frames
+    // (releasing it per frame measured ~0.8ms of FBO/texture churn on the
+    // GLES emulator — the dominant scroll_10k regression there).
+    const bool rec = ctx->backend == KX_BACKEND_GRAPHITE_METAL ||
+                     ctx->backend == KX_BACKEND_GRAPHITE_VULKAN ||
+                     ctx->backend == KX_BACKEND_GRAPHITE_DAWN ||
+                     ctx->backend == KX_BACKEND_GRAPHITE_WEBGPU;
+    if (rec) {
+        ctx->offscreen_pool = nullptr; // stale after the previous frame's flush
+        ctx->offscreen_pool_w = 0;
+        ctx->offscreen_pool_h = 0;
+    }
     // Unbalanced layer records from a previous frame die with it.
     ctx->layers.clear();
     ctx->frame_ops = 0;
@@ -1867,25 +1891,62 @@ void kx_clip_reset(kx_ctx* ctx) {
 // the snapshot so kx_draw_image/kx_image_destroy work on the returned id.
 bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || ctx->offscreen_prev_canvas) return false;
-    // GPU ctx: a backend render target so the snapshot draws GPU→GPU
-    // (Graphite drops raster images entirely). Falls back to raster.
-    ctx->offscreen = ctx->gpu ? kx::gpu_offscreen_surface(ctx->gpu, w, h) : nullptr;
-    if (!ctx->offscreen) ctx->offscreen = SkSurfaces::Raster(SkImageInfo::MakeN32Premul(w, h));
-    if (!ctx->offscreen) return false;
+    // Pool the surface: a fresh RenderTarget per pass was the dominant
+    // retained-raster cost on GPU (Metal measured ~0.2ms per list row
+    // entering the scroll window — a surface alloc + teardown each). One
+    // grow-only surface per ctx covers every offscreen pass; the snapshot
+    // takes only the requested (w,h) corner. GPU keeps a backend render
+    // target so the snapshot draws GPU→GPU (Graphite drops raster images).
+    if (!ctx->offscreen_pool || w > ctx->offscreen_pool_w || h > ctx->offscreen_pool_h) {
+        const int pw = std::max(w, ctx->offscreen_pool_w);
+        const int ph = std::max(h, ctx->offscreen_pool_h);
+        // Small passes rasterize on CPU even under a GPU ctx: a backend
+        // RenderTarget + snapshot costs ~0.2ms on Metal while a row-sized
+        // CPU raster + one texture upload is far cheaper (the registry's
+        // lazy upload still lands the blit GPU→GPU). Large passes stay on
+        // the GPU surface — CPU raster of a viewport-sized layer loses.
+        const bool small = pw * ph <= 192 * 1024;
+        sk_sp<SkSurface> pool = (ctx->gpu && !small)
+            ? kx::gpu_offscreen_surface(ctx->gpu, pw, ph)
+            : SkSurfaces::Raster(SkImageInfo::MakeN32Premul(pw, ph));
+        if (!pool) return false;
+        ctx->offscreen_pool = std::move(pool);
+        ctx->offscreen_pool_w = pw;
+        ctx->offscreen_pool_h = ph;
+    }
+    ctx->offscreen = ctx->offscreen_pool; // shared — snapshot only (0,0,w,h)
     ctx->offscreen_w = w;
     ctx->offscreen_h = h;
     ctx->offscreen_prev_canvas = ctx->canvas;
     ctx->canvas = ctx->offscreen->getCanvas();
-    ctx->canvas->clear(SK_ColorTRANSPARENT);
+    // Isolate the pass: matrix/clip mutations made at the canvas's BASE
+    // level (kx_translate has no save) outlive restoreToCount(1) — a reused
+    // pool canvas would carry the previous pass's offset, rasterizing the
+    // next subtree off-image (measured: list rows all blitted item1's stale
+    // pixels). save/restore brackets the pass instead; restoreToCount(1)
+    // stays as a guard for an unbalanced exit.
+    ctx->canvas->restoreToCount(1);
+    ctx->canvas->save();
+    // Clear ONLY the snapshotted corner — the pool may cover far more
+    // (clear() on the whole surface measured +48% on resize-heavy scenes).
+    {
+        SkPaint clear;
+        clear.setBlendMode(SkBlendMode::kSrc);
+        ctx->canvas->drawRect(SkRect::MakeWH(w, h), clear);
+    }
     return true;
 }
 
 uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
     if (!ctx || !ctx->offscreen_prev_canvas) return 0;
-    sk_sp<SkImage> img = ctx->offscreen->makeImageSnapshot();
+    ctx->canvas->restore(); // balance the begin's save — unwinds the pass's
+                            // matrix/clip mutations before the pool reuses
+    // Snapshot the requested corner only — the pooled surface may be larger.
+    sk_sp<SkImage> img = ctx->offscreen->makeImageSnapshot(
+            SkIRect::MakeWH(ctx->offscreen_w, ctx->offscreen_h));
     ctx->canvas = ctx->offscreen_prev_canvas;
     ctx->offscreen_prev_canvas = nullptr;
-    ctx->offscreen.reset();
+    ctx->offscreen.reset(); // drops the alias — the pool surface stays alive
     ctx->offscreen_w = 0;
     ctx->offscreen_h = 0;
     if (!img) return 0;
