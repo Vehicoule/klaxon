@@ -1227,6 +1227,11 @@ fn deinitSlot4(a: ?*Node, b: ?*Node, c: ?*Node, d: ?*Node) void {
     if (d) |n| n.deinit();
 }
 
+fn deinitSlot5(a: ?*Node, b: ?*Node, c: ?*Node, d: ?*Node, e: ?*Node) void {
+    deinitSlot4(a, b, c, d);
+    if (e) |n| n.deinit();
+}
+
 fn buildBottomSheet(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
     const sopts = try value_mod.optionsFromValue(bottom_sheet_w.BottomSheetOptions, opts, buildSlotNode, ctx);
     errdefer deinitSlot2(sopts.content, sopts.body);
@@ -1239,7 +1244,7 @@ fn buildBottomSheet(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) a
 
 fn buildDialog(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
     const dopts = try value_mod.optionsFromValue(dialog_w.DialogOptions, opts, buildSlotNode, ctx);
-    errdefer deinitSlot4(dopts.icon, dopts.title, dopts.content, dopts.actions);
+    errdefer deinitSlot5(dopts.icon, dopts.title, dopts.content, dopts.actions, dopts.action);
     const sig = try buildBoolSignal(allocator, opts, ctx, "open");
     const n = try dialog_w.dialog(allocator, sig, null, dopts);
     // the node's children (internal scrim/panel + the slot column) are not

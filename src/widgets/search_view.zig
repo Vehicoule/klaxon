@@ -1,0 +1,1144 @@
+// SearchView (Phase 2d.3 follow-up, M3E) — the Material 3 Expressive
+// EXPANDED search view (Compose SearchBar.kt's ExpandedFullScreenSearchView):
+// opened from the collapsed SearchBar, it covers the viewport with a
+// full-bleed Surface — a header row (back arrow, the editable query, a
+// trailing clear button), a 1dp divider, and a suggestion list.
+//
+// Spec: m3.material.io/components/search + Compose SearchBar.kt /
+// ExpandedFullScreenSearchView / SearchViewTokens / ListTokens:
+//   - container: Surface, CornerNone, FULL BLEED (the whole window — no
+//     scrim: the surface itself covers the content behind)
+//   - header: a 64dp row — the leading back button (a 48dp touch box, the
+//     24dp arrow visual at 16..40), the query text (body_large OnSurface,
+//     a 1dp Primary caret at the text end while focused), the trailing
+//     clear button (a 48dp box, shown iff the query is non-empty)
+//   - divider: 1dp outline_variant, full width, under the header
+//   - suggestions: 56dp one-line rows (ListTokens) — the leading icon
+//     (24dp OnSurfaceVariant) at 16, the label (body_large OnSurface) at
+//     56, the optional trailing "fill" affordance (a 24dp icon, e.g. the
+//     M3 insert arrow) at 16 from the end. A click on a row selects it
+//     (on_select + selectedIndex); a click on the fill zone writes the
+//     suggestion into the query; Up/Down move a keyboard highlight and
+//     Enter activates it (or submits the query without one).
+//   - state layers: OnSurface @ hover 0.08 / focus 0.10 / pressed 0.12
+//   - dismissal: the back arrow, Escape (the focused chain gets it first),
+//     and the router's modal back stack (hardware back / Escape unfocused)
+//   - open state: an app-owned Signal(bool) — the view is visible iff the
+//     signal is true; while open it takes the keyboard focus (the query
+//     field IS the view) and registers on the modal back stack
+//
+// The widget is a LEAF (the search_bar / list_item idiom): the surface,
+// the header chrome and the suggestion rows are all painted by the widget
+// itself — the rows' hover/highlight/pressed colors change at paint time
+// so they need no child nodes. A11y exposes the suggestions as VIRTUAL
+// semantic children (Semantics.children + child_bounds — the segmented
+// button idiom).
+//
+// Sizing: the view fills FINITE constraints (a modal is screen-sized —
+// embed it in a full-viewport overlay/container). Inside an unbounded
+// parent, wrap it in a bounded box.
+//
+// v1 deviations (documented, fixed later):
+//   - No expand/collapse spring (the M3E shared-axis motion is a follow-up;
+//     the view snaps open/closed); the caret is static (no blink) and
+//     always at the text end; no IME panel placement (the query field
+//     renders/edits the buffer but there is no on-screen keyboard yet);
+//     the suggestion list does not scroll — rows past the bounds clip;
+//     IconName has no `history` glyph (the leading icon is per-item,
+//     defaulting to .search); RTL mirrors the chrome but the text runs
+//     stay LTR (no bidi — same as text.zig/search_bar.zig).
+const std = @import("std");
+const kx = @import("../kx.zig");
+const ui = @import("../ui.zig");
+const input = @import("../ui/input.zig");
+const gestures = @import("../ui/gestures.zig");
+const theme_mod = @import("../theme.zig");
+const icon_w = @import("icon.zig");
+const golden = @import("../golden.zig"); // tests
+
+const Node = ui.node.Node;
+const Rect = ui.node.Rect;
+const Constraints = ui.layout.Constraints;
+const Size = ui.layout.Size;
+const Color = ui.paint.Color;
+const Callback = ui.state.Callback;
+const Theme = theme_mod.Theme;
+
+/// One suggestion row. `label` is copied at build. `icon` is the leading
+/// affordance (M3: history for recent queries, search for suggestions —
+/// IconName has no history glyph; pick per item, .search is the default).
+/// `trailing_icon` enables the end-side "fill query" affordance (M3 shows
+/// an insert arrow — e.g. .arrow_up).
+pub const SuggestionItem = struct {
+    label: []const u8,
+    icon: icon_w.IconName = .search,
+    trailing_icon: ?icon_w.IconName = null,
+    enabled: bool = true,
+};
+
+pub const SearchViewOptions = struct {
+    placeholder: []const u8 = "",
+    /// The initial query text (used when no live signal is given).
+    initial: []const u8 = "",
+    theme: Theme = theme_mod.light,
+    /// The accessible name of the search region (the dialog role's label).
+    label: []const u8 = "Search",
+};
+
+// --- M3E tokens (SearchView/ListTokens + the TextFieldImpl paddings) ---
+const header_h: f32 = 64; // the input row (TopAppBar container height)
+const icon_box: f32 = 48; // minimumInteractiveComponentSize
+const icon_size: f32 = 24;
+const icon_edge: f32 = 16; // the icon visual offset (12 centered + 4 offset)
+const text_start: f32 = 52; // icon_box + (TextFieldPadding 16 - icon padding 12)
+const text_gap_trail: f32 = 4; // the text's end padding before the icon box
+const text_end_no_icon: f32 = 16; // TextFieldPadding without a trailing icon
+const caret_w: f32 = 1;
+const divider_h: f32 = 1; // DividerTokens thickness under the header
+const row_h: f32 = 56; // ListTokens one-line item height
+const row_h_pad: f32 = 16; // ListItem start/end padding
+const row_icon_gap: f32 = 16; // ListTokens LeadingContentEndPadding
+
+const ItemDef = struct {
+    label: [:0]const u8, // owned
+    icon: icon_w.IconName,
+    trailing_icon: ?icon_w.IconName,
+    enabled: bool,
+};
+
+const SearchViewState = struct {
+    buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
+    placeholder: [:0]const u8, // owned
+    label_z: [:0]const u8, // owned
+    items: std.array_list.Managed(ItemDef),
+    /// One virtual semantic child per suggestion (segmented_button idiom):
+    /// the borrow stays valid — the list is filled once at build, before
+    /// attach, and never reallocated.
+    sem_children: std.array_list.Managed(ui.semantics.Semantics),
+    opts: SearchViewOptions,
+    /// The open state — app-owned (the dialog idiom). `open` mirrors it.
+    open_sig: *ui.state.Signal(bool),
+    open: bool = false,
+    /// The query's live text channel (search_bar idiom): the widget sets it
+    /// on edit; an external set replaces the buffer (two-way).
+    query_sig: ?*ui.state.TextSignal = null,
+    on_changed: ?Callback = null,
+    on_select: ?Callback = null, // read the index via selectedIndex(node)
+    on_submitted: ?Callback = null,
+    on_close: ?Callback = null,
+    selected: usize = 0, // the last activated row (selectedIndex accessor)
+    /// The hovered/keyboard-highlighted suggestion (menu idiom — one index
+    /// for both), -1 = none.
+    highlight: i32 = -1,
+    pressed_index: i32 = -1, // the row held by the press
+    fill_pressed: i32 = -1, // the row whose trailing fill zone is held
+    back_hovered: bool = false,
+    back_pressed: bool = false,
+    clear_hovered: bool = false,
+    clear_pressed: bool = false,
+    /// The down position in raw (window) coordinates (drag deltas are
+    /// physical finger motion — gestures.SLOP).
+    down_raw_x: f32 = 0,
+    down_raw_y: f32 = 0,
+    back_registered: bool = false, // on the router's modal back stack while open
+
+    fn text(s: *SearchViewState) [:0]const u8 {
+        // Sentinel slice via the many-item pointer (see search_bar.zig).
+        return s.buf.items.ptr[0..s.buf.items.len :0];
+    }
+};
+
+fn stateOf(n: *Node) *SearchViewState {
+    return @ptrCast(@alignCast(n.state.?));
+}
+
+/// Write the null sentinel at items[len] (the P0 TextField helper).
+fn setSentinel(buf: *std.array_list.Managed(u8)) void {
+    buf.items.len += 1;
+    buf.items[buf.items.len - 1] = 0;
+    buf.items.len -= 1;
+}
+
+/// An owned null-terminated copy of a string.
+fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
+    const buf = try allocator.alloc(u8, str.len + 1);
+    @memcpy(buf[0..str.len], str);
+    buf[str.len] = 0;
+    return buf[0..str.len :0];
+}
+
+fn hasText(s: *SearchViewState) bool {
+    return s.buf.items.len > 0;
+}
+
+/// Mirror a horizontal rect across the view for RTL chrome.
+fn mirrorX(bx: f32, bw: f32, x: f32, w: f32, rtl: bool) f32 {
+    return if (rtl) bx + bw - (x - bx) - w else x;
+}
+
+/// Suggestion `index`'s row rect in parent space.
+fn rowRect(b: Rect, index: usize) Rect {
+    return .{
+        .x = b.x,
+        .y = b.y + header_h + divider_h + @as(f32, @floatFromInt(index)) * row_h,
+        .w = b.w,
+        .h = row_h,
+    };
+}
+
+/// The back button's zone (the start-side 48dp min-interactive box of the
+/// header), in parent space.
+fn backZone(b: Rect) Rect {
+    return .{ .x = b.x, .y = b.y, .w = icon_box, .h = header_h };
+}
+
+/// The clear button's zone (the end-side 48dp box of the header).
+fn clearZone(b: Rect) Rect {
+    return .{ .x = b.x + b.w - icon_box, .y = b.y, .w = icon_box, .h = header_h };
+}
+
+/// The trailing fill zone of a suggestion row (the end-side 48dp box).
+fn fillZone(b: Rect, index: usize) Rect {
+    const r = rowRect(b, index);
+    return .{ .x = r.x + r.w - icon_box, .y = r.y, .w = icon_box, .h = r.h };
+}
+
+fn contains(z: Rect, x: f32, y: f32) bool {
+    return x >= z.x and x < z.x + z.w and y >= z.y and y < z.y + z.h;
+}
+
+fn inBack(b: Rect, x: f32, y: f32) bool {
+    var z = backZone(b);
+    if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
+    return contains(z, x, y);
+}
+
+fn inClear(s: *SearchViewState, b: Rect, x: f32, y: f32) bool {
+    if (!hasText(s)) return false;
+    var z = clearZone(b);
+    if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
+    return contains(z, x, y);
+}
+
+/// The suggestion index under the point, or null (rows clipped at the
+/// bounds' bottom edge still answer for their visible part; rows past it
+/// are unreachable).
+fn suggestionAt(s: *SearchViewState, b: Rect, x: f32, y: f32) ?usize {
+    const top = b.y + header_h + divider_h;
+    if (x < b.x or x >= b.x + b.w or y < top or y >= b.y + b.h) return null;
+    const i: usize = @intFromFloat((y - top) / row_h);
+    if (i >= s.items.items.len) return null;
+    return i;
+}
+
+/// The point is inside row `index`'s trailing fill affordance.
+fn inFill(s: *SearchViewState, b: Rect, index: usize, x: f32, y: f32) bool {
+    if (s.items.items[index].trailing_icon == null) return false;
+    var z = fillZone(b, index);
+    if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
+    return contains(z, x, y);
+}
+
+fn searchViewMeasure(n: *Node, c: Constraints) Size {
+    _ = n;
+    const size = Size{};
+    const w = if (std.math.isFinite(c.max_w)) c.max_w else size.w;
+    const h = if (std.math.isFinite(c.max_h)) c.max_h else size.h;
+    return c.constrain(.{ .w = w, .h = h }); // a modal: fills finite constraints
+}
+
+fn searchViewLayout(n: *Node, bounds: Rect) void {
+    _ = n;
+    _ = bounds; // leaf: everything is positioned from the bounds at paint/hit time
+}
+
+/// Paint an icon centered in a 24x24 box — vector geometry (icon.zig), not
+/// a font glyph (emoji-capable codepoints bypass the theme ink).
+fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, color: Color) void {
+    if (color & 0xFF == 0) return;
+    icon_w.drawIcon(ctx, name, x, y, icon_size / 24.0, color);
+}
+
+fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s = stateOf(n);
+    if (!s.open) return;
+    const b = n.bounds;
+    const t = s.opts.theme;
+    const cs = t.colors;
+    const rtl = ui.i18n.direction() == .rtl;
+    const focused = input.isFocused(n);
+    const surface = cs.surface;
+
+    // --- the full-bleed Surface (CornerNone — no scrim: it covers all) ---
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, surface);
+
+    // --- header row ---
+    // the back button's state layer (a 48dp circle centered in its box)
+    const bz = backZone(b);
+    const bx = mirrorX(b.x, b.w, bz.x, bz.w, rtl);
+    const back_alpha: f32 = if (s.back_pressed)
+        t.state.pressed
+    else if (s.back_hovered)
+        t.state.hover
+    else
+        0;
+    if (back_alpha > 0) {
+        ui.paint.fillRRect(ctx, bx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha));
+    }
+    // the arrow visual at 16..40 — a back arrow (pointing at the start edge
+    // in RTL too: the arrow direction mirrors with the layout)
+    const icon_y = b.y + (header_h - icon_size) / 2;
+    const back_x = mirrorX(b.x, b.w, b.x + icon_edge, icon_size, rtl);
+    paintIcon(ctx, if (rtl) .arrow_right else .arrow_left, back_x, icon_y, cs.on_surface);
+
+    // the clear button (the trailing 48dp box; shown iff the query is non-empty)
+    if (hasText(s)) {
+        const z = clearZone(b);
+        const zx = mirrorX(b.x, b.w, z.x, z.w, rtl);
+        const clear_alpha: f32 = if (s.clear_pressed)
+            t.state.pressed
+        else if (s.clear_hovered)
+            t.state.hover
+        else
+            0;
+        if (clear_alpha > 0) {
+            ui.paint.fillRRect(ctx, zx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, clear_alpha));
+        }
+        const cx = mirrorX(b.x, b.w, b.x + b.w - icon_edge - icon_size, icon_size, rtl);
+        paintIcon(ctx, .close, cx, icon_y, cs.on_surface_variant);
+    }
+
+    // --- the query text (clipped between the icons; the whole clip rect
+    // mirrors in RTL — mirroring only the edge would clip the text away) ---
+    const style = t.type_scale.body_large;
+    const ty = b.y + (header_h - style.line_height) / 2;
+    const right = if (hasText(s)) icon_box + text_gap_trail else text_end_no_icon;
+    const clip_w = b.w - text_start - right;
+    const clip_x = mirrorX(b.x, b.w, b.x + text_start, clip_w, rtl);
+    ui.paint.clipRect(ctx, clip_x, b.y, clip_w, header_h);
+    if (hasText(s)) {
+        const m = ui.paint.measureText(s.text(), style.size, false);
+        const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
+        ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, cs.on_surface);
+        if (focused) {
+            // the caret at the end of the text
+            ui.paint.fillRect(ctx, tx + m.width, ty, caret_w, m.height, cs.primary);
+        }
+    } else {
+        if (s.placeholder.len > 0) {
+            const m = ui.paint.measureText(s.placeholder, style.size, false);
+            const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
+            ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, cs.on_surface_variant);
+        }
+        if (focused) {
+            // the caret at the (mirrored) start (empty text)
+            const caret_x = mirrorX(b.x, b.w, b.x + text_start, 0, rtl);
+            ui.paint.fillRect(ctx, caret_x, ty, caret_w, style.line_height, cs.primary);
+        }
+    }
+    ui.paint.clipReset(ctx);
+
+    // --- the divider under the header (1dp, outline_variant, full width) ---
+    ui.paint.fillRect(ctx, b.x, b.y + header_h, b.w, divider_h, cs.outline_variant);
+
+    // --- the suggestion rows ---
+    const list_y = b.y + header_h + divider_h;
+    const list_h = b.y + b.h - list_y;
+    if (list_h <= 0) return;
+    ui.paint.clipRect(ctx, b.x, list_y, b.w, list_h);
+    for (s.items.items, 0..) |it, i| {
+        const r = rowRect(b, i);
+        if (r.y >= b.y + b.h) break; // ordered rows: the rest is clipped away
+        const enabled = it.enabled;
+        const content: Color = if (enabled) cs.on_surface else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+        const muted: Color = if (enabled) cs.on_surface_variant else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+        // the state layer over the row (pressed > hovered/keyboard highlight)
+        var alpha: f32 = 0;
+        if (enabled) {
+            if (s.pressed_index == @as(i32, @intCast(i)) or s.fill_pressed == @as(i32, @intCast(i)))
+                alpha = t.state.pressed
+            else if (s.highlight == @as(i32, @intCast(i)))
+                alpha = if (focused) t.state.focus else t.state.hover;
+        }
+        if (alpha > 0) {
+            ui.paint.fillRect(ctx, r.x, r.y, r.w, r.h, theme_mod.stateLayer(surface, cs.on_surface, alpha));
+        }
+        const iy = r.y + (row_h - icon_size) / 2;
+        // the leading icon (24dp at 16 from the start)
+        const lix = mirrorX(b.x, b.w, r.x + row_h_pad, icon_size, rtl);
+        paintIcon(ctx, it.icon, lix, iy, muted);
+        // the trailing "fill" affordance (24dp at 16 from the end)
+        if (it.trailing_icon) |tic| {
+            const tix = mirrorX(b.x, b.w, r.x + r.w - row_h_pad - icon_size, icon_size, rtl);
+            paintIcon(ctx, tic, tix, iy, muted);
+        }
+        // the label (body_large at 56 from the start, clipped before the
+        // trailing affordance)
+        const label_x = r.x + row_h_pad + icon_size + row_icon_gap;
+        const trail_w: f32 = if (it.trailing_icon != null) icon_box else row_h_pad;
+        const max_tw = @max(0, r.w - (label_x - r.x) - trail_w);
+        const lclip_x = mirrorX(b.x, b.w, label_x, max_tw, rtl);
+        ui.paint.clipRect(ctx, lclip_x, r.y, max_tw, r.h);
+        const lm = ui.paint.measureText(it.label, style.size, false);
+        const ltx = mirrorX(b.x, b.w, label_x, lm.width, rtl);
+        ui.paint.text(ctx, it.label, ltx, r.y + (row_h - style.line_height) / 2 + lm.ascent, style.size, false, content);
+        ui.paint.clipReset(ctx);
+    }
+    ui.paint.clipReset(ctx);
+}
+
+fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const s = stateOf(n);
+    if (!s.open) return false;
+    const b = n.bounds;
+    switch (ev.phase) {
+        .down => {
+            s.down_raw_x = ev.raw_x;
+            s.down_raw_y = ev.raw_y;
+            if (inBack(b, ev.x, ev.y)) {
+                s.back_pressed = true;
+            } else if (inClear(s, b, ev.x, ev.y)) {
+                s.clear_pressed = true;
+            } else if (suggestionAt(s, b, ev.x, ev.y)) |i| {
+                if (s.items.items[i].enabled) {
+                    if (inFill(s, b, i, ev.x, ev.y)) {
+                        s.fill_pressed = @intCast(i);
+                    } else {
+                        s.pressed_index = @intCast(i);
+                    }
+                }
+            } else {
+                // the header text area / empty space: the query keeps focus
+                input.requestFocus(n);
+            }
+            // the press is modal — nothing under the view sees it
+            n.markDirty();
+            return true;
+        },
+        .up => {
+            const was_back = s.back_pressed;
+            const was_clear = s.clear_pressed;
+            const fill_i = s.fill_pressed;
+            const item_i = s.pressed_index;
+            s.back_pressed = false;
+            s.clear_pressed = false;
+            s.fill_pressed = -1;
+            s.pressed_index = -1;
+            n.markDirty();
+            if (was_back) {
+                if (inBack(b, ev.x, ev.y)) closeSearchView(n, s); // M3: the nav icon dismisses
+            } else if (was_clear) {
+                if (inClear(s, b, ev.x, ev.y)) clearQuery(n, s);
+            } else if (fill_i >= 0) {
+                const i: usize = @intCast(fill_i);
+                if (suggestionAt(s, b, ev.x, ev.y) == i and inFill(s, b, i, ev.x, ev.y)) fillQuery(n, s, i);
+            } else if (item_i >= 0) {
+                const i: usize = @intCast(item_i);
+                if (suggestionAt(s, b, ev.x, ev.y) == i and !inFill(s, b, i, ev.x, ev.y)) select(n, s, i);
+            }
+            return true;
+        },
+        .move => {
+            // A drag beyond the touch slop is a scroll, not a press: cancel
+            // the pressed state. The move is NOT claimed (return false) so
+            // it keeps bubbling to scrollable ancestors.
+            if (s.back_pressed or s.clear_pressed or s.pressed_index >= 0 or s.fill_pressed >= 0) {
+                const dx = ev.raw_x - s.down_raw_x;
+                const dy = ev.raw_y - s.down_raw_y;
+                if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    s.back_pressed = false;
+                    s.clear_pressed = false;
+                    s.fill_pressed = -1;
+                    s.pressed_index = -1;
+                    n.markDirty();
+                }
+            }
+            return false;
+        },
+        // the pointer went down outside while we held the capture: cancel
+        .outside_down => {
+            s.back_pressed = false;
+            s.clear_pressed = false;
+            s.fill_pressed = -1;
+            s.pressed_index = -1;
+            n.markDirty();
+            return true;
+        },
+        .enter => {
+            updateHover(n, s, ev.x, ev.y);
+            return true;
+        },
+        // moving within the leaf emits hover_move (not enter/leave):
+        // re-resolve the hover zones
+        .hover_move => {
+            updateHover(n, s, ev.x, ev.y);
+            return true;
+        },
+        .leave => {
+            s.highlight = -1;
+            s.back_hovered = false;
+            s.clear_hovered = false;
+            n.markDirty();
+            return true;
+        },
+    }
+    return false;
+}
+
+/// Re-resolve the hovered zones from the pointer position (the suggestion
+/// highlight doubles as the hover state — the menu idiom).
+fn updateHover(n: *Node, s: *SearchViewState, x: f32, y: f32) void {
+    const b = n.bounds;
+    const bh = inBack(b, x, y);
+    const ch = inClear(s, b, x, y);
+    var hi: i32 = -1;
+    if (!bh and !ch) {
+        if (suggestionAt(s, b, x, y)) |i| {
+            if (s.items.items[i].enabled) hi = @intCast(i);
+        }
+    }
+    if (bh != s.back_hovered or ch != s.clear_hovered or hi != s.highlight) {
+        s.back_hovered = bh;
+        s.clear_hovered = ch;
+        s.highlight = hi;
+        n.markDirty();
+    }
+}
+
+/// Move the keyboard highlight to the next/previous enabled suggestion
+/// (wrapping); a no-op when there is no enabled row. From no highlight,
+/// Down lands on the first row and Up wraps to the last.
+fn moveHighlight(n: *Node, s: *SearchViewState, dir: i32) void {
+    const count: i32 = @intCast(s.items.items.len);
+    if (count == 0) return;
+    var i = s.highlight;
+    var steps: i32 = 0;
+    while (steps < count) : (steps += 1) {
+        i = if (i < 0)
+            (if (dir > 0) 0 else count - 1)
+        else
+            @mod(i + dir, count);
+        if (s.items.items[@intCast(i)].enabled) {
+            if (i != s.highlight) {
+                s.highlight = i;
+                n.markDirty();
+            }
+            return;
+        }
+    }
+}
+
+/// An edit happened: repaint, sync the a11y value, mirror the signal, fire
+/// the callback. The view fills its constraints — the text width drives no
+/// measure, so no markLayoutDirty (unlike the collapsed bar).
+fn applyEdit(n: *Node, s: *SearchViewState) void {
+    n.markDirty();
+    if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
+    ui.semantics.notifyControlChanged(n); // a11y: the control's value changed
+    // The buffer is already bounded by the 1 MiB input cap → set cannot fail.
+    if (s.query_sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
+    if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
+}
+
+/// Clear the query (the clear button): keep the focus, fire on_changed.
+fn clearQuery(n: *Node, s: *SearchViewState) void {
+    s.buf.clearRetainingCapacity();
+    setSentinel(&s.buf);
+    applyEdit(n, s);
+}
+
+/// The trailing fill affordance: write the suggestion into the query
+/// (M3's "insert" arrow — the field fills, the view stays open).
+fn fillQuery(n: *Node, s: *SearchViewState, i: usize) void {
+    const label = s.items.items[i].label;
+    s.buf.clearRetainingCapacity();
+    s.buf.ensureTotalCapacity(label.len + 1) catch @panic("klaxon: out of memory");
+    s.buf.appendSlice(label) catch @panic("klaxon: out of memory");
+    setSentinel(&s.buf);
+    applyEdit(n, s);
+}
+
+/// A suggestion was activated (click / Enter on the highlight): record the
+/// index and fire the callback — the app decides what it means (fill the
+/// query, submit, navigate); the view stays open.
+fn select(n: *Node, s: *SearchViewState, i: usize) void {
+    s.selected = i;
+    _ = n;
+    if (s.on_select) |cb| cb.fn_ptr(cb.userdata);
+}
+
+/// Dismiss: flip the open signal (the sync callback hides the view, drops
+/// the focus, pops the back handler) and fire on_close.
+fn closeSearchView(n: *Node, s: *SearchViewState) void {
+    s.open_sig.set(false);
+    if (s.on_close) |cb| cb.fn_ptr(cb.userdata);
+    _ = n;
+}
+
+fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
+    const s = stateOf(n);
+    if (!s.open) return false;
+    switch (ev.kind) {
+        .text_input => {
+            // Reject (never truncate) input that would grow the text past
+            // the documented cap — a paste/IME burst is applied whole or
+            // not at all.
+            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
+            s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
+            s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+            setSentinel(&s.buf);
+            applyEdit(n, s);
+            return true;
+        },
+        .key_down => switch (ev.key) {
+            .backspace => {
+                // Delete the last UTF-8 codepoint (continuation bytes first).
+                while (s.buf.items.len > 0) {
+                    const last = s.buf.items[s.buf.items.len - 1];
+                    s.buf.items.len -= 1;
+                    if ((last & 0xC0) != 0x80) break;
+                }
+                setSentinel(&s.buf);
+                applyEdit(n, s);
+                return true;
+            },
+            .up => {
+                moveHighlight(n, s, -1);
+                return true;
+            },
+            .down => {
+                moveHighlight(n, s, 1);
+                return true;
+            },
+            .enter => {
+                // M3: Enter activates the highlighted suggestion; without
+                // one it submits the query (imeAction = Search).
+                if (s.highlight >= 0 and s.highlight < @as(i32, @intCast(s.items.items.len))) {
+                    const i: usize = @intCast(s.highlight);
+                    if (s.items.items[i].enabled) {
+                        select(n, s, i);
+                        return true;
+                    }
+                }
+                if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
+                return true;
+            },
+            .escape => {
+                closeSearchView(n, s); // M3: Escape dismisses the view
+                return true;
+            },
+            else => {},
+        },
+    }
+    return false;
+}
+
+/// Show/hide to match the open signal: visible iff open, the modal back
+/// handler tracks it, and the focus lands on the query field (or is
+/// released on dismiss).
+fn applyOpen(n: *Node, s: *SearchViewState, open: bool) void {
+    if (s.open == open) return;
+    s.open = open;
+    n.setVisible(open);
+    s.highlight = -1;
+    s.pressed_index = -1;
+    s.fill_pressed = -1;
+    s.back_pressed = false;
+    s.clear_pressed = false;
+    s.back_hovered = false;
+    s.clear_hovered = false;
+    if (open) {
+        input.requestFocus(n); // the query field takes the focus while open
+    } else if (input.isFocused(n)) {
+        input.requestFocus(null); // a dismissed view drops the focus
+    }
+    syncBackHandler(n, s);
+}
+
+/// Open state changed (the app set the signal).
+fn svOpenSyncCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    applyOpen(n, s, s.open_sig.peek());
+}
+
+/// Escape / hardware-back while the view is open (the router consults the
+/// modal back stack before the navigator — dispatchBack).
+fn svBackCb(userdata: ?*anyopaque) bool {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (!s.open) return false;
+    closeSearchView(n, s); // the signal sync pops the handler
+    return true;
+}
+
+/// Keep the router's modal back stack in sync with the open state.
+fn syncBackHandler(n: *Node, s: *SearchViewState) void {
+    const want = s.open;
+    if (want == s.back_registered) return;
+    const router = input.current() orelse return;
+    if (want) {
+        if (router.pushBackHandler(.{ .fn_ptr = svBackCb, .userdata = n })) s.back_registered = true;
+    } else {
+        router.popBackHandler(n);
+        s.back_registered = false;
+    }
+}
+
+/// An external signal set (the designer): replace the buffer when the text
+/// differs. The signal holds the full text, so the comparison runs against
+/// the buffer itself — the widget's own sets round-trip as no-ops (the
+/// signal dedups equal content).
+fn svQuerySyncCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    const incoming = s.query_sig.?.peek();
+    if (std.mem.eql(u8, s.text(), incoming)) return;
+    s.buf.clearRetainingCapacity();
+    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
+    setSentinel(&s.buf);
+    n.markDirty();
+    if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
+}
+
+fn searchViewDeinit(n: *Node) void {
+    const s = stateOf(n);
+    s.open_sig.unsubscribe(.{ .callback = .{ .fn_ptr = svOpenSyncCb, .userdata = n } });
+    if (s.query_sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = svQuerySyncCb, .userdata = n } });
+    if (s.back_registered) {
+        if (input.current()) |r| r.popBackHandler(n); // destroyed while open
+        s.back_registered = false;
+    }
+    input.releaseNode(n);
+    for (s.items.items) |it| n.allocator.free(it.label);
+    s.items.deinit();
+    s.sem_children.deinit();
+    n.allocator.free(s.placeholder);
+    n.allocator.free(s.label_z);
+    s.buf.deinit();
+    n.allocator.destroy(s);
+}
+
+const search_view_vtable = ui.node.VTable{
+    .measure = searchViewMeasure,
+    .layout = searchViewLayout,
+    .paint = searchViewPaint,
+    .deinit = searchViewDeinit,
+    .on_pointer = searchViewOnPointer,
+    .on_key = searchViewOnKey,
+};
+
+/// Suggestion `index`'s rect in NODE-LOCAL space (Semantics.child_bounds —
+/// 0,0 is the node's top-left).
+fn suggestionChildBounds(n: *Node, index: usize) Rect {
+    return .{
+        .x = 0,
+        .y = header_h + divider_h + @as(f32, @floatFromInt(index)) * row_h,
+        .w = n.bounds.w,
+        .h = row_h,
+    };
+}
+
+/// The M3E expanded search view (full-screen). `items` is the suggestion
+/// list (copied — the view owns the labels). `open` is the app-owned open
+/// signal: true = visible + focused + on the modal back stack; flipping it
+/// animates nothing (v1 snaps). `query` = null → the text starts at
+/// `opts.initial`; non-null → the query mirrors the signal both ways.
+/// `on_changed` fires on every edit (incl. the clear + fill affordances);
+/// `on_select` on a suggestion activation (read the row via
+/// selectedIndex(node)); `on_submitted` on Enter without a highlight;
+/// `on_close` on dismissal. The view is a leaf: it owns its text buffer
+/// and paints all of its chrome; the suggestions are virtual semantic
+/// children. The query text is growable up to
+/// ui.state.TextSignal.max_len (1 MiB); over-cap initial text is REJECTED
+/// (error.TextTooLong), never truncated.
+pub fn searchView(
+    allocator: std.mem.Allocator,
+    items: []const SuggestionItem,
+    open: *ui.state.Signal(bool),
+    query: ?*ui.state.TextSignal,
+    on_changed: ?Callback,
+    on_select: ?Callback,
+    on_submitted: ?Callback,
+    on_close: ?Callback,
+    opts: SearchViewOptions,
+) !*Node {
+    // Rejected up front: over the documented cap → error.TextTooLong (never
+    // truncated). Checked before any allocation so nothing needs freeing.
+    const initial: []const u8 = if (query) |q| q.peek() else opts.initial;
+    if (initial.len > ui.state.TextSignal.max_len) return error.TextTooLong;
+    const node = try Node.create(allocator, &search_view_vtable);
+    errdefer allocator.destroy(node); // no state yet; children list is empty
+    const placeholder = try dupeZ(allocator, opts.placeholder);
+    errdefer allocator.free(placeholder);
+    const label_z = try dupeZ(allocator, opts.label);
+    errdefer allocator.free(label_z);
+    const s = try allocator.create(SearchViewState);
+    errdefer allocator.destroy(s);
+    s.* = .{
+        .buf = std.array_list.Managed(u8).init(allocator),
+        .placeholder = placeholder,
+        .label_z = label_z,
+        .items = std.array_list.Managed(ItemDef).init(allocator),
+        .sem_children = std.array_list.Managed(ui.semantics.Semantics).init(allocator),
+        .opts = opts,
+        .open_sig = open,
+        .query_sig = query,
+        .on_changed = on_changed,
+        .on_select = on_select,
+        .on_submitted = on_submitted,
+        .on_close = on_close,
+    };
+    errdefer {
+        for (s.items.items) |it| allocator.free(it.label);
+        s.items.deinit();
+        s.sem_children.deinit();
+        s.buf.deinit();
+    }
+    try s.items.ensureTotalCapacity(items.len);
+    try s.sem_children.ensureTotalCapacity(items.len);
+    for (items) |it| {
+        const label = try dupeZ(allocator, it.label);
+        s.items.appendAssumeCapacity(.{
+            .label = label,
+            .icon = it.icon,
+            .trailing_icon = it.trailing_icon,
+            .enabled = it.enabled,
+        });
+        // The suggestion rows are virtual a11y children (no Node of their
+        // own) — activation lands on the row rect via child_bounds.
+        s.sem_children.appendAssumeCapacity(.{
+            .role = .list_item,
+            .label = label,
+            .disabled = !it.enabled,
+            .actions = if (it.enabled) ui.semantics.Actions.initOne(.activate) else .{},
+        });
+    }
+    s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
+    if (initial.len > 0) {
+        s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
+    }
+    setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
+    node.state = s;
+    if (!open.peek()) node.setVisible(false); // hidden until the signal opens it
+    ui.semantics.attach(node, .{
+        .role = .dialog, // the search region (a full-screen dialog)
+        .label = s.label_z,
+        .hint = s.placeholder,
+        .value = s.text(),
+        .focusable = true,
+        .children = s.sem_children.items,
+        .child_bounds = suggestionChildBounds,
+    }); // Phase 2c
+    open.subscribe(.{ .callback = .{ .fn_ptr = svOpenSyncCb, .userdata = node } });
+    if (query) |q| {
+        q.subscribe(.{ .callback = .{ .fn_ptr = svQuerySyncCb, .userdata = node } }); // external edits land in the buffer
+    }
+    if (open.peek()) applyOpen(node, s, true); // built open: focus + back stack
+    return node;
+}
+
+/// Current query text — borrowed from the widget's buffer (valid until the
+/// next edit or deinit).
+pub fn text(n: *Node) [:0]const u8 {
+    return stateOf(n).text();
+}
+
+/// Replace the query text (e.g. the gallery restores it across rebuilds).
+/// Over-cap text is rejected: the view keeps its current contents.
+pub fn setText(n: *Node, str: []const u8) void {
+    const s = stateOf(n);
+    if (str.len > ui.state.TextSignal.max_len) return;
+    s.buf.clearRetainingCapacity();
+    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
+    s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
+    setSentinel(&s.buf);
+    n.markDirty();
+    if (n.semantics) |sem| sem.value = s.text();
+    ui.semantics.notifyControlChanged(n);
+    if (s.query_sig) |sig| sig.set(s.text()) catch @panic("klaxon: text buffer exceeds the 1 MiB cap");
+}
+
+/// Whether the view is open (mirrors the open signal).
+pub fn isOpen(n: *Node) bool {
+    return stateOf(n).open;
+}
+
+/// Flip the open signal (the sync callback applies it).
+pub fn setOpen(n: *Node, open: bool) void {
+    stateOf(n).open_sig.set(open);
+}
+
+/// The last activated suggestion's index (read inside on_select).
+pub fn selectedIndex(n: *Node) usize {
+    return stateOf(n).selected;
+}
+
+// --- tests ---
+
+const SuggestionList = struct {
+    const items = [_]SuggestionItem{
+        .{ .label = "apples", .icon = .search },
+        .{ .label = "apricots", .icon = .star, .trailing_icon = .arrow_up },
+        .{ .label = "bananas", .icon = .search },
+    };
+};
+
+fn countingCb(userdata: ?*anyopaque) void {
+    const c: *u32 = @ptrCast(@alignCast(userdata.?));
+    c.* += 1;
+}
+
+test "search_view: closed by default — invisible; the signal opens it" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, null, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    try std.testing.expect(!v.visible);
+    try std.testing.expect(!isOpen(v));
+    open.set(true);
+    try std.testing.expect(v.visible);
+    try std.testing.expect(isOpen(v));
+    open.set(false);
+    try std.testing.expect(!v.visible);
+}
+
+test "search_view: fills finite constraints" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const v = try searchView(std.testing.allocator, &.{}, open, null, null, null, null, null, .{});
+    defer v.deinit();
+    const m = v.measure(.{ .max_w = 720, .max_h = 480 });
+    try std.testing.expectEqual(@as(f32, 720), m.w);
+    try std.testing.expectEqual(@as(f32, 480), m.h);
+}
+
+test "search_view: the back arrow and Escape close; on_close fires" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    var closed: u32 = 0;
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, null, null, .{ .fn_ptr = countingCb, .userdata = &closed }, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // open with the router live: the modal back handler registers and the
+    // query field takes the focus
+    open.set(true);
+    try std.testing.expectEqual(@as(usize, 1), router.back_stack_len);
+    try std.testing.expect(router.focused == v);
+    // a click on the back arrow (the 48dp start box of the 64dp header)
+    router.dispatchPointer(v, .{ .phase = .down, .x = 24, .y = 32 });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 24, .y = 32 });
+    try std.testing.expect(!open.peek());
+    try std.testing.expectEqual(@as(u32, 1), closed);
+    try std.testing.expectEqual(@as(usize, 0), router.back_stack_len);
+    try std.testing.expect(router.focused == null); // the close released the focus
+    // reopen: Escape (the focused key path) closes it too
+    open.set(true);
+    try std.testing.expect(router.focused == v);
+    try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .escape }));
+    try std.testing.expect(!open.peek());
+    try std.testing.expectEqual(@as(u32, 2), closed);
+    // reopen, blur: the modal back stack still closes it (unfocused Escape)
+    open.set(true);
+    router.focus(null);
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expect(!open.peek());
+    try std.testing.expectEqual(@as(u32, 3), closed);
+}
+
+test "search_view: a suggestion click fires on_select with the row index" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    var picked: u32 = 0;
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, .{ .fn_ptr = countingCb, .userdata = &picked }, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // row 1 (apricots) center — under the header + divider
+    const ry = header_h + divider_h + row_h + row_h / 2;
+    router.dispatchPointer(v, .{ .phase = .down, .x = 180, .y = ry });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 180, .y = ry });
+    try std.testing.expectEqual(@as(u32, 1), picked);
+    try std.testing.expectEqual(@as(usize, 1), selectedIndex(v));
+    // a click up outside the pressed row does not fire (release on row 2)
+    const ry2 = header_h + divider_h + 2 * row_h + row_h / 2;
+    router.dispatchPointer(v, .{ .phase = .down, .x = 180, .y = ry });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 180, .y = ry2 });
+    try std.testing.expectEqual(@as(u32, 1), picked);
+}
+
+test "search_view: the fill affordance writes the suggestion into the query" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    var changed: u32 = 0;
+    var picked: u32 = 0;
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, .{ .fn_ptr = countingCb, .userdata = &changed }, .{ .fn_ptr = countingCb, .userdata = &picked }, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // the trailing 48dp zone of row 1 (the only row with a trailing icon)
+    const ry = header_h + divider_h + row_h + row_h / 2;
+    router.dispatchPointer(v, .{ .phase = .down, .x = 360 - 24, .y = ry });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 360 - 24, .y = ry });
+    try std.testing.expectEqualStrings("apricots", text(v));
+    try std.testing.expectEqual(@as(u32, 1), changed); // an edit, not a select
+    try std.testing.expectEqual(@as(u32, 0), picked);
+}
+
+test "search_view: typing edits the query; the signal mirrors; clear empties it" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const query = try ui.state.TextSignal.init(std.testing.allocator, "");
+    defer query.deinit();
+    var changed: u32 = 0;
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, query, .{ .fn_ptr = countingCb, .userdata = &changed }, null, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // open with the router live → the query field takes the focus
+    open.set(true);
+    try std.testing.expect(router.focused == v);
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "ap" });
+    try std.testing.expectEqualStrings("ap", text(v));
+    try std.testing.expectEqualStrings("ap", query.peek());
+    try std.testing.expectEqual(@as(u32, 1), changed);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("a", text(v));
+    // an external set replaces the buffer (two-way sync)
+    query.set("app") catch return error.TestUnexpectedError;
+    try std.testing.expectEqualStrings("app", text(v));
+    // the clear button (the trailing 48dp header box) empties the field
+    router.dispatchPointer(v, .{ .phase = .down, .x = 360 - 24, .y = 32 });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 360 - 24, .y = 32 });
+    try std.testing.expectEqualStrings("", text(v));
+    try std.testing.expectEqualStrings("", query.peek());
+}
+
+test "search_view: Up/Down highlight and Enter activates the suggestion" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    var picked: u32 = 0;
+    var submitted: u32 = 0;
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, .{ .fn_ptr = countingCb, .userdata = &picked }, .{ .fn_ptr = countingCb, .userdata = &submitted }, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    open.set(true); // focused with the router live
+    // Enter with no highlight submits the query
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqual(@as(u32, 1), submitted);
+    try std.testing.expectEqual(@as(u32, 0), picked);
+    // Down lands on row 0; Down again on row 1; Enter selects it
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .down });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .down });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqual(@as(u32, 1), picked);
+    try std.testing.expectEqual(@as(usize, 1), selectedIndex(v));
+}
+
+test "search_view: semantics — the dialog role with virtual list_item children" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, null, null, null, .{ .label = "Find stuff" });
+    defer v.deinit();
+    const sem = v.semantics.?;
+    try std.testing.expectEqual(ui.semantics.Role.dialog, sem.role);
+    try std.testing.expectEqualStrings("Find stuff", sem.label);
+    try std.testing.expect(sem.focusable);
+    try std.testing.expectEqual(@as(usize, 3), sem.children.len);
+    try std.testing.expectEqual(ui.semantics.Role.list_item, sem.children[0].role);
+    try std.testing.expectEqualStrings("apples", sem.children[0].label);
+    // the virtual child bounds: row 1 sits under the header + divider
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    const cb = sem.child_bounds.?(v, 1);
+    try std.testing.expectEqual(header_h + divider_h + row_h, cb.y);
+    try std.testing.expectEqual(row_h, cb.h);
+    try std.testing.expectEqual(@as(f32, 360), cb.w);
+}
+
+test "search_view: setText + a disabled row is not selectable" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const dis_items = [_]SuggestionItem{
+        .{ .label = "on", .icon = .search },
+        .{ .label = "off", .icon = .search, .enabled = false },
+    };
+    var picked: u32 = 0;
+    const v = try searchView(std.testing.allocator, &dis_items, open, null, null, .{ .fn_ptr = countingCb, .userdata = &picked }, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    open.set(true); // focused for the keyboard part below
+    setText(v, "hello");
+    try std.testing.expectEqualStrings("hello", text(v));
+    // a click on the disabled row does not fire
+    const ry = header_h + divider_h + row_h + row_h / 2;
+    router.dispatchPointer(v, .{ .phase = .down, .x = 180, .y = ry });
+    router.dispatchPointer(v, .{ .phase = .up, .x = 180, .y = ry });
+    try std.testing.expectEqual(@as(u32, 0), picked);
+    // keyboard highlight skips the disabled row (Down wraps back to row 0)
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .down });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .down });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqual(@as(u32, 1), picked);
+    try std.testing.expectEqual(@as(usize, 0), selectedIndex(v));
+}
+
+test "golden: search_view open paints the surface, the header and the rows" {
+    const t = theme_mod.light;
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const query = try ui.state.TextSignal.init(std.testing.allocator, "ap");
+    defer query.deinit();
+    const items = [_]SuggestionItem{
+        .{ .label = "apples", .icon = .search },
+        .{ .label = "apricots", .icon = .star, .trailing_icon = .arrow_up },
+    };
+    const v = try searchView(std.testing.allocator, &items, open, query, null, null, null, null, .{ .theme = t });
+    defer v.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 360, 400);
+    defer r.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 400 });
+    r.paint(v, 0x112233FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // the surface covers the whole frame (full bleed — the corner is surface)
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(2, 2));
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(358, 398));
+    // the divider row is outline_variant, full width
+    try std.testing.expect(f.countColorIn(.{ .x = 0, .y = header_h, .w = 360, .h = divider_h }, t.colors.outline_variant) > 300);
+    // the back arrow + the clear button ink in the header (on_surface /
+    // on_surface_variant — AA blends count as "not surface")
+    try std.testing.expect(f.countNotIn(.{ .x = 0, .y = 0, .w = 48, .h = header_h }, t.colors.surface) > 0);
+    try std.testing.expect(f.countNotIn(.{ .x = 312, .y = 0, .w = 48, .h = header_h }, t.colors.surface) > 0);
+    // the suggestion rows: leading icon + label + trailing arrow ink
+    const row0 = Rect{ .x = 0, .y = header_h + divider_h, .w = 360, .h = row_h };
+    const row1 = Rect{ .x = 0, .y = header_h + divider_h + row_h, .w = 360, .h = row_h };
+    try std.testing.expect(f.countColorIn(row0, t.colors.on_surface) > 0); // label ink
+    try std.testing.expect(f.countColorIn(row0, t.colors.on_surface_variant) > 0); // icon ink
+    try std.testing.expect(f.countColorIn(row1, t.colors.on_surface) > 0);
+    try std.testing.expect(f.countNotIn(row1, t.colors.surface) > 0);
+    // closed: nothing paints — the body shows through
+    open.set(false);
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 400 });
+    r.paint(v, 0x112233FF);
+    var f2 = try r.readback(std.testing.allocator);
+    defer f2.deinit();
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(2, 2));
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(180, 200));
+}

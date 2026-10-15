@@ -45,6 +45,8 @@
 // filled style, 5 sizes) — Phase 2d.3 PR D3.
 // SearchBar (1): the M3E collapsed search bar (56dp pill, text entry, clear
 // button) — Phase 2d.3 PR D4.
+// SearchView (1): the M3E expanded full-screen search view (header row +
+// suggestion list, signal-driven open state) — Phase 2d.3 PR D4 follow-up.
 // NavigationRail (1): the M3E navigation rail (collapsed circle indicator /
 // expanded pill, signal-driven selection) — Phase 2d.3 PR D4.
 // SideSheet (1): the M3E side sheet (standard coplanar / modal + scrim,
@@ -95,6 +97,7 @@ pub const date_picker = @import("widgets/date_picker.zig");
 pub const time_picker = @import("widgets/time_picker.zig");
 pub const color_picker = @import("widgets/color_picker.zig");
 pub const fab = @import("widgets/fab.zig");
+pub const fab_menu = @import("widgets/fab_menu.zig");
 pub const carousel = @import("widgets/carousel.zig");
 pub const bottom_app_bar = @import("widgets/bottom_app_bar.zig");
 pub const gestures = @import("widgets/gestures.zig");
@@ -121,3 +124,6 @@ pub const stepper = @import("widgets/stepper.zig");
 pub const calendar = @import("widgets/calendar.zig");
 pub const table = @import("widgets/table.zig");
 pub const tree = @import("widgets/tree.zig");
+pub const button_group = @import("widgets/button_group.zig");
+pub const toolbar = @import("widgets/toolbar.zig");
+pub const search_view = @import("widgets/search_view.zig");

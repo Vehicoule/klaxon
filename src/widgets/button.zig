@@ -80,7 +80,7 @@ pub const ButtonOptions = struct {
 };
 
 /// Per-size measurement tokens (Compose Button*Tokens + Button.kt paddings).
-const Dims = struct {
+pub const Dims = struct {
     height: f32,
     icon: f32,
     icon_gap: f32,
@@ -91,7 +91,7 @@ const Dims = struct {
     outline_width: f32,
 };
 
-fn dimsFor(size: ButtonSize) Dims {
+pub fn dimsFor(size: ButtonSize) Dims {
     return switch (size) {
         .xsmall => .{ .height = 32, .icon = 20, .icon_gap = 8, .h_padding = 12, .v_padding = 6, .square_corner = 12, .pressed_corner = 8, .outline_width = 1 },
         .small => .{ .height = 40, .icon = 20, .icon_gap = 8, .h_padding = 16, .v_padding = 8, .square_corner = 12, .pressed_corner = 8, .outline_width = 1 },
@@ -107,7 +107,7 @@ const min_target: f32 = 48; // a11y touch-target floor
 /// FilledTonalButtonTokens.IconSize (the small tonal icon is 18dp).
 const tonal_icon_small: f32 = 18;
 
-const VariantColors = struct {
+pub const VariantColors = struct {
     container: Color, // enabled (transparent for outlined/text)
     on: Color, // label/icon color + the state layer's on-color
     disabled_container: Color,
@@ -116,7 +116,7 @@ const VariantColors = struct {
     disabled_outline: Color,
 };
 
-fn variantColors(t: Theme, variant: ButtonVariant) VariantColors {
+pub fn variantColors(t: Theme, variant: ButtonVariant) VariantColors {
     const cs = t.colors;
     const transparent: Color = 0x00000000;
     return switch (variant) {
@@ -164,7 +164,7 @@ fn variantColors(t: Theme, variant: ButtonVariant) VariantColors {
 }
 
 /// The label's type style per size (Compose ButtonDefaults.textStyleFor).
-fn labelStyle(t: Theme, size: ButtonSize) theme_mod.TypeStyle {
+pub fn labelStyle(t: Theme, size: ButtonSize) theme_mod.TypeStyle {
     return switch (size) {
         .xsmall, .small => t.type_scale.label_large,
         .medium => t.type_scale.title_medium,
@@ -175,7 +175,7 @@ fn labelStyle(t: Theme, size: ButtonSize) theme_mod.TypeStyle {
 
 /// Content padding (Compose ButtonDefaults.<Size>ContentPadding; the text
 /// variant uses TextButtonContentPadding: 12 horizontal, end 16 with icon).
-fn contentPadding(opts: ButtonOptions) EdgeInsets {
+pub fn contentPadding(opts: ButtonOptions) EdgeInsets {
     const d = dimsFor(opts.size);
     if (opts.variant == .text) {
         return .{
