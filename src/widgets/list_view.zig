@@ -243,10 +243,13 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         // bounds.y - offset on screen; the image's top-left is (ix, iy).
         ui.paint.translate(ctx, -ix, -iy - s.scroll.offset);
         // Cull in the same screen space the normal pass uses (children map
-        // their paint rects through the list's map_paint_rect).
-        const band_screen = ui.node.rectIntersect(child_region, .{
+        // their paint rects through the list's map_paint_rect). The band is
+        // in IMAGE space — n.bounds' parent space — while child_region is
+        // root space: map before intersecting or a scrolled ancestor puts
+        // the band nowhere near the rows (empty backing → blank list).
+        const band_screen = ui.node.rectIntersect(child_region, n.mapRectToRoot(.{
             .x = ix, .y = iy + repaint.y, .w = repaint.w, .h = repaint.h,
-        });
+        }));
         ui.paint.spriteBatchBegin(ctx); // row atlas blits → one mesh
         for (n.children.items) |c| {
             if (c.defer_paint or c.zombie) continue;
@@ -313,6 +316,7 @@ fn listScrollSetOffset(n: *Node, value: f32) void {
 fn listDeinit(n: *Node) void {
     const s = stateOf(ListState, n);
     dropBacking(s);
+    s.input.deinit(); // a live flight ticker borrows this state
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -466,6 +470,33 @@ fn testList(count: usize) !*Node {
     });
 }
 
+
+test "repro: a fast fling never blanks the viewport" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const list = try testList(10_000);
+    defer list.deinit();
+    list.layout(.{ .x = 0, .y = 0, .w = 100, .h = 240 });
+    var r = try golden.Renderer.init(std.testing.allocator, 100, 240);
+    defer r.deinit();
+    const bgc: Color = 0x202020FF;
+    r.paint(list, bgc);
+    // A fling: press + a burst of large moves, painting each frame like the host.
+    router.dispatchPointer(list, .{ .phase = .down, .x = 50, .y = 200 });
+    var y: f32 = 200;
+    for (0..12) |i| {
+        y -= 300; // drag up fast
+        router.dispatchPointer(list, .{ .phase = .move, .x = 50, .y = y });
+        r.paintDamage(list, bgc);
+        var f = try r.readback(std.testing.allocator);
+        defer f.deinit();
+        const colored = f.countColor(red) + f.countColor(green) + f.countColor(blue);
+        if (colored == 0) std.debug.print("BLANK frame {d} offset={d} children={d} first={d}\n", .{ i, scrollOffset(list), list.children.items.len, stateOf(ListState, list).first });
+        try std.testing.expect(colored > 0);
+    }
+}
+
 test "listView: virtualizes — 10k items keep ~7 children alive" {
     const list = try testList(10_000);
     defer list.deinit();
@@ -589,7 +620,7 @@ test "listView: a large backward jump rebuilds only the new window" {
     try std.testing.expectEqual(@as(usize, 0), stateOf(ListState, list).first);
 }
 
-test "listView: scrolling away a captured item releases the router capture" {
+test "listView: a virtualized-out capture hands to the list — the drag keeps scrolling" {
     var router = input.InputRouter{};
     input.setCurrent(&router);
     defer input.setCurrent(null);
@@ -599,8 +630,15 @@ test "listView: scrolling away a captured item releases the router capture" {
     router.dispatchPointer(list, .{ .phase = .down, .x = 50, .y = 10 });
     try std.testing.expect(router.capturedNode(0) != null);
     _ = setScrollOffset(list, 48 * 50); // the captured item is virtualized out
-    try std.testing.expect(router.capturedNode(0) == null); // no dangling capture
-    router.dispatchPointer(list, .{ .phase = .move, .x = 50, .y = 10 }); // safe (hover path)
+    // The capture moved up to the list — no dangling row ref, and the
+    // in-flight drag still reaches the scrollable (this was the mid-drag
+    // freeze: every .move after the row's eviction went nowhere).
+    try std.testing.expect(router.capturedNode(0) == list);
+    const before = scrollOffset(list);
+    router.dispatchPointer(list, .{ .phase = .move, .x = 50, .y = 0 });
+    try std.testing.expect(scrollOffset(list) == before + 10); // still scrolling
+    router.dispatchPointer(list, .{ .phase = .up, .x = 50, .y = 0 });
+    try std.testing.expect(router.capturedNode(0) == null); // released cleanly
 }
 
 test "listView: growing the viewport re-clamps the offset" {
