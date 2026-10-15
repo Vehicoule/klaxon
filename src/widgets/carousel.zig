@@ -304,9 +304,19 @@ const CarouselState = struct {
     /// Per-pointer drag tracks (window-space x — see ScrollInput).
     tracks: [8]Track = @splat(.{ .pointer = 0, .x = 0, .active = false }),
     dragged: bool = false,
+    /// Channel owning the release snap/fling spring — a retargeted play
+    /// cancels it in place; a fresh grab cancels it directly.
+    anim_channel: u8 = 0,
 };
 
-const Track = struct { pointer: u64, x: f32, active: bool };
+const Track = struct {
+    pointer: u64,
+    x: f32,
+    active: bool,
+    /// Content-space velocity EMA, px/ms (finger left = positive).
+    vel: f32 = 0,
+    last_ms: u64 = 0,
+};
 
 fn stateOf(n: *Node) *CarouselState {
     return @ptrCast(@alignCast(n.state.?));
@@ -513,7 +523,33 @@ fn applyScrollOffset(n: *Node, s: *CarouselState, value: f32) bool {
 /// + after a wheel click when the pointer rests on the strip — wheel
 /// scrolling stays free; the snap applies on the next drag release).
 fn snapNow(n: *Node, s: *CarouselState) void {
-    _ = applyScrollOffset(n, s, snapOffset(s, s.scroll.offset));
+    settleSnap(n, s, 0);
+}
+
+/// Release settle: project the landing from the release velocity (v px/ms
+/// × the decay horizon), then let the M3 spatial spring carry the strip to
+/// the nearest item-focal candidate — seeded WITH the fling velocity, so a
+/// fast release sails past an item before it settles. No timeline → snap
+/// immediately (headless tests).
+fn settleSnap(n: *Node, s: *CarouselState, v: f32) void {
+    const projected = s.scroll.offset + v * 260; // ms: decay horizon
+    const target = snapOffset(s, projected);
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ s.scroll.offset, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ v * 1000, 0, 0, 0 }),
+            .from = from,
+            .channel = @ptrCast(&s.anim_channel),
+            .on_update = .{ .fn_ptr = snapUpdateCb, .userdata = n },
+        });
+    } else {
+        _ = applyScrollOffset(n, s, target);
+    }
+}
+
+fn snapUpdateCb(userdata: ?*anyopaque, value: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    _ = applyScrollOffset(n, stateOf(n), value[0]);
 }
 
 fn carouselMeasure(n: *Node, c: Constraints) Size {
@@ -583,15 +619,24 @@ fn carouselOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             const t = trackFor(s, ev.pointer);
-            t.* = .{ .pointer = ev.pointer, .x = ev.raw_x, .active = true };
+            t.* = .{ .pointer = ev.pointer, .x = ev.raw_x, .active = true, .last_ms = ev.time_ms };
             s.dragged = false;
+            // A grab interrupts an in-flight snap — the strip follows the finger.
+            if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel));
             return false; // items handle taps
         },
         .up, .outside_down => {
-            releaseTrack(s, ev.pointer);
+            var v: f32 = 0;
+            for (&s.tracks) |*t| {
+                if (t.active and t.pointer == ev.pointer) {
+                    // A finger held still before release carries no fling.
+                    if (ev.time_ms -| t.last_ms <= 120) v = t.vel;
+                    t.active = false;
+                }
+            }
             if (s.dragged) {
                 s.dragged = false;
-                snapNow(n, s); // snap to the nearest item on release
+                settleSnap(n, s, v); // fling → spring onto the nearest item
             }
             return false;
         },
@@ -601,8 +646,16 @@ fn carouselOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const router = input.current() orelse return false;
     const dragging = router.capturedNode(ev.pointer) != null;
     const t = trackFor(s, ev.pointer);
-    const last = if (t.active and t.pointer == ev.pointer) t.x else ev.raw_x;
-    t.* = .{ .pointer = ev.pointer, .x = ev.raw_x, .active = true };
+    const same = t.active and t.pointer == ev.pointer;
+    const last = if (same) t.x else ev.raw_x;
+    const last_ms = if (same) t.last_ms else ev.time_ms;
+    var vel = if (same) t.vel else 0;
+    if (ev.time_ms > last_ms) {
+        // content-space velocity: finger left (dx < 0) scrolls forward
+        const inst = (last - ev.raw_x) / @as(f32, @floatFromInt(ev.time_ms - last_ms));
+        vel = vel * 0.65 + inst * 0.35;
+    }
+    t.* = .{ .pointer = ev.pointer, .x = ev.raw_x, .active = true, .vel = vel, .last_ms = ev.time_ms };
     if (!dragging) return false; // hover move: no scroll
     const dx = ev.raw_x - last;
     if (dx == 0) return false;
