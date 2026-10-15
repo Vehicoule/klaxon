@@ -24,7 +24,6 @@ const layout_w = @import("widgets/layout.zig");
 const text_w = @import("widgets/text.zig");
 const icon_w = @import("widgets/icon.zig");
 const divider_w = @import("widgets/divider.zig");
-const input_w = @import("widgets/input.zig");
 const button_w = @import("widgets/button.zig");
 const icon_button_w = @import("widgets/icon_button.zig");
 const checkbox_w = @import("widgets/checkbox.zig");

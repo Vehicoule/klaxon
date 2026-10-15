@@ -248,6 +248,7 @@ fn buildNodeDef(allocator: std.mem.Allocator, src: *const TreeNode) !TreeNodeDef
         .label = buf[0..src.label.len :0],
         .children = std.array_list.Managed(TreeNodeDef).init(allocator),
     };
+    errdefer freeNode(allocator, &def);
     if (src.children) |children| {
         for (children) |*child| {
             try def.children.append(try buildNodeDef(allocator, child));
@@ -272,6 +273,7 @@ pub fn tree(
         .root = try buildNodeDef(allocator, root),
         .on_select = on_select,
     };
+    errdefer freeNode(allocator, &s.root);
     node.state = @ptrCast(s);
 
     ui.semantics.attach(node, .{
