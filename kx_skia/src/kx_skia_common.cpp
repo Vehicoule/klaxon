@@ -2634,8 +2634,8 @@ void kx_layer_alpha(kx_ctx* ctx, float alpha) {
     if (!ctx || !ctx->canvas) return;
     if (ctx->sprite_batch_open) kx_sprite_flush(ctx); // ordering: layer boundary
     float a = alpha;
-    if (a < 0.0f) a = 0.0f;
-    if (a > 1.0f) a = 1.0f;
+    if (!(a >= 0.0f)) a = 0.0f; // NaN/-inf: a saveLayerAlphaf NaN is undefined
+    else if (a > 1.0f) a = 1.0f;
     if (!ctx->offscreen_stack.empty()) {
         // The offscreen raster is a plain canvas: layers inside it keep the
         // real saveLayer behaviour (recording is suspended there).
@@ -3020,6 +3020,12 @@ bool kx_gpu_warmup(kx_ctx* ctx) {
     // the exact paint code paths real frames take, so the programs compiled
     // here are the programs the first real frames would otherwise compile
     // on the fly (Ganesh compiles lazily per draw op on first use).
+    // Save the frame state: warmup may run after begin_frame (the real
+    // canvas would be clobbered) or inside a recorded layer (the ops would
+    // replay onto the wrong canvas later).
+    SkCanvas* prev_canvas = ctx->canvas;
+    std::vector<std::unique_ptr<KxRecLayer>> prev_layers;
+    prev_layers.swap(ctx->layers);
     ctx->canvas = canvas;
     kx_clear(ctx, 0x000000FF);
     kx_fill_rect(ctx, 2, 2, 20, 20, 0x3366CCFF);
@@ -3048,7 +3054,8 @@ bool kx_gpu_warmup(kx_ctx* ctx) {
     kx_draw_text_styled(ctx, "warmup", 4, 40, 12, true, 0xFFFFFFFF);
     kx_draw_text(ctx, "warmup", 4, 56, 12, 0xCCCCCCCC);
     kx_restore(ctx); // pops the saveLayer pushed by kx_layer_alpha
-    ctx->canvas = nullptr;
+    ctx->canvas = prev_canvas;
+    ctx->layers.swap(prev_layers); // restore an in-flight recording untouched
     return kx::gpu_end_offscreen(ctx->gpu);
 }
 
