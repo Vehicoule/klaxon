@@ -324,6 +324,11 @@ pub fn ctxSerialAlive(serial: u64) bool {
 pub fn imageDrawRegion(ctx: *kx.Ctx, id: u64, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32) void {
     kx.c.kx_draw_image_region(ctx, id, sx, sy, sw, sh, dx, dy, dw, dh);
 }
+/// imageDrawRegion under an rgba tint — the mesh carries it per-sprite,
+/// so opacity-animated atlas blits never re-raster (QSG opacity idiom).
+pub fn imageDrawRegionTinted(ctx: *kx.Ctx, id: u64, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32, rgba: u32) void {
+    kx.c.kx_draw_image_region_tinted(ctx, id, sx, sy, sw, sh, dx, dy, dw, dh, rgba);
+}
 /// Bracket a children pass: atlas blits inside accumulate into ONE
 /// drawVertices (GPU only — no-op on raster/while recording layers).
 pub fn spriteBatchBegin(ctx: *kx.Ctx) void {

@@ -337,6 +337,7 @@ const SceneRunner = struct {
     router: ?input_mod.InputRouter = null, // input_ime + input_latency (installed process-global)
     text_field: ?*Node = null, // input_ime
     scroll_list: ?*Node = null, // scroll_10k + list_ops + scroll_anim + backdrop_scroll
+    pulse_overlay: ?*Node = null, // scroll_anim's live pulse layer
     list_empty_text: ?*Node = null, // list_ops empty-state ("No rows")
     list_ctx: ListItemCtx = undefined, // the virtualized lists' factory ctx
     video: ?*VideoState = null, // video_playback
@@ -571,12 +572,14 @@ const SceneRunner = struct {
                 }
             },
             .scroll_anim => {
-                // 600 dp/s at 60 Hz ≈ 10 px/frame; the row icons pulse opacity
-                // off the drive clock at paint (PulseItemCtx.drive).
+                // 600 dp/s at 60 Hz ≈ 10 px/frame. The overlay repaints the
+                // ~30 visible row icons every frame (Qt's banded delegates
+                // pay the same); it reads the live offset + drive clock.
                 const list = r.scroll_list.?;
                 const max_off = widgets.list_view.maxScrollOffset(list);
                 const off = @mod(@as(f32, @floatFromInt(frame)) * 10.0, max_off + 1.0);
                 _ = widgets.list_view.setScrollOffset(list, off);
+                r.pulse_overlay.?.markDirty();
             },
             .backdrop_scroll => {
                 const list = r.scroll_list.?;
@@ -2237,49 +2240,115 @@ fn buildMountChurn(r: *SceneRunner) !*Node {
 // "30 embedded row icons" ARE the live window of a virtualized 10k list).
 
 const PulseItemCtx = struct { allocator: std.mem.Allocator, drive: *Drive };
-const PulseState = struct { drive: *Drive, i: usize };
 
-fn pulseMeasure(n: *Node, c: Constraints) Size {
+/// The pulse overlay: one dot per visible row, repainted EVERY frame —
+/// the honest equivalent of the QML delegate's `opacity: banded ?
+/// list.pulse : 1.0` (Qt re-issues the band delegates' star each frame).
+/// Kept OUT of the row delegates: a dot baked into a retained row slot
+/// could never update between rasters — frozen paint would be a fake win.
+const PulseOverlayState = struct {
+    list: *Node,
+    drive: *Drive,
+    // The 12x12 dot rasterized ONCE into a shared-atlas slot — the ~30
+    // per-frame repaints are tinted slot blits (mesh vertex alpha), the
+    // QSG opacity-uniform idiom. Raster/GLES fall back to direct rrects.
+    dot_ok: bool = false,
+    dot_slot: [4]f32 = .{ 0, 0, 0, 0 },
+    dot_gen: u32 = 0,
+    dot_serial: u64 = 0,
+};
+
+fn pulseOverlayMeasure(n: *Node, c: Constraints) Size {
     _ = n;
-    return c.constrain(.{ .w = 12, .h = 12 });
+    return c.constrain(.{ .w = 640, .h = 470 });
 }
-fn pulsePaint(n: *Node, ctx: *kx.Ctx) void {
-    const s: *PulseState = @ptrCast(@alignCast(n.state.?));
-    const t = @as(f32, @floatFromInt(s.drive.frame));
-    const k = 0.25 + 0.75 * (0.5 + 0.5 * @sin(0.12 * t + @as(f32, @floatFromInt(s.i)) * 0.7));
+fn pulseOverlayPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s: *PulseOverlayState = @ptrCast(@alignCast(n.state.?));
     const b = n.bounds;
-    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, 6, ui.paint.withAlphaScaled(0xFFD54FFF, k));
+    const off = widgets.list_view.scrollOffset(s.list);
+    const t = @as(f32, @floatFromInt(s.drive.frame));
+    const row_h: f32 = 16;
+    const first: usize = @intFromFloat(@max(0, @floor(off / row_h)));
+    const last: usize = @intFromFloat(@min(9_999, @floor((off + b.h) / row_h)));
+    if (ui.paint.inNestedPass(ctx)) {
+        pulseOverlayDots(ctx, b, off, t, first, last, null);
+        return;
+    }
+    // Establish the atlas tile once per ctx (serial) / atlas regrow (gen).
+    const serial = ui.paint.ctxSerial(ctx);
+    const gen = ui.paint.atlasGen(ctx);
+    if (!s.dot_ok or s.dot_serial != serial or s.dot_gen != gen) {
+        s.dot_ok = false;
+        if (ui.paint.atlasBegin(ctx, 12, 12, &s.dot_slot)) {
+            ui.paint.fillRRect(ctx, 0, 0, 12, 12, 6, 0xFFD54FFF);
+            ui.paint.atlasEnd(ctx);
+            s.dot_gen = ui.paint.atlasGen(ctx); // post-begin: regrow bumps
+            s.dot_serial = serial;
+            s.dot_ok = true;
+        }
+    }
+    pulseOverlayDots(ctx, b, off, t, first, last, if (s.dot_ok) s else null);
 }
-fn pulseDeinit(n: *Node) void {
-    n.allocator.destroy(@as(*PulseState, @ptrCast(@alignCast(n.state.?))));
+
+/// Dot pass: the band's ~30 visible rows. With a live atlas slot the dots
+/// are tinted blits inside one sprite mesh; without one (raster, nested
+/// pass) each paints as its own rrect — same pixels either way.
+fn pulseOverlayDots(ctx: *kx.Ctx, b: Rect, off: f32, t: f32, first: usize, last: usize, s: ?*PulseOverlayState) void {
+    if (s != null) ui.paint.spriteBatchBegin(ctx);
+    defer if (s != null) ui.paint.spriteBatchEnd(ctx);
+    const row_h: f32 = 16;
+    var row = first;
+    while (row <= last) : (row += 1) {
+        // Same band rule as the QML: the first 30 visible rows pulse,
+        // anything past them stays opaque (at ~30 rows / viewport the
+        // band is effectively the whole viewport).
+        const in_band = row < first + 30;
+        const k = if (in_band)
+            0.25 + 0.75 * (0.5 + 0.5 * @sin(0.12 * t + @as(f32, @floatFromInt(row)) * 0.7))
+        else
+            1.0;
+        const y = b.y + @as(f32, @floatFromInt(row)) * row_h - off + 2;
+        if (s) |ov| {
+            const img = ui.paint.atlasImage(ctx);
+            if (img != 0) {
+                ui.paint.imageDrawRegionTinted(ctx, img, ov.dot_slot[0], ov.dot_slot[1], ov.dot_slot[2], ov.dot_slot[3], b.x + 2, y, 12, 12, ui.paint.withAlphaScaled(0xFFFFFFFF, k));
+                continue;
+            }
+            ui.paint.fillRRect(ctx, b.x + 2, y, 12, 12, 6, ui.paint.withAlphaScaled(0xFFD54FFF, k));
+        } else {
+            ui.paint.fillRRect(ctx, b.x + 2, y, 12, 12, 6, ui.paint.withAlphaScaled(0xFFD54FFF, k));
+        }
+    }
 }
-const pulse_vtable = ui.node.VTable{ .measure = pulseMeasure, .layout = noopLayout, .paint = pulsePaint, .deinit = pulseDeinit };
+fn pulseOverlayHit(n: *Node) Rect {
+    _ = n;
+    return .{}; // decorative overlay: never a pointer target
+}
+fn pulseOverlayDeinit(n: *Node) void {
+    n.allocator.destroy(@as(*PulseOverlayState, @ptrCast(@alignCast(n.state.?))));
+}
+const pulse_overlay_vtable = ui.node.VTable{ .measure = pulseOverlayMeasure, .layout = noopLayout, .paint = pulseOverlayPaint, .deinit = pulseOverlayDeinit, .hit_bounds = pulseOverlayHit };
 
 fn scrollAnimItem(userdata: ?*anyopaque, index: usize) *Node {
     const ctx: *PulseItemCtx = @ptrCast(@alignCast(userdata.?));
     const a = ctx.allocator;
-    const row = widgets.layout.row(a, .{ .gap = 8, .padding = 2, .cross_align = .center }) catch @panic("klaxon: out of memory");
-    const dot = Node.create(a, &pulse_vtable) catch @panic("klaxon: out of memory");
-    const s = a.create(PulseState) catch @panic("klaxon: out of memory");
-    s.* = .{ .drive = ctx.drive, .i = index };
-    dot.state = s;
-    row.add(dot);
+    const row = widgets.layout.row(a, .{ .gap = 0, .padding = 2, .cross_align = .center }) catch @panic("klaxon: out of memory");
+    // 20px holds the 12px icon + its 8px label gap; the overlay paints
+    // the pulsing dot there (kept live per frame, not baked in the slot).
+    row.add(widgets.layout.constrainedBox(a, .{ .min_w = 20, .max_w = 20, .min_h = 12, .max_h = 12 }) catch @panic("klaxon: out of memory"));
     var buf: [32]u8 = undefined;
     const label = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch "Item";
     row.add(widgets.text.text(a, label, .{ .size = 11, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
     return row;
 }
 
-/// scroll_anim rows recycle: update the dot's phase index + the label.
+/// scroll_anim rows recycle: update the label (the dot lives in the
+/// pulse overlay — nothing per-row left to refresh).
 fn scrollAnimRebind(userdata: ?*anyopaque, index: usize, node: *Node) bool {
     _ = userdata;
-    const dot = node.children.items[0];
-    const s: *PulseState = @ptrCast(@alignCast(dot.state.?));
-    s.i = index;
     var buf: [32]u8 = undefined;
     const str = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch return false;
     widgets.text.setText(node.children.items[1], str);
-    dot.markDirty(); // phase moved — the pulse repaint must refresh
     return true;
 }
 
@@ -2292,8 +2361,16 @@ fn buildScrollAnim(r: *SceneRunner) !*Node {
         .item_height = 16,
     });
     r.scroll_list = list;
+    const stack = try widgets.layout.stack(a, .{ .fit = .expand });
+    stack.add(list);
+    const overlay = try Node.create(a, &pulse_overlay_vtable);
+    const os = try a.create(PulseOverlayState);
+    os.* = .{ .list = list, .drive = r.pulse_ctx.drive };
+    overlay.state = os;
+    stack.add(overlay);
+    r.pulse_overlay = overlay;
     const box = try widgets.layout.constrainedBox(a, .{ .max_w = 640, .max_h = 470 });
-    box.add(list);
+    box.add(stack);
     col.add(box);
     return col;
 }

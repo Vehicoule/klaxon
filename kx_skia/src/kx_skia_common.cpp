@@ -24,6 +24,7 @@
 #include "include/core/SkTextBlob.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkVertices.h"
+#include "include/core/SkColorFilter.h"
 #include "include/effects/SkGradient.h"
 #include "include/effects/SkImageFilters.h"
 #include "include/utils/SkShadowUtils.h"
@@ -150,7 +151,7 @@ struct kx_ctx {
     // and flush as one textured mesh when the batch closes.
     bool sprite_batch_open = false;
     SkCanvas* sprite_target = nullptr; // canvas the open batch collected on
-    struct KxPendingSprite { SkPoint dst[4]; SkRect src; };
+    struct KxPendingSprite { SkPoint dst[4]; SkRect src; SkColor color; };
     std::vector<KxPendingSprite> sprite_batch;
     bool sprite_flushing = false;
     // Image registry (per-ctx; images are plain pixel data, shared by all draws).
@@ -1182,9 +1183,10 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 // alpha and the draw replays with an alpha paint.
                 if (!op.flag) {
                     if (op.xs.size() == 4) // recorded region draw (atlas slot)
-                        kx_draw_image_region(ctx, op.image, op.xs[0], op.xs[1],
-                                             op.xs[2], op.xs[3], op.f[0], op.f[1],
-                                             op.f[2], op.f[3]);
+                        kx_draw_image_region_tinted(ctx, op.image, op.xs[0],
+                                             op.xs[1], op.xs[2], op.xs[3],
+                                             op.f[0], op.f[1], op.f[2], op.f[3],
+                                             op.color ? op.color : 0xFFFFFFFFu);
                     else
                         kx_draw_image(ctx, op.image, op.f[0], op.f[1], op.f[2], op.f[3]);
                 } else {
@@ -1972,12 +1974,17 @@ void kx_sprite_flush(kx_ctx* ctx) {
     sk_sp<SkImage> atlas_img = ctx->atlas_view;
     if (!atlas_img) return;
     SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * n, 6 * n,
-                          SkVertices::kHasTexCoords_BuilderFlag);
+                          SkVertices::kHasTexCoords_BuilderFlag |
+                          SkVertices::kHasColors_BuilderFlag);
     SkPoint* pos = b.positions();
     SkPoint* tc = b.texCoords();
+    SkColor* cols = b.colors();
     uint16_t* idx = b.indices();
     for (int i = 0; i < n; ++i) {
-        for (int c = 0; c < 4; ++c) pos[4 * i + c] = sprites[i].dst[c];
+        for (int c = 0; c < 4; ++c) {
+            pos[4 * i + c] = sprites[i].dst[c];
+            cols[4 * i + c] = sprites[i].color;
+        }
         tc[4 * i + 0] = {sprites[i].src.fLeft, sprites[i].src.fTop};
         tc[4 * i + 1] = {sprites[i].src.fRight, sprites[i].src.fTop};
         tc[4 * i + 2] = {sprites[i].src.fRight, sprites[i].src.fBottom};
@@ -1991,10 +1998,11 @@ void kx_sprite_flush(kx_ctx* ctx) {
     // Draw onto the canvas the batch collected on — a flush can fire while
     // ctx->canvas is the ATLAS canvas (sprites stay pending across an
     // entering row's rasterize so the batch isn't split per row).
+    // kModulate: the per-vertex tint multiplies the sampled texel.
     SkCanvas* target = ctx->sprite_target ? ctx->sprite_target : ctx->canvas;
     target->save();
     target->setMatrix(SkMatrix::I());
-    target->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
+    target->drawVertices(b.detach(), SkBlendMode::kModulate, paint);
     target->restore();
     ctx->frame_ops++;
     kx_prof("sprite_mesh", t0);
@@ -2016,6 +2024,17 @@ void kx_sprite_batch_end(kx_ctx* ctx) {
 void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
                           float sx, float sy, float sw, float sh,
                           float dx, float dy, float dw, float dh) {
+    kx_draw_image_region_tinted(ctx, image, sx, sy, sw, sh,
+                                dx, dy, dw, dh, 0xFFFFFFFFu);
+}
+
+// rgba tint (0xRRGGBBAA): modulates the blit — opacity-animated sprites
+// (QSG's per-delegate opacity idiom) replay the SAME texture under a new
+// alpha in the batch mesh instead of re-rasterizing.
+void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
+                                 float sx, float sy, float sw, float sh,
+                                 float dx, float dy, float dw, float dh,
+                                 uint32_t rgba) {
     if (!ctx || !ctx->canvas || !image || dw <= 0 || dh <= 0) return;
     auto it = ctx->images.find(image);
     if (it == ctx->images.end()) return;
@@ -2024,6 +2043,7 @@ void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
         op.f[0] = dx; op.f[1] = dy; op.f[2] = dw; op.f[3] = dh;
         op.image = image;
         op.xs = {sx, sy, sw, sh};
+        op.color = rgba;
         op.local_bounds = kx_xywh(dx, dy, dw, dh, 0.5f);
         kx_rec_op(ctx, std::move(op));
         return;
@@ -2037,6 +2057,7 @@ void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
         ctx->canvas == ctx->sprite_target) {
         kx_ctx::KxPendingSprite sp;
         sp.src = src;
+        sp.color = kx_to_skcolor(rgba);
         const SkPoint corners[4] = {{dx, dy}, {dx + dw, dy},
                                     {dx + dw, dy + dh}, {dx, dy + dh}};
         ctx->canvas->getTotalMatrix().mapPoints(
@@ -2047,9 +2068,21 @@ void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
     if (ctx->gpu && !it->second.img->isTextureBacked())
         it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
     kx_count_op(ctx);
+    SkPaint paint;
+    SkPaint* pp = nullptr;
+    if (rgba != 0xFFFFFFFFu) {
+        const SkColor c = kx_to_skcolor(rgba);
+        if (SkColorGetR(c) == 0xFF && SkColorGetG(c) == 0xFF &&
+            SkColorGetB(c) == 0xFF)
+            paint.setAlphaf(SkColorGetA(c) / 255.0f);
+        else
+            paint.setColorFilter(
+                SkColorFilters::Blend(c, SkBlendMode::kModulate));
+        pp = &paint;
+    }
     ctx->canvas->drawImageRect(it->second.img.get(), src,
                                SkRect::MakeXYWH(dx, dy, dw, dh),
-                               SkSamplingOptions(), nullptr,
+                               SkSamplingOptions(), pp,
                                SkCanvas::kFast_SrcRectConstraint);
 }
 

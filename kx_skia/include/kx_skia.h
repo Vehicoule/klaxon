@@ -309,6 +309,14 @@ void kx_atlas_free(kx_ctx* ctx, float sx, float sy, float sw, float sh);
 void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
                           float sx, float sy, float sw, float sh,
                           float dx, float dy, float dw, float dh);
+// Same blit under an rgba tint (0xRRGGBBAA modulates texels — alpha-only
+// for opacity fades). Batched like kx_draw_image_region: the tint lands
+// in the mesh vertex colors, so animating a sprite's opacity costs a
+// re-recorded blit, never a re-raster — the QSG opacity idiom.
+void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
+                                 float sx, float sy, float sw, float sh,
+                                 float dx, float dy, float dw, float dh,
+                                 uint32_t rgba);
 // Sprite batch (added in 0.18.0): while open, draws of ATLAS-region images
 // accumulate as device-space sprites and flush as ONE drawVertices when the
 // batch closes or any other op intervenes (ordering preserved). Lists wrap
