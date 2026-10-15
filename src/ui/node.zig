@@ -2189,3 +2189,19 @@ test "backdrop_subtree propagates up and blocks auto-retain" {
     // Every frame ran the hooks (9 entries/frame: root+box+blur chain).
     try std.testing.expectEqual(@as(usize, 27), log.items.len);
 }
+
+// Note: add()/insert() assert on cycles in debug builds (a tree cycle is a
+// programmer bug, not runtime data) and refuse silently in release — the
+// crash path itself isn't unit-testable in-process.
+test "add reparents a node from its previous parent" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const mid = try testNode(50, 50);
+    const leaf = try testNode(10, 10);
+    root.add(mid);
+    mid.add(leaf);
+    root.add(leaf); // reparent: leaf leaves mid, joins root
+    try std.testing.expectEqual(root, leaf.parent.?);
+    try std.testing.expectEqual(@as(usize, 0), mid.children.items.len);
+    try std.testing.expectEqual(@as(usize, 2), root.children.items.len);
+}

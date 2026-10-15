@@ -1280,3 +1280,33 @@ test "up with no capture and no hit delivers nothing" {
     try std.testing.expectEqual(@as(usize, 1), recState(root).log.items.len);
     try std.testing.expectEqual(PointerPhase.up, recState(root).log.items[0]);
 }
+
+var decline_flag: bool = false;
+fn declineBack(_: ?*anyopaque) bool {
+    return false; // a modal that declines (e.g. already-closed dialog)
+}
+fn countBack2(userdata: ?*anyopaque) bool {
+    const c: *u32 = @ptrCast(@alignCast(userdata.?));
+    c.* += 1;
+    return true;
+}
+
+test "back: a declining modal handler falls through to lower handlers" {
+    var router = InputRouter{};
+    var handled: u32 = 0;
+    router.setBackHandler(.{ .fn_ptr = countBack2, .userdata = &handled });
+    // Topmost modal declines → the next stack entry gets the event.
+    var lower: u32 = 0;
+    try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = countBack2, .userdata = &lower }));
+    try std.testing.expect(router.pushBackHandler(.{ .fn_ptr = declineBack, .userdata = &decline_flag }));
+    try std.testing.expect(router.dispatchBack());
+    try std.testing.expectEqual(@as(u32, 1), lower); // lower stack entry ran
+    try std.testing.expectEqual(@as(u32, 0), handled); // back handler untouched
+    // Every stack entry declines → the back handler (navigator) runs.
+    var router2 = InputRouter{};
+    router2.setBackHandler(.{ .fn_ptr = countBack2, .userdata = &handled });
+    try std.testing.expect(router2.pushBackHandler(.{ .fn_ptr = declineBack, .userdata = &decline_flag }));
+    try std.testing.expect(router2.pushBackHandler(.{ .fn_ptr = declineBack, .userdata = &decline_flag }));
+    try std.testing.expect(router2.dispatchBack());
+    try std.testing.expectEqual(@as(u32, 1), handled);
+}
