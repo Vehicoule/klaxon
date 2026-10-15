@@ -60,10 +60,46 @@ pub const SignalBase = struct {
     /// notify iterate the LIVE list in place — no per-notify dupe, no
     /// revalidation scan — while (un)subscribes mid-notify stay correct.
     notify_gen: u64 = 0,
+    /// Depth of nested notify() calls on this signal. A deinit while >0
+    /// marks `dying` instead of freeing — the loop still walks
+    /// `subscribers` and the owner struct embeds the base.
+    notify_depth: u32 = 0,
+    dying: bool = false,
     subscribers: std.array_list.Managed(Entry),
     allocator: std.mem.Allocator,
 
     const Entry = struct { sub: Subscriber, fired_gen: u64 };
+
+    /// A signal/effect destroyed inside its own notify must stay alive
+    /// until the notify stack unwinds (the loop walks `subscribers`, which
+    /// lives inside the owner struct). deinit pushes a zombie entry; the
+    /// outermost notify exit sweeps everything whose base is no longer
+    /// busy — the same class the node zombie sweep already covers.
+    const ZombieSignal = struct {
+        owner: *anyopaque,
+        base: *SignalBase,
+        destroy: *const fn (owner: *anyopaque) void,
+    };
+    var zombie_signals: std.ArrayListUnmanaged(ZombieSignal) = .empty;
+
+    pub fn deferSignalDestroy(owner: *anyopaque, base: *SignalBase, destroy: *const fn (owner: *anyopaque) void) void {
+        zombie_signals.append(std.heap.c_allocator, .{ .owner = owner, .base = base, .destroy = destroy }) catch @panic("klaxon: out of memory");
+    }
+
+    fn sweepZombieSignals() void {
+        var i = zombie_signals.items.len;
+        while (i > 0) {
+            i -= 1;
+            const z = zombie_signals.items[i];
+            if (z.base.notify_depth == 0) {
+                // Free the subscriber list while the struct is still alive
+                // (it lives inside the owner), then destroy the owner.
+                z.base.subscribers.deinit();
+                z.destroy(z.owner);
+                _ = zombie_signals.swapRemove(i);
+            }
+        }
+    }
 
     pub fn init(allocator: std.mem.Allocator) SignalBase {
         return .{
@@ -95,6 +131,11 @@ pub const SignalBase = struct {
         // traversal freeze defers those deinits to a safe point.
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
+        base.notify_depth += 1;
+        defer {
+            base.notify_depth -= 1;
+            if (base.notify_depth == 0) sweepZombieSignals();
+        }
         base.notify_gen += 1;
         const gen = base.notify_gen;
         // Rescan from the top after every callback: (un)subscribes inside a
@@ -115,6 +156,13 @@ pub const SignalBase = struct {
     }
 
     pub fn deinit(base: *SignalBase) void {
+        if (base.notify_depth > 0) {
+            // Deinit'd mid-notify (a subscriber tore down its own signal):
+            // the owner defers the struct free via deferSignalDestroy and
+            // notify's exit frees this list through the zombie sweep.
+            base.dying = true;
+            return;
+        }
         base.subscribers.deinit();
     }
 };
@@ -172,6 +220,15 @@ pub fn Signal(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             self.base.deinit();
+            if (self.base.dying) {
+                SignalBase.deferSignalDestroy(self, &self.base, struct {
+                    fn f(owner: *anyopaque) void {
+                        const s: *Self = @ptrCast(@alignCast(owner));
+                        s.base.allocator.destroy(s);
+                    }
+                }.f);
+                return;
+            }
             self.base.allocator.destroy(self);
         }
     };
@@ -275,8 +332,17 @@ pub const TextSignal = struct {
 
     pub fn deinit(self: *TextSignal) void {
         // Nodes unsubscribe in their own deinit, which always runs first.
-        self.buf.deinit();
+        self.buf.deinit(); // buf is not walked by notify — free it now
         self.base.deinit();
+        if (self.base.dying) {
+            SignalBase.deferSignalDestroy(self, &self.base, struct {
+                fn f(owner: *anyopaque) void {
+                    const s: *TextSignal = @ptrCast(@alignCast(owner));
+                    s.base.allocator.destroy(s);
+                }
+            }.f);
+            return;
+        }
         self.base.allocator.destroy(self);
     }
 };
@@ -292,6 +358,14 @@ pub const Effect = struct {
     /// re-track get unsubscribed afterwards.
     dependencies: std.array_list.Managed(Dep),
     run_gen: u64,
+    /// Reentrancy: an effect whose fn_ptr transitively notifies one of its
+    /// own deps re-enters run() — running the cleanup against the stale
+    /// outer gen then wiped every dep (all re-stamped by the inner run).
+    /// Re-runs coalesce into one extra pass after the active run ends.
+    running: bool = false,
+    pending_rerun: bool = false,
+    /// deinit() inside fn_ptr → run frees the effect itself at settle.
+    dying: bool = false,
     allocator: std.mem.Allocator,
 
     const Dep = struct { base: *SignalBase, gen: u64 };
@@ -315,21 +389,40 @@ pub const Effect = struct {
     /// Run (or re-run) the effect with this effect as the current observer:
     /// re-tracked deps keep their subscription, stale ones unsubscribe.
     pub fn run(effect: *Effect) void {
-        effect.run_gen += 1;
-        const gen = effect.run_gen;
-        const prev = current_effect;
-        current_effect = effect;
-        defer current_effect = prev;
-        effect.fn_ptr(effect.userdata);
-        var i = effect.dependencies.items.len;
-        while (i > 0) {
-            i -= 1;
-            const dep = effect.dependencies.items[i];
-            if (dep.gen != gen) {
-                dep.base.unsubscribe(.{ .effect = effect });
-                _ = effect.dependencies.swapRemove(i);
-            }
+        if (effect.running) {
+            // Reentrant trigger (self-notifying dep): don't nest — rerun
+            // once the active pass settles so it sees the fresh inputs.
+            effect.pending_rerun = true;
+            return;
         }
+        effect.running = true;
+        while (true) {
+            effect.pending_rerun = false;
+            effect.run_gen += 1;
+            const gen = effect.run_gen;
+            const prev = current_effect;
+            current_effect = effect;
+            effect.fn_ptr(effect.userdata);
+            current_effect = prev;
+            if (effect.dying) {
+                // fn_ptr destroyed this effect mid-run — finish the free
+                // here (last touch of `effect`; no running=false write to
+                // freed memory).
+                freeEffectNow(effect);
+                return;
+            }
+            var i = effect.dependencies.items.len;
+            while (i > 0) {
+                i -= 1;
+                const dep = effect.dependencies.items[i];
+                if (dep.gen != gen) {
+                    dep.base.unsubscribe(.{ .effect = effect });
+                    _ = effect.dependencies.swapRemove(i);
+                }
+            }
+            if (!effect.pending_rerun) break;
+        }
+        effect.running = false;
     }
 
     fn track(effect: *Effect, base: *SignalBase) void {
@@ -345,10 +438,19 @@ pub const Effect = struct {
         base.subscribe(.{ .effect = effect });
     }
 
-    pub fn deinit(effect: *Effect) void {
+    fn freeEffectNow(effect: *Effect) void {
         for (effect.dependencies.items) |dep| dep.base.unsubscribe(.{ .effect = effect });
         effect.dependencies.deinit();
         effect.allocator.destroy(effect);
+    }
+
+    pub fn deinit(effect: *Effect) void {
+        if (effect.running) {
+            // Inside fn_ptr — the run loop frees at settle.
+            effect.dying = true;
+            return;
+        }
+        freeEffectNow(effect);
     }
 };
 
@@ -394,6 +496,15 @@ pub fn Memo(comptime T: type, comptime compute: fn () T) type {
         pub fn deinit(self: *Self) void {
             self.effect.deinit();
             self.base.deinit();
+            if (self.base.dying) {
+                SignalBase.deferSignalDestroy(self, &self.base, struct {
+                    fn f(owner: *anyopaque) void {
+                        const s: *Self = @ptrCast(@alignCast(owner));
+                        s.allocator.destroy(s);
+                    }
+                }.f);
+                return;
+            }
             self.allocator.destroy(self);
         }
     };

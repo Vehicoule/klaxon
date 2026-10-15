@@ -539,14 +539,19 @@ pub const FocusManager = struct {
             }
         }
         // No router in context (unit tests, headless callers): synthesize
-        // down+up on the nearest pointer-handling ancestor directly.
+        // down+up on the nearest pointer-handling ancestor directly. The
+        // traversal freeze matters here too: a .down handler that deinits
+        // its subtree defers the destroy, so .up can't land on freed state.
+        node_mod.traversalBegin();
+        defer node_mod.traversalEnd();
         var n: ?*Node = node;
         while (n) |cur| {
+            if (cur.zombie) return; // freed by the .down
             if (cur.vtable.on_pointer) |op| {
                 const cx = cur.bounds.x + cur.bounds.w / 2;
                 const cy = cur.bounds.y + cur.bounds.h / 2;
                 _ = op(cur, .{ .phase = .down, .x = cx, .y = cy });
-                _ = op(cur, .{ .phase = .up, .x = cx, .y = cy });
+                if (!cur.zombie) _ = op(cur, .{ .phase = .up, .x = cx, .y = cy });
                 return;
             }
             n = cur.parent;

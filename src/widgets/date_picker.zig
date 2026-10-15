@@ -45,6 +45,7 @@ const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
 const golden = @import("../golden.zig"); // tests
@@ -103,15 +104,46 @@ const grid_y_off: f32 = header_h + nav_h + weekday_row_h; // 224
 const footer_y_off: f32 = grid_y_off + grid_h; // 512
 const total_h: f32 = footer_y_off + footer_h + footer_pad_bottom; // 564
 
+// Month/weekday names route through the active locale (i18n.Locale) — the
+// English tables below are the no-i18n fallback only.
 const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+
+fn monthLong(m: i64) []const u8 {
+    if (m < 1 or m > 12) return "?";
+    if (i18n_mod.current()) |i| {
+        if (i.current) |loc| return loc.month_long[@intCast(m - 1)];
+    }
+    return month_names[@intCast(m - 1)];
+}
 
 /// The month name (1-based month index).
 pub fn monthName(m: i64) []const u8 {
-    return month_names[@intCast(m - 1)];
+    return monthLong(m);
 }
 const month_names_short = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+fn monthShort(m: i64) []const u8 {
+    if (m < 1 or m > 12) return "?";
+    if (i18n_mod.current()) |i| {
+        if (i.current) |loc| return loc.month_short[@intCast(m - 1)];
+    }
+    return month_names_short[@intCast(m - 1)];
+}
 const weekday_names_short = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+fn weekdayShort(wd: usize) []const u8 {
+    if (wd > 6) return "?";
+    if (i18n_mod.current()) |i| {
+        if (i.current) |loc| return loc.weekday_short[wd];
+    }
+    return weekday_names_short[wd];
+}
 const weekday_letters = [_][:0]const u8{ "S", "M", "T", "W", "T", "F", "S" };
+fn weekdayLetter(wd: usize) [:0]const u8 {
+    if (wd > 6) return "?";
+    if (i18n_mod.current()) |i| {
+        if (i.current) |loc| return loc.weekday_letter[wd];
+    }
+    return weekday_letters[wd];
+}
 
 // --- civil calendar (UTC epoch days; Howard Hinnant's algorithms) ---
 
@@ -186,13 +218,13 @@ fn shiftMonth(day: i64, delta: i64) i64 {
 pub fn formatDay(day: i64, buf: []u8) [:0]const u8 {
     const c = civilFromDays(day);
     const wd = weekdayFromDays(day);
-    return std.fmt.bufPrintSentinel(buf, "{s}, {s} {d}", .{ weekday_names_short[wd], month_names_short[@intCast(c.m - 1)], c.d }, 0) catch "?";
+    return std.fmt.bufPrintSentinel(buf, "{s}, {s} {d}", .{ weekdayShort(wd), monthShort(c.m), c.d }, 0) catch "?";
 }
 
 /// "MMMM yyyy" (e.g. "October 2026") — the month-year nav label.
 fn formatMonthYear(day: i64, buf: []u8) [:0]const u8 {
     const c = civilFromDays(day);
-    return std.fmt.bufPrintSentinel(buf, "{s} {d}", .{ month_names[@intCast(c.m - 1)], c.y }, 0) catch "?";
+    return std.fmt.bufPrintSentinel(buf, "{s} {d}", .{ monthLong(c.m), c.y }, 0) catch "?";
 }
 
 /// The system clock's UTC epoch day (opts.today = null).
@@ -451,8 +483,9 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
     const weekday_y = b.y + header_h + nav_h;
     for (0..7) |col| {
         const cx = g.x + g.gap + @as(f32, @floatFromInt(col)) * (cell + g.gap) + cell / 2;
-        const lm = ui.paint.measureText(weekday_letters[col], bl.size, bl_bold);
-        ui.paint.text(ctx, weekday_letters[col], cx - lm.width / 2, weekday_y + (weekday_row_h - lm.height) / 2 + lm.ascent, bl.size, bl_bold, cs.on_surface);
+        const wl = weekdayLetter(col);
+        const lm = ui.paint.measureText(wl, bl.size, bl_bold);
+        ui.paint.text(ctx, wl, cx - lm.width / 2, weekday_y + (weekday_row_h - lm.height) / 2 + lm.ascent, bl.size, bl_bold, cs.on_surface);
     }
     // the day grid
     const sel = s.sel.peek();

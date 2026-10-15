@@ -65,7 +65,10 @@ pub fn clipReset(ctx: *kx.Ctx) void {
 /// false for the hard scanline clip (matches Qt's default setClipPath).
 /// Star masks and avatar cutouts are polygons generated in Zig.
 pub fn clipPath(ctx: *kx.Ctx, xs: []const f32, ys: []const f32, aa: bool) void {
-    kx.c.kx_clip_path(ctx, xs.ptr, ys.ptr, @intCast(xs.len), @intFromBool(aa));
+    // Mismatched arrays would make C++ read past the shorter one.
+    const n = @min(xs.len, ys.len);
+    std.debug.assert(n == xs.len);
+    kx.c.kx_clip_path(ctx, xs.ptr, ys.ptr, @intCast(n), @intFromBool(aa));
 }
 
 /// Push an alpha layer (saveLayer with alpha, ABI 0.4.0): everything painted
@@ -78,6 +81,7 @@ pub fn layerAlpha(ctx: *kx.Ctx, alpha: f32) void {
 /// Scale a color's alpha channel by `k` (0..1) — fades that preserve the
 /// color's own opacity (scrollbar show/hide, Phase 2d-0.5).
 pub fn withAlphaScaled(c: Color, k: f32) Color {
+    if (!std.math.isFinite(k)) return c; // NaN/inf scale — keep the alpha as-is
     const r: u32 = (c >> 24) & 0xFF;
     const g: u32 = (c >> 16) & 0xFF;
     const b: u32 = (c >> 8) & 0xFF;
@@ -266,16 +270,13 @@ pub fn imageDrawAtlas(ctx: *kx.Ctx, id: u64, xforms: []const SpriteXform) void {
 
 /// Batched distinct-image draw (ABI 0.18.0): one submission for N quads
 /// that may each sample a different registered image (retained-row scroll).
+/// (No Zig wrapper — the C++ op-replay path calls kx_draw_image_set
+/// directly; kx_image_quad is the wire type.)
 pub const ImageQuad = extern struct {
     image: u64,
     sx: f32, sy: f32, sw: f32, sh: f32, // source rect (sw/sh <= 0 = full image)
     dx: f32, dy: f32, dw: f32, dh: f32, // destination rect
 };
-
-pub fn imageDrawSet(ctx: *kx.Ctx, quads: []const ImageQuad) void {
-    if (quads.len == 0) return;
-    kx.c.kx_draw_image_set(ctx, @ptrCast(quads.ptr), @intCast(quads.len));
-}
 
 // --- Row atlas + sprite batch (ABI 0.18.0) ---
 // Retained subtrees rasterize straight into slots of ONE shared texture —
@@ -304,11 +305,6 @@ pub fn atlasFree(ctx: *kx.Ctx, slot: [4]f32) void {
 /// when the current gen differs (the texture it was written into is gone).
 pub fn atlasGen(ctx: *kx.Ctx) u32 {
     return kx.c.kx_atlas_gen(ctx);
-}
-/// True while a nested pass owns the canvas (atlas slot / offscreen) —
-/// image blits must not run there (self-sampling + wrong sprite target).
-pub fn inNestedPass(ctx: *kx.Ctx) bool {
-    return kx.c.kx_in_nested_pass(ctx) != 0;
 }
 /// True only while the ATLAS write pass owns the canvas — atlas-slot blits
 /// there would self-sample the texture being written (illegal on GPU). An
@@ -361,8 +357,9 @@ pub fn drawPixels(ctx: *kx.Ctx, rgba: [*]const u8, w: i32, h: i32, x: f32, y: f3
 /// target to a fresh w×h transparent raster surface; everything drawn until
 /// offscreenEndImage lands there and registers like an imageCreate image.
 /// The retained-cache idiom: rasterize a stable subtree once, blit it while
-/// it stays clean (Compose's graphicsLayer / QML layer.enabled). May NOT
-/// nest inside layerAlpha regions or other offscreen passes.
+/// it stays clean (Compose's graphicsLayer / QML layer.enabled). Passes are
+/// stackable — an offscreen regen may contain nested offscreen/atlas
+/// writes (the C++ keeps a per-depth surface pool).
 pub fn offscreenBegin(ctx: *kx.Ctx, w: i32, h: i32) bool {
     return kx.c.kx_offscreen_begin(ctx, w, h);
 }
@@ -372,6 +369,8 @@ pub fn offscreenBegin(ctx: *kx.Ctx, w: i32, h: i32) bool {
 /// Push a content-blur layer: draws until layerClose() rasterize once and
 /// composite through a Gaussian image filter — real glass blur, not an
 /// alpha stand-in. Balanced by the same layerClose as layerAlpha.
+/// (kx_layer_blur is also emitted by the C++ op-replay for recorded blur
+/// layers.)
 pub fn layerBlur(ctx: *kx.Ctx, sigma: f32) void {
     kx.c.kx_layer_blur(ctx, sigma);
 }
@@ -407,8 +406,8 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 
 // --- tests ---
 
-test "kx ABI version reports 0.17.0 (variable-font axes)" {
-    try std.testing.expectEqualStrings("0.17.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.18.0 (atlas + sprite batch)" {
+    try std.testing.expectEqualStrings("0.18.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "shaped text paints ink inside the measured box" {

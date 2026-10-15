@@ -986,13 +986,18 @@ const DoubleMapper = struct {
 
 fn linearMap(xs: []const f32, ys: []const f32, x: f32) f32 {
     std.debug.assert(x >= 0 and x <= 1);
+    // A degenerate mapping (featureMapper can emit a single entry when
+    // every later candidate is rejected) has no segment to find — flat-map
+    // to the single target instead of reading xs[n] out of bounds.
+    const n = xs.len;
+    if (n == 0) return x;
+    if (n == 1) return ys[0];
     // find the segment (wrapping) containing x
     var i: usize = 0;
-    const n = xs.len;
     while (i < n) : (i += 1) {
         if (progressInRange(x, xs[i], xs[(i + 1) % n])) break;
     }
-    std.debug.assert(i < n);
+    if (i >= n) return ys[n - 1]; // x fell between segments (float dust)
     const j = (i + 1) % n;
     const sx = pmod(xs[j] - xs[i], 1);
     const sy = pmod(ys[j] - ys[i], 1);

@@ -43,6 +43,9 @@ pub const Locale = struct {
     allocator: std.mem.Allocator,
     tag: []const u8, // owned ("fr-FR")
     direction: Direction = .ltr,
+    /// The caller pinned the direction (addArb's `dir` arg) — locale
+    /// defaults like ar→rtl must not override it.
+    direction_explicit: bool = false,
     messages: std.StringHashMap([]const u8), // key → message (both owned)
     // Number formatting.
     decimal_sep: []const u8 = ".",
@@ -54,6 +57,10 @@ pub const Locale = struct {
     month_long: [12][]const u8 = .{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" },
     month_short: [12][]const u8 = .{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" },
     months_owned: bool = false, // month names were duped (applyFormatData)
+    // Weekday names, Sunday-first (weekdayFromDays epoch convention).
+    // Static literals — sentinel-terminated for the text painter.
+    weekday_short: [7][:0]const u8 = .{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" },
+    weekday_letter: [7][:0]const u8 = .{ "S", "M", "T", "W", "T", "F", "S" },
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8) !*Locale {
         const loc = try allocator.create(Locale);
@@ -94,7 +101,18 @@ pub const Locale = struct {
             const value = entry.value_ptr.*;
             if (value != .string) continue;
             // StringHashMap stores the key slice as-is: dupe it (owned).
-            try loc.messages.put(try loc.allocator.dupe(u8, key), try loc.allocator.dupe(u8, value.string));
+            // Re-parsing a duplicate key replaces the entry — free the
+            // previously owned pair or it leaks.
+            const new_key = try loc.allocator.dupe(u8, key);
+            errdefer loc.allocator.free(new_key);
+            const new_val = try loc.allocator.dupe(u8, value.string);
+            errdefer loc.allocator.free(new_val);
+            const gop = try loc.messages.getOrPut(new_key);
+            if (gop.found_existing) {
+                loc.allocator.free(new_key); // the map kept the old owned key
+                loc.allocator.free(gop.value_ptr.*);
+            }
+            gop.value_ptr.* = new_val;
         }
     }
 
@@ -108,6 +126,12 @@ pub const Locale = struct {
             v = -v;
         }
         if (opts.percent) v *= 100;
+        // Fixed decimals round FIRST (the carry can grow the integer part:
+        // 9.99 @ 1 → "10.0") — raw-digit truncation printed wrong values.
+        if (opts.decimals) |d| {
+            const p = std.math.pow(f64, 10, @floatFromInt(d));
+            v = std.math.round(v * p) / p;
+        }
         // Shortest round-trip digits, then split integer/fraction.
         var digits_buf: [64]u8 = undefined;
         const all = try std.fmt.bufPrint(&digits_buf, "{d}", .{v});
@@ -152,6 +176,10 @@ pub const Locale = struct {
 
     /// Format a date per the locale and kind (pattern tokens y/M/d).
     pub fn formatDate(loc: *const Locale, allocator: std.mem.Allocator, date: Date, kind: DateKind) ![]u8 {
+        // month indexes month_short/month_long[12] — unvalidated input was
+        // an OOB read in release builds (and a u8 underflow at month=0).
+        if (date.month < 1 or date.month > 12 or date.day < 1 or date.day > 31)
+            return error.InvalidDate;
         const pattern = switch (kind) {
             .short => loc.date_short,
             .medium => loc.date_medium,
@@ -247,6 +275,8 @@ pub fn applyFormatData(loc: *Locale) void {
             "nov.",
             "déc.",
         });
+        loc.weekday_short = .{ "dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam." };
+        loc.weekday_letter = .{ "D", "L", "M", "M", "J", "V", "S" };
     } else if (std.mem.eql(u8, base, "ja")) {
         loc.date_short = "y/MM/dd";
         loc.date_medium = "y/MM/dd";
@@ -278,8 +308,10 @@ pub fn applyFormatData(loc: *Locale) void {
             "11月",
             "12月",
         });
+        loc.weekday_short = .{ "日", "月", "火", "水", "木", "金", "土" };
+        loc.weekday_letter = .{ "日", "月", "火", "水", "木", "金", "土" };
     } else if (std.mem.eql(u8, base, "ar")) {
-        loc.direction = .rtl;
+        if (!loc.direction_explicit) loc.direction = .rtl;
         loc.date_short = "d/M/y";
         loc.date_medium = "d MMM y";
         loc.date_long = "d MMMM y";
@@ -310,6 +342,8 @@ pub fn applyFormatData(loc: *Locale) void {
             "نوفمبر",
             "ديسمبر",
         });
+        loc.weekday_short = .{ "أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت" };
+        loc.weekday_letter = .{ "ح", "ن", "ث", "ر", "خ", "ج", "س" };
     }
     // en: defaults
 }
@@ -331,27 +365,27 @@ fn setMonths(loc: *Locale, long: *const [12][]const u8, short: *const [12][]cons
 pub const PluralCategory = enum { zero, one, two, few, many, other };
 
 /// CLDR plural category for a locale tag and count (en/fr/ja/ar built in;
-/// the default rule is one/other like English).
+/// the default rule is one/other like English). CLDR operands run on |n|
+/// — a negative count resolves exactly like its positive.
 pub fn pluralCategory(tag: []const u8, n: i64) PluralCategory {
     const base = if (std.mem.indexOfScalar(u8, tag, '-')) |i| tag[0..i] else tag;
+    const u: u64 = @intCast(@abs(n));
     if (std.mem.eql(u8, base, "fr")) {
         // fr: one covers 0 and 1
-        return if (n >= 0 and n < 2) .one else .other;
+        return if (u < 2) .one else .other;
     }
     if (std.mem.eql(u8, base, "ja")) return .other;
     if (std.mem.eql(u8, base, "ar")) {
-        if (n == 0) return .zero;
-        if (n == 1) return .one;
-        if (n == 2) return .two;
-        if (n > 0) {
-            const m100 = @mod(n, 100);
-            if (m100 >= 3 and m100 <= 10) return .few;
-            if (m100 >= 11 and m100 <= 99) return .many;
-        }
+        if (u == 0) return .zero;
+        if (u == 1) return .one;
+        if (u == 2) return .two;
+        const m100 = u % 100;
+        if (m100 >= 3 and m100 <= 10) return .few;
+        if (m100 >= 11 and m100 <= 99) return .many;
         return .other;
     }
     // en + default: one is exactly 1
-    return if (n == 1) .one else .other;
+    return if (u == 1) .one else .other;
 }
 
 pub const PluralBranch = struct {
@@ -370,12 +404,26 @@ pub const PluralMsg = struct {
 /// Parse an ARB plural block: `{count, plural, =0 {...} one {...} other {...}}`.
 /// Returns null when the message is not a plural block.
 pub fn parsePlural(msg: []const u8) ?PluralMsg {
-    const p = std.mem.indexOf(u8, msg, ", plural,") orelse return null;
-    // The block opens at the '{' before the count name.
-    const open = std.mem.lastIndexOfScalar(u8, msg[0..p], '{') orelse return null;
+    // `{name , plural ,` — whitespace around both commas is optional (ICU
+    // writes "{count,plural,...}" just as often).
+    const bounds = blk: {
+        var k: usize = 0;
+        while (std.mem.indexOfPos(u8, msg, k, "plural")) |q| {
+            var l = q;
+            while (l > 0 and msg[l - 1] == ' ') l -= 1;
+            var r = q + "plural".len;
+            while (r < msg.len and msg[r] == ' ') r += 1;
+            if (l > 0 and msg[l - 1] == ',' and r < msg.len and msg[r] == ',')
+                break :blk .{ .comma = l - 1, .branches = r + 1 };
+            k = q + 1;
+        }
+        return null;
+    };
+    // The block opens at the '{' before the variable name.
+    const open = std.mem.lastIndexOfScalar(u8, msg[0..bounds.comma], '{') orelse return null;
     var out = PluralMsg{};
     out.prefix = msg[0..open];
-    var i = p + ", plural,".len;
+    var i = bounds.branches;
     while (i < msg.len) {
         // skip whitespace
         while (i < msg.len and msg[i] == ' ') i += 1;
@@ -395,7 +443,9 @@ pub fn parsePlural(msg: []const u8) ?PluralMsg {
                 i += 1;
             }
             while (i < msg.len and msg[i] >= '0' and msg[i] <= '9') : (i += 1) {
-                num = num * 10 + (msg[i] - '0');
+                // untrusted ARB input — no overflow traps
+                num = std.math.mul(i64, num, 10) catch return null;
+                num = std.math.add(i64, num, msg[i] - '0') catch return null;
             }
             branch.exact = if (neg) -num else num;
         } else {
@@ -593,23 +643,34 @@ pub const I18n = struct {
     pub fn addLocale(i18n: *I18n, loc: *Locale) !void {
         var replaced_current: ?Direction = null;
         if (i18n.locales.get(loc.tag)) |old| {
+            if (old == loc) {
+                // Same object re-registered: nothing to free, just refresh
+                // the format data and re-notify as a hot reload.
+                applyFormatData(loc);
+                if (i18n.current == loc) i18n.locale_sig.notify();
+                return;
+            }
             // Drop the old entry first: the map key aliases old.tag (owned).
             _ = i18n.locales.remove(loc.tag);
-            if (i18n.current == old) {
-                replaced_current = old.direction;
-                i18n.current = loc;
-            }
+            if (i18n.current == old) replaced_current = old.direction;
+            // put BEFORE old.deinit: a failed put must leave `current`
+            // (still pointing at the live `old`) and `old` itself intact.
+            try i18n.locales.put(loc.tag, loc);
+            if (replaced_current != null) i18n.current = loc;
             old.deinit();
+        } else {
+            try i18n.locales.put(loc.tag, loc);
+            if (i18n.current == null) i18n.current = loc;
         }
-        try i18n.locales.put(loc.tag, loc);
         applyFormatData(loc);
-        if (i18n.current == null) i18n.current = loc;
         if (replaced_current) |old_dir| {
-            // Hot reload of the active locale: force-notify (Signal.set
-            // would suppress an unchanged tag) and fire the direction
-            // callback when the direction flipped.
-            i18n.locale_sig.notify();
+            // Hot reload of the active locale: set() with the NEW tag slice
+            // (the old one is freed — a bare notify() would leave
+            // locale_sig holding a dangling slice) and fire the direction
+            // callback + relayout epoch when the direction flipped.
+            i18n.locale_sig.set(loc.tag);
             if (loc.direction != old_dir) {
+                node_mod.bumpLayoutEpoch();
                 if (i18n.on_direction_changed) |cb| cb.fn_ptr(cb.userdata);
             }
         } else if (std.mem.eql(u8, loc.tag, i18n.fallback)) {
@@ -626,6 +687,7 @@ pub const I18n = struct {
         errdefer loc.deinit();
         try loc.parseArb(arb_json);
         loc.direction = dir;
+        loc.direction_explicit = true;
         try i18n.addLocale(loc);
     }
 

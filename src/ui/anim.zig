@@ -555,6 +555,7 @@ pub const Timeline = struct {
     /// animations are removed BEFORE their callbacks run, and inactive
     /// tickers are compacted after the ticker pass.
     pub fn tick(tl: *Timeline, now_ms: u64) void {
+        const prev_now = tl.last_now_ms;
         tl.last_now_ms = now_ms;
         // Ticker/animation callbacks run widget code — a callback that
         // destroys a node defers via the traversal freeze.
@@ -595,14 +596,21 @@ pub const Timeline = struct {
                 tl.fixSwapIndex(i);
                 continue;
             }
+            if (a.priority == .low and tl.frame_overrun) {
+                // Paused while the frame budget is blown (1e.7): shift
+                // start_ms by the pause delta so a resume doesn't jump by
+                // the paused-away time; an unstarted anim stays unstarted
+                // (its delay begins with the first unpaused tick).
+                if (a.started and prev_now != 0 and now_ms > prev_now)
+                    a.start_ms += now_ms - prev_now;
+                tl.animations.items[i] = a;
+                i += 1;
+                continue;
+            }
             if (!a.started) {
                 a.started = true;
                 a.start_ms = now_ms + a.delay_ms;
                 tl.animations.items[i] = a;
-            }
-            if (a.priority == .low and tl.frame_overrun) {
-                i += 1; // paused while the frame budget is blown (1e.7)
-                continue;
             }
             if (a.isComplete(now_ms)) {
                 // Remove BEFORE the callbacks: they may play/cancel.

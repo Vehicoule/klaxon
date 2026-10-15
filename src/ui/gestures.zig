@@ -166,7 +166,7 @@ pub const Recognizer = struct {
     pub fn tick(rec: *Recognizer, now_ms: u64) ?Fire {
         if (rec.kind != .long_press) return null;
         if (rec.state != .possible or rec.long_press_fired) return null;
-        if (now_ms - rec.start_time < LONG_PRESS_MS) return null;
+        if (elapsedMs(now_ms, rec.start_time) < LONG_PRESS_MS) return null;
         rec.long_press_fired = true;
         rec.state = .idle;
         rec.tracking = null;
@@ -178,6 +178,14 @@ fn dist(x1: f32, y1: f32, x2: f32, y2: f32) f32 {
     const dx = x2 - x1;
     const dy = y2 - y1;
     return @sqrt(dx * dx + dy * dy);
+}
+
+/// Elapsed ms between two timestamps — saturating: the host can feed a
+/// regressed `now` (min(now, oldest queued event ts) — host.zig) so a
+/// stale event must not underflow into ~1.8e19 (spurious timeouts in
+/// release builds, a u64 panic in safe ones).
+fn elapsedMs(later: u64, earlier: u64) u64 {
+    return later -| earlier;
 }
 
 /// Single-pointer recognizers follow only the pointer they started with.
@@ -280,13 +288,13 @@ fn velocity(rec: *Recognizer, now: u64) struct { vx: f32, vy: f32 } {
     if (rec.sample_len == 0) return .{ .vx = 0, .vy = 0 };
     var first = rec.samples[rec.sample_len - 1];
     for (rec.samples[0..rec.sample_len]) |s| {
-        if (now - s.t <= VELOCITY_WINDOW_MS) {
+        if (elapsedMs(now, s.t) <= VELOCITY_WINDOW_MS) {
             first = s;
             break;
         }
     }
     const last = rec.samples[rec.sample_len - 1];
-    const dt_ms = last.t - first.t;
+    const dt_ms = elapsedMs(last.t, first.t);
     if (dt_ms == 0) return .{ .vx = 0, .vy = 0 };
     const dt: f32 = @as(f32, @floatFromInt(dt_ms)) / 1000;
     return .{ .vx = (last.x - first.x) / dt, .vy = (last.y - first.y) / dt };
@@ -312,7 +320,7 @@ fn feedTap(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
         .up => {
             const ok = rec.state == .possible and
                 dist(ev.x, ev.y, rec.start_x, rec.start_y) <= SLOP and
-                ev.time_ms - rec.start_time < TAP_TIMEOUT_MS;
+                elapsedMs(ev.time_ms, rec.start_time) < TAP_TIMEOUT_MS;
             rec.state = .idle;
             rec.tracking = null;
             return if (ok) .tap else null;
@@ -342,7 +350,7 @@ fn feedDoubleTap(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
         .up => {
             const is_tap = rec.state == .possible and
                 dist(ev.x, ev.y, rec.start_x, rec.start_y) <= SLOP and
-                ev.time_ms - rec.start_time < TAP_TIMEOUT_MS;
+                elapsedMs(ev.time_ms, rec.start_time) < TAP_TIMEOUT_MS;
             rec.state = .idle;
             rec.tracking = null;
             if (!is_tap) {
@@ -350,7 +358,7 @@ fn feedDoubleTap(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
                 return null;
             }
             if (rec.has_last_tap and
-                ev.time_ms - rec.last_tap_time < DOUBLE_TAP_MS and
+                elapsedMs(ev.time_ms, rec.last_tap_time) < DOUBLE_TAP_MS and
                 dist(ev.x, ev.y, rec.last_tap_x, rec.last_tap_y) <= SLOP)
             {
                 rec.has_last_tap = false;
@@ -385,7 +393,7 @@ fn feedLongPress(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
                 rec.state = .rejected;
                 return null;
             }
-            if (!rec.long_press_fired and ev.time_ms - rec.start_time >= LONG_PRESS_MS) {
+            if (!rec.long_press_fired and elapsedMs(ev.time_ms, rec.start_time) >= LONG_PRESS_MS) {
                 rec.long_press_fired = true;
                 rec.state = .idle;
                 rec.tracking = null;
@@ -396,7 +404,7 @@ fn feedLongPress(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
         .up => {
             const ok = rec.state == .possible and !rec.long_press_fired and
                 dist(ev.x, ev.y, rec.start_x, rec.start_y) <= SLOP and
-                ev.time_ms - rec.start_time >= LONG_PRESS_MS;
+                elapsedMs(ev.time_ms, rec.start_time) >= LONG_PRESS_MS;
             rec.state = .idle;
             rec.tracking = null;
             return if (ok) .long_press else null;

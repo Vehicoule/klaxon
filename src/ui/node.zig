@@ -322,7 +322,14 @@ pub const Node = struct {
     /// texture upload, and blits sprite-batch into one submission.
     retained_atlas: bool = false,
     retained_slot: [4]f32 = .{ 0, 0, 0, 0 },
+    /// Owner ctx + its instance serial. A ctx address is recycled on
+    /// recreate — frees and "same owner" checks must key on the serial
+    /// (ctxSerialAlive), never the pointer (UAF / ABA on a dead ctx).
     retained_ctx: ?*kx.Ctx = null,
+    retained_serial: u64 = 0,
+    /// Atlas generation at alloc time: kx_atlas_recreate resets the shelf
+    /// layout — a stale-gen slot freed into it corrupts the allocator.
+    retained_gen: u32 = 0,
     retained_w: i32 = 0, // image pixel size (= the snapped extent)
     retained_h: i32 = 0,
     retained_ix: f32 = 0, // image origin in this node's parent space (integer)
@@ -378,6 +385,14 @@ pub const Node = struct {
 
     /// Append a child. OOM while building the tree is fatal (same as Flutter).
     pub fn add(node: *Node, child: *Node) void {
+        // Cycle check: attaching an ancestor (or self) would recurse
+        // forever in paint/layout/deinit. Refuse in release too — a
+        // corrupted tree is worse than a dropped attach.
+        var anc: ?*Node = node;
+        while (anc) |a| : (anc = a.parent) {
+            std.debug.assert(a != child); // add() cycle: child is an ancestor
+            if (a == child) return;
+        }
         // Detach from a previous parent — otherwise the child stays in two
         // children lists and both deinit it (double free).
         if (child.parent) |prev| _ = prev.remove(child);
@@ -419,6 +434,11 @@ pub const Node = struct {
     /// as add(): the child is parented, not owned. Re-insertion at the original
     /// index restores paint order (hero flight, Phase 2a).
     pub fn insert(node: *Node, index: usize, child: *Node) void {
+        var anc: ?*Node = node;
+        while (anc) |a| : (anc = a.parent) {
+            std.debug.assert(a != child); // insert() cycle: child is an ancestor
+            if (a == child) return;
+        }
         if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
         child.dirty_mark_gen = 0;
@@ -813,7 +833,13 @@ pub const Node = struct {
                 } else if (sc(node, ctx, child_region)) return;
             }
             if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
-            for (node.children.items) |child| {
+            // Iterate by INDEX, re-reading `items` each step — a paint hook
+            // running a subscriber may add/remove children (the traversal
+            // freeze only defers deinit); a captured slice would dangle on
+            // an append-realloc or skip/double on a remove-shift.
+            var ci: usize = 0;
+            while (ci < node.children.items.len) : (ci += 1) {
+                const child = node.children.items[ci];
                 if (child.defer_paint or child.zombie) continue; // defer_paint → popup overlay; zombie → swept
                 if (dbg) {
                     const t0 = sdl.c.SDL_GetTicksNS();
@@ -835,7 +861,9 @@ pub const Node = struct {
     /// e.g. nested inside another retained rasterization).
     fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool, auto: bool) bool {
         const pr = node.paintRect(); // parent space — the damage-contract rect
-        if (node.retained_ctx != ctx and (node.retained_image != 0 or node.retained_atlas)) {
+        if (node.retained_serial != 0 and node.retained_serial != paint_mod.ctxSerial(ctx) and
+            (node.retained_image != 0 or node.retained_atlas))
+        {
             node.clearRetained(); // image/slot belongs to another ctx — drop it
         }
         // A clean subtree is rigid: the cached image re-blits at its
@@ -857,7 +885,12 @@ pub const Node = struct {
                     // texture being written — paint directly. An offscreen
                     // pass can blit slots freely (different surfaces).
                     if (paint_mod.inAtlasPass(ctx)) return false;
-                    const img = paint_mod.atlasImage(ctx);
+                    // A recreated atlas (gen bump) reset the shelf layout —
+                    // this slot's coords point into a dead layout.
+                    const img = if (node.retained_gen == paint_mod.atlasGen(ctx))
+                        paint_mod.atlasImage(ctx)
+                    else
+                        0;
                     if (img != 0) {
                         paint_mod.imageDrawRegion(ctx, img,
                             node.retained_slot[0], node.retained_slot[1],
@@ -882,12 +915,23 @@ pub const Node = struct {
         // (retained_bg) pins the image to the paintRect instead: clearing
         // the whole overflow extent opaque would paint over neighbours.
         const ext = if (node.retained_bg != null) pr else node.paintExtent(false);
+        // A NaN/inf extent (widget bounds bug) would trap @intFromFloat in
+        // safe builds and UB in release — paint directly instead.
+        if (!std.math.isFinite(ext.x) or !std.math.isFinite(ext.y) or
+            !std.math.isFinite(ext.w) or !std.math.isFinite(ext.h))
+            return false;
         const ix = @floor(ext.x);
         const iy = @floor(ext.y);
         const iw: i32 = @intFromFloat(@ceil(ext.x + ext.w) - ix);
         const ih: i32 = @intFromFloat(@ceil(ext.y + ext.h) - iy);
-        if (iw <= 0 or ih <= 0) return true; // nothing reachable — painted
-        if (auto and @as(u64, @intCast(iw)) * @as(u64, @intCast(ih)) > AUTO_RETAIN_MAX_PX) {
+        if (iw <= 0 or ih <= 0) {
+            node.clearRetained(); // don't keep a stale raster for an empty extent
+            return true; // nothing reachable — painted
+        }
+        // u64 product: i32*i32 overflows on big extents (wraps negative →
+        // the <= would PASS and attempt a giant atlas alloc).
+        const px = @as(u64, @intCast(iw)) * @as(u64, @intCast(ih));
+        if (auto and px > AUTO_RETAIN_MAX_PX) {
             node.retained_blocked = true; // too big to be a win — stay direct
             node.clearRetained(); // drop any stale image (smaller extent before)
             return false;
@@ -907,7 +951,7 @@ pub const Node = struct {
         // is illegal on GPU), which would force a full direct repaint.
         const backend = kx.c.kx_backend_of(ctx);
         const use_atlas = backend != kx.c.KX_BACKEND_RASTER and
-            iw * ih <= 96 * 1024 and
+            px <= 96 * 1024 and
             atlasEnabled() and
             !autoRetainOffscreenExpensive(ctx) and
             paint_mod.atlasBegin(ctx, iw, ih, &node.retained_slot);
@@ -929,6 +973,10 @@ pub const Node = struct {
             if (node.retained_image == 0) return false; // pass failed — direct paint
         }
         node.retained_ctx = ctx;
+        node.retained_serial = paint_mod.ctxSerial(ctx);
+        // Captured AFTER the begin/end — an atlas recreate inside bumped
+        // the generation (the slot lives in the NEW texture's layout).
+        node.retained_gen = if (use_atlas) paint_mod.atlasGen(ctx) else 0;
         node.retained_w = iw;
         node.retained_h = ih;
         node.retained_ix = ix;
@@ -973,16 +1021,26 @@ pub const Node = struct {
     fn clearRetained(node: *Node) void {
         if (dbgRetained() and (node.retained_atlas or node.retained_image != 0))
             std.debug.print("  clearRetained {*} atlas={} img={} y={d:.0} h={d:.0}\n", .{ node, node.retained_atlas, node.retained_image, node.bounds.y, node.bounds.h });
+        // Free resources only into a LIVE ctx — a destroyed ctx already
+        // released them; freeing into a recycled address would be a UAF.
+        const live = node.retained_ctx != null and node.retained_serial != 0 and
+            paint_mod.ctxSerialAlive(node.retained_serial);
         if (node.retained_image != 0) {
-            if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
+            if (live) kx.c.kx_image_destroy(node.retained_ctx.?, node.retained_image);
             node.retained_image = 0;
         }
         if (node.retained_atlas) {
-            if (node.retained_ctx) |ctx| paint_mod.atlasFree(ctx, node.retained_slot);
+            // And only while the slot's shelf layout is current — an atlas
+            // recreate reset it, so a stale-gen free would corrupt the
+            // allocator's free ranges.
+            if (live and node.retained_gen == paint_mod.atlasGen(node.retained_ctx.?))
+                paint_mod.atlasFree(node.retained_ctx.?, node.retained_slot);
             node.retained_atlas = false;
             node.retained_slot = .{ 0, 0, 0, 0 };
         }
         node.retained_ctx = null;
+        node.retained_serial = 0;
+        node.retained_gen = 0;
         node.retained_w = 0;
         node.retained_h = 0;
         node.retained_ix = 0;
@@ -1090,6 +1148,9 @@ pub const Node = struct {
         var r = rect;
         var n = node;
         while (n.parent) |p| {
+            // A torn-down ancestor's widget state is freed — its hook would
+            // dereference dead memory. Treat the zombie chain as the end.
+            if (p.torn_down) break;
             if (p.vtable.map_paint_rect) |m| r = rectNormalize(m(p, r));
             n = p;
         }
@@ -1128,7 +1189,10 @@ pub const Node = struct {
         // is freed — virtualized lists destroy captured items on scroll.
         input_mod.releaseNode(node);
         semantics_mod.focusNodeDestroyed(node); // drop the a11y focus if it was focused (Phase 2c)
-        for (node.children.items) |child| {
+        // Drain with pop(), not a captured slice: a child's vtable deinit
+        // can mutate this node's child list (a sibling removing itself)
+        // — realloc would dangle the slice, a shift would skip a child.
+        while (node.children.pop()) |child| {
             child.parent = null; // detach BEFORE teardown — callbacks walking
             // up from this child must not reach the about-to-be-freed parent
             if (!child.torn_down) {
@@ -1173,7 +1237,8 @@ pub fn traversalBegin() void {
 /// Close the window; at depth 0 the queued zombies are torn down and freed.
 /// Balanced — every traversalBegin must reach its traversalEnd (defer).
 pub fn traversalEnd() void {
-    traversal_depth -= 1;
+    std.debug.assert(traversal_depth > 0); // unbalanced — every Begin must pair its End
+    traversal_depth -|= 1;
     if (traversal_depth != 0) return;
     // Sweeping runs callbacks (vtable deinits can touch the tree): hold a
     // freeze so nested deinits queue onto the list we drain below.
