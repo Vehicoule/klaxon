@@ -171,7 +171,14 @@ fn ptrMeasure(n: *Node, c: Constraints) Size {
 
 fn ptrLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
-    if (n.children.items.len > 0) n.children.items[0].layout(bounds);
+    if (n.children.items.len > 0) {
+        const content = n.children.items[0];
+        content.layout(bounds);
+        // The PTR supplies the top-edge elastic feedback (pull × 0.5) —
+        // the scrollable's own rubber band stays off or it double-stretches
+        // and eats the moves the pull needs.
+        if (scroll_view.isScrollView(content)) scroll_view.setBounces(content, false);
+    }
     const target: f32 = if (s.sig.peek()) resting else 0;
     if (!s.laid_out) {
         s.anim_to = target;

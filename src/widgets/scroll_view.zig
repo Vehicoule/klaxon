@@ -112,6 +112,7 @@ fn scrollViewScrollSetOffset(n: *Node, value: f32) void {
     _ = setScrollOffset(n, value);
 }
 fn scrollViewDeinit(n: *Node) void {
+    stateOf(ScrollViewState, n).input.deinit(); // flight ticker borrow
     input.releaseNode(n);
     n.allocator.destroy(stateOf(ScrollViewState, n));
 }
@@ -166,6 +167,12 @@ pub fn setScrollOffset(n: *Node, value: f32) bool {
 
 pub fn scrollBy(n: *Node, dy: f32) void {
     _ = setScrollOffset(n, stateOf(ScrollViewState, n).scroll.offset + dy);
+}
+
+/// Rubber-band edges on/off — a wrapping gesture consumer (pull-to-refresh)
+/// turns them off: it supplies its own elastic feedback at scroll top.
+pub fn setBounces(n: *Node, v: bool) void {
+    stateOf(ScrollViewState, n).input.bounces = v;
 }
 
 // --- tests ---

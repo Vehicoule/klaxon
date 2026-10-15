@@ -141,6 +141,7 @@ fn gridScrollSetOffset(n: *Node, value: f32) void {
     _ = setScrollOffset(n, value);
 }
 fn gridDeinit(n: *Node) void {
+    stateOf(GridState, n).input.deinit(); // flight ticker borrow
     input.releaseNode(n);
     n.allocator.destroy(stateOf(GridState, n));
 }

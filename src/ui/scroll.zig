@@ -38,7 +38,9 @@ pub const ScrollState = struct {
 
     pub fn info(s: *const ScrollState) ScrollInfo {
         return .{
-            .offset = s.offset,
+            // Rubber-band overscroll is a paint detail — consumers (thumb
+            // math, at-edge checks) see the clamped position.
+            .offset = std.math.clamp(s.offset, 0, s.maxOffset()),
             .max_offset = s.maxOffset(),
             .viewport = s.viewport,
             .content = s.content,
@@ -47,10 +49,31 @@ pub const ScrollState = struct {
 
     /// Set the offset (clamped to [0, max]). Returns true if it changed.
     pub fn setOffset(s: *ScrollState, value: f32) bool {
+        // NaN/inf would translate the canvas into a blank frame.
+        if (!std.math.isFinite(value)) return false;
         const clamped = std.math.clamp(value, 0, s.maxOffset());
         if (clamped == s.offset) return false;
         s.offset = clamped;
         return true;
+    }
+
+    /// Physics-driven offset (rubber-band drag / fling): the offset may sit
+    /// up to `over` px past either edge — the paint path shows the stretch.
+    /// The rest of the stack (scrollbar, scroll info) still sees the
+    /// clamped value via info(). Returns true if it changed.
+    pub fn setOffsetLoose(s: *ScrollState, value: f32, over: f32) bool {
+        if (!std.math.isFinite(value)) return false;
+        const lim = @max(0, over);
+        const clamped = std.math.clamp(value, -lim, s.maxOffset() + lim);
+        if (clamped == s.offset) return false;
+        s.offset = clamped;
+        return true;
+    }
+
+    /// Signed overscroll: <0 before the top edge, >0 past the end, 0 inside.
+    pub fn overscroll(s: *const ScrollState) f32 {
+        if (s.offset < 0) return s.offset;
+        return @max(0, s.offset - s.maxOffset());
     }
 
     /// Scroll by a delta (clamped). Returns true if the offset changed.

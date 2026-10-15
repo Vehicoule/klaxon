@@ -36,16 +36,68 @@ pub const ItemFactory = struct {
 /// Tracks live in window space (raw_*): the delta is physical finger
 /// motion — the content scrolling under a held finger must not cancel it.
 ///
+/// Physics: drags rubber-band past the edges (iOS-style diminishing
+/// resistance), a fast release flings with exponential-decay momentum, and
+/// an overscrolled rest position eases back to the edge. The flight runs on
+/// the animation timeline — the ticker borrows the ScrollInput, so the
+/// widget's deinit must call inp.deinit().
+///
 /// `set_offset` is the widget's apply function: it clamps, shifts the
 /// virtualization window and marks the node dirty — and returns whether the
 /// offset changed.
 pub const ScrollInput = struct {
     pub const MAX_TRACKS = 8; // matches input.MAX_POINTERS
     /// y is window-space (raw_y) — see the struct doc above.
-    const Track = struct { pointer: u64 = 0, y: f32 = 0, active: bool = false };
+    const Track = struct {
+        pointer: u64 = 0,
+        y: f32 = 0,
+        active: bool = false,
+        /// Content-space velocity EMA in px/ms (finger up = positive —
+        /// offsets grow). Drives the release fling.
+        vel: f32 = 0,
+        last_ms: u64 = 0,
+    };
     tracks: [MAX_TRACKS]Track = std.mem.zeroes([MAX_TRACKS]Track),
 
+    // Momentum state — one flight per scrollable. `fling_v` is the content
+    // velocity (px/ms, positive scrolls down); the same ticker settles
+    // rubber-band overscroll back to the edge (v=0 while overscrolled).
+    fling_v: f32 = 0,
+    fling_ms: u64 = 0,
+    fling_on: bool = false,
+    ticker_live: bool = false,
+    fling_scroll: ?*scroll_mod.ScrollState = null,
+    fling_set: ?SetOffset = null,
+    fling_node: ?*Node = null,
+
+    /// Rubber-band edges. A wrapping gesture consumer (pull-to-refresh)
+    /// turns this off — it supplies its own elastic feedback instead.
+    bounces: bool = true,
+
+    /// Rubber-band: reach ~1/3 of the viewport, per-delta factor starts at
+    /// the iOS 0.55 and shrinks quadratically as the band fills.
+    const OVER_FRACTION: f32 = 0.30;
+    const OVER_MIN: f32 = 24;
+    const RESIST_C: f32 = 0.55;
+    /// Momentum: releases slower than FLING_MIN px/ms settle in place.
+    const FLING_MIN: f32 = 0.18;
+    const FLING_DECEL: f32 = 0.0038; // exponential — ~55% left per 210ms
+    const EDGE_DECEL: f32 = 0.02; // snap-back rate while overscrolled
+    const FLING_EPS: f32 = 0.02; // dead velocity, px/ms
+    const VEL_STALE_MS: u64 = 120; // a held-still finger doesn't fling
+
     pub const SetOffset = *const fn (n: *Node, value: f32) bool;
+
+    fn overLimit(scroll: *const scroll_mod.ScrollState) f32 {
+        return @max(OVER_MIN, scroll.viewport * OVER_FRACTION);
+    }
+
+    /// iOS rubber-band derivative: the fraction of a push-deeper delta that
+    /// applies, shrinking quadratically as the band fills.
+    fn resistFactor(over: f32, limit: f32) f32 {
+        const denom = limit + RESIST_C * over;
+        return RESIST_C * limit * limit / (denom * denom);
+    }
 
     fn trackFor(inp: *ScrollInput, pointer: u64) *Track {
         for (&inp.tracks) |*t| {
@@ -63,16 +115,47 @@ pub const ScrollInput = struct {
         }
     }
 
+    /// Apply a content offset target: the in-bounds part goes through the
+    /// widget's setter (window sync + damage); the overshoot stretches the
+    /// rubber band — resisted pushing deeper, free pulling back.
+    fn applyTarget(inp: *ScrollInput, n: *Node, scroll: *scroll_mod.ScrollState, set_offset: SetOffset, target: f32) bool {
+        const max = scroll.maxOffset();
+        if (target >= 0 and target <= max) return set_offset(n, target);
+        if (!inp.bounces) return set_offset(n, std.math.clamp(target, 0, max)); // a wrapper owns the edge
+        const edge: f32 = if (target < 0) 0 else max;
+        const want_over = target - edge; // signed
+        const cur = scroll.overscroll();
+        const d = want_over - cur;
+        const pushing = @abs(want_over) > @abs(cur);
+        const applied = if (pushing) d * resistFactor(@abs(cur), overLimit(scroll)) else d;
+        const final = edge + cur + applied;
+        _ = set_offset(n, edge);
+        if (scroll.setOffsetLoose(final, overLimit(scroll))) n.markDirty();
+        return true;
+    }
+
     /// Call from the widget's on_pointer.
     pub fn onPointer(inp: *ScrollInput, ev: input.PointerEvent, scroll: *scroll_mod.ScrollState, set_offset: SetOffset, n: *Node) bool {
         switch (ev.phase) {
             .down => {
                 const t = inp.trackFor(ev.pointer);
-                t.* = .{ .pointer = ev.pointer, .y = ev.raw_y, .active = true };
+                t.* = .{ .pointer = ev.pointer, .y = ev.raw_y, .active = true, .last_ms = ev.time_ms };
+                inp.stopFling(); // grabbing the content kills the flight
                 return false; // items handle taps
             },
             .up, .outside_down => {
-                inp.releaseTrack(ev.pointer);
+                // Fling with the release velocity; an overscrolled rest
+                // snaps back regardless. A stale last move (finger held
+                // still past VEL_STALE_MS) means no fling.
+                var v: f32 = 0;
+                for (&inp.tracks) |*t| {
+                    if (t.active and t.pointer == ev.pointer) {
+                        if (ev.time_ms -| t.last_ms <= VEL_STALE_MS) v = t.vel;
+                        t.active = false;
+                    }
+                }
+                if (scroll.overscroll() != 0 or @abs(v) > FLING_MIN)
+                    inp.startFlight(n, scroll, set_offset, v, ev.time_ms);
                 return false;
             },
             .move => {},
@@ -81,21 +164,121 @@ pub const ScrollInput = struct {
         const router = input.current() orelse return false;
         const dragging = router.capturedNode(ev.pointer) != null;
         const t = inp.trackFor(ev.pointer);
-        const last = if (t.active and t.pointer == ev.pointer) t.y else ev.raw_y;
-        t.* = .{ .pointer = ev.pointer, .y = ev.raw_y, .active = true };
+        const same = t.active and t.pointer == ev.pointer;
+        const last = if (same) t.y else ev.raw_y;
+        const last_ms = if (same) t.last_ms else ev.time_ms;
+        var vel = if (same) t.vel else 0;
+        // Velocity sample: content velocity is the finger's negated delta
+        // (finger up → offset grows). EMA so one big event can't dominate.
+        if (ev.time_ms > last_ms) {
+            const inst = (last - ev.raw_y) / @as(f32, @floatFromInt(ev.time_ms - last_ms));
+            vel = vel * 0.65 + inst * 0.35;
+        }
+        t.* = .{ .pointer = ev.pointer, .y = ev.raw_y, .active = true, .vel = vel, .last_ms = ev.time_ms };
         if (!dragging) return false; // hover move: no scroll
         const dy = ev.raw_y - last;
         if (dy == 0) return false;
         // The finger drags the content: moving up (dy < 0) increases the offset.
-        return set_offset(n, scroll.offset - dy);
+        return applyTarget(inp, n, scroll, set_offset, scroll.offset - dy);
     }
 
     /// Call from the widget's on_scroll (wheel). Positive delta_y = scroll
     /// up = offset decreases.
     pub fn onScroll(inp: *ScrollInput, ev: input.ScrollEvent, scroll: *scroll_mod.ScrollState, wheel_speed: f32, set_offset: SetOffset, n: *Node) bool {
-        _ = inp;
         if (!scroll.info().canScroll()) return false;
-        return set_offset(n, scroll.offset - ev.delta_y * wheel_speed);
+        inp.stopFling(); // a wheel tick takes the content back
+        // Wheel/trackpad deltas arrive already-momentized by the OS — apply
+        // directly (no rubber band: desktops hard-stop at edges).
+        const max = scroll.maxOffset();
+        const inside = std.math.clamp(scroll.offset - ev.delta_y * wheel_speed, 0, max);
+        return set_offset(n, inside);
+    }
+
+    /// Kill a running flight + drop the ticker. Widget deinits call this —
+    /// the ticker borrows the ScrollInput, it must not outlive the state.
+    pub fn deinit(inp: *ScrollInput) void {
+        inp.stopFling();
+    }
+
+    fn startFlight(inp: *ScrollInput, n: *Node, scroll: *scroll_mod.ScrollState, set_offset: SetOffset, v: f32, now_ms: u64) void {
+        inp.fling_v = v;
+        inp.fling_ms = now_ms;
+        inp.fling_on = true;
+        inp.fling_scroll = scroll;
+        inp.fling_set = set_offset;
+        inp.fling_node = n;
+        if (!inp.ticker_live) {
+            const tl = ui.anim.timeline() orelse {
+                inp.fling_on = false;
+                // No timeline: settle synchronously — an overscroll must
+                // never persist without the ticker that would unwind it.
+                if (scroll.overscroll() != 0) {
+                    _ = scroll.setOffsetLoose(std.math.clamp(scroll.offset, 0, scroll.maxOffset()), overLimit(scroll));
+                    n.markDirty();
+                }
+                return;
+            };
+            tl.addTicker(.{ .fn_ptr = flightTickCb, .userdata = inp, .has_pending = flightPendingCb });
+            inp.ticker_live = true;
+        }
+    }
+
+    fn stopFling(inp: *ScrollInput) void {
+        inp.fling_on = false;
+        inp.fling_v = 0;
+        if (inp.ticker_live) {
+            if (ui.anim.timeline()) |tl|
+                tl.removeTicker(.{ .fn_ptr = flightTickCb, .userdata = inp });
+            inp.ticker_live = false;
+        }
+    }
+
+    fn flightPendingCb(userdata: ?*anyopaque) bool {
+        const inp: *ScrollInput = @ptrCast(@alignCast(userdata.?));
+        return inp.fling_on;
+    }
+
+    fn flightTickCb(userdata: ?*anyopaque, now_ms: u64) void {
+        const inp: *ScrollInput = @ptrCast(@alignCast(userdata.?));
+        if (!inp.fling_on) return;
+        const scroll = inp.fling_scroll.?;
+        const n = inp.fling_node.?;
+        const set_offset = inp.fling_set.?;
+        const dt: f32 = @floatFromInt(@min(now_ms -| inp.fling_ms, 32));
+        inp.fling_ms = now_ms;
+        const max = scroll.maxOffset();
+        const limit = overLimit(scroll);
+
+        var v = inp.fling_v;
+        var target = scroll.offset;
+        if (v != 0) {
+            var step = v * dt;
+            // Momentum pushing deeper into the band is resisted like a drag.
+            const cur = @abs(scroll.overscroll());
+            if (cur > 0) step *= resistFactor(cur, limit);
+            target += step;
+            v *= @exp(-dt * FLING_DECEL);
+            if (@abs(v) < FLING_EPS) v = 0;
+        }
+        // The rubber band pulls back to its edge — exponential settle.
+        const over = overscrollOf(target, max);
+        if (over != 0) {
+            target -= over * (1 - @exp(-dt * EDGE_DECEL));
+            v *= @exp(-dt * EDGE_DECEL); // the band eats leftover momentum
+        }
+        const inside = std.math.clamp(target, 0, max);
+        _ = set_offset(n, inside);
+        if (target != inside) {
+            _ = scroll.setOffsetLoose(target, limit);
+            n.markDirty();
+        }
+        inp.fling_v = v;
+        if (v == 0 and scroll.overscroll() == 0) inp.stopFling();
+    }
+
+    fn overscrollOf(offset: f32, max: f32) f32 {
+        if (offset < 0) return offset;
+        return @max(0, offset - max);
     }
 };
 
@@ -332,21 +515,22 @@ test "ScrollInput: a drag scrolls (finger up = offset up); a hover move does not
     router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 100 });
     try std.testing.expectEqual(@as(f32, 0), s.scroll.offset);
     try std.testing.expectEqual(@as(u32, 0), s.set_calls);
-    // press (capture + track), then drag DOWN 30px: the content follows → offset -30 → clamped 0
+    // press (capture + track), then drag DOWN 30px: the finger pulls the
+    // content past the top — the rubber band resists (-30 × 0.55 = -16.5)
     router.dispatchPointer(n, .{ .phase = .down, .x = 50, .y = 100 });
     router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 130 });
-    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset); // clamped at 0
+    try std.testing.expectEqual(@as(f32, -16.5), s.scroll.offset); // stretched, not clamped
     try std.testing.expectEqual(@as(u32, 1), s.set_calls);
-    try std.testing.expectEqual(@as(f32, -30), s.last_value); // the requested (unclamped) value
-    // drag UP 50px from there: offset +50
+    try std.testing.expectEqual(@as(f32, 0), s.last_value); // the widget setter saw the edge
+    // drag UP 50px from there: -16.5 + 50 = +33.5 (the band releases first)
     router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 80 });
-    try std.testing.expectEqual(@as(f32, 50), s.scroll.offset);
+    try std.testing.expectEqual(@as(f32, 33.5), s.scroll.offset);
     try std.testing.expectEqual(@as(u32, 2), s.set_calls);
-    try std.testing.expectEqual(@as(f32, 50), s.last_value);
+    try std.testing.expectEqual(@as(f32, 33.5), s.last_value);
     // release: the track ends; a later hover move does not scroll
     router.dispatchPointer(n, .{ .phase = .up, .x = 50, .y = 80 });
     router.dispatchPointer(n, .{ .phase = .move, .x = 50, .y = 10 });
-    try std.testing.expectEqual(@as(f32, 50), s.scroll.offset);
+    try std.testing.expectEqual(@as(f32, 33.5), s.scroll.offset);
     try std.testing.expectEqual(@as(u32, 2), s.set_calls);
 }
 
