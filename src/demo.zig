@@ -36,7 +36,9 @@ const box_vtable = ui.node.VTable{ .measure = boxMeasure, .layout = boxLayout, .
 
 pub fn box(allocator: std.mem.Allocator, w: f32, h: f32, color: ui.paint.Color, radius: f32) !*Node {
     const node = try Node.create(allocator, &box_vtable);
+    errdefer node.allocator.destroy(node);
     const s = try allocator.create(BoxState);
+    errdefer allocator.destroy(s);
     s.* = .{ .w = w, .h = h, .color = color, .radius = radius };
     node.state = s;
     return node;
@@ -73,7 +75,9 @@ const label_vtable = ui.node.VTable{ .measure = labelMeasure, .layout = labelLay
 
 pub fn label(allocator: std.mem.Allocator, text: []const u8, size: f32, color: ui.paint.Color) !*Node {
     const node = try Node.create(allocator, &label_vtable);
+    errdefer node.allocator.destroy(node);
     const s = try allocator.create(LabelState);
+    errdefer allocator.destroy(s);
     const buf = try allocator.alloc(u8, text.len + 1);
     @memcpy(buf[0..text.len], text);
     buf[text.len] = 0;
@@ -110,7 +114,9 @@ const column_vtable = ui.node.VTable{ .measure = columnMeasure, .layout = column
 
 pub fn column(allocator: std.mem.Allocator, gap: f32, padding: f32, bg: ?*ui.state.Signal(u32)) !*Node {
     const node = try Node.create(allocator, &column_vtable);
+    errdefer node.allocator.destroy(node);
     const s = try allocator.create(ColumnState);
+    errdefer allocator.destroy(s);
     s.* = .{ .gap = gap, .padding = padding, .bg = bg };
     node.state = s;
     return node;
@@ -132,7 +138,9 @@ pub const Demo = struct {
 /// reactive background (set() → subscribers fire → root.markDirty → re-render).
 pub fn buildTree(allocator: std.mem.Allocator) !Demo {
     const bg = try ui.state.Signal(u32).init(allocator, 0x181828FF);
+    errdefer bg.deinit();
     const root = try column(allocator, 16, 24, bg);
+    errdefer root.deinit(); // deinit cascades to the children already added
     root.add(try box(allocator, 592, 96, 0x3B5BDBFF, 12));
     root.add(try label(allocator, "Hello from Klaxon", 28, 0xFFFFFFFF));
     root.add(try label(allocator, "rendered by the Skia widget tree", 16, 0xFFAAAAAA));
