@@ -236,6 +236,7 @@ struct kx_ctx {
         sk_sp<SkImage> img;
         uint64_t image_id = 0; // registry id (eviction erases it)
         float pad = 0;         // outset the image extends past the shape
+        float scale = 1.0f;    // device px per logical unit the raster holds
         uint64_t tick = 0;     // LRU
         size_t bytes = 0;      // raster footprint, for the byte budget
     };
@@ -2785,32 +2786,45 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
     // ambient+spot model Flutter's PhysicalShape uses). Identical params
     // rasterize ONCE into the image registry and re-blit — the same
     // optimization Qt's RectangularGlow performs with its 9-patch texture.
+    // HiDPI: the texture is a device-pixel raster — fold the canvas scale
+    // into the key or a Retina display re-blits a 1x shadow upscaled.
+    const float ds = fabsf(ctx->canvas->getTotalMatrix().getScaleX());
     const float pad = elevation * 2.0f + 24.0f;
     uint64_t key = 14695981039346656037ull;
     for (uint32_t v : {__builtin_bit_cast(uint32_t, w), __builtin_bit_cast(uint32_t, h),
                        __builtin_bit_cast(uint32_t, radius), __builtin_bit_cast(uint32_t, elevation),
+                       __builtin_bit_cast(uint32_t, ds),
                        ambient_rgba, spot_rgba, (uint32_t)(transparent_occluder != 0)}) {
         key ^= v; key *= 1099511628211ull;
     }
     const uint64_t tick = ++ctx->shadow_tick;
     auto it = ctx->shadow_cache.find(key);
     if (it == ctx->shadow_cache.end()) {
-        // Rasterize the shadow alone into a padded offscreen: the rrect sits
-        // at (pad,pad), the M3 key light above its top-center — a uniform
-        // per-shape light (a global screen-space light would defeat the
-        // cache; Qt's glow is per-shape too).
-        const int iw = (int)std::ceil(w + 2.0f * pad);
-        const int ih = (int)std::ceil(h + 2.0f * pad);
+        // Rasterize the shadow alone into a padded offscreen at DEVICE
+        // density: the rrect sits at (pad·ds, pad·ds), the M3 key light
+        // above its top-center — a uniform per-shape light (a global
+        // screen-space light would defeat the cache; Qt's glow is per-shape
+        // too). Geometry and light all scale by ds so the raster is a
+        // pixel-exact Retina version of the 1x shadow.
+        const float scale = std::max(0.25f, ds);
+        const int iw = (int)std::ceil((w + 2.0f * pad) * scale);
+        const int ih = (int)std::ceil((h + 2.0f * pad) * scale);
         if (iw <= 0 || ih <= 0 || iw > 4096 || ih > 4096) return;
         sk_sp<SkSurface> surf = SkSurfaces::Raster(
                 SkImageInfo::Make(iw, ih, kN32_SkColorType, kPremul_SkAlphaType));
         if (!surf) return;
+        // All shadow params in device px: DrawShadow maps the light's x/y
+        // through the canvas matrix but z-plane height and light radius
+        // stay in raw units — premultiplying every parameter keeps the
+        // canvas at identity and the geometry unambiguous.
         const SkPath path = SkPath::RRect(
-                SkRect::MakeXYWH(pad, pad, w, h), radius, radius);
-        const SkPoint3 z_plane = SkPoint3::Make(0.0f, 0.0f, elevation);
-        const SkPoint3 light_pos = SkPoint3::Make(pad + w * 0.5f, pad - 600.0f, 600.0f);
+                SkRect::MakeXYWH(pad * scale, pad * scale, w * scale, h * scale),
+                radius * scale, radius * scale);
+        const SkPoint3 z_plane = SkPoint3::Make(0.0f, 0.0f, elevation * scale);
+        const SkPoint3 light_pos = SkPoint3::Make(
+                (pad + w * 0.5f) * scale, (pad - 600.0f) * scale, 600.0f * scale);
         SkShadowUtils::DrawShadow(surf->getCanvas(), path, z_plane, light_pos,
-                                  800.0f /*light radius, M3 key*/,
+                                  800.0f * scale /*light radius, M3 key*/,
                                   kx_to_skcolor(ambient_rgba), kx_to_skcolor(spot_rgba),
                                   transparent_occluder
                                       ? (uint32_t)kTransparentOccluder_ShadowFlag
@@ -2836,7 +2850,8 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
             ctx->shadow_cache.erase(oldest_key);
         }
         kx_ctx::KxShadowEntry e;
-        e.img = std::move(img); e.image_id = id; e.pad = pad; e.tick = tick;
+        e.img = std::move(img); e.image_id = id; e.pad = pad; e.scale = scale;
+        e.tick = tick;
         e.bytes = bytes;
         ctx->shadow_bytes += bytes;
         it = ctx->shadow_cache.emplace(key, std::move(e)).first;
@@ -2844,8 +2859,11 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
         it->second.tick = tick;
     }
     const kx_ctx::KxShadowEntry& e = it->second;
-    // Unscaled 1:1 blit — the fast SrcOver path (no sampling filter pass).
-    ctx->canvas->drawImage(e.img, x - e.pad, y - e.pad, SkSamplingOptions(), nullptr);
+    // Device-res image → logical dst rect (the canvas's own scale maps it
+    // back to pixels 1:1; linear sampling absorbs the sub-pixel fringe).
+    ctx->canvas->drawImageRect(e.img, SkRect::MakeXYWH(x - e.pad, y - e.pad,
+                               e.img->width() / e.scale, e.img->height() / e.scale),
+                               SkSamplingOptions(SkFilterMode::kLinear), nullptr);
 }
 
 // Points consumed by a verb stream — 0 move(2f), 1 line(2f), 2 quad(4f),
