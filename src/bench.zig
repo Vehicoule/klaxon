@@ -585,11 +585,12 @@ const SceneRunner = struct {
                 const t3 = sdl.c.SDL_GetTicksNS();
                 var k: usize = 0;
                 while (k < CHURN_DELTA) : (k += 1) {
+                    const t3b = sdl.c.SDL_GetTicksNS();
                     const card = churnCard(r.allocator, r.churn_next);
                     const t4 = sdl.c.SDL_GetTicksNS();
                     parent.add(card);
                     const t5 = sdl.c.SDL_GetTicksNS();
-                    tcr += t4 - t3;
+                    tcr += t4 - t3b;
                     tad += t5 - t4;
                     r.churn_next +%= 1;
                 }

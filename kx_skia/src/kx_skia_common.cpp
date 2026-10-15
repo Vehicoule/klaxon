@@ -3084,6 +3084,18 @@ bool kx_readback_rgba(kx_ctx* ctx, void* dst, size_t dst_size, int* out_width, i
     return ctx->raster->readPixels(dst_info, dst, static_cast<size_t>(ctx->width) * 4, 0, 0);
 }
 
+bool kx_readback_rgba_rect(kx_ctx* ctx, void* dst, size_t dst_size, int x, int y, int w, int h) {
+    if (!ctx || !ctx->raster || !dst || w <= 0 || h <= 0) return false;
+    const int x0 = std::max(0, x), y0 = std::max(0, y);
+    const int x1 = std::min(ctx->width, x + w), y1 = std::min(ctx->height, y + h);
+    if (x1 <= x0 || y1 <= y0) return false;
+    const int rw = x1 - x0, rh = y1 - y0;
+    if (dst_size < static_cast<size_t>(rw) * static_cast<size_t>(rh) * 4) return false;
+    const SkImageInfo dst_info = SkImageInfo::Make(rw, rh,
+                                                  kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
+    return ctx->raster->readPixels(dst_info, dst, static_cast<size_t>(rw) * 4, x0, y0);
+}
+
 bool kx_gpu_warmup(kx_ctx* ctx) {
     if (!ctx) return false;
     if (!ctx->gpu) return true; // raster: nothing to pre-compile

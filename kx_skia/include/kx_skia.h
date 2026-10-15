@@ -352,6 +352,10 @@ uint64_t kx_offscreen_end_image(kx_ctx* ctx);
 // into dst. dst_size must be >= width*height*4. Returns false on GPU backends
 // (async readback lands in Phase 1) or on failure.
 bool kx_readback_rgba(kx_ctx* ctx, void* dst, size_t dst_size, int* out_width, int* out_height);
+/// Sub-rect readback: `dst` is a tight (w*h*4) RGBA unpremul buffer for the
+/// (x,y,w,h) region of the raster surface. Clamped to the surface bounds —
+/// returns false when the region lies entirely outside.
+bool kx_readback_rgba_rect(kx_ctx* ctx, void* dst, size_t dst_size, int x, int y, int w, int h);
 
 // GPU warmup (added in 0.11.0, Phase 4e.1): draw the framework's full op set
 // (fills, rrects, gradients, text, images, layers, clips) into a small

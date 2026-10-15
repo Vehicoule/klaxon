@@ -102,6 +102,16 @@ pub const Stats = struct {
 
 pub const OnFrame = *const fn (ctx: ?*anyopaque, frame: u64) void;
 
+// KLAXON_FULL_PRESENT=1 forces the full-surface readback+upload on the
+// raster present path — an A/B switch for measuring the damage-scoped
+// upload. Latched: getenv is not free in the frame loop.
+var full_present_latched: ?bool = null;
+fn fullPresentForced() bool {
+    if (full_present_latched == null)
+        full_present_latched = std.c.getenv("KLAXON_FULL_PRESENT") != null;
+    return full_present_latched.?;
+}
+
 fn sdlSystemCursor(c: input_mod.PointerCursor) sdl.c.SDL_SystemCursor {
     const id: c_int = switch (c) {
         .default => sdl.c.SDL_SYSTEM_CURSOR_DEFAULT,
@@ -148,6 +158,10 @@ pub const Host = struct {
     /// backgrounded (WILL/DID_ENTER_BACKGROUND); runIteration skips
     /// rendering while inactive.
     active: bool = true,
+    /// The surface-space rect repainted this frame (desktop raster present
+    /// path): only that region needs the readback + texture upload. null =
+    /// full surface (full repaint, overlays, or GPU backend).
+    present_rect: ?sdl.c.SDL_Rect,
     /// Mobile: window size in pixels (SDL_GetWindowSizeInPixels). The kx
     /// canvas is pixel-sized; width/height stay in points (dp) — the
     /// layout space.
@@ -546,6 +560,7 @@ pub const Host = struct {
             .renderer = renderer,
             .texture = texture,
             .pixels = pixels,
+            .present_rect = null,
             .width = win_w,
             .height = win_h,
             .pixel_width = pixel_w,
@@ -807,6 +822,7 @@ pub const Host = struct {
         // retained pixels) → full repaint until retained composition lands.
         const raster = kx.c.kx_backend_of(host.ctx) == kx.c.KX_BACKEND_RASTER;
         const focus = semantics_mod.currentFocus();
+        host.present_rect = null; // full present unless the damage path narrows it
         // The repaint region (root space = points): the traversal culls any
         // subtree that can't reach it — off-surface content costs nothing.
         const surface = ui.node.Rect{
@@ -828,8 +844,11 @@ pub const Host = struct {
             // unrelated repaints never redraw it.
             const d = ui.node.rectIntersect(root.damage, surface);
             if (d.w <= 0 or d.h <= 0) {
-                // Damage entirely off-surface: nothing to repaint.
+                // Damage entirely off-surface: nothing to repaint — and the
+                // texture already holds the pixels, so present() can skip
+                // the readback/upload too (zero-size rect).
                 root.clearDamage();
+                host.present_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
             } else {
                 // Clear the accumulator BEFORE painting: dirty marks raised
                 // during the paint pass (paint hooks writing signals) start
@@ -841,6 +860,18 @@ pub const Host = struct {
                 host.paintPopupOverlay(); // above the tree (a popup overflows its anchor), below the ring
                 if (focus) |fm| fm.paintRing(host.ctx);
                 kx.c.kx_clip_reset(host.ctx);
+                // The repaint touched only `d` — present uploads just that
+                // region instead of two full-frame copies. Rounded out to
+                // cover the AA fringe (raster surface == texture space on
+                // desktop).
+                const x0: c_int = @intFromFloat(@floor(d.x));
+                const y0: c_int = @intFromFloat(@floor(d.y));
+                host.present_rect = if (!fullPresentForced()) .{
+                    .x = x0,
+                    .y = y0,
+                    .w = @intFromFloat(@ceil(d.x + d.w) - @floor(d.x)),
+                    .h = @intFromFloat(@ceil(d.y + d.h) - @floor(d.y)),
+                } else null; // A/B: force the full-surface upload
             }
         } else {
             root.clearDamage(); // same: marks during paint seed the next frame
@@ -1316,6 +1347,28 @@ pub const Host = struct {
             const t0 = sdl.c.SDL_GetTicksNS();
             var w: c_int = 0;
             var h: c_int = 0;
+            if (host.present_rect) |r| {
+                // Damage path: readback + upload only the repainted rect —
+                // two copies shrink from w*h to the damaged region. An empty
+                // rect means nothing repainted: skip the copy entirely.
+                if (r.w > 0 and r.h > 0) {
+                    const need = @as(usize, @intCast(r.w)) * @as(usize, @intCast(r.h)) * 4;
+                    if (need <= host.pixels.len and
+                        kx.c.kx_readback_rgba_rect(host.ctx, host.pixels.ptr, need, r.x, r.y, r.w, r.h))
+                    {
+                        _ = sdl.c.SDL_UpdateTexture(t, &r, host.pixels.ptr, r.w * 4);
+                    }
+                }
+                if (host.renderer) |r2| {
+                    _ = sdl.c.SDL_RenderTexture(r2, t, null, null);
+                    const t_submit = sdl.c.SDL_GetTicksNS();
+                    _ = sdl.c.SDL_RenderPresent(r2);
+                    const t_present = sdl.c.SDL_GetTicksNS();
+                    host.stats.submit_time_ms = @as(f32, @floatFromInt(t_submit - t0)) / 1e6;
+                    host.stats.present_time_ms = @as(f32, @floatFromInt(t_present - t_submit)) / 1e6;
+                }
+                return;
+            }
             if (kx.c.kx_readback_rgba(host.ctx, host.pixels.ptr, host.pixels.len, &w, &h)) {
                 _ = sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.width * 4);
                 if (host.renderer) |r| {

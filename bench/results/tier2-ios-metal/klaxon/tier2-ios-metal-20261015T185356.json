@@ -1,0 +1,23 @@
+{
+  "scenes": [
+    {
+      "name": "elevation_grid",
+      "fps": 5444.5,
+      "presented_fps": 119.9,
+      "frame_time_avg_ms": 0.18,
+      "frame_time_p50_ms": 0.19,
+      "frame_time_p99_ms": 0.43,
+      "frame_time_p999_ms": 0.44,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "draw_calls_per_frame": 101,
+      "rss_mb": 175.6,
+      "ttff_ms": 166.6,
+      "frames_rendered": 310,
+      "extra": {"op_ms": null, "ramp": null, "n_max_60fps": null, "latency_ms": null, "latency_frames": null, "nodes_per_frame": null, "teardown_ms": null, "resume_ms": null}
+    }
+  ],
+  "binary_size_bytes": 18289208,
+  "backend": "graphite-metal",
+  "timestamp": "2026-10-15T16:53:54Z"
+}

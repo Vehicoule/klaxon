@@ -166,7 +166,7 @@ fn galleryMain(opts: Options) !void {
 
     std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d}\n", .{ host.stats.backend, countNodes(g.root), opts.width, opts.height });
     try host.run(g.root, opts.max_frames, onFrame, g);
-    std.debug.print("rendered {d} frames, last frame {d:.2} ms, done\n", .{ host.stats.frames, host.stats.frame_time_ms });
+    std.debug.print("rendered {d} frames, last frame {d:.2} ms, submit {d:.2} ms, present {d:.2} ms, done\n", .{ host.stats.frames, host.stats.frame_time_ms, host.stats.submit_time_ms, host.stats.present_time_ms });
 }
 
 fn countNodes(node: *ui.node.Node) u64 {

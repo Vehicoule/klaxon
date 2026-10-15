@@ -515,6 +515,31 @@ test "CJK + Arabic resolve through font fallback (nonzero ink + real advances)" 
     try std.testing.expect(ma.width < 100);
 }
 
+test "readback_rgba_rect returns the sub-region's pixels, not the whole frame" {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 64, 64);
+    defer r.deinit();
+    r.beginFrame();
+    kx.c.kx_clear(r.ctx, 0xFFFFFFFF);
+    // Quadrants: TL red, TR green, BL blue, BR yellow.
+    kx.c.kx_fill_rect(r.ctx, 0, 0, 32, 32, 0xFF0000FF);
+    kx.c.kx_fill_rect(r.ctx, 32, 0, 32, 32, 0x00FF00FF);
+    kx.c.kx_fill_rect(r.ctx, 0, 32, 32, 32, 0x0000FFFF);
+    kx.c.kx_fill_rect(r.ctx, 32, 32, 32, 32, 0xFFFF00FF);
+    r.endFrame();
+    // Read back a 16x16 rect starting inside TR (green): every pixel green.
+    var buf: [16 * 16 * 4]u8 = undefined;
+    try std.testing.expect(kx.c.kx_readback_rgba_rect(r.ctx, &buf, buf.len, 40, 8, 16, 16));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0xFF, 0, 0xFF }, buf[0..4]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0xFF, 0, 0xFF }, buf[buf.len - 4 ..]);
+    // A rect straddling the quadrant seam: TL red above (y<32), BL blue below.
+    try std.testing.expect(kx.c.kx_readback_rgba_rect(r.ctx, &buf, buf.len, 8, 24, 16, 16));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xFF, 0, 0, 0xFF }, buf[0..4]); // (23,24): red
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0xFF, 0xFF }, buf[buf.len - 4 ..]); // (23,39): blue
+    // Fully outside the surface: false, no pixels touched.
+    try std.testing.expect(!kx.c.kx_readback_rgba_rect(r.ctx, &buf, buf.len, 200, 200, 16, 16));
+}
+
 test "paint constructors: fill keeps the defaults, stroke carries color + width" {
     const f = Paint.fill(0x11223344);
     try std.testing.expectEqual(@as(Color, 0x11223344), f.color);
