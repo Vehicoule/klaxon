@@ -562,14 +562,30 @@ const SceneRunner = struct {
             .mount_churn => {
                 // Steady-state pool of 500: retire the 50 oldest, create 50 new.
                 const parent = r.churn_parent.?;
+                const prof = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+                var trm: u64 = 0;
+                var tde: u64 = 0;
+                var tcr: u64 = 0;
+                var tad: u64 = 0;
+                var detached: [CHURN_DELTA]*Node = undefined;
+                const ts = sdl.c.SDL_GetTicksNS();
+                const nd = parent.removeRange(0, CHURN_DELTA, &detached);
+                const t2 = sdl.c.SDL_GetTicksNS();
+                for (detached[0..nd]) |v| v.deinit();
+                const t3 = sdl.c.SDL_GetTicksNS();
                 var k: usize = 0;
                 while (k < CHURN_DELTA) : (k += 1) {
-                    const victim = parent.children.items[0];
-                    _ = parent.remove(victim);
-                    victim.deinit();
-                    parent.add(churnCard(r.allocator, r.churn_next));
+                    const card = churnCard(r.allocator, r.churn_next);
+                    const t4 = sdl.c.SDL_GetTicksNS();
+                    parent.add(card);
+                    const t5 = sdl.c.SDL_GetTicksNS();
+                    tcr += t4 - t3;
+                    tad += t5 - t4;
                     r.churn_next +%= 1;
                 }
+                trm += t2 - ts;
+                tde += t3 - t2;
+                if (prof) std.debug.print("  churn rm={d}us deinit={d}us create={d}us add={d}us\n", .{ trm / 1000, tde / 1000, tcr / 1000, tad / 1000 });
             },
             .scroll_anim => {
                 // 600 dp/s at 60 Hz ≈ 10 px/frame. The overlay repaints the
@@ -880,12 +896,16 @@ const SceneRunner = struct {
         if (opts.warmup_frames == 0) ttff_ms = @as(f64, @floatFromInt(o1 - start_ns)) / 1e6;
         i = 0;
         if (opts.windowed) wall_start = sdl.c.SDL_GetTicksNS();
+        const dbg_loop = std.c.getenv("KLAXON_BENCH_PHASES") != null;
         while (i < measured) : (i += 1) {
             const t0 = sdl.c.SDL_GetTicksNS();
             r.tick(renderer, i);
+            const tl = sdl.c.SDL_GetTicksNS();
             if (r.root.layout_dirty) r.root.layout(r.bounds);
+            const tp = sdl.c.SDL_GetTicksNS();
             renderer.paint(r.root, BG);
             const t1 = sdl.c.SDL_GetTicksNS();
+            if (dbg_loop) std.debug.print("  frame tick={d}us layout={d}us paint={d}us\n", .{ (tl - t0) / 1000, (tp - tl) / 1000, (t1 - tp) / 1000 });
             wall_end = t1;
             try frame_times.append(@as(f64, @floatFromInt(t1 - t0 -| renderer.last_frame_wait_ns)) / 1e6);
         }
@@ -2246,17 +2266,28 @@ fn buildRelayoutStorm(r: *SceneRunner) !*Node {
 const CHURN_POOL = 500;
 const CHURN_DELTA = 50;
 
+var churn_prof_latched: ?bool = null;
 fn churnCard(a: std.mem.Allocator, id: u64) *Node {
+    if (churn_prof_latched == null) churn_prof_latched = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+    const prof = churn_prof_latched.?;
+    var t0: u64 = 0;
+    if (prof) t0 = sdl.c.SDL_GetTicksNS();
     const card = widgets.container.container(a, .{
         .color = if (id % 2 == 0) 0x2A2A3EFF else 0x24303CFF,
         .radius = 6,
         .padding = .{ .left = 8, .top = 4, .right = 8, .bottom = 4 },
     }) catch @panic("klaxon: out of memory");
     const row = widgets.layout.row(a, .{ .gap = 8, .cross_align = .center }) catch @panic("klaxon: out of memory");
+    const t1 = sdl.c.SDL_GetTicksNS();
     row.add(widgets.icon.icon(a, .star, .{ .size = 12, .color = 0xFFD54FFF }) catch @panic("klaxon: out of memory"));
+    const t2 = sdl.c.SDL_GetTicksNS();
     var buf: [32]u8 = undefined;
     const label = std.fmt.bufPrint(&buf, "card #{d}", .{id}) catch "card";
     row.add(widgets.text.text(a, label, .{ .size = 12, .color = 0xFFFFFFFF }) catch @panic("klaxon: out of memory"));
+    if (prof) {
+        const t3 = sdl.c.SDL_GetTicksNS();
+        std.debug.print("    card: boxes={d}us icon={d}us text={d}us\n", .{ (t1 - t0) / 1000, (t2 - t1) / 1000, (t3 - t2) / 1000 });
+    }
     card.add(row);
     return card;
 }

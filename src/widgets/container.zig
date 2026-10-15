@@ -78,7 +78,7 @@ fn containerDeinit(n: *Node) void {
 // auto_retain: the decoration paints strictly inside bounds and the child
 // layout is deterministic — a clean Container subtree can replay its cached
 // raster (e.g. a static card next to a repainting sibling).
-const container_vtable = ui.node.VTable{ .measure = containerMeasure, .layout = containerLayout, .paint = containerPaint, .deinit = containerDeinit, .auto_retain = true };
+const container_vtable = ui.node.VTable{ .measure = containerMeasure, .layout = containerLayout, .paint = containerPaint, .deinit = containerDeinit, .auto_retain = true, .measure_pure = true };
 
 pub fn container(allocator: std.mem.Allocator, opts: ContainerOptions) !*Node {
     const node = try Node.create(allocator, &container_vtable);

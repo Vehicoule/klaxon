@@ -187,7 +187,7 @@ fn textPaintBounds(n: *Node) Rect {
     s.vt.ensureLayout(s.opts, s.text, &s.m);
     return .{ .x = textX(n, s.m, s.opts.text_align), .y = n.bounds.y, .w = s.m.width, .h = s.m.height };
 }
-const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds };
+const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds, .measure_pure = true };
 
 pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*Node {
     const node = try Node.create(allocator, &text_vtable);

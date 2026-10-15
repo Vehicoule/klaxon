@@ -165,7 +165,7 @@ fn containerDeinit(n: *Node) void {
     if (s.color_sig) |sig| sig.deinit();
     n.allocator.destroy(s);
 }
-const container_vtable = ui.node.VTable{ .measure = containerMeasure, .layout = containerLayout, .paint = containerPaint, .deinit = containerDeinit };
+const container_vtable = ui.node.VTable{ .measure = containerMeasure, .layout = containerLayout, .paint = containerPaint, .deinit = containerDeinit, .measure_pure = true };
 
 pub fn animatedContainer(allocator: std.mem.Allocator, opts: AnimatedContainerOptions) !*Node {
     const node = try Node.create(allocator, &container_vtable);

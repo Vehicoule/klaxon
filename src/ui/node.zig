@@ -118,6 +118,14 @@ pub const PointerCursor = enum { default, hand, ibeam, move, wait };
 
 pub const VTable = struct {
     measure: *const fn (node: *Node, c: Constraints) Size,
+    /// measure() is a pure function of (constraints, layout-marked state):
+    /// every input it reads — text metrics, immutable opts, child measures —
+    /// changes only through markLayoutDirty paths. That lets measure()
+    /// cache the last (constraints → size) result and skip a re-measure of
+    /// an untouched subtree (Flutter's relayout-boundary idiom). Anything
+    /// reading clocks, drives, or externally-mutated buffers must leave this
+    /// false — the default — or its silent changes would freeze the size.
+    measure_pure: bool = false,
     layout: *const fn (node: *Node, bounds: Rect) void,
     paint: *const fn (node: *Node, ctx: *kx.Ctx) void,
     deinit: ?*const fn (node: *Node) void = null,
@@ -231,6 +239,14 @@ pub const Node = struct {
     bounds: Rect = .{},
     dirty: bool = true,
     layout_dirty: bool = true,
+    /// measure() cache (relayout boundary): the last pure measurement and
+    /// the constraints it was taken under. Valid only while the subtree is
+    /// fully measure-pure — any descendant reading untracked state flips
+    /// `impure_descendant` on the whole ancestor chain at add() time.
+    m_valid: bool = false,
+    m_constraints: Constraints = .{},
+    m_size: Size = .{},
+    impure_descendant: bool = false,
     /// Last global layout epoch this node was laid out in. A global
     /// layout-affecting switch (text direction flip) bumps the epoch so a
     /// clean subtree at unchanged bounds still re-runs once.
@@ -374,12 +390,29 @@ pub const Node = struct {
         node.children.append(child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
         if (child.backdrop_subtree) node.markBackdropUp();
+        if (!(child.vtable.measure_pure and !child.impure_descendant))
+            node.markImpureUp();
         node.markLayoutDirty();
         // Damage the CHILD's rect, not the parent's — a 640×480 list would
         // otherwise repaint wholesale per row mutation (the krausest-style
         // list ops were floored by this). A not-yet-laid-out child has a
         // zero rect; layout's own bounds-change damage covers it landing.
         child.markDirty();
+    }
+
+    /// Propagate "subtree is not fully measure-pure" up the chain (stops at
+    /// the first ancestor already flagged). Once set it stays set — a removed
+    /// impure child leaves the flag behind rather than recomputing the whole
+    /// subtree (conservative: the cost is lost caching, never stale sizes).
+    fn markImpureUp(node: *Node) void {
+        var n = node;
+        while (true) {
+            if (n.impure_descendant) return;
+            n.impure_descendant = true;
+            n.m_valid = false; // a measure cached while pure may now be stale
+            const p = n.parent orelse return;
+            n = p;
+        }
     }
 
     /// Insert a child at `index` (clamped to the end). Same ownership contract
@@ -395,6 +428,8 @@ pub const Node = struct {
         node.children.insert(i, child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
         if (child.backdrop_subtree) node.markBackdropUp();
+        if (!(child.vtable.measure_pure and !child.impure_descendant))
+            node.markImpureUp();
         node.markLayoutDirty();
         child.markDirty(); // child-scoped damage — see add()
     }
@@ -417,6 +452,28 @@ pub const Node = struct {
             }
         }
         return false;
+    }
+
+    /// Detach `count` children starting at `start` into `out` — the caller
+    /// owns them (same contract as remove: NOT deinited). One array shift
+    /// for the whole range instead of one per child — the
+    /// notifyItemRangeRemoved idiom. Returns how many were detached.
+    pub fn removeRange(node: *Node, start: usize, count: usize, out: []*Node) usize {
+        const total = node.children.items.len;
+        const s = @min(start, total);
+        const n = @min(count, @min(out.len, total - s));
+        for (node.children.items[s .. s + n], out[0..n]) |c, *slot| {
+            // Damage each leaving rect (the parent chain is still intact
+            // for the walk); dedup makes the repeated ancestor marks cheap.
+            c.markDirty();
+            c.parent = null;
+            slot.* = c;
+        }
+        const tail = node.children.items[s + n .. total];
+        std.mem.copyForwards(*Node, node.children.items[s .. s + tail.len], tail);
+        node.children.items.len -= n;
+        if (n > 0) node.markLayoutDirty();
+        return n;
     }
 
     fn markDirtyUp(node: *Node) void {
@@ -514,6 +571,11 @@ pub const Node = struct {
     }
 
     pub fn markLayoutDirty(node: *Node) void {
+        // The cache drops on EVERY mark, stamped or not: a measure() could
+        // have repopulated it mid-epoch (a test measuring between ticks —
+        // in a real tree measure only runs inside clearing passes, where
+        // marks never early-out anyway).
+        node.m_valid = false;
         // Same stamp rule as markDirtyUp — outside a clearing pass a
         // stamped node's chain is already layout-dirty; inside a pass the
         // walk must run or a pruned subtree's pending relayout strands.
@@ -524,7 +586,19 @@ pub const Node = struct {
     }
 
     pub fn measure(node: *Node, c: Constraints) Size {
-        return node.vtable.measure(node, c);
+        if (node.m_valid and std.meta.eql(node.m_constraints, c))
+            return node.m_size;
+        const s = node.vtable.measure(node, c);
+        // Only a fully measure-pure subtree may cache: a cached container
+        // would skip measuring an impure descendant entirely, freezing the
+        // size it silently changed (the storm rows' frame-driven width is
+        // exactly that input — declared impure, they always re-measure).
+        if (node.vtable.measure_pure and !node.impure_descendant) {
+            node.m_constraints = c;
+            node.m_size = s;
+            node.m_valid = true;
+        }
+        return s;
     }
 
     pub fn layout(node: *Node, bounds: Rect) void {

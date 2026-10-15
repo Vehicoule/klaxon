@@ -293,6 +293,7 @@ fn listDeinit(n: *Node) void {
 }
 const list_vtable = ui.node.VTable{
     .measure = listMeasure,
+    .measure_pure = true, // fills the constraints — reads nothing else
     .layout = listLayout,
     .paint = listPaint,
     .deinit = listDeinit,

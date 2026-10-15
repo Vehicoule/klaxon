@@ -59,7 +59,7 @@ fn flexLayout(n: *Node, bounds: Rect) void {
 fn flexDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(FlexState, n));
 }
-const flex_vtable = ui.node.VTable{ .measure = flexMeasure, .layout = flexLayout, .paint = noopPaint, .deinit = flexDeinit, .auto_retain = true };
+const flex_vtable = ui.node.VTable{ .measure = flexMeasure, .layout = flexLayout, .paint = noopPaint, .deinit = flexDeinit, .auto_retain = true, .measure_pure = true };
 
 fn flex(allocator: std.mem.Allocator, axis: Axis, opts: FlexOptions) !*Node {
     const node = try Node.create(allocator, &flex_vtable);
@@ -126,7 +126,7 @@ fn stackLayout(n: *Node, bounds: Rect) void {
 fn stackDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(StackState, n));
 }
-const stack_vtable = ui.node.VTable{ .measure = stackMeasure, .layout = stackLayout, .paint = noopPaint, .deinit = stackDeinit, .auto_retain = true };
+const stack_vtable = ui.node.VTable{ .measure = stackMeasure, .layout = stackLayout, .paint = noopPaint, .deinit = stackDeinit, .auto_retain = true, .measure_pure = true };
 
 pub fn stack(allocator: std.mem.Allocator, opts: StackOptions) !*Node {
     const node = try Node.create(allocator, &stack_vtable);
@@ -297,7 +297,7 @@ fn gridDeinit(n: *Node) void {
     n.allocator.free(s.row_h);
     n.allocator.destroy(s);
 }
-const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit, .auto_retain = true, .hit_child = gridHitChild };
+const grid_vtable = ui.node.VTable{ .measure = gridMeasure, .layout = gridLayout, .paint = noopPaint, .deinit = gridDeinit, .auto_retain = true, .hit_child = gridHitChild, .measure_pure = true };
 
 pub fn grid(allocator: std.mem.Allocator, opts: GridOptions) !*Node {
     const node = try Node.create(allocator, &grid_vtable);
@@ -337,7 +337,7 @@ fn paddingLayout(n: *Node, bounds: Rect) void {
 fn paddingDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(PaddingState, n));
 }
-const padding_vtable = ui.node.VTable{ .measure = paddingMeasure, .layout = paddingLayout, .paint = noopPaint, .deinit = paddingDeinit, .auto_retain = true };
+const padding_vtable = ui.node.VTable{ .measure = paddingMeasure, .layout = paddingLayout, .paint = noopPaint, .deinit = paddingDeinit, .auto_retain = true, .measure_pure = true };
 
 pub fn padding(allocator: std.mem.Allocator, insets: EdgeInsets) !*Node {
     const node = try Node.create(allocator, &padding_vtable);

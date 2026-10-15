@@ -310,7 +310,7 @@ fn drawIconGeometry(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, colo
 fn iconDeinit(n: *Node) void {
     n.allocator.destroy(@as(*IconState, @ptrCast(@alignCast(n.state.?))));
 }
-const icon_vtable = ui.node.VTable{ .measure = iconMeasure, .layout = iconLayout, .paint = iconPaint, .deinit = iconDeinit };
+const icon_vtable = ui.node.VTable{ .measure = iconMeasure, .layout = iconLayout, .paint = iconPaint, .deinit = iconDeinit, .measure_pure = true };
 
 pub fn icon(allocator: std.mem.Allocator, name: IconName, opts: IconOptions) !*Node {
     const node = try Node.create(allocator, &icon_vtable);
