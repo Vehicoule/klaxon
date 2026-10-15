@@ -75,13 +75,38 @@ export fn kx_a11y_focus_node(root: ?*anyopaque, ptr: u64) callconv(.c) void {
     if (sem.currentFocus()) |fm| fm.focusNode(node);
 }
 
+/// Virtual-child ptr encoding: bit63 marks it, bits 48..62 carry the
+/// item index, low 48 bits carry the owning Node's address. Heap
+/// addresses stay below 2^48 on every supported platform, so the tag
+/// bits can never alias a real node pointer.
+pub const VIRTUAL_PTR_BIT: u64 = 1 << 63;
+const PTR_MASK: u64 = (1 << 48) - 1;
+
 /// VoiceOver double-tap (accessibilityActivate on iOS) — synthesize
 /// down+up at the node's visual center through the input router (a click
 /// at window coordinates: mapRectToRoot(bounds) center).
 export fn kx_a11y_activate_node(root: ?*anyopaque, ptr: u64) callconv(.c) void {
     const root_node: *Node = @ptrCast(@alignCast(root orelse return));
-    const node = findNodeByPtr(root_node, ptr) orelse return;
     const router = input_mod.current() orelse return;
+    if (ptr & VIRTUAL_PTR_BIT != 0) {
+        // A virtual child (compound widget item): dispatch at the ITEM's
+        // rect — the parent's hit-test resolves it like a real tap.
+        const node = findNodeByPtr(root_node, ptr & PTR_MASK) orelse return;
+        const descriptor = node.semantics orelse return;
+        const idx: usize = @intCast((ptr >> 48) & 0x7FFF);
+        const cb = descriptor.child_bounds orelse return;
+        if (idx >= descriptor.children.len) return;
+        var b = cb(node, idx);
+        b.x += node.bounds.x;
+        b.y += node.bounds.y;
+        const r = node.mapRectToRoot(b);
+        const cx = r.x + r.w / 2;
+        const cy = r.y + r.h / 2;
+        router.dispatchPointer(root_node, .{ .phase = .down, .x = cx, .y = cy });
+        router.dispatchPointer(root_node, .{ .phase = .up, .x = cx, .y = cy });
+        return;
+    }
+    const node = findNodeByPtr(root_node, ptr) orelse return;
     const r = node.mapRectToRoot(node.bounds);
     const cx = r.x + r.w / 2;
     const cy = r.y + r.h / 2;
@@ -127,13 +152,19 @@ fn dumpNode(sn: *sem.SemanticNode, depth: usize, buf: *std.array_list.Managed(u8
     const label = sanitizeA11yField(sn.label, &label_buf);
     const value = sanitizeA11yField(sn.value, &value_buf);
     const focusable: u8 = if (sn.focusable) 1 else 0;
-    const ptr: u64 = @intFromPtr(sn.node);
+    // Virtual children get a tagged ptr (see VIRTUAL_PTR_BIT) so the
+    // bridges' activate calls route to the item, not the group.
+    const ptr: u64 = if (sn.virtual_index) |vi|
+        VIRTUAL_PTR_BIT | (@as(u64, @intCast(vi)) << 48) | @intFromPtr(sn.node)
+    else
+        @intFromPtr(sn.node);
     // checked: 0 = null, 1 = false, 2 = true (?bool unwrapped — Zig does
     // not switch on an optional directly).
     const checked: u8 = if (sn.checked) |on| (if (on) 2 else 1) else 0;
     // Real rect: the node's bounds in window space — the bridges position
-    // their elements from these (Phase 3de; was 0|0|0|0).
-    const r = sn.node.mapRectToRoot(sn.node.bounds);
+    // their elements from these (Phase 3de; was 0|0|0|0). Virtual children
+    // carry their own item rect.
+    const r = sn.bounds_override orelse sn.node.mapRectToRoot(sn.node.bounds);
 
     var line_buf: [2048]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{d}|{s}|{s}|{s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{

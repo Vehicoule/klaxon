@@ -84,6 +84,9 @@ const ItemDef = struct {
 
 const SegState = struct {
     items: std.array_list.Managed(ItemDef), // owned defs
+    /// Live per-segment a11y descriptors — the semantics tree's virtual
+    /// children borrow this slice; segSelect updates `checked` in place.
+    sem_children: std.array_list.Managed(ui.semantics.Semantics),
     opts: SegmentedButtonOptions,
     sig: ?*ui.state.Signal(usize) = null,
     on_change: ?Callback = null,
@@ -130,6 +133,18 @@ fn segRectLtr(b: Rect, i: usize, w: f32) Rect {
 
 fn mirrorX(b: Rect, r: Rect) Rect {
     return .{ .x = b.x + b.w - (r.x - b.x) - r.w, .y = r.y, .w = r.w, .h = r.h };
+}
+
+/// Segment `index`'s rect in NODE-LOCAL space (Semantics.child_bounds —
+/// the a11y bridge maps it to window space for per-item highlights and
+/// targeted activation taps).
+fn segChildBounds(n: *Node, index: usize) Rect {
+    const s = stateOf(n);
+    const local = Rect{ .x = 0, .y = 0, .w = n.bounds.w, .h = n.bounds.h };
+    const w = segWidthFit(s, s.opts.theme, local);
+    var r = segRectLtr(local, index, w);
+    if (ui.i18n.direction() == .rtl) r = mirrorX(local, r);
+    return r;
 }
 
 /// The segment width FIT to the assigned bounds: the intrinsic width when
@@ -205,6 +220,7 @@ fn segSelect(n: *Node, index: usize) void {
     n.markDirty();
     if (n.semantics) |sem| {
         sem.value = s.items.items[index].label; // a11y: the value follows
+        for (s.sem_children.items, 0..) |*c, i| c.checked = (i == index);
         ui.semantics.notifyControlChanged(n);
     }
     if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
@@ -219,6 +235,7 @@ fn segSyncCb(userdata: ?*anyopaque) void {
         s.selected = v;
         if (n.semantics) |sem| {
             sem.value = s.items.items[v].label;
+            for (s.sem_children.items, 0..) |*c, i| c.checked = (i == v);
             ui.semantics.notifyControlChanged(n); // a11y follows external changes
         }
         n.markDirty();
@@ -419,6 +436,7 @@ fn segDeinit(n: *Node) void {
     input.releaseNode(n);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
+    s.sem_children.deinit();
     n.allocator.destroy(s);
 }
 
@@ -457,6 +475,7 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
     errdefer allocator.destroy(s);
     s.* = .{
         .items = std.array_list.Managed(ItemDef).init(allocator),
+        .sem_children = std.array_list.Managed(ui.semantics.Semantics).init(allocator),
         .opts = opts,
         .sig = sig,
         .on_change = on_change,
@@ -481,11 +500,26 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
         if (v < s.items.items.len) s.selected = v; // the signal wins
     }
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
+    // Per-segment virtual a11y children — VoiceOver reads/selects each
+    // segment (radio), not just an opaque group. The borrowed slice is
+    // stable (items never re-alloc after init); `checked` mutates in
+    // place on selection changes.
+    for (s.items.items, 0..) |*def, i| {
+        s.sem_children.append(.{
+            .role = .radio,
+            .label = def.label,
+            .checked = i == s.selected,
+            .disabled = !def.enabled,
+            .actions = ui.semantics.Actions.initOne(.activate),
+        }) catch @panic("klaxon: out of memory");
+    }
     ui.semantics.attach(node, .{
         .role = .group, // a radio group (single choice)
         .label = "Segmented button",
         .focusable = true, // takes the keyboard focus (arrow nav)
         .value = if (s.items.items.len > 0) s.items.items[s.selected].label else "",
+        .children = s.sem_children.items,
+        .child_bounds = segChildBounds,
     }); // Phase 2c
     return node;
 }

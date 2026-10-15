@@ -77,6 +77,16 @@ pub const Semantics = struct {
     focusable: bool = false,
     actions: Actions = .{},
     live: LiveRegion = .off,
+    /// Virtual per-item children for compound widgets (segmented buttons,
+    /// nav rails, steppers): each entry becomes a semantic node without a
+    /// Node of its own — activation dispatches at the item's rect, so the
+    /// parent's hit-test resolves the item like a real tap. Borrowed —
+    /// the widget owns the slice and updates it before a tree_dirty.
+    children: []const Semantics = &.{},
+    /// Bounds of virtual child `index` in the node's LOCAL space (0,0 =
+    /// the node's top-left). Needed for highlight rects and targeted
+    /// activation when `children` is non-empty.
+    child_bounds: ?*const fn (node: *Node, index: usize) Rect = null,
 };
 
 /// Attach (or replace) a node's accessibility descriptor.
@@ -101,6 +111,13 @@ pub const SemanticNode = struct {
     actions: Actions,
     live: LiveRegion,
     children: []SemanticNode, // owned (flat builds: a sub-slice of `backing`)
+    /// Set on a virtual child (Semantics.children entry): `node` is the
+    /// owning widget and `virtual_index` picks the item. Virtual nodes
+    /// never expand — they are a11y leaves.
+    virtual_index: ?usize = null,
+    /// Window-space rect for a virtual child (from Semantics.child_bounds).
+    /// Null → callers fall back to node.mapRectToRoot(node.bounds).
+    bounds_override: ?Rect = null,
     /// The single allocation every `children` slice in the tree is cut
     /// from — buildSemanticTree's flat layout. Set on the ROOT only:
     /// deinit frees it once instead of walking the tree freeing per-node
@@ -150,7 +167,7 @@ fn semanticSkipped(n: *Node) bool {
 /// descendants instead).
 fn countEmitted(n: *Node) usize {
     if (semanticSkipped(n)) return 0;
-    var s: usize = if (n.semantics != null) 1 else 0;
+    var s: usize = if (n.semantics) |sem| 1 + sem.children.len else 0;
     for (n.children.items) |c| s += countEmitted(c);
     return s;
 }
@@ -175,11 +192,48 @@ inline fn semanticValue(n: *Node, sem: *const Semantics) SemanticNode {
     };
 }
 
+/// A virtual child's SemanticNode: owned by `parent`'s widget, leaf in
+/// the tree, rect mapped from node-local space (child_bounds) into window
+/// space for the bridges' highlight/activation.
+fn virtualValue(parent: *Node, vc: *const Semantics, index: usize, bounds_cb: ?*const fn (*Node, usize) Rect) SemanticNode {
+    var r: ?Rect = null;
+    if (bounds_cb) |cb| {
+        var b = cb(parent, index);
+        b.x += parent.bounds.x;
+        b.y += parent.bounds.y;
+        r = parent.mapRectToRoot(b);
+    }
+    return .{
+        .node = parent,
+        .role = vc.role,
+        .label = vc.label,
+        .hint = vc.hint,
+        .value = vc.value,
+        .checked = vc.checked,
+        .disabled = vc.disabled,
+        .focusable = vc.focusable,
+        .actions = vc.actions,
+        .live = vc.live,
+        .children = &.{},
+        .virtual_index = index,
+        .bounds_override = r,
+    };
+}
+
 /// Emit `n`'s semantic frontier — the semantic descendants with no other
 /// semantic ancestor between them and `n` — into buf[w..]. `n` itself is
 /// assumed emitted/skipped by the caller. error.Overflow = buf is full
 /// (the caller retries with an exact-size buffer).
 fn emitFrontier(n: *Node, buf: []SemanticNode, w: *usize) error{Overflow}!void {
+    // Virtual per-item children first — they are the widget's own items
+    // (segmented button segments, nav rail destinations).
+    if (n.semantics) |sem| {
+        for (sem.children, 0..) |*vc, vi| {
+            if (w.* == buf.len) return error.Overflow;
+            buf[w.*] = virtualValue(n, vc, vi, sem.child_bounds);
+            w.* += 1;
+        }
+    }
     for (n.children.items) |c| {
         if (semanticSkipped(c)) continue;
         if (c.semantics) |sem| {
@@ -209,6 +263,12 @@ fn fillTree(root: *Node, buf: []SemanticNode) error{Overflow}!FillResult {
     const top = w; // the top-level frontier — the group wrapper's children
     var r: usize = 0;
     while (r < w) : (r += 1) {
+        // A virtual child is an a11y leaf — re-expanding its `node` (the
+        // owning widget) would emit the widget's frontier a second time.
+        if (buf[r].virtual_index != null) {
+            buf[r].children = &.{};
+            continue;
+        }
         const start = w;
         try emitFrontier(buf[r].node, buf, &w);
         buf[r].children = buf[start..w];

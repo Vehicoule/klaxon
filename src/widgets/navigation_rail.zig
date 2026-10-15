@@ -101,6 +101,9 @@ const ItemDef = struct {
 
 const RailState = struct {
     items: std.array_list.Managed(ItemDef), // owned defs
+    /// Live per-item a11y descriptors — the semantics tree's virtual
+    /// children borrow this slice; railSelect updates `checked` in place.
+    sem_children: std.array_list.Managed(ui.semantics.Semantics),
     opts: NavigationRailOptions,
     sig: ?*ui.state.Signal(usize) = null,
     on_change: ?Callback = null,
@@ -123,6 +126,11 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
     @memcpy(buf[0..str.len], str);
     buf[str.len] = 0;
     return buf[0..str.len :0];
+}
+
+/// Item `index`'s rect in NODE-LOCAL space (Semantics.child_bounds).
+fn railChildBounds(n: *Node, index: usize) Rect {
+    return itemRect(.{ .x = 0, .y = 0, .w = n.bounds.w, .h = n.bounds.h }, index);
 }
 
 /// The item's rect in the widget's parent space (top-aligned stack).
@@ -171,6 +179,7 @@ fn railSelect(n: *Node, index: usize) void {
     n.markDirty();
     if (n.semantics) |sem| {
         sem.value = s.items.items[index].label; // a11y: the value follows
+        for (s.sem_children.items, 0..) |*c, i| c.checked = (i == index);
         ui.semantics.notifyControlChanged(n);
     }
     if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
@@ -185,6 +194,7 @@ fn railSyncCb(userdata: ?*anyopaque) void {
         s.selected = v;
         if (n.semantics) |sem| {
             sem.value = s.items.items[v].label;
+            for (s.sem_children.items, 0..) |*c, i| c.checked = (i == v);
             ui.semantics.notifyControlChanged(n); // a11y follows external changes
         }
         n.markDirty();
@@ -403,6 +413,7 @@ fn railDeinit(n: *Node) void {
     input.releaseNode(n);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
+    s.sem_children.deinit();
     n.allocator.destroy(s);
 }
 
@@ -426,6 +437,7 @@ pub fn navigationRail(allocator: std.mem.Allocator, items: []const NavRailItem, 
     errdefer allocator.destroy(s);
     s.* = .{
         .items = std.array_list.Managed(ItemDef).init(allocator),
+        .sem_children = std.array_list.Managed(ui.semantics.Semantics).init(allocator),
         .opts = opts,
         .sig = sig,
         .on_change = on_change,
@@ -450,11 +462,24 @@ pub fn navigationRail(allocator: std.mem.Allocator, items: []const NavRailItem, 
         if (v < s.items.items.len) s.selected = v; // the signal wins
     }
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
+    // Per-destination virtual a11y children — VoiceOver reads/selects
+    // each tab, not just an opaque group.
+    for (s.items.items, 0..) |*def, i| {
+        s.sem_children.append(.{
+            .role = .tab,
+            .label = def.label,
+            .checked = i == s.selected,
+            .disabled = !def.enabled,
+            .actions = ui.semantics.Actions.initOne(.activate),
+        }) catch @panic("klaxon: out of memory");
+    }
     ui.semantics.attach(node, .{
         .role = .group, // a tab group (single choice)
         .label = "Navigation rail",
         .focusable = true, // takes the keyboard focus (arrow nav)
         .value = if (s.items.items.len > 0) s.items.items[s.selected].label else "",
+        .children = s.sem_children.items,
+        .child_bounds = railChildBounds,
     }); // Phase 2c
     return node;
 }
