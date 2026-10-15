@@ -86,11 +86,14 @@ pub const Constraints = struct {
         };
     }
 
-    /// Loosen the main axis (children may take any size along it).
+    /// Loosen the main axis (children may take ANY size along it, including
+    /// sizes past the incoming bound — a flex container's main size is the
+    /// sum of natural sizes, so a fill-seeking child like Center must not
+    /// claim the container's whole extent).
     pub fn loosenMain(c: Constraints, axis: Axis) Constraints {
         return switch (axis) {
-            .horizontal => .{ .min_w = 0, .max_w = c.max_w, .min_h = c.min_h, .max_h = c.max_h },
-            .vertical => .{ .min_w = c.min_w, .max_w = c.max_w, .min_h = 0, .max_h = c.max_h },
+            .horizontal => .{ .min_w = 0, .min_h = c.min_h, .max_h = c.max_h },
+            .vertical => .{ .min_w = c.min_w, .max_w = c.max_w, .min_h = 0 },
         };
     }
 
@@ -204,6 +207,13 @@ pub const Alignment = struct {
 /// axis; the container's main size is the sum (+ gaps + padding), the cross size
 /// is the max child cross size (+ padding).
 pub fn flexMeasure(node: *Node, c: Constraints, axis: Axis, gap: f32, padding: f32) Size {
+    // Layout reads whether THIS measure saw a bounded main axis: a flex in a
+    // scroll view is measured unbounded and must lay children out the same
+    // way (see m_main_unbounded on Node).
+    node.m_main_unbounded = !std.math.isFinite(switch (axis) {
+        .horizontal => c.max_w,
+        .vertical => c.max_h,
+    });
     const inner = c.deflate(padding * 2);
     const gaps: f32 = if (node.children.items.len > 1)
         gap * @as(f32, @floatFromInt(node.children.items.len - 1))
@@ -286,6 +296,11 @@ pub fn flexLayout(
     var natural_main: f32 = padding * 2;
     var flex_total: u32 = 0;
     var non_flex_main: f32 = 0;
+    // Non-flex children take the natural main size when this flex was
+    // measured unbounded (scroll content — see m_main_unbounded); a bounded
+    // flex keeps the inner_main bound so fill-seeking children (Center,
+    // ListView) still claim the container's extent.
+    const main_max = if (node.m_main_unbounded) std.math.inf(f32) else inner_main;
     const gaps_total: f32 = if (n > 1) gap * @as(f32, @floatFromInt(n - 1)) else 0;
     for (node.children.items, 0..) |child, i| {
         if (child.flex > 0) {
@@ -293,8 +308,8 @@ pub fn flexLayout(
             continue;
         }
         const child_c = switch (axis) {
-            .horizontal => Constraints{ .max_w = inner_main, .max_h = cross_avail },
-            .vertical => Constraints{ .max_w = cross_avail, .max_h = inner_main },
+            .horizontal => Constraints{ .max_w = main_max, .max_h = cross_avail },
+            .vertical => Constraints{ .max_w = cross_avail, .max_h = main_max },
         };
         sizes[i] = child.measure(child_c);
         non_flex_main += sizes[i].main(axis);
@@ -311,8 +326,8 @@ pub fn flexLayout(
             sizes[i] = child.measure(child_c);
         } else {
             const child_c = switch (axis) {
-                .horizontal => Constraints{ .max_w = inner_main, .max_h = cross_avail },
-                .vertical => Constraints{ .max_w = cross_avail, .max_h = inner_main },
+                .horizontal => Constraints{ .max_w = main_max, .max_h = cross_avail },
+                .vertical => Constraints{ .max_w = cross_avail, .max_h = main_max },
             };
             sizes[i] = child.measure(child_c);
         }

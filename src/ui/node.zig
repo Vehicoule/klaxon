@@ -246,6 +246,12 @@ pub const Node = struct {
     m_valid: bool = false,
     m_constraints: Constraints = .{},
     m_size: Size = .{},
+    /// Flex only: the last measure ran with an unbounded main axis (scroll
+    /// content). flexLayout then measures non-flex children unbounded too —
+    /// a fill-seeking child (Center/Align) must not claim the container's
+    /// whole content-derived extent. Bounded measures keep the historical
+    /// inner_main bound so ListView-style children still fill a tight flex.
+    m_main_unbounded: bool = false,
     impure_descendant: bool = false,
     /// Last global layout epoch this node was laid out in. A global
     /// layout-affecting switch (text direction flip) bumps the epoch so a

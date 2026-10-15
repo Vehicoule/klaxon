@@ -601,6 +601,25 @@ test "expanded: unbounded main axis keeps the natural size" {
     try std.testing.expectEqual(@as(f32, 25), size.h); // natural, not stretched
 }
 
+test "column measured unbounded lays Center at natural size (scroll content)" {
+    // Regression: a scroll view's content column is measured with max_h=inf
+    // but laid out at the content-derived height. flexLayout re-measuring
+    // children bounded to that height let a fill-seeking Center/Align claim
+    // the WHOLE column extent (gallery Gestures/Layout sections ballooned
+    // to 12080dp and pushed the tail past the scroll clamp).
+    const root = try column(std.testing.allocator, .{});
+    defer root.deinit();
+    root.add(try golden.solidBox(std.testing.allocator, 40, 20, 0xFF000000));
+    const ctr = try center(std.testing.allocator);
+    ctr.add(try golden.solidBox(std.testing.allocator, 10, 10, 0xFF000000));
+    root.add(ctr);
+    const size = root.measure(.{ .max_w = 100, .max_h = std.math.inf(f32) });
+    try std.testing.expectEqual(@as(f32, 30), size.h);
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = size.h });
+    try std.testing.expectEqual(@as(f32, 10), ctr.bounds.h);
+    try std.testing.expectEqual(@as(f32, 20), ctr.bounds.y);
+}
+
 test "row measure sums child widths + gap, cross is the max" {
     const root = try row(std.testing.allocator, .{ .gap = 10 });
     defer root.deinit();
