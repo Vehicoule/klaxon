@@ -174,6 +174,7 @@ fn freePendingTextBufs() void {
 ///   text_len: length in bytes
 export fn kx_a11y_text(text_ptr: [*]const u8, text_len: usize) callconv(.c) void {
     const sdl = @import("sdl.zig");
+    if (text_len > 1 << 20) return; // text input is keystroke-sized; also bounds + 1
     const buf = std.heap.page_allocator.alloc(u8, text_len + 1) catch return;
     @memcpy(buf[0..text_len], text_ptr[0..text_len]);
     buf[text_len] = 0;

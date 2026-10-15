@@ -513,8 +513,17 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
         item_node.state = is;
         item_node.setVisible(false);
         item_node.internal = true; // chrome: never serialized
-        item_node.exclude_semantics = true; // the menu node carries the semantics
+        // NOT exclude_semantics: each row carries its own .menu_item
+        // semantics — VoiceOver navigates/activates items individually
+        // (item bounds are laid out at their overlay position). Closed
+        // items are !visible → the flatten drops them automatically.
         item_node.defer_paint = true; // the rows paint in the popup overlay pass
+        ui.semantics.attach(item_node, .{
+            .role = .menu_item,
+            .label = s.items.items[i].label,
+            .disabled = !s.items.items[i].enabled,
+            .actions = ui.semantics.Actions.initOne(.activate),
+        });
         rows[row_count] = item_node;
         row_count += 1;
     }
