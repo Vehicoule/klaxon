@@ -144,6 +144,24 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     // Raster/GLES keep scroll-copy (their per-op cost is low, uploads are
     // not).
     if (std.c.getenv("KLAXON_NO_SCROLLCOPY") != null) return false;
+    // Skip the backing pass outright once the majority of visible rows
+    // self-blit: their retained slots already encode the shifted content,
+    // so the offscreen composite would be a second cache paying for what
+    // the first already covers (measured: +10us/frame on Metal while
+    // scrolling a retained list). Rows without a cache — entering the
+    // window, or on a non-retaining backend — keep scroll-copy's shared
+    // backing. Raster keeps it unconditionally: its row caches are CPU
+    // surfaces where the single backing blit is the cheap shape.
+    if (kx.c.kx_backend_of(ctx) != kx.c.KX_BACKEND_RASTER) {
+        var cached: usize = 0;
+        for (n.children.items) |c| {
+            if (c.retained_ctx == ctx and (c.retained_atlas or c.retained_image != 0))
+                cached += 1;
+        }
+        if (std.c.getenv("KLAXON_DBG_LIST") != null)
+            std.debug.print("  scrollcp cached={d}/{d}\n", .{ cached, n.children.items.len });
+        if (cached * 2 >= n.children.items.len) return false;
+    }
     const b = n.bounds;
     const ix = @floor(b.x);
     const iy = @floor(b.y);
