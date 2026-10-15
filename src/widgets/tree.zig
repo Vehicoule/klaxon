@@ -6,7 +6,7 @@
 //   - container: Surface, row height: 48dp, indent: 24dp/level
 //   - chevron: 24dp OnSurfaceVariant (▼/▶)
 //   - label: BodyMedium / OnSurface
-//   - hover (tappable): OnSurface @ 0.08
+//   - hover (tappable): OnSurface @ 0.08; pressed: OnSurface @ 0.12
 //   - selected: SecondaryContainer fill
 //
 // v1 deviations: no keyboard nav, no lazy loading, no drag-drop, no icons.
@@ -48,6 +48,7 @@ const TreeState = struct {
     root: TreeNodeDef, // owned tree
     on_select: ?Callback = null,
     hovered: i32 = -1, // flat visible index
+    pressed: i32 = -1, // flat visible index held under the pointer
     selected: i32 = -1,
 };
 
@@ -132,8 +133,11 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
     var y = b.y;
     for (list.items, 0..) |item, vi| {
         const row_y = y;
-        // Hover / selected background.
-        if (s.opts.tappable and s.hovered == @as(i32, @intCast(vi))) {
+        // Hover / pressed / selected background (M3 state layers).
+        if (s.opts.tappable and s.pressed == @as(i32, @intCast(vi))) {
+            const layer = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.pressed);
+            ui.paint.fillRect(ctx, b.x, row_y, b.w, row_h, layer);
+        } else if (s.opts.tappable and s.hovered == @as(i32, @intCast(vi))) {
             const layer = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.hover);
             ui.paint.fillRect(ctx, b.x, row_y, b.w, row_h, layer);
         }
@@ -165,6 +169,17 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
 
 // --- Input ---
 
+/// Row index under a pointer y (in the tree's parent space), or null.
+fn rowAt(s: *TreeState, n: *Node, py: f32) ?usize {
+    const dy = py - n.bounds.y;
+    if (dy < 0) return null;
+    const vi: usize = @intFromFloat(dy / row_h);
+    var list = collectVisible(s, n.allocator) catch return null;
+    defer list.deinit();
+    if (vi >= list.items.len) return null;
+    return vi;
+}
+
 fn treePointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (ev.phase != .up) {
@@ -180,11 +195,27 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
                     n.markDirty();
                 }
             }
-        } else if (ev.phase == .leave and s.hovered != -1) {
-            s.hovered = -1;
-            n.markDirty();
+        } else if (ev.phase == .leave) {
+            if (s.hovered != -1 or s.pressed != -1) {
+                s.hovered = -1;
+                s.pressed = -1;
+                n.markDirty();
+            }
+        } else if (ev.phase == .down and s.opts.tappable) {
+            // Press feedback (M3 pressed state layer) — the row stays
+            // highlighted until the release; the tap itself is handled on
+            // .up below (bubbling keeps the scroll view's drag take-over).
+            const vi = rowAt(s, n, ev.y);
+            if (vi != null and vi.? != s.pressed) {
+                s.pressed = @intCast(vi.?);
+                n.markDirty();
+            }
         }
         return false;
+    }
+    if (s.pressed != -1) {
+        s.pressed = -1;
+        n.markDirty();
     }
     const b = n.bounds;
     const dy2 = ev.y - b.y;
@@ -331,6 +362,44 @@ test "golden: the tree paints the root label" {
     defer f.deinit();
     // Root label ink (OnSurface) in the row.
     try std.testing.expect(f.countColorIn(.{ .x = 10, .y = 20, .w = 180, .h = 20 }, t.colors.on_surface) > 0);
+}
+
+test "tree: tappable tracks hover + press rows" {
+    const a = std.testing.allocator;
+    const root = TreeNode{
+        .label = "Root",
+        .children = &.{ .{ .label = "Child1" }, .{ .label = "Child2" } },
+    };
+    const n = try tree(a, &root, null, .{ .tappable = true });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h * 3 });
+    const s = stateOf(n);
+    try std.testing.expectEqual(@as(i32, -1), s.hovered);
+    // Hover over row 1 (Child1): hover_move tracks it.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .hover_move, .x = 40, .y = row_h + 10 });
+    try std.testing.expectEqual(@as(i32, 1), s.hovered);
+    // Press on row 1: the pressed layer follows until the release.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 40, .y = row_h + 10 });
+    try std.testing.expectEqual(@as(i32, 1), s.pressed);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 40, .y = row_h + 10 });
+    try std.testing.expectEqual(@as(i32, -1), s.pressed);
+    try std.testing.expectEqual(@as(i32, 1), s.selected); // the tap also selects
+    // Leaving the widget drops the hover marker.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .leave, .x = 0, .y = 0 });
+    try std.testing.expectEqual(@as(i32, -1), s.hovered);
+}
+
+test "tree: non-tappable ignores hover/press tracking" {
+    const a = std.testing.allocator;
+    const root = TreeNode{ .label = "Root" };
+    const n = try tree(a, &root, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h });
+    const s = stateOf(n);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .hover_move, .x = 40, .y = 10 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 40, .y = 10 });
+    try std.testing.expectEqual(@as(i32, -1), s.hovered);
+    try std.testing.expectEqual(@as(i32, -1), s.pressed);
 }
 
 test "golden: a collapsed root hides the child rows; expanding shows them" {
