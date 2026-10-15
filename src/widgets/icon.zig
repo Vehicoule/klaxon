@@ -188,11 +188,12 @@ var icon_cache_off: ?bool = null; // env latch — KX_NO_ICON_CACHE disables
 pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
     const size = 24 * k;
     if (size <= 0) return;
-    // Inside a nested pass (a retained row's own rasterize, a scroll-copy
-    // strip) image blits are unsafe — the icon paints as geometry and
-    // becomes part of the pass's output instead.
+    // Inside the ATLAS write pass (a retained row's own rasterize, a
+    // scroll-copy strip written into the atlas) slot blits self-sample the
+    // texture being written — the icon paints as geometry instead. An
+    // offscreen pass may blit tiles safely (different surfaces).
     if (icon_cache_off == null) icon_cache_off = std.c.getenv("KX_NO_ICON_CACHE") != null;
-    if (icon_cache_off.? or ui.paint.inNestedPass(ctx)) {
+    if (icon_cache_off.? or ui.paint.inAtlasPass(ctx)) {
         drawIconGeometry(ctx, name, ox, oy, k, color);
         return;
     }

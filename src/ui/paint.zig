@@ -310,6 +310,12 @@ pub fn atlasGen(ctx: *kx.Ctx) u32 {
 pub fn inNestedPass(ctx: *kx.Ctx) bool {
     return kx.c.kx_in_nested_pass(ctx) != 0;
 }
+/// True only while the ATLAS write pass owns the canvas — atlas-slot blits
+/// there would self-sample the texture being written (illegal on GPU). An
+/// offscreen pass may still blit atlas slots: different surfaces.
+pub fn inAtlasPass(ctx: *kx.Ctx) bool {
+    return kx.c.kx_in_atlas_pass(ctx) != 0;
+}
 /// Process-unique ctx id — a freed ctx's address is recycled, so caches
 /// must key on the serial, never the pointer.
 pub fn ctxSerial(ctx: *kx.Ctx) u64 {

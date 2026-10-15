@@ -55,7 +55,20 @@ const ListState = struct {
     backing_first: usize = 0,
     backing_w: i32 = 0,
     backing_h: i32 = 0,
+    /// Child-set fingerprint when the backing rendered — pure scroll shifts
+    /// survive (dy != 0 covers them: entering rows repaint, leaving rows
+    /// scroll off), but a content change at the SAME offset (rows removed,
+    /// clear) leaves stale pixels the repaint band can't see.
+    backing_sig: usize = 0,
 };
+
+/// Fingerprint of the child set a backing image was rendered from:
+/// window position + count + identities. Compare at dy==0 reuse only.
+fn childrenSig(s: *const ListState, n: *Node) usize {
+    var sig = s.first ^ n.children.items.len;
+    for (n.children.items) |c| sig = sig *% 31 +% @intFromPtr(c);
+    return sig;
+}
 
 fn dropBacking(s: *ListState) void {
     if (s.backing != 0) {
@@ -139,10 +152,18 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     if (iw <= 0 or ih <= 0) return true; // nothing to composite — consumed
     const w: f32 = @floatFromInt(iw);
     const h: f32 = @floatFromInt(ih);
+    // Empty window: nothing to composite — and whatever the backing held
+    // belongs to rows that no longer exist (drop it rather than re-blit
+    // stale pixels).
+    if (n.children.items.len == 0) {
+        dropBacking(s);
+        return true;
+    }
 
     const dy = s.scroll.offset - s.backing_offset;
     const usable = s.backing != 0 and s.backing_ctx == ctx and
-        s.backing_w == iw and s.backing_h == ih;
+        s.backing_w == iw and s.backing_h == ih and
+        (dy != 0 or childrenSig(s, n) == s.backing_sig);
     if (usable and @abs(dy) >= h) dropBacking(s); // a full page: no shared pixels
     const have = usable and @abs(dy) < h;
 
@@ -152,6 +173,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     // deliberately NOT part of the check).
     var repaint = Rect{ .x = 0, .y = 0, .w = w, .h = h };
     var any_dirty = false;
+    if (std.c.getenv("KLAXON_DBG_LIST") != null) std.debug.print("  scrollcp: backing={} usable={} dy={d:.0} sig={x} stored={x}\n", .{ s.backing, usable, dy, childrenSig(s, n), s.backing_sig });
     if (have) {
         repaint = if (dy > 0)
             .{ .x = 0, .y = h - dy, .w = w, .h = dy }
@@ -216,6 +238,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         s.backing_offset = s.scroll.offset;
         s.backing_w = iw;
         s.backing_h = ih;
+        s.backing_sig = childrenSig(s, n);
         ui.paint.imageDraw(ctx, img, ix, iy, w, h);
     }
     return true;

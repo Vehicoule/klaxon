@@ -288,6 +288,7 @@ uint32_t kx_atlas_gen(kx_ctx* ctx);
    offscreen) — image blits must not run there (self-sampling + wrong
    sprite target); callers paint directly instead. */
 int kx_in_nested_pass(const kx_ctx* ctx);
+int kx_in_atlas_pass(const kx_ctx* ctx);
 /* Process-unique ctx instance id (monotonic, never reused — a freed ctx's
    address can be reallocated, so cross-ctx caches must key on this, not on
    the pointer). kx_ctx_serial_alive reports whether the owning ctx is still

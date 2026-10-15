@@ -174,16 +174,17 @@ struct kx_ctx {
     std::vector<std::unique_ptr<KxRecLayer>> layers;
     // Offscreen render-to-image pass (0.12.0): kx_offscreen_begin swaps the
     // draw target; layer recording is paused inside (an offscreen pass is a
-    // raster target of its own, not layer content).
-    SkCanvas* offscreen_prev_canvas = nullptr;
-    sk_sp<SkSurface> offscreen;
-    int offscreen_w = 0;
-    int offscreen_h = 0;
-    // Pooled offscreen surface: grow-only — one alloc serves every
-    // offscreen pass; a fresh RenderTarget per pass was ~0.2ms on Metal.
-    sk_sp<SkSurface> offscreen_pool;
-    int offscreen_pool_w = 0;
-    int offscreen_pool_h = 0;
+    // raster target of its own, not layer content). Passes STACK: retained
+    // ancestors nest arbitrarily (a retained container's raster holds
+    // retained children), so each depth gets its own pooled surface —
+    // sharing one surface would let an inner pass overwrite the outer
+    // pass's in-flight pixels.
+    struct OffscreenPass { SkCanvas* prev_canvas; int w, h; };
+    std::vector<OffscreenPass> offscreen_stack;
+    struct OffscreenPool { sk_sp<SkSurface> surf; int w = 0, h = 0; };
+    // Pooled offscreen surfaces, one per depth: grow-only — a fresh
+    // RenderTarget per pass was ~0.2ms on Metal.
+    std::vector<OffscreenPool> offscreen_pools;
     // Video-style pixel streaming surface: kx_draw_pixels on GPU writes
     // into ONE persistent texture (writePixels) instead of alloc'ing a
     // fresh texture per frame — a real player's present path.
@@ -912,7 +913,7 @@ namespace {
 bool kx_recording(const kx_ctx* ctx) {
     // The offscreen pass is a raster target of its own: draws inside it are
     // not part of an open alpha layer's content.
-    return !ctx->layers.empty() && !ctx->offscreen_prev_canvas;
+    return !ctx->layers.empty() && ctx->offscreen_stack.empty();
 }
 
 // One canvas-op emission. Only counted when NOT inside a recorded layer —
@@ -1348,8 +1349,8 @@ void kx_destroy(kx_ctx* ctx) {
     ctx->sprite_batch.clear();
     ctx->atlas.reset();
     ctx->atlas_view.reset();
-    ctx->offscreen.reset();
-    ctx->offscreen_pool.reset();
+    ctx->offscreen_stack.clear();
+    ctx->offscreen_pools.clear();
     ctx->pixels_surf.reset();
     ctx->pixels_view.reset();
     ctx->images.clear();
@@ -1396,9 +1397,8 @@ void kx_begin_frame(kx_ctx* ctx) {
                      ctx->backend == KX_BACKEND_GRAPHITE_DAWN ||
                      ctx->backend == KX_BACKEND_GRAPHITE_WEBGPU;
     if (rec) {
-        ctx->offscreen_pool = nullptr; // stale: those platforms still reset
-        ctx->offscreen_pool_w = 0;     //        the recorder per frame
-        ctx->offscreen_pool_h = 0;
+        ctx->offscreen_pools.clear();  // stale: those platforms still reset
+                                        //        the recorder per frame
         ctx->pixels_surf = nullptr;
         ctx->pixels_view = nullptr;
         ctx->pixels_surf_w = 0;
@@ -1814,7 +1814,13 @@ void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
 
 uint32_t kx_atlas_gen(kx_ctx* ctx) { return ctx ? ctx->atlas_gen : 0; }
 int kx_in_nested_pass(const kx_ctx* ctx) {
-    return ctx && (ctx->atlas_prev != nullptr || ctx->offscreen_prev_canvas != nullptr);
+    return ctx && (ctx->atlas_prev != nullptr || !ctx->offscreen_stack.empty());
+}
+int kx_in_atlas_pass(const kx_ctx* ctx) {
+    // Only the ATLAS write pass forbids atlas blits — sampling the texture
+    // being rendered to is illegal on GPU. An atlas blit inside an
+    // OFFSCREEN pass samples a different surface and is legal.
+    return ctx && ctx->atlas_prev != nullptr;
 }
 uint64_t kx_ctx_serial(const kx_ctx* ctx) { return ctx ? ctx->serial : 0; }
 int kx_ctx_serial_alive(uint64_t serial) {
@@ -2430,7 +2436,7 @@ void kx_save(kx_ctx* ctx) {
 
 void kx_restore(kx_ctx* ctx) {
     if (!ctx || !ctx->canvas) return;
-    if (!ctx->layers.empty() && !ctx->offscreen_prev_canvas) {
+    if (!ctx->layers.empty() && ctx->offscreen_stack.empty()) {
         KxRecLayer* L = ctx->layers.back().get();
         if (L->depth > 0) {
             // Balances a save/clip recorded inside the layer.
@@ -2499,7 +2505,7 @@ void kx_layer_alpha(kx_ctx* ctx, float alpha) {
     float a = alpha;
     if (a < 0.0f) a = 0.0f;
     if (a > 1.0f) a = 1.0f;
-    if (ctx->offscreen_prev_canvas) {
+    if (!ctx->offscreen_stack.empty()) {
         // The offscreen raster is a plain canvas: layers inside it keep the
         // real saveLayer behaviour (recording is suspended there).
         ctx->canvas->saveLayerAlphaf(nullptr, a);
@@ -2517,7 +2523,7 @@ void kx_layer_blur(kx_ctx* ctx, float sigma) {
     if (!ctx || !ctx->canvas) return;
     if (ctx->sprite_batch_open) kx_sprite_flush(ctx); // ordering: layer boundary
     if (!(sigma > 0.0f)) { kx_layer_alpha(ctx, 1.0f); return; }
-    if (ctx->offscreen_prev_canvas) {
+    if (!ctx->offscreen_stack.empty()) {
         // Real saveLayer + blur paint on the offscreen raster (recording is
         // suspended there — same posture as kx_layer_alpha).
         SkPaint paint;
@@ -2762,17 +2768,20 @@ void kx_clip_reset(kx_ctx* ctx) {
 // the snapshot so kx_draw_image/kx_image_destroy work on the returned id.
 bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
-    if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || ctx->offscreen_prev_canvas) return false;
-    kx_sprite_flush(ctx); // pending sprites belong to the MAIN canvas
-    // Pool the surface: a fresh RenderTarget per pass was the dominant
-    // retained-raster cost on GPU (Metal measured ~0.2ms per list row
-    // entering the scroll window — a surface alloc + teardown each). One
-    // grow-only surface per ctx covers every offscreen pass; the snapshot
-    // takes only the requested (w,h) corner. GPU keeps a backend render
-    // target so the snapshot draws GPU→GPU (Graphite drops raster images).
-    if (!ctx->offscreen_pool || w > ctx->offscreen_pool_w || h > ctx->offscreen_pool_h) {
-        const int pw = std::max(w, ctx->offscreen_pool_w);
-        const int ph = std::max(h, ctx->offscreen_pool_h);
+    if (!ctx || !ctx->canvas || w <= 0 || h <= 0) return false;
+    kx_sprite_flush(ctx); // pending sprites belong to the enclosing canvas
+    // Pool the surface PER DEPTH: a fresh RenderTarget per pass was the
+    // dominant retained-raster cost on GPU (Metal measured ~0.2ms per list
+    // row entering the scroll window — a surface alloc + teardown each).
+    // Grow-only surfaces cover every offscreen pass; the snapshot takes
+    // only the requested (w,h) corner. GPU keeps a backend render target
+    // so the snapshot draws GPU→GPU (Graphite drops raster images).
+    const size_t depth = ctx->offscreen_stack.size();
+    if (ctx->offscreen_pools.size() <= depth) ctx->offscreen_pools.resize(depth + 1);
+    kx_ctx::OffscreenPool& pool_entry = ctx->offscreen_pools[depth];
+    if (!pool_entry.surf || w > pool_entry.w || h > pool_entry.h) {
+        const int pw = std::max(w, pool_entry.w);
+        const int ph = std::max(h, pool_entry.h);
         // Small passes rasterize on CPU even under a GPU ctx: a backend
         // RenderTarget + snapshot costs ~0.2ms on Metal while a row-sized
         // CPU raster + one texture upload is far cheaper (the registry's
@@ -2783,15 +2792,12 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
             ? kx::gpu_offscreen_surface(ctx->gpu, pw, ph)
             : SkSurfaces::Raster(SkImageInfo::MakeN32Premul(pw, ph));
         if (!pool) return false;
-        ctx->offscreen_pool = std::move(pool);
-        ctx->offscreen_pool_w = pw;
-        ctx->offscreen_pool_h = ph;
+        pool_entry.surf = std::move(pool);
+        pool_entry.w = pw;
+        pool_entry.h = ph;
     }
-    ctx->offscreen = ctx->offscreen_pool; // shared — snapshot only (0,0,w,h)
-    ctx->offscreen_w = w;
-    ctx->offscreen_h = h;
-    ctx->offscreen_prev_canvas = ctx->canvas;
-    ctx->canvas = ctx->offscreen->getCanvas();
+    ctx->offscreen_stack.push_back({ctx->canvas, w, h});
+    ctx->canvas = pool_entry.surf->getCanvas();
     // Isolate the pass: matrix/clip mutations made at the canvas's BASE
     // level (kx_translate has no save) outlive restoreToCount(1) — a reused
     // pool canvas would carry the previous pass's offset, rasterizing the
@@ -2816,19 +2822,18 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
 
 uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
     const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
-    if (!ctx || !ctx->offscreen_prev_canvas) return 0;
+    if (!ctx || ctx->offscreen_stack.empty()) return 0;
+    const size_t depth = ctx->offscreen_stack.size() - 1;
+    const kx_ctx::OffscreenPass pass = ctx->offscreen_stack.back();
     ctx->canvas->restore(); // balance the begin's save — unwinds the pass's
                             // matrix/clip mutations before the pool reuses
     // Snapshot the requested corner only — the pooled surface may be larger.
     sk_sp<SkImage> img = std::getenv("KX_TEMP_IMG")
-        ? ctx->offscreen->makeTemporaryImage()
-        : ctx->offscreen->makeImageSnapshot(
-            SkIRect::MakeWH(ctx->offscreen_w, ctx->offscreen_h));
-    ctx->canvas = ctx->offscreen_prev_canvas;
-    ctx->offscreen_prev_canvas = nullptr;
-    ctx->offscreen.reset(); // drops the alias — the pool surface stays alive
-    ctx->offscreen_w = 0;
-    ctx->offscreen_h = 0;
+        ? ctx->offscreen_pools[depth].surf->makeTemporaryImage()
+        : ctx->offscreen_pools[depth].surf->makeImageSnapshot(
+            SkIRect::MakeWH(pass.w, pass.h));
+    ctx->canvas = pass.prev_canvas;
+    ctx->offscreen_stack.pop_back();
     if (!img) return 0;
     const bool opaque = kx_image_content_opaque(img.get());
     const uint64_t id = ctx->next_image_id++;

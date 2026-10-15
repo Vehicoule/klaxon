@@ -4,6 +4,7 @@
 const std = @import("std");
 const kx = @import("../kx.zig");
 const paint_mod = @import("paint.zig");
+const sdl = @import("../sdl.zig");
 const layout_mod = @import("layout.zig");
 const input_mod = @import("input.zig");
 const scroll_mod = @import("scroll.zig");
@@ -705,15 +706,34 @@ pub const Node = struct {
     /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
     /// shared by the direct path and the retained rasterization.
     fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
-        if (own_hit) node.vtable.paint(node, ctx);
+        const dbg = std.c.getenv("KLAXON_DBG_PAINT_CHILD") != null;
+        if (own_hit) {
+            if (dbg) {
+                const t0 = sdl.c.SDL_GetTicksNS();
+                node.vtable.paint(node, ctx);
+                const us = (sdl.c.SDL_GetTicksNS() - t0) / 1000;
+                if (us > 5) std.debug.print("    own {*} {d}x{d} = {d}us\n", .{ node, node.bounds.w, node.bounds.h, us });
+            } else node.vtable.paint(node, ctx);
+        }
         if (children_hit) {
             if (node.vtable.scroll_children_paint) |sc| {
-                if (sc(node, ctx, child_region)) return;
+                if (dbg) {
+                    const t0 = sdl.c.SDL_GetTicksNS();
+                    const consumed = sc(node, ctx, child_region);
+                    const us = (sdl.c.SDL_GetTicksNS() - t0) / 1000;
+                    if (us > 5) std.debug.print("    scrollcp {*} = {d}us\n", .{ node, us });
+                    if (consumed) return;
+                } else if (sc(node, ctx, child_region)) return;
             }
             if (node.vtable.pre_children_paint) |pre| pre(node, ctx);
             for (node.children.items) |child| {
                 if (child.defer_paint or child.zombie) continue; // defer_paint → popup overlay; zombie → swept
-                child.paint(ctx, child_region);
+                if (dbg) {
+                    const t0 = sdl.c.SDL_GetTicksNS();
+                    child.paint(ctx, child_region);
+                    const us = (sdl.c.SDL_GetTicksNS() - t0) / 1000;
+                    if (us > 5) std.debug.print("    child {*} {d}x{d} = {d}us\n", .{ child, child.bounds.w, child.bounds.h, us });
+                } else child.paint(ctx, child_region);
             }
             if (node.vtable.post_children_paint) |post| post(node, ctx);
         }
@@ -735,6 +755,9 @@ pub const Node = struct {
         // rasterized origin shifted by the node's move — but only on an
         // exact pixel boundary (a fractional blit would sample-shift the
         // cached content off the direct-paint pixels).
+        if (std.c.getenv("KLAXON_DBG_RETAINED") != null and !subtree_dirty and node.vtable.auto_retain) {
+            std.debug.print("  retainchk {*} img={} atlas={} prw={d:.0}/{d:.0} prh={d:.0}/{d:.0} bx={d} by={d}\n", .{ node, node.retained_image, node.retained_atlas, node.retained_pr.w, pr.w, node.retained_pr.h, pr.h, node.bounds.x, node.bounds.y });
+        }
         if (!subtree_dirty and (node.retained_image != 0 or node.retained_atlas) and
             node.retained_pr.w == pr.w and node.retained_pr.h == pr.h)
         {
@@ -742,10 +765,11 @@ pub const Node = struct {
             const by = node.retained_iy + (pr.y - node.retained_pr.y);
             if (bx == @floor(bx) and by == @floor(by)) {
                 if (node.retained_atlas) {
-                    // Inside a nested pass (this subtree IS being rasterized)
-                    // the atlas blit would self-sample the surface being
-                    // written — paint the content directly instead.
-                    if (paint_mod.inNestedPass(ctx)) return false;
+                    // Inside the ATLAS write pass (this subtree IS being
+                    // rasterized into it) the blit would self-sample the
+                    // texture being written — paint directly. An offscreen
+                    // pass can blit slots freely (different surfaces).
+                    if (paint_mod.inAtlasPass(ctx)) return false;
                     const img = paint_mod.atlasImage(ctx);
                     if (img != 0) {
                         paint_mod.imageDrawRegion(ctx, img,
@@ -781,19 +805,22 @@ pub const Node = struct {
             node.clearRetained(); // drop any stale image (smaller extent before)
             return false;
         }
-        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: dirty={} img={} {d}x{d} ext={d:.0}x{d:.0}\n", .{ subtree_dirty, node.retained_image, iw, ih, ext.w, ext.h });
+        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: {*} dirty={} img={} {d}x{d} ext={d:.0}x{d:.0} y={d:.0}\n", .{ node, subtree_dirty, node.retained_image, iw, ih, ext.w, ext.h, node.bounds.y });
         // Drop the stale image first so a failed pass can't resurrect a
         // stale blit on a later frame.
         node.clearRetained();
-        // Retained nodes (list rows etc.) rasterize into a slot of the
+        // Retained leaf nodes (list rows etc.) rasterize into a slot of the
         // shared row atlas on GPU backends: the subtree draws straight into
         // the texture — no per-row texture alloc, no upload task, and the
         // blit joins the open sprite batch (one mesh for the whole list).
-        // Size-bound like the auto extent cap: a huge retained node keeps
-        // the private-image path rather than starving the atlas.
+        // Leaf-scale only: a container-sized subtree keeps the offscreen
+        // image path — an offscreen pass may blit ATLAS children inside its
+        // regen (different surfaces), so descendants keep their caches;
+        // inside an atlas write nothing may sample the atlas (self-sample
+        // is illegal on GPU), which would force a full direct repaint.
         const backend = kx.c.kx_backend_of(ctx);
         const use_atlas = backend != kx.c.KX_BACKEND_RASTER and
-            iw * ih <= 512 * 1024 and
+            iw * ih <= 96 * 1024 and
             atlasEnabled() and
             !autoRetainOffscreenExpensive(ctx) and
             paint_mod.atlasBegin(ctx, iw, ih, &node.retained_slot);
@@ -857,6 +884,8 @@ pub const Node = struct {
     /// retained_blocked is NOT cleared here — it belongs to the auto-retain
     /// policy, which resets it on the next dirty frame.
     fn clearRetained(node: *Node) void {
+        if (std.c.getenv("KLAXON_DBG_RETAINED") != null and (node.retained_atlas or node.retained_image != 0))
+            std.debug.print("  clearRetained {*} atlas={} img={} y={d:.0} h={d:.0}\n", .{ node, node.retained_atlas, node.retained_image, node.bounds.y, node.bounds.h });
         if (node.retained_image != 0) {
             if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
             node.retained_image = 0;

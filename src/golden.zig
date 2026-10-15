@@ -236,11 +236,15 @@ pub const Renderer = struct {
     /// instrument begin/end themselves (the windowed bench measures the
     /// vsync wait inside begin) drive the pieces directly.
     pub fn paintDamageInner(r: *Renderer, root: *Node, bg: Color) void {
+        const dbg = std.c.getenv("KLAXON_DBG_PAINT") != null;
+        var t0: u64 = 0;
+        if (dbg) t0 = sdl.c.SDL_GetTicksNS();
         const surface = Rect{ .x = 0, .y = 0, .w = @floatFromInt(r.w), .h = @floatFromInt(r.h) };
         // An opaque full-coverage retained-root blit rewrites every pixel —
         // the pre-paint clear would be dead work (Qt's backingstore skips it
         // the same way for fully-opaque dirty regions).
         const skip_clear = root.retainedBlitCoversSurface(r.ctx, surface);
+        if (dbg) std.debug.print("  covers={d}us ", .{(sdl.c.SDL_GetTicksNS() - t0) / 1000});
         // The damage-clip path needs a surface that already holds this
         // tree's pixels: r.painted excludes the first frame / post-resize
         // (pixels outside the damage would be the fresh surface's garbage).
@@ -250,16 +254,21 @@ pub const Renderer = struct {
             if (d.w > 0 and d.h > 0) {
                 kx.c.kx_clip_rect(r.ctx, d.x, d.y, d.w, d.h);
                 if (!skip_clear) kx.c.kx_clear(r.ctx, bg); // SkCanvas::clear is clip-aware
+                const tp = sdl.c.SDL_GetTicksNS();
                 root.paint(r.ctx, d);
+                if (dbg) std.debug.print("paint={d}us ", .{(sdl.c.SDL_GetTicksNS() - tp) / 1000});
                 paintOverlayPass(root, r.ctx);
                 kx.c.kx_clip_reset(r.ctx);
             } // else: damage entirely off-surface — nothing to repaint
         } else {
             root.clearDamage(); // GPU drawable: stale damage must not leak forward
             if (!skip_clear) kx.c.kx_clear(r.ctx, bg);
+            const tp = sdl.c.SDL_GetTicksNS();
             root.paint(r.ctx, surface);
+            if (dbg) std.debug.print("paint={d}us ", .{(sdl.c.SDL_GetTicksNS() - tp) / 1000});
             paintOverlayPass(root, r.ctx);
         }
+        if (dbg) std.debug.print("total={d}us\n", .{(sdl.c.SDL_GetTicksNS() - t0) / 1000});
         r.painted = true;
     }
 
