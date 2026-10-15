@@ -44,8 +44,7 @@
 //     always at the text end; no IME panel placement (the query field
 //     renders/edits the buffer but there is no on-screen keyboard yet);
 //     the suggestion list does not scroll — rows past the bounds clip;
-//     IconName has no `history` glyph (the leading icon is per-item,
-//     defaulting to .search); RTL mirrors the chrome but the text runs
+//     RTL mirrors the chrome but the text runs
 //     stay LTR (no bidi — same as text.zig/search_bar.zig).
 const std = @import("std");
 const kx = @import("../kx.zig");
@@ -66,9 +65,9 @@ const Theme = theme_mod.Theme;
 
 /// One suggestion row. `label` is copied at build. `icon` is the leading
 /// affordance (M3: history for recent queries, search for suggestions —
-/// IconName has no history glyph; pick per item, .search is the default).
-/// `trailing_icon` enables the end-side "fill query" affordance (M3 shows
-/// an insert arrow — e.g. .arrow_up).
+/// e.g. .history or .search). `trailing_icon` enables the end-side
+/// "fill query" affordance (M3 shows a north-west insert arrow —
+/// .north_west).
 pub const SuggestionItem = struct {
     label: []const u8,
     icon: icon_w.IconName = .search,

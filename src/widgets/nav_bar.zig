@@ -3,11 +3,14 @@
 // Spec: m3.material.io/components/navigation-bar (M3E) + Compose
 // NavigationBarTokens / NavigationBarVerticalItemTokens:
 //   - container height 80 (tall), color surface_container,
-//   - items split the width equally; each item is passive content
-//     (icon + label supplied by the app) — the bar owns the interaction,
+//   - items split the width equally (64dp minimum touch width each); an
+//     item is passive content — `destination()` builds the M3E icon+label
+//     content and recolors it on selection — the bar owns the interaction,
 //   - active indicator: 56x32 pill (corner full), color secondary_container,
-//     centered on the item's icon; active label/icon colors are the app's
-//     (M3E: secondary / on_secondary_container), inactive on_surface_variant,
+//     centered on the item's icon (wrapping the icon, not the label);
+//     active label/icon colors are the app's (M3E: secondary /
+//     on_secondary_container — destination() supplies them), inactive
+//     on_surface_variant,
 //   - state layers: on_secondary_container over the active indicator,
 //     on_surface_variant over the indicator zone when inactive.
 //
@@ -19,6 +22,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const icon_w = @import("icon.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
 
@@ -30,11 +34,13 @@ const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
 /// M3E measurement tokens: active indicator 56x32, icon 24, item horizontal
-/// padding 8 (the indicator never exceeds item width - 16).
+/// padding 8 (the indicator never exceeds item width - 16), item minimum
+/// touch width 64.
 const indicator_w: f32 = 56;
 const indicator_h: f32 = 32;
 const icon_size: f32 = 24;
 const item_padding_h: f32 = 8;
+const min_item_w: f32 = 64;
 
 pub const NavBarOptions = struct {
     theme: Theme = theme_mod.light,
@@ -102,7 +108,10 @@ fn focusedItem(n: *Node) ?usize {
 fn navBarMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const count: f32 = @floatFromInt(n.children.items.len);
-    const w = if (std.math.isFinite(c.max_w)) c.max_w else count * 80;
+    var w = if (std.math.isFinite(c.max_w)) c.max_w else count * 80;
+    // M3E: each destination keeps a 64dp minimum touch width — the request
+    // asks for it; a tighter parent still wins through constrain().
+    w = @max(w, count * min_item_w);
     return c.constrain(.{ .w = w, .h = s.opts.height });
 }
 
@@ -148,14 +157,13 @@ fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const sel = s.sig.peek();
     for (s.cells.items, 0..) |cell, i| {
         // Indicator zone: 56 wide max (item width - 2*8), 32 high, centered
-        // horizontally; vertically centered on the item's icon (the content's
-        // top when it is taller than the indicator).
+        // horizontally; vertically it wraps the ICON, not the label — the
+        // item's content is laid out icon-first (the bar centers the
+        // content block), so the pill's center is the icon's center:
+        // content_top + icon/2 - pill/2.
         const iw = @min(indicator_w, cell.w - item_padding_h * 2);
         const content_h = s.content_sizes.items[i].h;
-        const iy = if (content_h > indicator_h)
-            cell.y + (cell.h - content_h) / 2 - (indicator_h - icon_size) / 2
-        else
-            cell.y + (cell.h - indicator_h) / 2;
+        const iy = cell.y + (cell.h - content_h) / 2 - (indicator_h - icon_size) / 2;
         const ix = cell.x + (cell.w - iw) / 2;
         const hovered = s.hovered != null and s.hovered.? == i;
         const pressed = s.pressed != null and s.pressed.? == i;
@@ -291,6 +299,100 @@ pub fn navBar(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), o
     node.state = s;
     ui.semantics.attach(node, .{ .role = .group, .label = opts.label }); // Phase 2c
     selected.subscribe(.{ .callback = .{ .fn_ptr = navBarSyncCb, .userdata = node } });
+    return node;
+}
+
+// --- destination item ---
+// navBar()'s children are passive content — but the M3E destination look
+// (icon over label, ink recoloring on selection) is what the bar's
+// indicator math assumes. `destination` builds exactly that: a 24dp icon
+// at the content's top, the label_medium label 4dp below, both recolored
+// from the parent bar's selection at paint time — active: the icon inks
+// on_secondary_container (it sits on the secondary_container pill) and the
+// label inks secondary; inactive: on_surface_variant. A destination used
+// outside a nav bar paints the inactive colors of the light theme.
+
+const dest_icon_label_gap: f32 = 4;
+
+const DestState = struct {
+    icon: icon_w.IconName,
+    label: [:0]const u8, // owned
+    m: ui.paint.TextMetrics,
+};
+
+fn destState(n: *Node) *DestState {
+    return @ptrCast(@alignCast(n.state.?));
+}
+
+/// The parent bar's theme + this item's index/selection (standalone use:
+/// the light theme, never active).
+fn destContext(n: *Node) struct { theme: Theme, active: bool } {
+    if (n.parent) |p| {
+        if (p.vtable == &nav_bar_vtable) {
+            const ps = stateOf(p);
+            const sel = ps.sig.peek();
+            for (p.children.items, 0..) |ch, i| {
+                if (ch == n) return .{ .theme = ps.opts.theme, .active = i == sel };
+            }
+            return .{ .theme = ps.opts.theme, .active = false };
+        }
+    }
+    return .{ .theme = theme_mod.light, .active = false };
+}
+
+fn destMeasure(n: *Node, c: Constraints) Size {
+    const s = destState(n);
+    // Refresh metrics against the live theme — the type style comes from
+    // the parent bar, not from construction-time options.
+    const ls = destContext(n).theme.type_scale.label_medium;
+    s.m = ui.paint.measureText(s.label, ls.size, ls.weight >= 500);
+    return c.constrain(.{ .w = @max(icon_size, s.m.width), .h = icon_size + dest_icon_label_gap + s.m.height });
+}
+
+fn destLayout(n: *Node, bounds: Rect) void {
+    _ = n;
+    _ = bounds;
+}
+
+fn destPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s = destState(n);
+    const dc = destContext(n);
+    const cs = dc.theme.colors;
+    const icon_c = if (dc.active) cs.on_secondary_container else cs.on_surface_variant;
+    const label_c = if (dc.active) cs.secondary else cs.on_surface_variant;
+    // Icon at the content's TOP — the bar centers its 56x32 pill on it.
+    const ix = n.bounds.x + (n.bounds.w - icon_size) / 2;
+    icon_w.drawIcon(ctx, s.icon, ix, n.bounds.y, icon_size / 24.0, icon_c);
+    const ls = dc.theme.type_scale.label_medium;
+    const lx = n.bounds.x + (n.bounds.w - s.m.width) / 2;
+    ui.paint.text(ctx, s.label, lx, n.bounds.y + icon_size + dest_icon_label_gap + s.m.ascent, ls.size, ls.weight >= 500, label_c);
+}
+
+fn destDeinit(n: *Node) void {
+    const s = destState(n);
+    n.allocator.free(s.label);
+    n.allocator.destroy(s);
+}
+
+const dest_vtable = ui.node.VTable{ .measure = destMeasure, .layout = destLayout, .paint = destPaint, .deinit = destDeinit, .measure_pure = false };
+
+/// A nav-bar destination: 24dp icon over a label_medium label, recoloring
+/// with the parent bar's selection. `label` is copied.
+pub fn destination(allocator: std.mem.Allocator, icon: icon_w.IconName, label: []const u8) !*Node {
+    const node = try Node.create(allocator, &dest_vtable);
+    errdefer node.allocator.destroy(node); // no state yet; children list is empty
+    const s = try allocator.create(DestState);
+    errdefer allocator.destroy(s);
+    const buf = try allocator.alloc(u8, label.len + 1);
+    errdefer allocator.free(buf);
+    @memcpy(buf[0..label.len], label);
+    buf[label.len] = 0;
+    const ls = theme_mod.light.type_scale.label_medium;
+    s.* = .{ .icon = icon, .label = buf[0..label.len :0], .m = ui.paint.measureText(buf[0..label.len :0], ls.size, ls.weight >= 500) };
+    node.state = s;
+    // The bar's syncItemSemantics upgrades this descriptor (focusable,
+    // checked, actions) while keeping the label.
+    ui.semantics.attach(node, .{ .role = .tab, .label = s.label, .focusable = true });
     return node;
 }
 
@@ -446,6 +548,29 @@ test "golden: nav_bar paints the surface container and the active indicator" {
     defer f2.deinit();
     try std.testing.expect(f2.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 80 }, t.colors.secondary_container) == 0);
     try std.testing.expect(f2.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 80 }, t.colors.secondary_container) > 500);
+}
+
+test "golden: destination items recolor ink with the selection" {
+    const t = theme_mod.light;
+    const sel = try ui.state.Signal(usize).init(std.testing.allocator, 0);
+    defer sel.deinit();
+    const bar = try navBar(std.testing.allocator, sel, .{ .theme = t });
+    defer bar.deinit();
+    bar.add(try destination(std.testing.allocator, .home, "One"));
+    bar.add(try destination(std.testing.allocator, .star, "Two"));
+    var r = try golden.Renderer.init(std.testing.allocator, 400, 80);
+    defer r.deinit();
+    bar.layout(.{ .x = 0, .y = 0, .w = 400, .h = 80 });
+    r.paint(bar, 0x000000FF);
+    var f1 = try r.readback(std.testing.allocator);
+    defer f1.deinit();
+    // Item 0 active: on_secondary_container icon ink over the pill +
+    // secondary label; item 1 inactive: on_surface_variant ink only.
+    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 80 }, t.colors.on_secondary_container) > 0);
+    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 80 }, t.colors.secondary) > 0);
+    try std.testing.expectEqual(@as(u64, 0), f1.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 80 }, t.colors.on_secondary_container));
+    try std.testing.expectEqual(@as(u64, 0), f1.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 80 }, t.colors.secondary));
+    try std.testing.expect(f1.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 80 }, t.colors.on_surface_variant) > 0);
 }
 
 test "golden: nav_bar paints a state layer on hover" {
