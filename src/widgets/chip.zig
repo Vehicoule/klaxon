@@ -498,6 +498,7 @@ test "chip: the automatic filter check follows the selected state" {
     try std.testing.expect(!check.visible);
     const w0 = b.measure(.{ .max_w = 2000, .max_h = 2000 }).w;
     b.layout_dirty = false;
+    ui.node.bumpMarkEpoch(); // manual flag clear models a consumed layout pass
     sig.set(true);
     try std.testing.expect(check.visible); // the check shows
     try std.testing.expect(b.layout_dirty); // the width changed → re-layout

@@ -48,6 +48,30 @@ pub fn bumpLayoutEpoch() void {
     layout_epoch += 1;
 }
 
+/// Dirty-mark dedup epoch — see Node.dirty_mark_gen. Starts at 1 so a
+/// fresh node's zero stamps never match. Bumped when the outermost
+/// clearing traversal (paint/layout) ENDS: every stamp from before the
+/// pass is stale because the pass may have cleared ancestors anywhere.
+var mark_epoch: u32 = 1;
+/// >0 while a paint()/layout() traversal runs. Marks inside a pass
+/// bypass the stamp early-out and always re-walk the ancestor chain —
+/// mid-pass the ancestors may have been cleared already.
+var in_clearing_pass: u32 = 0;
+
+fn clearingPassEnter() void {
+    in_clearing_pass += 1;
+}
+fn clearingPassExit() void {
+    in_clearing_pass -= 1;
+    if (in_clearing_pass == 0) mark_epoch += 1;
+}
+
+/// Invalidate every dirty-mark stamp — the real invalidator is a clearing
+/// pass; tests that reset flags by hand call this to model one.
+pub fn bumpMarkEpoch() void {
+    mark_epoch += 1;
+}
+
 /// Bounding box of two rects (the swept region of a monotonic translation).
 pub fn rectUnion(a: Rect, b: Rect) Rect {
     const x0 = @min(a.x, b.x);
@@ -245,6 +269,21 @@ pub const Node = struct {
     /// overlay_subtree's upward propagation; sticky like it (removal keeps
     /// the flag — an over-blocked subtree is always safe).
     backdrop_subtree: bool = false,
+    /// Dirty-mark dedup stamps: markDirtyUp/markLayoutDirty set them to the
+    /// current mark_epoch as they walk, and stop at a node already stamped
+    /// this epoch — its ancestor chain is guaranteed still marked, because
+    /// dirty/layout_dirty flags only ever clear INSIDE a paint()/layout()
+    /// traversal, which bumps the epoch at pass end (invalidating every
+    /// stamp) and holds in_clearing_pass > 0 (bypassing the early-out —
+    /// mid-pass marks re-walk, preserving the "mark during paint survives
+    /// to the next frame" contract).
+    /// dirty_mark_gen: "my ancestor FLAG chain is already marked this
+    /// epoch" (set on every walked node — ancestors' own paint rects are
+    /// NOT implied). dirty_self_gen: "this node's full markDirty —
+    /// flag chain AND own paint rect — already ran this epoch".
+    dirty_mark_gen: u32 = 0,
+    dirty_self_gen: u32 = 0,
+    layout_mark_gen: u32 = 0,
     // Dirty-rect (Phase 1e): the root accumulates the damaged region — the
     // union of every dirty mark's rect — and the host repaints the tree
     // clipped to it (the surface is retained between frames).
@@ -326,6 +365,11 @@ pub const Node = struct {
         // children lists and both deinit it (double free).
         if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
+        // The stamps only ever mean "my CURRENT ancestor chain is marked" —
+        // reparenting swaps the chain, so they must not early-out here.
+        child.dirty_mark_gen = 0;
+        child.dirty_self_gen = 0;
+        child.layout_mark_gen = 0;
         node.children.append(child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
         if (child.backdrop_subtree) node.markBackdropUp();
@@ -343,6 +387,9 @@ pub const Node = struct {
     pub fn insert(node: *Node, index: usize, child: *Node) void {
         if (child.parent) |prev| _ = prev.remove(child);
         child.parent = node;
+        child.dirty_mark_gen = 0;
+        child.dirty_self_gen = 0;
+        child.layout_mark_gen = 0;
         const i = @min(index, node.children.items.len);
         node.children.insert(i, child) catch @panic("klaxon: out of memory");
         if (child.overlay_subtree) node.markOverlayUp();
@@ -374,10 +421,13 @@ pub const Node = struct {
     fn markDirtyUp(node: *Node) void {
         var n = node;
         while (true) {
-            // No early-out on n.dirty: paint/layout clear the flag per
-            // visited node, so a pruned subtree can keep dirty descendants
-            // under clean ancestors — the walk must re-mark the whole
-            // chain or a retained ancestor would blit its stale image.
+            // Early-out only outside a clearing pass: inside paint()/
+            // layout() an ancestor may have been cleared earlier in the
+            // pass, so the full re-walk is required (a dirty descendant
+            // under a clean ancestor must re-mark the chain or a retained
+            // ancestor would blit its stale image).
+            if (in_clearing_pass == 0 and n.dirty_mark_gen == mark_epoch) return;
+            n.dirty_mark_gen = mark_epoch;
             n.dirty = true;
             const p = n.parent orelse return;
             n = p;
@@ -438,8 +488,14 @@ pub const Node = struct {
     /// to its visible position through any transformed ancestors — is
     /// unioned into the root's damage region.
     pub fn markDirty(node: *Node) void {
+        // A repeat markDirty on the same node within one mark epoch is
+        // fully idempotent — flag chain marked and the same paint rect
+        // already unioned (hot signal fan-out marks a node once per
+        // signal, e.g. 3x/frame in anim_100).
+        if (in_clearing_pass == 0 and node.dirty_self_gen == mark_epoch) return;
         markDirtyUp(node);
         damageRectUp(node, node.paintRect());
+        node.dirty_self_gen = mark_epoch;
     }
 
     /// Mark dirty + record an explicit damaged rect (given in the node's
@@ -457,9 +513,11 @@ pub const Node = struct {
     }
 
     pub fn markLayoutDirty(node: *Node) void {
-        // No early-out either — same reason as markDirtyUp: a dirty
-        // descendant under a clean ancestor must re-mark the chain or the
-        // scoped-layout prune would strand the pending relayout.
+        // Same stamp rule as markDirtyUp — outside a clearing pass a
+        // stamped node's chain is already layout-dirty; inside a pass the
+        // walk must run or a pruned subtree's pending relayout strands.
+        if (in_clearing_pass == 0 and node.layout_mark_gen == mark_epoch) return;
+        node.layout_mark_gen = mark_epoch;
         node.layout_dirty = true;
         if (node.parent) |p| p.markLayoutDirty();
     }
@@ -469,6 +527,8 @@ pub const Node = struct {
     }
 
     pub fn layout(node: *Node, bounds: Rect) void {
+        clearingPassEnter();
+        defer clearingPassExit();
         // Damage-scoped layout: a clean subtree at unchanged bounds produces
         // the same child positions — every layout is a pure function of its
         // bounds + children, and layout_dirty propagates UP, so a dirty leaf
@@ -587,6 +647,8 @@ pub const Node = struct {
     /// flag — like an invisible one, it repaints when it becomes visible.
     pub fn paint(node: *Node, ctx: *kx.Ctx, visible: Rect) void {
         if (!node.visible or node.zombie) return;
+        clearingPassEnter();
+        defer clearingPassExit();
         // The region descendants can paint into: `visible`, tightened by the
         // node's children clip (viewport) when it declares one.
         var child_region = visible;
@@ -1100,6 +1162,7 @@ test "markDirty propagates up to the root" {
     const child = try testNode(10, 10);
     root.add(child);
     root.dirty = false;
+    bumpMarkEpoch(); // manual flag clear models a completed paint pass
     child.markDirty();
     try std.testing.expect(root.dirty);
     try std.testing.expect(child.dirty);
@@ -1186,6 +1249,7 @@ test "markLayoutDirty propagates up to the root" {
     mid.add(leaf);
     root.layout_dirty = false;
     mid.layout_dirty = false;
+    bumpMarkEpoch(); // manual flag clear models a completed layout pass
     leaf.markLayoutDirty();
     try std.testing.expect(leaf.layout_dirty);
     try std.testing.expect(mid.layout_dirty);
