@@ -119,8 +119,10 @@ fn onFrame(ctx: ?*anyopaque, frame: u64) void {
     const t = @as(f32, @floatFromInt(frame % 240)) / 240.0;
     const s = (@sin(t * 2 * std.math.pi) + 1) / 2;
     const theme = g.currentTheme();
-    // M3 state layer: the pulse rides the hover opacity (0..8% on_primary).
-    g.pulse_sig.set(lerpColor(theme.colors.primary, theme.colors.on_primary, theme.state.hover * s));
+    // Breathe primary → tertiary over the full swing — an 8% state-layer
+    // ride reads as a static box; this hue shift is visible at a glance and
+    // never drops near-black (both roles stay light in dark theme).
+    g.pulse_sig.set(lerpColor(theme.colors.primary, theme.colors.tertiary, s));
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

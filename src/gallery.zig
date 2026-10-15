@@ -1037,10 +1037,10 @@ fn buildSearchBarSection(g: *Gallery, theme: Theme) !*Node {
     // frame: the view fills its bounds when the open signal flips.
     col.add(try button_w.button(a, .{ .fn_ptr = svOpenCb, .userdata = g }, .{ .label = "Open search view", .theme = theme }));
     const sv = try search_view_w.searchView(a, &.{
-        .{ .label = "Recent searches", .icon = .search },
-        .{ .label = "klaxon gallery", .icon = .search, .trailing_icon = .arrow_up },
-        .{ .label = "material 3 expressive", .icon = .search, .trailing_icon = .arrow_up },
-        .{ .label = "zig ui framework", .icon = .search, .trailing_icon = .arrow_up },
+        .{ .label = "Recent searches", .icon = .history },
+        .{ .label = "klaxon gallery", .icon = .history, .trailing_icon = .north_west },
+        .{ .label = "material 3 expressive", .icon = .history, .trailing_icon = .north_west },
+        .{ .label = "zig ui framework", .icon = .search, .trailing_icon = .north_west },
         .{ .label = "disabled suggestion", .enabled = false },
     }, g.sv_open, null, null, .{ .fn_ptr = svSelectCb, .userdata = g }, .{ .fn_ptr = sbSubmitCb, .userdata = g }, null, .{ .placeholder = "Search…", .theme = theme });
     const sv_frame = try layout.constrainedBox(a, .{ .min_w = 360, .max_w = 360, .min_h = 420, .max_h = 420 });
@@ -1059,9 +1059,9 @@ fn buildNavRailSection(g: *Gallery, theme: Theme) !*Node {
     const a = g.allocator;
     const items = [_]navigation_rail_w.NavRailItem{
         .{ .label = "Home", .icon = .home },
-        .{ .label = "Music", .icon = .play },
-        .{ .label = "Video", .icon = .square },
-        .{ .label = "Books", .icon = .star },
+        .{ .label = "Music", .icon = .music_note },
+        .{ .label = "Video", .icon = .movie },
+        .{ .label = "Books", .icon = .library_books },
     };
     const row = try layout.row(a, .{ .gap = 16, .cross_align = .start });
     const nr = try navigation_rail_w.navigationRail(a, &items, g.nr_selected, .{ .fn_ptr = nrChangeCb, .userdata = g }, .{ .theme = theme });
@@ -1292,7 +1292,10 @@ fn buildTreeSection(g: *Gallery, theme: Theme) !*Node {
             .{ .label = "Notes" },
         },
     };
-    return tree_w.tree(a, &root, null, .{ .theme = theme });
+    // tappable: rows paint the M3 hover state layer + the selected-row
+    // highlight — without it the tree expanded on tap but gave no pointer
+    // feedback (read as "fake"). Chevron/label taps toggle expansion either way.
+    return tree_w.tree(a, &root, null, .{ .theme = theme, .tappable = true });
 }
 
 fn fabPressCb(userdata: ?*anyopaque) void {
@@ -1460,20 +1463,19 @@ fn buildNavSection(g: *Gallery, theme: Theme) !*Node {
         .title = try text_w.text(a, "Klaxon", .{ .size = theme.type_scale.title_large.size, .color = theme.colors.on_surface }),
         .actions = actions,
     }));
-    // NavBar: 4 destinations (icon + label content; the bar owns selection).
+    // NavBar: 4 destinations — the destination items recolor themselves
+    // with the bar's selection (active icon on_secondary_container on the
+    // pill, secondary label; inactive on_surface_variant).
     const destinations = [_]struct { icon: icon_w.IconName, label: []const u8 }{
         .{ .icon = .home, .label = "Home" },
-        .{ .icon = .play, .label = "Music" },
-        .{ .icon = .square, .label = "Video" },
-        .{ .icon = .star, .label = "Books" },
+        .{ .icon = .music_note, .label = "Music" },
+        .{ .icon = .movie, .label = "Video" },
+        .{ .icon = .library_books, .label = "Books" },
     };
     const nav = try nav_bar_w.navBar(a, g.nav_selected, .{ .theme = theme });
     g.refs.nav_bar = nav;
     for (destinations) |d| {
-        const item = try layout.column(a, .{ .gap = 4, .cross_align = .center });
-        item.add(try icon_w.icon(a, d.icon, .{ .size = 24, .color = theme.colors.on_surface_variant }));
-        item.add(try text_w.text(a, d.label, .{ .size = theme.type_scale.label_medium.size, .color = theme.colors.on_surface_variant }));
-        nav.add(item);
+        nav.add(try nav_bar_w.destination(a, d.icon, d.label));
     }
     col.add(nav);
     col.add(try text_w.BoundText(usize).text(a, g.nav_selected, fmtNavSel, .{ .size = 12, .color = theme.colors.on_surface_variant }));
@@ -1481,8 +1483,8 @@ fn buildNavSection(g: *Gallery, theme: Theme) !*Node {
     const tabs = try tabs_w.tabs(a, g.tabs_selected, .{ .theme = theme });
     g.refs.tabs = tabs;
     const tab_items = [_]struct { icon: icon_w.IconName, label: []const u8 }{
-        .{ .icon = .play, .label = "Music" },
-        .{ .icon = .square, .label = "Video" },
+        .{ .icon = .music_note, .label = "Music" },
+        .{ .icon = .movie, .label = "Video" },
         .{ .icon = .heart, .label = "Favorites" },
     };
     for (tab_items) |d| {
@@ -1531,13 +1533,15 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     const a = g.allocator;
     const col = try layout.column(a, .{ .gap = 12 });
     // Progress indicators: linear determinate (25% / 60% / 100%), linear
-    // indeterminate, M3E wavy determinate, circular determinate + indeterminate.
+    // indeterminate, M3E wavy determinate + indeterminate, circular
+    // determinate + indeterminate.
     const prog_col = try layout.column(a, .{ .gap = 12 });
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 0.25, .theme = theme }));
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 0.6, .theme = theme }));
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 1.0, .theme = theme }));
     prog_col.add(try progress_w.progressIndicator(a, .{ .theme = theme })); // indeterminate
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 0.6, .wavy = true, .theme = theme }));
+    prog_col.add(try progress_w.progressIndicator(a, .{ .wavy = true, .theme = theme })); // indeterminate wavy
     const circ_row = try layout.row(a, .{ .gap = 24, .cross_align = .center });
     circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .progress = 0.75, .theme = theme }));
     circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .theme = theme })); // indeterminate
@@ -1655,24 +1659,38 @@ fn buildAnimSection(g: *Gallery, theme: Theme) !*Node {
     pulse_col.add(pulse);
     pulse_col.add(try text_w.text(a, "AnimatedContainer — color pulses", .{ .size = 12, .color = theme.colors.on_surface_variant }));
     row.add(pulse_col);
-    // AnimatedOffset: the Slide button moves the box.
+    // AnimatedOffset: the Slide button moves the box. The slot reserves the
+    // travel rect (64+48 × 44+16) so the box springs inside its own space
+    // instead of overlapping the neighbouring scale demo mid-flight.
     const slide = try anim_w.animatedOffset(a, .{ .offset = g.offset_sig });
     const slide_box = try container_w.container(a, .{ .color = theme.colors.primary, .radius = 8 });
     slide_box.add(try layout.constrainedBox(a, .{ .min_w = 64, .min_h = 44, .max_w = 64, .max_h = 44 }));
     slide.add(slide_box);
+    // Tight constraints: Align is a fill container (claims c.max_* on
+    // measure) — loose maxima would let it eat the column's whole extent.
+    const slide_slot = try layout.constrainedBox(a, .{ .min_w = 64 + 48, .max_w = 64 + 48, .min_h = 44 + 16, .max_h = 44 + 16 });
+    const slide_track = try layout.alignTo(a, .{ .alignment = .bottom_left });
+    slide_track.add(slide);
+    slide_slot.add(slide_track);
     const slide_btn = try button_w.button(a, .{ .fn_ptr = slideCb, .userdata = g }, .{ .variant = .filled_tonal, .label = "Slide", .theme = theme });
     const slide_col = try layout.column(a, .{ .gap = 6, .cross_align = .center });
-    slide_col.add(slide);
+    slide_col.add(slide_slot);
     slide_col.add(slide_btn);
     row.add(slide_col);
-    // AnimatedScale: the toggle grows the box.
+    // AnimatedScale: the toggle grows the box. The slot reserves the 1.5×
+    // footprint (72×72): resting at 48 centered, the box fills the slot at
+    // full scale — never covering the switch below or the demos beside it.
     const scale = try anim_w.animatedScale(a, .{ .scale = g.scale_sig });
     const scale_box = try container_w.container(a, .{ .color = theme.colors.@"error", .radius = 8 });
     scale_box.add(try layout.constrainedBox(a, .{ .min_w = 48, .min_h = 48, .max_w = 48, .max_h = 48 }));
     scale.add(scale_box);
+    const scale_slot = try layout.constrainedBox(a, .{ .min_w = 72, .max_w = 72, .min_h = 72, .max_h = 72 });
+    const scale_track = try layout.alignTo(a, .{}); // centered in the slot
+    scale_track.add(scale);
+    scale_slot.add(scale_track);
     const big = try switch_w.@"switch"(a, g.scale_toggle, .{ .fn_ptr = bigToggleCb, .userdata = g }, .{ .theme = theme });
     const scale_col = try layout.column(a, .{ .gap = 6, .cross_align = .center });
-    scale_col.add(scale);
+    scale_col.add(scale_slot);
     scale_col.add(big);
     row.add(scale_col);
     col.add(row);
@@ -1733,7 +1751,7 @@ fn buildTypoSection(a: std.mem.Allocator, theme: Theme) !*Node {
         .{ .text = "colors", .size = 16, .bold = true, .color = theme.colors.primary },
     }));
     const icons = try layout.row(a, .{ .gap = 10, .cross_align = .center });
-    const icon_names = [_]icon_w.IconName{ .play, .pause, .stop, .heart, .star, .home, .search, .menu };
+    const icon_names = [_]icon_w.IconName{ .play, .pause, .stop, .heart, .star, .home, .search, .menu, .music_note, .movie };
     for (icon_names) |name| icons.add(try icon_w.icon(a, name, .{ .size = 20, .color = theme.colors.on_surface }));
     icons.add(try text_w.text(a, "Icon", .{ .size = 12, .color = theme.colors.on_surface_variant }));
     col.add(icons);
@@ -2961,4 +2979,92 @@ test "gallery: the scroll view fits the window (bottom reachable)" {
     // and its scroll range can reveal the very bottom of the content
     _ = widgets.scroll_view.setScrollOffset(sv, 1_000_000); // clamps to max
     try std.testing.expect(widgets.scroll_view.scrollOffset(sv) > 0);
+}
+
+fn findByLabel(n: *Node, label: []const u8) ?*Node {
+    if (n.semantics) |s| {
+        if (std.mem.eql(u8, s.label, label)) return n;
+    }
+    for (n.children.items) |ch| {
+        if (findByLabel(ch, label)) |f| return f;
+    }
+    return null;
+}
+
+test "gallery: tree rows expand/collapse on tap; Slide + scale animate over ticks" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    var g = try Gallery.init(std.testing.allocator);
+    defer g.deinit();
+    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(WINDOW_W), .h = @floatFromInt(WINDOW_H) });
+    const sv = g.refs.scroll_view;
+
+    // --- Tree: tapping the Documents row collapses its children.
+    const tree_n = findByLabel(g.root, "Tree").?;
+    const tb = tree_n.bounds;
+    const h0 = tree_n.measure(.{ .max_w = tb.w, .max_h = 1e9 }).h;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, tb.y - sv.bounds.y));
+    const sy = widgets.scroll_view.scrollOffset(sv);
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = tb.x + 40, .y = tb.y + 24 - sy });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = tb.x + 40, .y = tb.y + 24 - sy });
+    const h1 = tree_n.measure(.{ .max_w = tb.w, .max_h = 1e9 }).h;
+    try std.testing.expect(h1 < h0); // 8 rows -> 1 row
+
+    // --- Slide: the button retargets the offset; the widget tweens over ticks.
+    const slide_btn = findByLabel(g.root, "Slide").?;
+    // column[0] = reserved slot (constrainedBox) -> alignTo -> AnimatedOffset
+    const slide_slot = slide_btn.parent.?.children.items[0];
+    const sld = slide_slot.children.items[0].children.items[0];
+    const hb0 = sld.vtable.hit_bounds.?(sld);
+    const sb = slide_btn.bounds;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, sb.y - sv.bounds.y));
+    const sy2 = widgets.scroll_view.scrollOffset(sv);
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = sb.x + sb.w / 2, .y = sb.y + sb.h / 2 - sy2 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = sb.x + sb.w / 2, .y = sb.y + sb.h / 2 - sy2 });
+    try std.testing.expectEqual(anim_w.Offset{ .x = 48, .y = -16 }, g.offset_sig.peek());
+    try std.testing.expect(tl.hasActive()); // animating toward the target, not snapped
+    tl.tick(0); // lazy start
+    tl.tick(150); // mid-flight: the displayed offset is part-way
+    const hb_mid = sld.vtable.hit_bounds.?(sld);
+    try std.testing.expect(hb_mid.x > hb0.x and hb_mid.x < hb0.x + 48);
+    tl.tick(1000); // settles on the target
+    const hb_end = sld.vtable.hit_bounds.?(sld);
+    try std.testing.expectEqual(hb0.x + 48, hb_end.x);
+
+    // --- Scale: the switch grows the box over ticks (hit_bounds follows).
+    const scale_col = slide_btn.parent.?.parent.?.children.items[2];
+    const scale_slot = scale_col.children.items[0]; // constrainedBox -> alignTo -> AnimatedScale
+    const scale_n = scale_slot.children.items[0].children.items[0];
+    const sw_n = scale_col.children.items[1]; // the switch
+    const sb0 = scale_n.vtable.hit_bounds.?(scale_n);
+    const swb = sw_n.bounds;
+    _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, swb.y - sv.bounds.y));
+    const sy3 = widgets.scroll_view.scrollOffset(sv);
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = swb.x + swb.w / 2, .y = swb.y + swb.h / 2 - sy3 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = swb.x + swb.w / 2, .y = swb.y + swb.h / 2 - sy3 });
+    try std.testing.expectEqual(@as(f32, 1.5), g.scale_sig.peek());
+    tl.tick(1100); // start the retarget
+    tl.tick(1200);
+    const sb_mid = scale_n.vtable.hit_bounds.?(scale_n);
+    try std.testing.expect(sb_mid.w > sb0.w);
+    tl.tick(2000); // settled: 1.5x
+    const sb_end = scale_n.vtable.hit_bounds.?(scale_n);
+    try std.testing.expectApproxEqAbs(sb0.w * 1.5, sb_end.w, 0.5);
+
+    // --- Pulse: the AnimatedContainer chases pulse_sig — a tick advances
+    // the spring and repaints the box (onFrame feeds it a full-range
+    // primary→tertiary sweep in the app). tl.hasActive() stays true forever
+    // here — the gallery's indeterminate progress loops never stop — so the
+    // check is the box's own dirty flag.
+    const pulse_box = slide_btn.parent.?.parent.?.children.items[0].children.items[0];
+    g.pulse_sig.set(0xEFB8C8FF);
+    tl.tick(3000); // lazy start (value == from, possibly no notify yet)
+    pulse_box.dirty = false;
+    tl.tick(3200); // mid-flight: the spring writes a new color → repaint
+    try std.testing.expect(pulse_box.dirty); // an animation tick repainted it
 }
