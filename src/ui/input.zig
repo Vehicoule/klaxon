@@ -278,9 +278,15 @@ pub const InputRouter = struct {
         if (self.focused) |f| {
             if (sendKey(f, .{ .kind = .key_down, .key = .escape })) return true;
         }
-        if (self.back_stack_len > 0) {
-            const h = self.back_stack[self.back_stack_len - 1];
-            return h.fn_ptr(h.userdata);
+        // The modal stack topmost-first; a handler that declines (returns
+        // false, e.g. a dialog already closed) falls through to the next —
+        // the topmost entry must not swallow the event. Handlers pop
+        // themselves on accept, so resync i against the live stack length.
+        var i = self.back_stack_len;
+        while (i > 0) {
+            i -= 1;
+            if (self.back_stack[i].fn_ptr(self.back_stack[i].userdata)) return true;
+            if (i > self.back_stack_len) i = self.back_stack_len;
         }
         if (self.back_handler) |h| return h.fn_ptr(h.userdata);
         return false;
@@ -325,7 +331,14 @@ pub const InputRouter = struct {
             self.last_y = ev.y;
             self.has_last = true;
         }
-        const hit = root.hitTest(ev.x, ev.y) orelse return;
+        // An open popup's overflow children (menu rows outside the popup's
+        // bounds) must receive wheel events like they receive hovers —
+        // plain hitTest can't reach them, so the wheel would scroll the
+        // page behind the popup.
+        const hit = if (self.open_popup) |popup|
+            (hitPopupOrRoot(root, popup, ev.x, ev.y) orelse return).node
+        else
+            root.hitTest(ev.x, ev.y) orelse return;
         _ = sendScroll(hit, ev);
     }
 
@@ -455,7 +468,7 @@ fn isDescendant(node: *Node, ancestor: *Node) bool {
 /// transforms still apply (pre_children_hit) and the popup's own effective
 /// hit rect is hit_bounds-aware.
 fn hitTestSubtree(node: *Node, px: f32, py: f32) ?*Node {
-    if (!node.visible) return null;
+    if (!node.visible or node.zombie) return null;
     var cx = px;
     var cy = py;
     if (node.vtable.pre_children_hit) |pre| {

@@ -92,6 +92,24 @@ pub const Inspector = struct {
     pub fn rebuildRows(insp: *Inspector, root: *Node) void {
         insp.rows.clearRetainingCapacity();
         rebuildRowsInner(insp, root, 0);
+        // Prune expand-state for nodes no longer in the tree — an entry
+        // keyed by a recycled address would silently inherit stale state.
+        // Rebuilt rather than removed mid-iteration (swap-remove invalidates
+        // the iterator).
+        var kept = std.AutoHashMap(*Node, bool).init(insp.allocator);
+        var prune = insp.expanded.iterator();
+        while (prune.next()) |e| {
+            var present = false;
+            for (insp.rows.items) |row| {
+                if (row.node == e.key_ptr.*) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) kept.put(e.key_ptr.*, e.value_ptr.*) catch @panic("klaxon: out of memory");
+        }
+        insp.expanded.deinit();
+        insp.expanded = kept;
         // Drop the selection if the node vanished from the tree; otherwise
         // re-sync sel_index to its row (the walk order may have shifted).
         if (insp.selected) |sel| {
@@ -114,12 +132,12 @@ pub const Inspector = struct {
     }
 
     fn rebuildRowsInner(insp: *Inspector, node: *Node, depth: u8) void {
-        if (!node.visible) return;
+        if (!node.visible or node.zombie) return;
         insp.rows.append(.{ .node = node, .depth = depth }) catch @panic("klaxon: out of memory");
         const is_expanded = insp.expanded.get(node) orelse true;
         if (is_expanded) {
             for (node.children.items) |child| {
-                rebuildRowsInner(insp, child, depth + 1);
+                rebuildRowsInner(insp, child, depth +| 1); // saturates; indent just clamps
             }
         }
     }
@@ -305,12 +323,13 @@ pub const Inspector = struct {
         kx.c.kx_stroke_rrect(ctx, r.x - 1, r.y - 1, r.w + 2, r.h + 2, 0, 2, HIGHLIGHT);
     }
 
-    /// Paint the inspector panel (right side, full height). No-op when disabled.
-    pub fn paint(insp: *Inspector, ctx: *kx.Ctx, root: *Node, w: c_int, h: c_int) void {
+    /// Paint the inspector panel (right side, full height). No-op when
+    /// disabled. `rows` must be fresh — the caller (host renderFrame) rebuilds
+    /// once per frame before paintHighlight; event handlers rebuild on entry.
+    pub fn paint(insp: *Inspector, ctx: *kx.Ctx, w: c_int, h: c_int) void {
         if (!insp.enabled) return;
         insp.last_w = w;
         insp.last_h = h;
-        insp.rebuildRows(root);
 
         const px = @as(f32, @floatFromInt(w)) - PANEL_W;
         const ph = @as(f32, @floatFromInt(h));
@@ -881,7 +900,7 @@ test "golden: inspector paints panel + bounds highlight (exact pixels)" {
     kx.c.kx_clear(r.ctx, bg);
     root.paint(r.ctx, .{ .x = 0, .y = 0, .w = 640, .h = 480 });
     insp.paintHighlight(r.ctx);
-    insp.paint(r.ctx, root, 640, 480);
+    insp.paint(r.ctx, 640, 480);
     kx.c.kx_end_frame(r.ctx);
     var f1 = try r.readback(a);
     defer f1.deinit();
@@ -896,7 +915,7 @@ test "golden: inspector paints panel + bounds highlight (exact pixels)" {
     root.paint(r.ctx, .{ .x = 0, .y = 0, .w = 640, .h = 480 });
     if (insp.enabled) {
         insp.paintHighlight(r.ctx);
-        insp.paint(r.ctx, root, 640, 480);
+        insp.paint(r.ctx, 640, 480);
     }
     kx.c.kx_end_frame(r.ctx);
     var f2 = try r.readback(a);

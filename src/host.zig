@@ -301,9 +301,11 @@ pub const Host = struct {
         var resolved_backend = backend;
         var window: *sdl.c.SDL_Window = if (is_android) blk: {
             var count: c_int = 0;
-            const windows = sdl.c.SDL_GetWindows(&count);
-            if (count > 0) {
-                if (windows[0]) |win| break :blk win;
+            if (sdl.c.SDL_GetWindows(&count)) |windows| {
+                defer sdl.c.SDL_free(windows); // the array is a single SDL-owned allocation
+                if (count > 0) {
+                    if (windows[0]) |win| break :blk win;
+                }
             }
             // Request the display's natural size: Android_CreateWindow passes
             // the requested w/h to setOrientation, and a fixed (non-resizable)
@@ -517,9 +519,10 @@ pub const Host = struct {
             if (texture) |t| sdl.c.SDL_DestroyTexture(t);
         }
 
-        // Mobile GPU: no CPU pixel buffer (the GPU shim owns presentation).
-        // iOS raster: CPU pixel buffer for SDL texture upload.
-        const pixels: []u8 = if (!use_sdl_present)
+        // CPU pixel buffer only for the raster+SDL present path — on GPU
+        // backends the shim presents and kx_readback_rgba always fails, so
+        // allocating w*h*4 here would be dead memory (~33 MB at 4K).
+        const pixels: []u8 = if (renderer == null)
             &[_]u8{}
         else
             try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4);
@@ -851,11 +854,10 @@ pub const Host = struct {
         if (host.inspector.enabled) {
             // Rebuild FIRST: a selected node destroyed since the last frame
             // (e.g. a virtualized list scrolled) must be dropped before the
-            // highlight paint dereferences it (use-after-free). paint()
-            // rebuilds again — idempotent, same tree.
+            // highlight paint dereferences it (use-after-free).
             host.inspector.rebuildRows(root);
             host.inspector.paintHighlight(host.ctx);
-            host.inspector.paint(host.ctx, root, host.width, host.height);
+            host.inspector.paint(host.ctx, host.width, host.height);
         }
         // DevTools overlay (Phase 4a): painted after the tree and the focus
         // ring, outside the damage clip — above everything, always unclipped.
@@ -1020,15 +1022,10 @@ pub const Host = struct {
                     log("klaxon: low memory warning", .{});
                     return false;
                 },
-                sdl.c.SDL_EVENT_TERMINATING => {
-                    // iOS simulator sends TERMINATING when the simctl launch
-                    // parent exits — ignore it so the app keeps running.
-                    if (is_ios) {
-                        log("klaxon: ignoring SDL_EVENT_TERMINATING on iOS", .{});
-                        return false;
-                    }
-                    return true;
-                },
+                // iOS TERMINATING already returned above (line ~997); the
+                // only mobile build reaching this arm is Android, where the
+                // event is never queued anyway.
+                sdl.c.SDL_EVENT_TERMINATING => return true,
                 else => {},
             }
         }
@@ -1060,6 +1057,10 @@ pub const Host = struct {
                 root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(w), .h = @floatFromInt(h) });
                 root.dirty = true;
                 root.clearDamage();
+                // The layout consumed the dirty flag renderFrame uses to
+                // refresh hover — without this, hover/cursor stay stale
+                // under a stationary pointer until the next motion event.
+                host.input.refreshHover(root);
             }
         }
         // Input routing (Phase 1c/1d): platform events → router → widget tree.
@@ -1078,15 +1079,15 @@ pub const Host = struct {
                 // the captured node keeps receiving moves even outside its
                 // bounds, and dropping them would leave a stale drag whose
                 // release lands later as an accidental click.
-                const has_capture = host.input.capturedNode(0) != null;
-                if (host.inspector.enabled and !has_capture and host.inspector.hitZone(event.motion.x, event.motion.y, host.width, host.height) != .none) {
-                    host.input.clearHover();
-                    return false; // skip routing
-                }
                 // Mobile: mouse coordinates arrive in pixels — convert to
                 // the point (dp) layout space via the display scale.
                 const sx = if (is_mobile) event.motion.x / host.display_scale else event.motion.x;
                 const sy = if (is_mobile) event.motion.y / host.display_scale else event.motion.y;
+                const has_capture = host.input.capturedNode(0) != null;
+                if (host.inspector.enabled and !has_capture and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
+                    host.input.clearHover();
+                    return false; // skip routing
+                }
                 host.input.dispatchPointer(root, .{
                     .phase = .move,
                     .x = sx,
@@ -1100,13 +1101,16 @@ pub const Host = struct {
                 // (tree: select/expand, props: no-op); a click on the canvas
                 // passively selects the hit node (routing continues normally).
                 if (host.inspector.enabled) {
-                    const z = host.inspector.hitZone(event.button.x, event.button.y, host.width, host.height);
+                    // Mobile: pixels → points before the zone test/click.
+                    const px = if (is_mobile) event.button.x / host.display_scale else event.button.x;
+                    const py = if (is_mobile) event.button.y / host.display_scale else event.button.y;
+                    const z = host.inspector.hitZone(px, py, host.width, host.height);
                     if (z != .none) {
-                        host.inspector.clickAt(root, event.button.x, event.button.y, host.width, host.height);
+                        host.inspector.clickAt(root, px, py, host.width, host.height);
                         root.dirty = true;
                         return false; // consume the panel click
                     }
-                    host.inspector.pickAt(root, event.button.x, event.button.y); // passive selection
+                    host.inspector.pickAt(root, px, py); // passive selection
                 }
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
                     // Mobile: pixels → points (layout space), like motion.
@@ -1122,6 +1126,17 @@ pub const Host = struct {
                 }
             },
             sdl.c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                // A press that began on the inspector panel releases over it
+                // too — without this, a widget under the panel gets a stray
+                // `.up` it never saw `.down` for.
+                if (host.inspector.enabled and host.input.capturedNode(0) == null and
+                    host.inspector.hitZone(
+                        if (is_mobile) event.button.x / host.display_scale else event.button.x,
+                        if (is_mobile) event.button.y / host.display_scale else event.button.y,
+                        host.width,
+                        host.height,
+                    ) != .none)
+                    return false;
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
                     const sx = if (is_mobile) event.button.x / host.display_scale else event.button.x;
                     const sy = if (is_mobile) event.button.y / host.display_scale else event.button.y;
@@ -1159,9 +1174,12 @@ pub const Host = struct {
             // Wheel → scroll event (Phase 1f): routed like pointer input.
             // The content may scroll under a stationary pointer: refresh hover.
             sdl.c.SDL_EVENT_MOUSE_WHEEL => {
+                // Mobile: pixels → points (layout space), like motion.
+                const sx = if (is_mobile) event.wheel.mouse_x / host.display_scale else event.wheel.mouse_x;
+                const sy = if (is_mobile) event.wheel.mouse_y / host.display_scale else event.wheel.mouse_y;
                 // Inspector (Phase 4a.2): wheel over the panel scrolls the
                 // tree view (consumed — no widget scroll).
-                if (host.inspector.enabled and host.inspector.hitZone(event.wheel.mouse_x, event.wheel.mouse_y, host.width, host.height) != .none) {
+                if (host.inspector.enabled and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
                     // SDL3: wheel.y > 0 = scroll up (toward the start),
                     // wheel.y < 0 = scroll down. scrollBy's positive dy grows
                     // scroll_y (content moves down) → negate the event value.
@@ -1169,9 +1187,6 @@ pub const Host = struct {
                     root.dirty = true;
                     return false; // consume
                 }
-                // Mobile: pixels → points (layout space), like motion.
-                const sx = if (is_mobile) event.wheel.mouse_x / host.display_scale else event.wheel.mouse_x;
-                const sy = if (is_mobile) event.wheel.mouse_y / host.display_scale else event.wheel.mouse_y;
                 host.input.dispatchScroll(root, .{
                     .x = sx,
                     .y = sy,
@@ -1193,6 +1208,9 @@ pub const Host = struct {
                 // focus, arrows/Enter/Escape navigate it — consumed before
                 // any widget routing.
                 if (host.inspector.enabled and host.inspector.tree_focus and !event.key.repeat) {
+                    // Rows may reference nodes freed by a pointer/scroll
+                    // dispatch earlier in this drain — rebuild first.
+                    host.inspector.rebuildRows(root);
                     if (host.inspector.handleKey(event.key.key)) {
                         root.dirty = true;
                         return false; // consumed, no widget routing
@@ -1252,16 +1270,20 @@ pub const Host = struct {
         }
         kx.c.kx_resize(host.ctx, w, h);
         // Memory ledger (Phase 4a.3): the pixel buffer is re-allocated —
-        // move its tracked bytes (renderer subsystem) to the new size.
+        // move its tracked bytes (renderer subsystem) to the new size. GPU
+        // backends keep no buffer (renderer == null → readback always fails).
         host.devtools.ledger.recordFree(.renderer, host.pixels.len);
         host.allocator.free(host.pixels);
         // Fail-soft on OOM (an @panic here would pull std.debug into the
         // mobile compile — see log()): the next present skips the readback
         // (kx_readback_rgba rejects a short buffer).
-        host.pixels = host.allocator.alloc(u8, @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) catch blk: {
-            log("klaxon: out of memory", .{});
-            break :blk &[_]u8{};
-        };
+        host.pixels = if (host.renderer == null)
+            &[_]u8{}
+        else
+            host.allocator.alloc(u8, @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) catch blk: {
+                log("klaxon: out of memory", .{});
+                break :blk &[_]u8{};
+            };
         host.devtools.ledger.recordAlloc(.renderer, host.pixels.len);
         if (host.texture) |t| {
             sdl.c.SDL_DestroyTexture(t);

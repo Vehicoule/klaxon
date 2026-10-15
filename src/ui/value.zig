@@ -444,7 +444,10 @@ pub fn valueFromOptions(allocator: std.mem.Allocator, comptime T: type, opts: T,
     const info = @typeInfo(T).@"struct";
     inline for (info.field_names, info.field_types) |name, FT| {
         const fv = try valueOfField(allocator, FT, @field(opts, name), describe_node, userdata);
-        try fields.append(.{ .name = try allocator.dupe(u8, name), .value = fv });
+        errdefer fv.deinit(allocator);
+        const dname = try allocator.dupe(u8, name);
+        errdefer allocator.free(dname);
+        try fields.append(.{ .name = dname, .value = fv });
     }
     return .{ .object = try fields.toOwnedSlice() };
 }
@@ -581,9 +584,12 @@ fn unwrapOptional(comptime FT: type) type {
 pub fn appendSchemaProp(list: []PropSchema, allocator: std.mem.Allocator, name: []const u8, kind: EditorKind, enum_tags: []const []const u8, default: Value) ![]PropSchema {
     var duped_tags = enum_tags;
     if (enum_tags.len > 0) duped_tags = try allocator.dupe([]const u8, enum_tags);
-    const duped_default = try default.dupe(allocator);
+    const duped_default = default.dupe(allocator) catch |e| {
+        if (enum_tags.len > 0) allocator.free(duped_tags);
+        return e;
+    };
     const grown = allocator.realloc(list, list.len + 1) catch |e| {
-        allocator.free(duped_tags);
+        if (enum_tags.len > 0) allocator.free(duped_tags);
         duped_default.deinit(allocator);
         return e;
     };
