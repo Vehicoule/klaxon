@@ -300,7 +300,12 @@ pub const Host = struct {
             else
                 0
         else
-            0;
+            // Desktop (macOS/Windows): HIGH_PIXEL_DENSITY so
+            // SDL_GetWindowSizeInPixels reports real backing pixels on
+            // Retina/HiDPI instead of synthesizing 1:1 points — without it
+            // every backend renders at logical size and SDL/Cocoa upscales
+            // the result, which is the blurry look this fixes.
+            sdl.c.SDL_WINDOW_HIGH_PIXEL_DENSITY;
         // Linux only: the first window carries SDL_WINDOW_VULKAN — if the
         // backend chain falls through to raster, the ganesh-gl leg is retried
         // below on a recreated OPENGL window (see the retry block after
@@ -430,11 +435,12 @@ pub const Host = struct {
         var pixel_w: c_int = width;
         var pixel_h: c_int = height;
         var display_scale: f32 = 1.0;
-        if (is_mobile) {
-            _ = sdl.c.SDL_GetWindowSize(window, &win_w, &win_h);
-            _ = sdl.c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
-            display_scale = displayScaleOf(window, win_w, pixel_w);
-        }
+        // All platforms: logical window size (layout space) vs backing pixel
+        // size (canvas space). On desktop they differ whenever the display
+        // scale isn't 1.0 (Retina 2x, Windows 150%, Wayland fractional).
+        _ = sdl.c.SDL_GetWindowSize(window, &win_w, &win_h);
+        _ = sdl.c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
+        display_scale = displayScaleOf(window, win_w, pixel_w);
 
         // kx_create walks the backend fallback chain internally (explicit
         // request → itself → raster; AUTO → full platform chain → raster).
@@ -526,7 +532,7 @@ pub const Host = struct {
         const texture = if (!use_sdl_present)
             null
         else if (renderer) |r|
-            sdl.c.SDL_CreateTexture(r, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, width, height) orelse return error.SdlTexture
+            sdl.c.SDL_CreateTexture(r, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, pixel_w, pixel_h) orelse return error.SdlTexture
         else
             null;
         errdefer {
@@ -539,7 +545,7 @@ pub const Host = struct {
         const pixels: []u8 = if (renderer == null)
             &[_]u8{}
         else
-            try allocator.alloc(u8, @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4);
+            try allocator.alloc(u8, @as(usize, @intCast(pixel_w)) * @as(usize, @intCast(pixel_h)) * 4);
         errdefer allocator.free(pixels);
 
         const backend_name: [*:0]const u8 = kx.c.kx_backend_name(resolved_backend) orelse "unknown";
@@ -805,13 +811,12 @@ pub const Host = struct {
         }
         host.frame_start_ns = sdl.c.SDL_GetTicksNS();
         kx.c.kx_begin_frame(host.ctx);
-        // Mobile (Phase 3d/3e): the canvas is pixel-sized (kx_create got
+        // HiDPI: the canvas is pixel-sized (kx_create got
         // pixel_width/pixel_height) while the tree lays out in points —
-        // Scale the point-space paint onto the pixel canvas (crisp on
-        // Retina). Skipped on iOS only for the Metal shims, which scale the
-        // canvas themselves in gpu_begin_frame (raster + Ganesh GLES need
-        // this host-side scale).
-        if (is_mobile and host.display_scale != 1.0 and
+        // scale the point-space paint onto the pixel canvas (crisp on
+        // Retina/HiDPI). Skipped only for the iOS Metal shim, which scales
+        // the canvas itself in gpu_begin_frame.
+        if (host.display_scale != 1.0 and
             !(is_ios and iosShimScalesCanvas(host.ctx)))
         {
             kx.c.kx_save(host.ctx);
@@ -861,16 +866,18 @@ pub const Host = struct {
                 if (focus) |fm| fm.paintRing(host.ctx);
                 kx.c.kx_clip_reset(host.ctx);
                 // The repaint touched only `d` — present uploads just that
-                // region instead of two full-frame copies. Rounded out to
-                // cover the AA fringe (raster surface == texture space on
-                // desktop).
-                const x0: c_int = @intFromFloat(@floor(d.x));
-                const y0: c_int = @intFromFloat(@floor(d.y));
+                // region instead of two full-frame copies. Stored in PIXEL
+                // space (the raster surface and texture are pixel-sized —
+                // display_scale ≠ 1 on HiDPI), rounded out to cover the AA
+                // fringe.
+                const s = host.display_scale;
+                const px0: c_int = @intFromFloat(@floor(d.x * s));
+                const py0: c_int = @intFromFloat(@floor(d.y * s));
                 host.present_rect = if (!fullPresentForced()) .{
-                    .x = x0,
-                    .y = y0,
-                    .w = @intFromFloat(@ceil(d.x + d.w) - @floor(d.x)),
-                    .h = @intFromFloat(@ceil(d.y + d.h) - @floor(d.y)),
+                    .x = px0,
+                    .y = py0,
+                    .w = @as(c_int, @intFromFloat(@ceil((d.x + d.w) * s))) - px0,
+                    .h = @as(c_int, @intFromFloat(@ceil((d.y + d.h) * s))) - py0,
                 } else null; // A/B: force the full-surface upload
             }
         } else {
@@ -898,7 +905,7 @@ pub const Host = struct {
             host.devtools.recordFrame(host.stats.frame_time_ms);
             host.devtools.paint(host.ctx, host.width, host.height, &host.stats);
         }
-        if (is_mobile and host.display_scale != 1.0 and
+        if (host.display_scale != 1.0 and
             !(is_ios and iosShimScalesCanvas(host.ctx)))
             kx.c.kx_restore(host.ctx);
         kx.c.kx_end_frame(host.ctx);
@@ -1078,6 +1085,17 @@ pub const Host = struct {
             root.clearDamage();
             return false;
         }
+        // Moving the window between displays at different DPR fires these
+        // without RESIZED — the backing pixel size and display_scale change,
+        // so the canvas + buffers must be rebuilt (same work as a resize).
+        if (event.type == sdl.c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED or
+            event.type == sdl.c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED)
+        {
+            host.resize(host.width, host.height);
+            root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
+            root.dirty = true;
+            return false;
+        }
         if (event.type == sdl.c.SDL_EVENT_WINDOW_RESIZED) {
             const w: c_int = @intCast(event.window.data1);
             const h: c_int = @intCast(event.window.data2);
@@ -1112,8 +1130,8 @@ pub const Host = struct {
                 // release lands later as an accidental click.
                 // Mobile: mouse coordinates arrive in pixels — convert to
                 // the point (dp) layout space via the display scale.
-                const sx = if (is_mobile) event.motion.x / host.display_scale else event.motion.x;
-                const sy = if (is_mobile) event.motion.y / host.display_scale else event.motion.y;
+                const sx = event.motion.x / host.display_scale;
+                const sy = event.motion.y / host.display_scale;
                 const has_capture = host.input.capturedNode(0) != null;
                 if (host.inspector.enabled and !has_capture and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
                     host.input.clearHover();
@@ -1133,8 +1151,8 @@ pub const Host = struct {
                 // passively selects the hit node (routing continues normally).
                 if (host.inspector.enabled) {
                     // Mobile: pixels → points before the zone test/click.
-                    const px = if (is_mobile) event.button.x / host.display_scale else event.button.x;
-                    const py = if (is_mobile) event.button.y / host.display_scale else event.button.y;
+                    const px = event.button.x / host.display_scale;
+                    const py = event.button.y / host.display_scale;
                     const z = host.inspector.hitZone(px, py, host.width, host.height);
                     if (z != .none) {
                         host.inspector.clickAt(root, px, py, host.width, host.height);
@@ -1145,8 +1163,8 @@ pub const Host = struct {
                 }
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
                     // Mobile: pixels → points (layout space), like motion.
-                    const sx = if (is_mobile) event.button.x / host.display_scale else event.button.x;
-                    const sy = if (is_mobile) event.button.y / host.display_scale else event.button.y;
+                    const sx = event.button.x / host.display_scale;
+                    const sy = event.button.y / host.display_scale;
                     host.input.dispatchPointer(root, .{
                         .phase = .down,
                         .x = sx,
@@ -1162,15 +1180,15 @@ pub const Host = struct {
                 // `.up` it never saw `.down` for.
                 if (host.inspector.enabled and host.input.capturedNode(0) == null and
                     host.inspector.hitZone(
-                        if (is_mobile) event.button.x / host.display_scale else event.button.x,
-                        if (is_mobile) event.button.y / host.display_scale else event.button.y,
+                        event.button.x / host.display_scale,
+                        event.button.y / host.display_scale,
                         host.width,
                         host.height,
                     ) != .none)
                     return false;
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
-                    const sx = if (is_mobile) event.button.x / host.display_scale else event.button.x;
-                    const sy = if (is_mobile) event.button.y / host.display_scale else event.button.y;
+                    const sx = event.button.x / host.display_scale;
+                    const sy = event.button.y / host.display_scale;
                     host.input.dispatchPointer(root, .{
                         .phase = .up,
                         .x = sx,
@@ -1206,8 +1224,8 @@ pub const Host = struct {
             // The content may scroll under a stationary pointer: refresh hover.
             sdl.c.SDL_EVENT_MOUSE_WHEEL => {
                 // Mobile: pixels → points (layout space), like motion.
-                const sx = if (is_mobile) event.wheel.mouse_x / host.display_scale else event.wheel.mouse_x;
-                const sy = if (is_mobile) event.wheel.mouse_y / host.display_scale else event.wheel.mouse_y;
+                const sx = event.wheel.mouse_x / host.display_scale;
+                const sy = event.wheel.mouse_y / host.display_scale;
                 // Inspector (Phase 4a.2): wheel over the panel scrolls the
                 // tree view (consumed — no widget scroll).
                 if (host.inspector.enabled and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
@@ -1291,15 +1309,12 @@ pub const Host = struct {
     fn resize(host: *Host, w: c_int, h: c_int) void {
         host.width = w;
         host.height = h;
-        if (is_mobile) {
-            // Mobile: the canvas is pixel-sized — re-query the pixel size
-            // and DPR (WINDOW_RESIZED carries points). No SDL
-            // renderer/texture/pixel buffer on mobile.
-            host.refreshPixelSize();
-            kx.c.kx_resize(host.ctx, host.pixel_width, host.pixel_height);
-            return;
-        }
-        kx.c.kx_resize(host.ctx, w, h);
+        // All platforms: the canvas is pixel-sized — re-query the pixel size
+        // and DPR (WINDOW_RESIZED carries points). Mobile has no SDL
+        // renderer/texture/pixel buffer to rebuild.
+        host.refreshPixelSize();
+        kx.c.kx_resize(host.ctx, host.pixel_width, host.pixel_height);
+        if (is_mobile) return;
         // Memory ledger (Phase 4a.3): the pixel buffer is re-allocated —
         // move its tracked bytes (renderer subsystem) to the new size. GPU
         // backends keep no buffer (renderer == null → readback always fails).
@@ -1311,14 +1326,14 @@ pub const Host = struct {
         host.pixels = if (host.renderer == null)
             &[_]u8{}
         else
-            host.allocator.alloc(u8, @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4) catch blk: {
+            host.allocator.alloc(u8, @as(usize, @intCast(host.pixel_width)) * @as(usize, @intCast(host.pixel_height)) * 4) catch blk: {
                 log("klaxon: out of memory", .{});
                 break :blk &[_]u8{};
             };
         host.devtools.ledger.recordAlloc(.renderer, host.pixels.len);
         if (host.texture) |t| {
             sdl.c.SDL_DestroyTexture(t);
-            host.texture = sdl.c.SDL_CreateTexture(host.renderer.?, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, w, h);
+            host.texture = sdl.c.SDL_CreateTexture(host.renderer.?, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, host.pixel_width, host.pixel_height);
         }
     }
 
@@ -1370,7 +1385,7 @@ pub const Host = struct {
                 return;
             }
             if (kx.c.kx_readback_rgba(host.ctx, host.pixels.ptr, host.pixels.len, &w, &h)) {
-                _ = sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.width * 4);
+                _ = sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.pixel_width * 4);
                 if (host.renderer) |r| {
                     _ = sdl.c.SDL_RenderTexture(r, t, null, null);
                     const t_submit = sdl.c.SDL_GetTicksNS();
