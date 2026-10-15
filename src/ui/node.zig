@@ -330,7 +330,11 @@ pub const Node = struct {
         if (child.overlay_subtree) node.markOverlayUp();
         if (child.backdrop_subtree) node.markBackdropUp();
         node.markLayoutDirty();
-        node.markDirty();
+        // Damage the CHILD's rect, not the parent's — a 640×480 list would
+        // otherwise repaint wholesale per row mutation (the krausest-style
+        // list ops were floored by this). A not-yet-laid-out child has a
+        // zero rect; layout's own bounds-change damage covers it landing.
+        child.markDirty();
     }
 
     /// Insert a child at `index` (clamped to the end). Same ownership contract
@@ -344,7 +348,7 @@ pub const Node = struct {
         if (child.overlay_subtree) node.markOverlayUp();
         if (child.backdrop_subtree) node.markBackdropUp();
         node.markLayoutDirty();
-        node.markDirty();
+        child.markDirty(); // child-scoped damage — see add()
     }
 
     /// Remove a child. The child is NOT deinited (the caller owns it) and its
@@ -355,9 +359,12 @@ pub const Node = struct {
         for (node.children.items, 0..) |c, i| {
             if (c == child) {
                 _ = node.children.orderedRemove(i);
+                // Damage the leaving child's rect (its last pixels must
+                // repaint) — not the whole parent. The parent chain is
+                // still intact for the damage walk.
+                child.markDirty();
                 child.parent = null;
                 node.markLayoutDirty();
-                node.markDirty();
                 return true;
             }
         }
@@ -410,7 +417,13 @@ pub const Node = struct {
         var r = rect;
         var n = node;
         while (n.parent) |p| {
-            if (p.vtable.map_paint_rect) |m| r = m(p, r);
+            // Skip the hook on a mid-construction ancestor — its state is
+            // not assigned yet and every map_paint_rect impl derefs it. The
+            // damage is provisional anyway: first layout+paint sets the
+            // real bounds, and a stateless transform is identity here.
+            if (p.vtable.map_paint_rect) |m| {
+                if (p.state != null) r = m(p, r);
+            }
             n = p;
         }
         unionDamage(n, r);

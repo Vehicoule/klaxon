@@ -328,8 +328,41 @@ pub fn maxScrollOffset(n: *Node) f32 {
 /// Re-create the live window from the factory: the model changed (row
 /// content is re-created, not diffed per node — the krausest-style list ops
 /// benchmark drives this). Keeps the scroll offset + window position.
+/// A rebind-capable factory rewrites the live rows in place instead —
+/// the RecyclerView notifyDataSetChanged idiom (no node churn).
 pub fn reloadItems(n: *Node) void {
     const s = stateOf(ListState, n);
+    if (s.opts.factory.rebind) |rebind| {
+        // Re-sync the window FIRST (a count change trims/recycles rows) —
+        // rebinding rows that are about to be dropped is wasted work.
+        if (s.scroll.viewport > 0) {
+            const range = scroll_mod.visibleRange(s.opts.item_count, strideOf(s), s.scroll.viewport, s.scroll.offset, s.opts.margin);
+            scroll_util.syncItemWindow(n, &s.first, s.opts.factory, range, layoutItem);
+        } else {
+            s.first = 0;
+        }
+        var i: usize = 0;
+        while (i < n.children.items.len) : (i += 1) {
+            const child = n.children.items[i];
+            const index = s.first + i;
+            if (rebind(s.opts.factory.userdata, index, child)) {
+                // Content size may follow the model — re-lay the row out.
+                layoutItem(n, child, index);
+            } else {
+                // Declined: swap a fresh node into the same slot (the
+                // detach-then-deinit order holds — deinit defers destroys).
+                _ = n.remove(child);
+                child.deinit();
+                const fresh = s.opts.factory.fn_ptr(s.opts.factory.userdata, index);
+                n.insert(i, fresh);
+                layoutItem(n, fresh, index);
+            }
+        }
+        // Damage stays row-scoped: the rebinds/adds/removes mark their own
+        // rects — a no-change reload repaints nothing.
+        n.markLayoutDirty();
+        return;
+    }
     // Detach-then-deinit from the back — the scroll_util.syncItemWindow
     // invariant. child.deinit()'s sweep orderedRemoves the child from
     // n.children AND frees the struct: a for-loop over n.children.items
