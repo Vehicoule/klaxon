@@ -176,10 +176,17 @@ void gpu_end_frame(GpuState* state) {
         }
         state->recorder.reset();
     }
-    // Synchronous submit: ensures GPU work completes before we release the
-    // drawable texture. The simulator's Metal is software-emulated and may
-    // have different timing than real hardware.
+#if TARGET_OS_SIMULATOR
+    // Synchronous submit: the simulator's Metal is software-emulated and may
+    // have different timing — guarantee completion before we release the
+    // drawable texture.
     state->context->submit(skgpu::graphite::SyncToCpu::kYes);
+#else
+    // Device: async submit keeps CPU and GPU pipelined — the command
+    // buffer's presentDrawable retains the drawable (and thereby its
+    // texture) until present completes, so releasing our refs below is safe.
+    state->context->submit(skgpu::graphite::SyncToCpu::kNo);
+#endif
     // Release the frame surface BEFORE presenting: the surface holds a
     // BackendTexture referencing drawable_texture.
     state->frame_surface = nullptr;
