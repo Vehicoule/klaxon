@@ -277,6 +277,42 @@ pub fn imageDrawSet(ctx: *kx.Ctx, quads: []const ImageQuad) void {
     kx.c.kx_draw_image_set(ctx, @ptrCast(quads.ptr), @intCast(quads.len));
 }
 
+// --- Row atlas + sprite batch (ABI 0.18.0) ---
+// Retained subtrees rasterize straight into slots of ONE shared texture —
+// no per-row texture alloc/upload (the dominant Graphite scroll cost) — and
+// blit by sampling their rect; an open sprite batch merges them into one
+// drawVertices submission.
+
+/// Begin painting into a fresh atlas slot ≥ w×h. On success returns the
+/// slot rect via `out` (x,y,w,h); paint in local space, then atlasEnd.
+/// False when nested/full — caller falls back to the image path.
+pub fn atlasBegin(ctx: *kx.Ctx, w: i32, h: i32, out: *[4]f32) bool {
+    return kx.c.kx_atlas_begin(ctx, w, h, @ptrCast(out));
+}
+pub fn atlasEnd(ctx: *kx.Ctx) void {
+    kx.c.kx_atlas_end(ctx);
+}
+/// The shared atlas texture's registry id (0 until the first pass ends).
+pub fn atlasImage(ctx: *kx.Ctx) u64 {
+    return kx.c.kx_atlas_image(ctx);
+}
+/// Return a slot to its shelf when the retained row is evicted.
+pub fn atlasFree(ctx: *kx.Ctx, slot: [4]f32) void {
+    kx.c.kx_atlas_free(ctx, slot[0], slot[1], slot[2], slot[3]);
+}
+/// Blit a sub-rect of an image to a dst rect (atlas slots included).
+pub fn imageDrawRegion(ctx: *kx.Ctx, id: u64, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32) void {
+    kx.c.kx_draw_image_region(ctx, id, sx, sy, sw, sh, dx, dy, dw, dh);
+}
+/// Bracket a children pass: atlas blits inside accumulate into ONE
+/// drawVertices (GPU only — no-op on raster/while recording layers).
+pub fn spriteBatchBegin(ctx: *kx.Ctx) void {
+    kx.c.kx_sprite_batch_begin(ctx);
+}
+pub fn spriteBatchEnd(ctx: *kx.Ctx) void {
+    kx.c.kx_sprite_batch_end(ctx);
+}
+
 /// True when every pixel of the image is fully opaque (ABI 0.13.0) — a
 /// full-coverage opaque blit lets the caller skip the destination clear.
 pub fn imageIsOpaque(ctx: *kx.Ctx, id: u64) bool {

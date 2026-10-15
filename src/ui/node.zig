@@ -248,6 +248,11 @@ pub const Node = struct {
     // dirty mark in the subtree or a paintRect size change re-rasterizes.
     retained: bool = false,
     retained_image: u64 = 0,
+    /// Row-atlas mode (ABI 0.18.0): the subtree rasterized into a slot of
+    /// the shared atlas texture instead of its own image — no per-row
+    /// texture upload, and blits sprite-batch into one submission.
+    retained_atlas: bool = false,
+    retained_slot: [4]f32 = .{ 0, 0, 0, 0 },
     retained_ctx: ?*kx.Ctx = null,
     retained_w: i32 = 0, // image pixel size (= the snapped extent)
     retained_h: i32 = 0,
@@ -614,22 +619,34 @@ pub const Node = struct {
     /// e.g. nested inside another retained rasterization).
     fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool, auto: bool) bool {
         const pr = node.paintRect(); // parent space — the damage-contract rect
-        if (node.retained_ctx != ctx and node.retained_image != 0) {
-            node.clearRetained(); // image belongs to another ctx — drop it
+        if (node.retained_ctx != ctx and (node.retained_image != 0 or node.retained_atlas)) {
+            node.clearRetained(); // image/slot belongs to another ctx — drop it
         }
         // A clean subtree is rigid: the cached image re-blits at its
         // rasterized origin shifted by the node's move — but only on an
         // exact pixel boundary (a fractional blit would sample-shift the
         // cached content off the direct-paint pixels).
-        if (!subtree_dirty and node.retained_image != 0 and
+        if (!subtree_dirty and (node.retained_image != 0 or node.retained_atlas) and
             node.retained_pr.w == pr.w and node.retained_pr.h == pr.h)
         {
             const bx = node.retained_ix + (pr.x - node.retained_pr.x);
             const by = node.retained_iy + (pr.y - node.retained_pr.y);
             if (bx == @floor(bx) and by == @floor(by)) {
-                kx.c.kx_draw_image(ctx, node.retained_image, bx, by,
-                    @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
-                return true;
+                if (node.retained_atlas) {
+                    const img = paint_mod.atlasImage(ctx);
+                    if (img != 0) {
+                        paint_mod.imageDrawRegion(ctx, img,
+                            node.retained_slot[0], node.retained_slot[1],
+                            node.retained_slot[2], node.retained_slot[3],
+                            bx, by, @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
+                        return true;
+                    }
+                    node.retained_atlas = false; // atlas gone — re-rasterize below
+                } else {
+                    kx.c.kx_draw_image(ctx, node.retained_image, bx, by,
+                        @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
+                    return true;
+                }
             }
         }
         // (Re)rasterize. The image covers the subtree's PAINT EXTENT — the
@@ -655,7 +672,18 @@ pub const Node = struct {
         // Drop the stale image first so a failed pass can't resurrect a
         // stale blit on a later frame.
         node.clearRetained();
-        if (!kx.c.kx_offscreen_begin(ctx, iw, ih)) {
+        // Retained nodes (list rows etc.) rasterize into a slot of the
+        // shared row atlas on GPU backends: the subtree draws straight into
+        // the texture — no per-row texture alloc, no upload task, and the
+        // blit joins the open sprite batch (one mesh for the whole list).
+        // Size-bound like the auto extent cap: a huge retained node keeps
+        // the private-image path rather than starving the atlas.
+        const backend = kx.c.kx_backend_of(ctx);
+        const use_atlas = backend != kx.c.KX_BACKEND_RASTER and
+            iw * ih <= 512 * 1024 and
+            !autoRetainOffscreenExpensive(ctx) and
+            paint_mod.atlasBegin(ctx, iw, ih, &node.retained_slot);
+        if (!use_atlas and !kx.c.kx_offscreen_begin(ctx, iw, ih)) {
             return false; // nested offscreen pass — paint directly this frame
         }
         if (node.retained_bg) |bg| kx.c.kx_clear(ctx, bg);
@@ -664,16 +692,31 @@ pub const Node = struct {
         // against the mapped paint extent (the damage-contract bound).
         const mapped = node.mapRectToRoot(ext);
         node.paintContent(ctx, true, mapped, true);
-        node.retained_image = kx.c.kx_offscreen_end_image(ctx);
-        if (node.retained_image == 0) return false; // pass failed — direct paint
+        if (use_atlas) {
+            paint_mod.atlasEnd(ctx);
+            node.retained_atlas = true;
+            node.retained_image = 0;
+        } else {
+            node.retained_image = kx.c.kx_offscreen_end_image(ctx);
+            if (node.retained_image == 0) return false; // pass failed — direct paint
+        }
         node.retained_ctx = ctx;
         node.retained_w = iw;
         node.retained_h = ih;
         node.retained_ix = ix;
         node.retained_iy = iy;
         node.retained_pr = pr;
-        kx.c.kx_draw_image(ctx, node.retained_image, ix, iy,
-            @floatFromInt(iw), @floatFromInt(ih));
+        if (use_atlas) {
+            const img = paint_mod.atlasImage(ctx);
+            if (img == 0) { node.retained_atlas = false; return false; }
+            paint_mod.imageDrawRegion(ctx, img,
+                node.retained_slot[0], node.retained_slot[1],
+                node.retained_slot[2], node.retained_slot[3],
+                ix, iy, @floatFromInt(iw), @floatFromInt(ih));
+        } else {
+            kx.c.kx_draw_image(ctx, node.retained_image, ix, iy,
+                @floatFromInt(iw), @floatFromInt(ih));
+        }
         return true;
     }
 
@@ -703,6 +746,11 @@ pub const Node = struct {
         if (node.retained_image != 0) {
             if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
             node.retained_image = 0;
+        }
+        if (node.retained_atlas) {
+            if (node.retained_ctx) |ctx| paint_mod.atlasFree(ctx, node.retained_slot);
+            node.retained_atlas = false;
+            node.retained_slot = .{ 0, 0, 0, 0 };
         }
         node.retained_ctx = null;
         node.retained_w = 0;

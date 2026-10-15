@@ -124,6 +124,24 @@ struct kx_ctx {
     sk_sp<SkSurface> raster;     // raster backend
     kx::GpuState* gpu = nullptr; // GPU backends
     SkCanvas* canvas = nullptr;  // current frame
+    // Row atlas: ONE persistent surface every retained subtree rasterizes
+    // into — kills the per-row texture alloc+upload (the dominant scroll
+    // cost on Graphite) and lets N row blits batch into one drawVertices.
+    sk_sp<SkSurface> atlas;
+    int atlas_w = 0, atlas_h = 0;
+    uint32_t atlas_gen = 1;
+    struct AtlasShelf { int y, h, x_next; std::vector<int> free_x, free_w; };
+    std::vector<AtlasShelf> atlas_shelves;
+    int atlas_next_y = 0;
+    sk_sp<SkImage> atlas_view;    // makeTemporaryImage view (zero copy)
+    uint64_t atlas_image_id = 0;  // registry id for the view (0 = none)
+    SkCanvas* atlas_prev = nullptr; // canvas saved by kx_atlas_begin
+    // Sprite batch: atlas-region draws accumulate device-space quads here
+    // and flush as one textured mesh when the batch closes.
+    bool sprite_batch_open = false;
+    struct KxPendingSprite { SkPoint dst[4]; SkRect src; };
+    std::vector<KxPendingSprite> sprite_batch;
+    bool sprite_flushing = false;
     // Image registry (per-ctx; images are plain pixel data, shared by all draws).
     struct KxImg {
         sk_sp<SkImage> img;
@@ -132,6 +150,10 @@ struct kx_ctx {
         // which premul rasters never satisfy). Opaque blits take the Src
         // path (write-only, no dst read).
         bool opaque = false;
+        // Atlas alias: img is the shared atlas view and `src` selects the
+        // slot rect — blits of these batch into one drawVertices on GPU.
+        bool atlas = false;
+        SkRect src = SkRect::MakeEmpty();
     };
     std::unordered_map<uint64_t, KxImg> images;
     uint64_t next_image_id = 1;
@@ -203,6 +225,10 @@ struct kx_ctx {
     uint64_t frame_ops = 0;
     uint64_t last_frame_ops = 0;
 };
+
+// Forward — defined with the atlas block below; kx_count_op flushes pending
+// sprites before any real op so batch ordering stays exact.
+void kx_sprite_flush(kx_ctx* ctx);
 
 // Font manager is process-global: text metrics are needed at layout time,
 // before/without a kx_ctx. Initialized once (thread-confined afterwards).
@@ -822,6 +848,9 @@ bool kx_recording(const kx_ctx* ctx) {
 // One canvas-op emission. Only counted when NOT inside a recorded layer —
 // a recorded op counts later, when its replay issues the same entry.
 inline void kx_count_op(kx_ctx* ctx) {
+    // Ordering: any real op drains the pending sprite batch first — the
+    // batched blits must land before whatever draws next.
+    if (ctx->sprite_batch_open && !ctx->sprite_batch.empty()) kx_sprite_flush(ctx);
     if (!kx_recording(ctx)) ctx->frame_ops++;
 }
 
@@ -1083,7 +1112,12 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 // `flag` marks a folded op: `size` then carries the layer
                 // alpha and the draw replays with an alpha paint.
                 if (!op.flag) {
-                    kx_draw_image(ctx, op.image, op.f[0], op.f[1], op.f[2], op.f[3]);
+                    if (op.xs.size() == 4) // recorded region draw (atlas slot)
+                        kx_draw_image_region(ctx, op.image, op.xs[0], op.xs[1],
+                                             op.xs[2], op.xs[3], op.f[0], op.f[1],
+                                             op.f[2], op.f[3]);
+                    else
+                        kx_draw_image(ctx, op.image, op.f[0], op.f[1], op.f[2], op.f[3]);
                 } else {
                     auto it = ctx->images.find(op.image);
                     if (it != ctx->images.end()) {
@@ -1220,6 +1254,16 @@ kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
 
 void kx_destroy(kx_ctx* ctx) {
     if (!ctx) return;
+    // Drop GPU-bound resources while the recorder/context are still alive:
+    // surfaces (atlas, pool) and texture images release their proxies into
+    // the resource provider — after gpu_shutdown those pointers dangle.
+    ctx->sprite_batch.clear();
+    ctx->atlas.reset();
+    ctx->atlas_view.reset();
+    ctx->offscreen.reset();
+    ctx->offscreen_pool.reset();
+    ctx->images.clear();
+    ctx->owned_images.clear();
     if (ctx->gpu) kx::gpu_shutdown(ctx->gpu);
     delete ctx;
 }
@@ -1254,13 +1298,16 @@ void kx_begin_frame(kx_ctx* ctx) {
     // raster surfaces are persistent, so they keep the pool across frames
     // (releasing it per frame measured ~0.8ms of FBO/texture churn on the
     // GLES emulator — the dominant scroll_10k regression there).
-    const bool rec = ctx->backend == KX_BACKEND_GRAPHITE_METAL ||
-                     ctx->backend == KX_BACKEND_GRAPHITE_VULKAN ||
+    // Graphite recorders now persist across frames (snap() leaves them
+    // reusable) — surfaces made on them stay valid, so the pool keeps its
+    // texture like the raster/Ganesh paths instead of reallocating a
+    // RenderTarget every frame.
+    const bool rec = ctx->backend == KX_BACKEND_GRAPHITE_VULKAN ||
                      ctx->backend == KX_BACKEND_GRAPHITE_DAWN ||
                      ctx->backend == KX_BACKEND_GRAPHITE_WEBGPU;
     if (rec) {
-        ctx->offscreen_pool = nullptr; // stale after the previous frame's flush
-        ctx->offscreen_pool_w = 0;
+        ctx->offscreen_pool = nullptr; // stale: those platforms still reset
+        ctx->offscreen_pool_w = 0;     //        the recorder per frame
         ctx->offscreen_pool_h = 0;
     }
     // Unbalanced layer records from a previous frame die with it.
@@ -1426,7 +1473,22 @@ uint8_t kx_image_is_opaque(kx_ctx* ctx, uint64_t image) {
     return (it != ctx->images.end() && it->second.opaque) ? 1 : 0;
 }
 
+static bool kx_prof_on() {
+    static const bool on = std::getenv("KX_PROF") != nullptr;
+    return on;
+}
+static uint64_t kx_prof_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void kx_prof(const char* name, uint64_t t0) {
+    if (!kx_prof_on()) return;
+    std::fprintf(stderr, "  PROF %-16s %lldus\n", name,
+                 (long long)((kx_prof_ns() - t0) / 1000));
+}
+
 void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float h) {
+    const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || !ctx->canvas || !image || w <= 0 || h <= 0) return;
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::ImageDraw};
@@ -1499,12 +1561,14 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
             }
         }
         ctx->canvas->drawImage(img, x, y, SkSamplingOptions(), nullptr);
+        kx_prof("draw_image1", T0);
         return;
     }
     ctx->canvas->drawImageRect(img, SkRect::MakeIWH(img->width(), img->height()),
                                SkRect::MakeXYWH(x, y, w, h),
                                SkSamplingOptions(), nullptr,
                                SkCanvas::kFast_SrcRectConstraint);
+    kx_prof("draw_image", T0);
 }
 
 // Union of the device-space quad an RSXform maps a sw×sh src rect to.
@@ -1646,6 +1710,221 @@ void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
     ctx->canvas->experimental_DrawEdgeAAImageSet(
         entries.data(), (int)entries.size(), nullptr, nullptr,
         SkSamplingOptions(), nullptr, SkCanvas::kFast_SrcRectConstraint);
+}
+
+// --- Row atlas + sprite batch (0.18.0) -----------------------------------
+// One persistent surface hosts every retained row raster: no texture alloc
+// or upload task per row (the dominant scroll cost on Graphite — each fresh
+// row image uploaded ~100-250us at first blit). Blits of atlas slots
+// collect into the sprite batch and flush as a single textured mesh.
+
+uint32_t kx_atlas_gen(kx_ctx* ctx) { return ctx ? ctx->atlas_gen : 0; }
+
+// Shelf-allocate a w×h slot. Shelves are keyed by exact height (lists of
+// same-height rows pack perfectly); horizontal bump within the shelf.
+static bool kx_atlas_alloc(kx_ctx* ctx, int w, int h, int* sx, int* sy) {
+    for (auto& sh : ctx->atlas_shelves) {
+        if (h <= sh.h) {
+            for (size_t fi = 0; fi < sh.free_x.size(); ++fi) {
+                if (w <= sh.free_w[fi]) {
+                    *sx = sh.free_x[fi]; *sy = sh.y;
+                    sh.free_x.erase(sh.free_x.begin() + fi);
+                    sh.free_w.erase(sh.free_w.begin() + fi);
+                    return true;
+                }
+            }
+            if (sh.x_next + w <= ctx->atlas_w) {
+                *sx = sh.x_next; *sy = sh.y;
+                sh.x_next += w;
+                return true;
+            }
+        }
+    }
+    if (ctx->atlas_next_y + h > ctx->atlas_h) return false;
+    *sx = 0; *sy = ctx->atlas_next_y;
+    ctx->atlas_shelves.push_back({*sy, h, w, {}, {}});
+    ctx->atlas_next_y += h;
+    return true;
+}
+
+static void kx_atlas_recreate(kx_ctx* ctx, int w, int h) {
+    sk_sp<SkSurface> surf = ctx->gpu
+        ? kx::gpu_offscreen_surface(ctx->gpu, w, h)
+        : SkSurfaces::Raster(SkImageInfo::MakeN32Premul(w, h));
+    if (!surf) return;
+    if (ctx->atlas) {
+        // Carry the old content across — every slot stays valid.
+        sk_sp<SkImage> old = ctx->atlas->makeTemporaryImage();
+        if (old) surf->getCanvas()->drawImage(old, 0, 0);
+        ctx->atlas_shelves.clear();
+        ctx->atlas_next_y = ctx->atlas_h; // old content occupies the top
+        // Re-shelf the old footprint so new slots never overlap it — the
+        // old rows' slots were compacted away; simplest: treat the whole
+        // old region as one full-width shelf.
+        ctx->atlas_shelves.push_back({0, ctx->atlas_h, ctx->atlas_w, {}, {}});
+    }
+    ctx->atlas = std::move(surf);
+    ctx->atlas_w = w;
+    ctx->atlas_h = h;
+    ctx->atlas_view.reset();
+    ctx->atlas_image_id = 0;
+    ctx->atlas_gen++;
+}
+
+bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
+    const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
+    if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || ctx->atlas_prev ||
+        kx_recording(ctx)) return false;
+    // Nesting inside an offscreen pass is fine: the atlas is a SEPARATE
+    // surface — the flush below lands pending sprites on the strip canvas,
+    // the pass writes atlas, end restores the strip canvas.
+    kx_sprite_flush(ctx); // pending sprites belong to the MAIN canvas
+    // Writing to the atlas invalidates its image view (makeTemporaryImage
+    // is only valid until the next surface write) — re-alias lazily.
+    if (ctx->atlas_view) { ctx->atlas_view.reset(); ctx->atlas_image_id = 0; }
+    if (!ctx->atlas) {
+        // Start modest — ~2MB — and grow on demand: a wide-but-short atlas
+        // fits list rows; a tall screen-sized atlas would waste 8MB of RAM
+        // on apps that never retain anything.
+        const int w0 = std::max(512, std::max(w, ctx->width));
+        const int h0 = std::max(512, h * 2);
+        kx_atlas_recreate(ctx, w0, h0);
+        if (!ctx->atlas) return false;
+    }
+    int sx, sy;
+    if (!kx_atlas_alloc(ctx, w, h, &sx, &sy)) {
+        if (ctx->atlas_h >= 16384) return false; // cap — fall back
+        kx_atlas_recreate(ctx, ctx->atlas_w, ctx->atlas_h * 2);
+        if (!ctx->atlas || !kx_atlas_alloc(ctx, w, h, &sx, &sy)) return false;
+        kx_prof("atlas_grow", t0);
+    }
+    ctx->atlas_prev = ctx->canvas;
+    ctx->canvas = ctx->atlas->getCanvas();
+    // Same isolation as the offscreen pool (base-level mutations persist).
+    ctx->canvas->restoreToCount(1);
+    ctx->canvas->save();
+    ctx->canvas->clipRect(SkRect::MakeXYWH(sx, sy, w, h));
+    ctx->canvas->translate(sx, sy);
+    out_slot[0] = (float)sx; out_slot[1] = (float)sy;
+    out_slot[2] = (float)w; out_slot[3] = (float)h;
+    kx_prof("atlas_begin", t0);
+    return true;
+}
+
+void kx_atlas_end(kx_ctx* ctx) {
+    if (!ctx || !ctx->atlas_prev) return;
+    ctx->canvas->restore();
+    ctx->canvas = ctx->atlas_prev;
+    ctx->atlas_prev = nullptr;
+}
+
+void kx_atlas_free(kx_ctx* ctx, float sx, float sy, float sw, float sh) {
+    if (!ctx || !ctx->atlas) return;
+    for (auto& shelf : ctx->atlas_shelves) {
+        if ((int)sy == shelf.y && (int)sh <= shelf.h) {
+            shelf.free_x.push_back((int)sx);
+            shelf.free_w.push_back((int)sw);
+            return;
+        }
+    }
+}
+
+uint64_t kx_atlas_image(kx_ctx* ctx) {
+    if (!ctx || !ctx->atlas) return 0;
+    if (!ctx->atlas_view) {
+        // Zero-copy view of the atlas texture — valid while we own the
+        // surface; command ordering keeps reads/writes correct on GPU.
+        ctx->atlas_view = ctx->atlas->makeTemporaryImage();
+        if (!ctx->atlas_view) return 0;
+        const uint64_t id = ctx->next_image_id++;
+        ctx->images.emplace(id, kx_ctx::KxImg{ctx->atlas_view, false, true,
+                                              SkRect::MakeEmpty()});
+        ctx->atlas_image_id = id;
+    }
+    return ctx->atlas_image_id;
+}
+
+// Flush the pending sprite batch as ONE textured triangle mesh under the
+// identity matrix (dst points were recorded in device space). The clip is
+// unaffected by setMatrix — the batch's clip applies normally.
+void kx_sprite_flush(kx_ctx* ctx) {
+    const int n = (int)ctx->sprite_batch.size();
+    if (n == 0) return;
+    const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
+    std::vector<kx_ctx::KxPendingSprite> sprites;
+    sprites.swap(ctx->sprite_batch);
+    sk_sp<SkImage> atlas_img = ctx->atlas_view;
+    if (!atlas_img) return;
+    SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * n, 6 * n,
+                          SkVertices::kHasTexCoords_BuilderFlag);
+    SkPoint* pos = b.positions();
+    SkPoint* tc = b.texCoords();
+    uint16_t* idx = b.indices();
+    for (int i = 0; i < n; ++i) {
+        for (int c = 0; c < 4; ++c) pos[4 * i + c] = sprites[i].dst[c];
+        tc[4 * i + 0] = {sprites[i].src.fLeft, sprites[i].src.fTop};
+        tc[4 * i + 1] = {sprites[i].src.fRight, sprites[i].src.fTop};
+        tc[4 * i + 2] = {sprites[i].src.fRight, sprites[i].src.fBottom};
+        tc[4 * i + 3] = {sprites[i].src.fLeft, sprites[i].src.fBottom};
+        const uint16_t v = (uint16_t)(4 * i);
+        idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
+        idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
+    }
+    SkPaint paint;
+    paint.setShader(atlas_img->makeShader(SkSamplingOptions()));
+    ctx->canvas->save();
+    ctx->canvas->setMatrix(SkMatrix::I());
+    ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
+    ctx->canvas->restore();
+    ctx->frame_ops++;
+    kx_prof("sprite_mesh", t0);
+}
+
+void kx_sprite_batch_begin(kx_ctx* ctx) {
+    if (!ctx || !ctx->gpu || kx_recording(ctx)) return; // batch is a GPU win;
+                                                        // raster per-sprite wins
+    ctx->sprite_batch_open = true;
+}
+void kx_sprite_batch_end(kx_ctx* ctx) {
+    if (!ctx || !ctx->sprite_batch_open) return;
+    ctx->sprite_batch_open = false;
+    kx_sprite_flush(ctx);
+}
+
+void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
+                          float sx, float sy, float sw, float sh,
+                          float dx, float dy, float dw, float dh) {
+    if (!ctx || !ctx->canvas || !image || dw <= 0 || dh <= 0) return;
+    auto it = ctx->images.find(image);
+    if (it == ctx->images.end()) return;
+    if (kx_recording(ctx)) {
+        KxRecOp op{KxRecOp::K::ImageDraw};
+        op.f[0] = dx; op.f[1] = dy; op.f[2] = dw; op.f[3] = dh;
+        op.image = image;
+        op.xs = {sx, sy, sw, sh};
+        op.local_bounds = kx_xywh(dx, dy, dw, dh, 0.5f);
+        kx_rec_op(ctx, std::move(op));
+        return;
+    }
+    const SkRect src = SkRect::MakeXYWH(sx, sy, sw, sh);
+    // Batch: atlas blits under an open batch collect instead of drawing.
+    if (ctx->sprite_batch_open && it->second.atlas && ctx->gpu) {
+        kx_ctx::KxPendingSprite sp;
+        sp.src = src;
+        const SkPoint corners[4] = {{dx, dy}, {dx + dw, dy},
+                                    {dx + dw, dy + dh}, {dx, dy + dh}};
+        ctx->canvas->getTotalMatrix().mapPoints(
+            SkSpan<SkPoint>(sp.dst, 4), SkSpan<const SkPoint>(corners, 4));
+        ctx->sprite_batch.push_back(sp);
+        return;
+    }
+    if (ctx->gpu && !it->second.img->isTextureBacked())
+        it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+    kx_count_op(ctx);
+    ctx->canvas->drawImageRect(it->second.img.get(), src,
+                               SkRect::MakeXYWH(dx, dy, dw, dh),
+                               SkSamplingOptions(), nullptr,
+                               SkCanvas::kFast_SrcRectConstraint);
 }
 
 void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
@@ -1979,6 +2258,7 @@ void kx_restore(kx_ctx* ctx) {
         kx_layer_close(ctx);
         return;
     }
+    kx_sprite_flush(ctx); // restore pops clip/matrix — sprites drew under it
     ctx->canvas->restore();
 }
 
@@ -1994,6 +2274,7 @@ void kx_translate(kx_ctx* ctx, float dx, float dy) {
         L->ops.push_back(std::move(op));
         return;
     }
+    kx_sprite_flush(ctx); // pending sprites were mapped under the OLD matrix
     ctx->canvas->translate(dx, dy);
 }
 
@@ -2009,6 +2290,7 @@ void kx_scale(kx_ctx* ctx, float sx, float sy) {
         L->ops.push_back(std::move(op));
         return;
     }
+    kx_sprite_flush(ctx);
     ctx->canvas->scale(sx, sy);
 }
 
@@ -2024,11 +2306,13 @@ void kx_rotate(kx_ctx* ctx, float degrees) {
         L->ops.push_back(std::move(op));
         return;
     }
+    kx_sprite_flush(ctx);
     ctx->canvas->rotate(degrees);
 }
 
 void kx_layer_alpha(kx_ctx* ctx, float alpha) {
     if (!ctx || !ctx->canvas) return;
+    if (ctx->sprite_batch_open) kx_sprite_flush(ctx); // ordering: layer boundary
     float a = alpha;
     if (a < 0.0f) a = 0.0f;
     if (a > 1.0f) a = 1.0f;
@@ -2048,6 +2332,7 @@ void kx_layer_alpha(kx_ctx* ctx, float alpha) {
 
 void kx_layer_blur(kx_ctx* ctx, float sigma) {
     if (!ctx || !ctx->canvas) return;
+    if (ctx->sprite_batch_open) kx_sprite_flush(ctx); // ordering: layer boundary
     if (!(sigma > 0.0f)) { kx_layer_alpha(ctx, 1.0f); return; }
     if (ctx->offscreen_prev_canvas) {
         // Real saveLayer + blur paint on the offscreen raster (recording is
@@ -2260,6 +2545,7 @@ void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h) {
         L->ops.push_back(std::move(op));
         return;
     }
+    kx_sprite_flush(ctx); // pending sprites drew under the OLD clip
     ctx->canvas->save();
     ctx->canvas->clipRect(SkRect::MakeXYWH(x, y, w, h), SkClipOp::kIntersect, true);
 }
@@ -2278,6 +2564,7 @@ void kx_clip_path(kx_ctx* ctx, const float* xs, const float* ys, int count, int 
         return;
     }
     const SkPath& path = kx_cached_path(ctx, xs, ys, count, /*closed=*/true);
+    kx_sprite_flush(ctx);
     ctx->canvas->save();
     ctx->canvas->clipPath(path, SkClipOp::kIntersect, aa != 0);
 }
@@ -2291,7 +2578,9 @@ void kx_clip_reset(kx_ctx* ctx) {
 // ctx draw target onto a private raster surface; the image registry stores
 // the snapshot so kx_draw_image/kx_image_destroy work on the returned id.
 bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
+    const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || ctx->offscreen_prev_canvas) return false;
+    kx_sprite_flush(ctx); // pending sprites belong to the MAIN canvas
     // Pool the surface: a fresh RenderTarget per pass was the dominant
     // retained-raster cost on GPU (Metal measured ~0.2ms per list row
     // entering the scroll window — a surface alloc + teardown each). One
@@ -2338,15 +2627,19 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
         clear.setBlendMode(SkBlendMode::kSrc);
         ctx->canvas->drawRect(SkRect::MakeWH(w, h), clear);
     }
+    kx_prof("offscreen_begin", T0);
     return true;
 }
 
 uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
+    const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || !ctx->offscreen_prev_canvas) return 0;
     ctx->canvas->restore(); // balance the begin's save — unwinds the pass's
                             // matrix/clip mutations before the pool reuses
     // Snapshot the requested corner only — the pooled surface may be larger.
-    sk_sp<SkImage> img = ctx->offscreen->makeImageSnapshot(
+    sk_sp<SkImage> img = std::getenv("KX_TEMP_IMG")
+        ? ctx->offscreen->makeTemporaryImage()
+        : ctx->offscreen->makeImageSnapshot(
             SkIRect::MakeWH(ctx->offscreen_w, ctx->offscreen_h));
     ctx->canvas = ctx->offscreen_prev_canvas;
     ctx->offscreen_prev_canvas = nullptr;
@@ -2357,6 +2650,7 @@ uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
     const bool opaque = kx_image_content_opaque(img.get());
     const uint64_t id = ctx->next_image_id++;
     ctx->images.emplace(id, kx_ctx::KxImg{std::move(img), opaque});
+    kx_prof("offscreen_end", T0);
     return id;
 }
 

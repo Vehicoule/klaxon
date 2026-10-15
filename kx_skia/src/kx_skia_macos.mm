@@ -95,8 +95,15 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
     if (!state || !state->context || !state->layer) return nullptr;
     state->drawable = [state->layer nextDrawable];
     if (!state->drawable) return nullptr;
-    state->recorder = state->context->makeRecorder();
-    if (!state->recorder) return nullptr;
+    // One recorder for the ctx lifetime: Recorder::snap() leaves it
+    // reusable (it drains the task list and resets the buffer managers).
+    // Resetting it per frame killed every RenderTarget surface created on
+    // it — the offscreen pool had to be dropped each frame and the row
+    // atlas could not persist at all.
+    if (!state->recorder) {
+        state->recorder = state->context->makeRecorder();
+        if (!state->recorder) return nullptr;
+    }
     const skgpu::graphite::BackendTexture backend_tex = skgpu::graphite::BackendTextures::MakeMetal(
         SkISize::Make(state->width, state->height),
         (__bridge CFTypeRef)state->drawable.texture);
@@ -116,7 +123,9 @@ void gpu_end_frame(GpuState* state) {
             info.fTargetSurface = state->frame_surface.get();
             state->context->insertRecording(info);
         }
-        state->recorder.reset();
+        // Keep the recorder: surfaces created on it (offscreen pool, row
+        // atlas) stay alive across frames — snap() already reset the
+        // per-recording state.
     }
     state->context->submit();
     if (state->drawable) {

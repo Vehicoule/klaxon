@@ -278,6 +278,32 @@ typedef struct {
     float dx, dy, dw, dh; // destination rect in device space
 } kx_image_quad;
 void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count);
+// Row atlas (added in 0.18.0): a persistent grow-only surface shared by all
+// retained subtrees — a row rasterizes STRAIGHT into its slot (no texture
+// alloc, no upload task per row — the dominant scroll cost on Graphite)
+// and re-blits by sampling its rect of the one atlas texture. Slots are
+// shelves; gen bumps whenever the atlas regrows and every slot resets.
+uint32_t kx_atlas_gen(kx_ctx* ctx);
+// Begin a paint pass into a fresh slot of at least w×h; on success the ctx
+// canvas targets the atlas region and *out_slot receives {x,y,w,h} — paint
+// in LOCAL space as usual, then kx_atlas_end returns the atlas image id to
+// blit with kx_draw_image_region. Returns false when nested/full.
+bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot);
+void kx_atlas_end(kx_ctx* ctx);
+uint64_t kx_atlas_image(kx_ctx* ctx); // 0 until the first pass ends
+// Return a slot's pixels to its shelf (evicted retained rows); pass the
+// exact {x,y,w,h} the begin call returned.
+void kx_atlas_free(kx_ctx* ctx, float sx, float sy, float sw, float sh);
+// Blit an image sub-rect to a dst rect (atlas slots and plain images alike).
+void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
+                          float sx, float sy, float sw, float sh,
+                          float dx, float dy, float dw, float dh);
+// Sprite batch (added in 0.18.0): while open, draws of ATLAS-region images
+// accumulate as device-space sprites and flush as ONE drawVertices when the
+// batch closes or any other op intervenes (ordering preserved). Lists wrap
+// their children pass in it: N retained-row blits become a single draw.
+void kx_sprite_batch_begin(kx_ctx* ctx);
+void kx_sprite_batch_end(kx_ctx* ctx);
 // Zero-copy draw (added in 0.12.0): draw raw RGBA pixels stretched into the
 // rect WITHOUT the registry round-trip — the pixel buffer is borrowed for
 // the synchronous raster draw (no memcpy, no image object). The video

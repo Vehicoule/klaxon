@@ -123,8 +123,25 @@ fn listPaint(n: *Node, ctx: *kx.Ctx) void {
 /// compositor translating a layer. Returns false → the normal per-child
 /// pass runs (first paint, a slid virtualization window, a stale backing,
 /// or a nested offscreen pass where none is available).
+// KLAXON_BENCH_PHASES: split the scroll-copy frame into offscreen
+// begin/strip/snapshot/screen-blit so the residual cost is attributable.
+const sdl_probe = @import("../sdl.zig");
+var g_t0: u64 = 0;
+inline fn probe(comptime name: []const u8) void {
+    const t = sdl_probe.c.SDL_GetTicksNS();
+    if (g_t0 != 0) std.debug.print("  sc {s}: {d}us\n", .{ name, (t - g_t0) / 1000 });
+    g_t0 = t;
+}
+
 fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
+    probe("enter");
     const s = stateOf(ListState, n);
+    // GPU + row atlas: every retained row is a slot blit that joins the
+    // sprite batch (ONE mesh for the viewport) — cheaper than the
+    // backing-store path's offscreen pass + two viewport-sized blits.
+    // Raster/GLES keep scroll-copy (their per-op cost is low, uploads are
+    // not).
+    if (std.c.getenv("KLAXON_NO_SCROLLCOPY") != null) return false;
     const b = n.bounds;
     const ix = @floor(b.x);
     const iy = @floor(b.y);
@@ -173,15 +190,19 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
                 break;
             }
         }
-        // No backing AND churning rows: building one costs an offscreen pass
-        // the copy path can never amortize — stay direct.
+        // No backing AND churning rows: building one costs an offscreen
+        // pass + a forced mid-frame submit of it on Graphite (sampling the
+        // freshly-written texture resolves the task ordering — measured
+        // ~0.4ms, MORE than the direct row blits it replaces).
         if (any_dirty) return false;
     }
     if (!ui.paint.offscreenBegin(ctx, iw, ih)) {
         dropBacking(s);
         return false;
     }
+    probe("begin");
     if (have) ui.paint.imageDraw(ctx, s.backing, 0, -dy, w, h);
+    probe("backing-blit");
     if (repaint.w > 0 and repaint.h > 0) {
         ui.paint.clipRect(ctx, repaint.x, repaint.y, repaint.w, repaint.h);
         // Image space → content space: a child's own bounds place it at
@@ -192,13 +213,17 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         const band_screen = ui.node.rectIntersect(child_region, .{
             .x = ix, .y = iy + repaint.y, .w = repaint.w, .h = repaint.h,
         });
+        ui.paint.spriteBatchBegin(ctx); // row atlas blits → one mesh
         for (n.children.items) |c| {
             if (c.defer_paint or c.zombie) continue;
             c.paint(ctx, band_screen);
         }
+        ui.paint.spriteBatchEnd(ctx); // flush BEFORE clipReset reorders it
         ui.paint.clipReset(ctx);
     }
+    probe("strip");
     const img = ui.paint.offscreenEndImage(ctx);
+    probe("snapshot");
     dropBacking(s);
     if (img != 0) {
         s.backing = img;
@@ -207,7 +232,9 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         s.backing_w = iw;
         s.backing_h = ih;
         ui.paint.imageDraw(ctx, img, ix, iy, w, h);
+        probe("screen-blit");
     }
+    g_t0 = 0;
     return true;
 }
 
@@ -217,9 +244,13 @@ fn listPreChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
     ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
     ui.paint.translate(ctx, 0, -s.scroll.offset);
+    // Row atlas blits accumulate into ONE textured mesh (GPU only) — must
+    // end before clipReset so the flush draws under the viewport clip.
+    ui.paint.spriteBatchBegin(ctx);
 }
 fn listPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = n;
+    ui.paint.spriteBatchEnd(ctx);
     ui.paint.clipReset(ctx);
 }
 fn listMapPaintRect(n: *Node, rect: Rect) Rect {
