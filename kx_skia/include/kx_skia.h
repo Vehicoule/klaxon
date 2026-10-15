@@ -284,6 +284,17 @@ void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count);
 // and re-blits by sampling its rect of the one atlas texture. Slots are
 // shelves; gen bumps whenever the atlas regrows and every slot resets.
 uint32_t kx_atlas_gen(kx_ctx* ctx);
+/* Nonzero while a nested render pass owns the ctx canvas (atlas slot or
+   offscreen) — image blits must not run there (self-sampling + wrong
+   sprite target); callers paint directly instead. */
+int kx_in_nested_pass(const kx_ctx* ctx);
+/* Process-unique ctx instance id (monotonic, never reused — a freed ctx's
+   address can be reallocated, so cross-ctx caches must key on this, not on
+   the pointer). kx_ctx_serial_alive reports whether the owning ctx is still
+   alive, so cache entries for a dead ctx are dropped rather than freed
+   into it (the ctx's teardown already released its resources). */
+uint64_t kx_ctx_serial(const kx_ctx* ctx);
+int kx_ctx_serial_alive(uint64_t serial);
 // Begin a paint pass into a fresh slot of at least w×h; on success the ctx
 // canvas targets the atlas region and *out_slot receives {x,y,w,h} — paint
 // in LOCAL space as usual, then kx_atlas_end returns the atlas image id to

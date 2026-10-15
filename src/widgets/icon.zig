@@ -122,9 +122,146 @@ fn pline(ctx: *kx.Ctx, ox: f32, oy: f32, k: f32, comptime pts: []const [2]f32, w
     ui.paint.strokePolyline(ctx, &xs, &ys, w * k, true, color);
 }
 
+// --- icon tile cache ---
+// The built-in icons are the same 24dp geometry recolored — every painted
+// frame used to re-tessellate the same paths (stroke tessellation ~25µs/op
+// on Graphite, e.g. ~180µs/frame for a text_field with two icons). The
+// glyph-cache idiom: rasterize each (icon, px size, fractional phase,
+// color) once into a snapped tile — a slot of the row atlas on GPU (blits
+// join the open sprite mesh) or a private image elsewhere — then blit.
+// Padding keeps stroke overhang inside the tile; the snapped tile origin +
+// fractional key make the blit pixel-identical to a direct paint.
+const icon_cache_pad = 1;
+const IconKey = struct {
+    name: IconName,
+    tw: i32,
+    th: i32,
+    fx: u16, // fractional origin ×256 inside the tile
+    fy: u16,
+    color: Color,
+};
+const IconEntry = struct {
+    key: IconKey,
+    ctx: ?*kx.Ctx = null, // owner — used to free resources, never for lookup
+    serial: u64 = 0, // ctx instance id — a recycled address can't collide
+    image: u64 = 0, // private image (raster / atlas fallback)
+    slot: [4]f32 = .{ 0, 0, 0, 0 },
+    atlas: bool = false,
+    atlas_gen: u32 = 0,
+};
+var icon_cache: [128]IconEntry = undefined;
+var icon_cache_len: usize = 0;
+var icon_cache_next: usize = 0; // FIFO evict
+
+fn iconCacheEvict(e: *IconEntry) void {
+    // Free only into a LIVE ctx — a destroyed ctx already released its
+    // images/atlas; freeing into a recycled address would be a UAF.
+    const ctx = e.ctx;
+    if (ctx != null and e.serial != 0 and ui.paint.ctxSerialAlive(e.serial)) {
+        if (e.atlas) {
+            if (e.atlas_gen == ui.paint.atlasGen(ctx.?)) ui.paint.atlasFree(ctx.?, e.slot);
+        } else if (e.image != 0) {
+            ui.paint.imageDestroy(ctx.?, e.image);
+        }
+    }
+    e.* = .{ .key = undefined };
+}
+
+/// Blit the cached tile at its snapped integer origin.
+fn iconBlit(e: *const IconEntry, ctx: *kx.Ctx, tx: f32, ty: f32) void {
+    if (e.atlas) {
+        const img = ui.paint.atlasImage(ctx);
+        if (img != 0) {
+            ui.paint.imageDrawRegion(ctx, img, e.slot[0], e.slot[1], e.slot[2], e.slot[3],
+                tx, ty, e.slot[2], e.slot[3]);
+            return;
+        }
+    }
+    if (e.image != 0)
+        ui.paint.imageDraw(ctx, e.image, tx, ty, @floatFromInt(e.key.tw), @floatFromInt(e.key.th));
+}
+
 /// Draw a built-in icon into a `24*k` box at (ox,oy). Shared by the icon
 /// widget and widgets that paint icons inline (navigation rail, FAB, etc.).
+var icon_cache_off: ?bool = null; // env latch — KX_NO_ICON_CACHE disables
+
 pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
+    const size = 24 * k;
+    if (size <= 0) return;
+    // Inside a nested pass (a retained row's own rasterize, a scroll-copy
+    // strip) image blits are unsafe — the icon paints as geometry and
+    // becomes part of the pass's output instead.
+    if (icon_cache_off == null) icon_cache_off = std.c.getenv("KX_NO_ICON_CACHE") != null;
+    if (icon_cache_off.? or ui.paint.inNestedPass(ctx)) {
+        drawIconGeometry(ctx, name, ox, oy, k, color);
+        return;
+    }
+    // Snapped tile covering the ink + 1px stroke overhang — the fractional
+    // phase is part of the key so the blit lands bit-identically.
+    const tx = @floor(ox) - icon_cache_pad;
+    const ty = @floor(oy) - icon_cache_pad;
+    const tw: i32 = @intFromFloat(@ceil(ox + size) - tx);
+    const th: i32 = @intFromFloat(@ceil(oy + size) - ty);
+    const key: IconKey = .{
+        .name = name,
+        .tw = tw,
+        .th = th,
+        .fx = @intFromFloat(@round((ox - tx) * 256)),
+        .fy = @intFromFloat(@round((oy - ty) * 256)),
+        .color = color,
+    };
+    const gen = ui.paint.atlasGen(ctx);
+    const serial = ui.paint.ctxSerial(ctx);
+    for (icon_cache[0..icon_cache_len]) |*e| {
+        if (e.serial == serial and std.meta.eql(e.key, key) and
+            (!e.atlas or e.atlas_gen == gen))
+        {
+            iconBlit(e, ctx, tx, ty);
+            return;
+        }
+    }
+    // Miss — rasterize into the cache. GPU atlas tiles join the sprite
+    // batch; raster/offscreen keep a private image (same pixels either way).
+    const b = kx.c.kx_backend_of(ctx);
+    const atlas_ok = b != kx.c.KX_BACKEND_RASTER and
+        b != kx.c.KX_BACKEND_GANESH_GLES and b != kx.c.KX_BACKEND_GANESH_WEBGL2;
+    var e: IconEntry = .{ .key = key, .ctx = ctx, .serial = serial };
+    var ok = false;
+    if (atlas_ok and ui.paint.atlasBegin(ctx, tw, th, &e.slot)) {
+        // atlas_begin already translated to the slot origin — shift the
+        // icon's absolute coords into the tile like the offscreen path.
+        ui.paint.translate(ctx, -tx, -ty);
+        drawIconGeometry(ctx, name, ox, oy, k, color);
+        ui.paint.atlasEnd(ctx);
+        e.atlas = true;
+        e.atlas_gen = gen;
+        ok = true;
+    } else if (ui.paint.offscreenBegin(ctx, tw, th)) {
+        ui.paint.translate(ctx, -tx, -ty);
+        drawIconGeometry(ctx, name, ox, oy, k, color);
+        e.image = ui.paint.offscreenEndImage(ctx);
+        ok = e.image != 0;
+    }
+    if (!ok) { // nested offscreen pass — paint directly, cache nothing
+        drawIconGeometry(ctx, name, ox, oy, k, color);
+        return;
+    }
+    var slot_idx: usize = undefined;
+    if (icon_cache_len < icon_cache.len) {
+        slot_idx = icon_cache_len;
+        icon_cache[icon_cache_len] = e;
+        icon_cache_len += 1;
+    } else {
+        iconCacheEvict(&icon_cache[icon_cache_next]);
+        icon_cache[icon_cache_next] = e;
+        slot_idx = icon_cache_next;
+        icon_cache_next = (icon_cache_next + 1) % icon_cache.len;
+    }
+    iconBlit(&icon_cache[slot_idx], ctx, tx, ty);
+}
+
+/// The icon's vector geometry — the pre-cache paint body.
+fn drawIconGeometry(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
     const X = struct {
         fn f(ox_: f32, k_: f32, v: f32) f32 {
             return ox_ + v * k_;

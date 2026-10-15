@@ -48,6 +48,7 @@
 #include "modules/skunicode/include/SkUnicode_icu.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -65,6 +67,10 @@
 #endif
 
 struct KxRecLayer;
+
+static bool kx_prof_on();
+static uint64_t kx_prof_ns();
+static void kx_prof(const char* name, uint64_t t0);
 
 // One op recorded inside an alpha layer (0.12.0). The flat union keeps every
 // argument needed to replay the draw later; only the variants in use carry
@@ -124,6 +130,10 @@ struct kx_ctx {
     sk_sp<SkSurface> raster;     // raster backend
     kx::GpuState* gpu = nullptr; // GPU backends
     SkCanvas* canvas = nullptr;  // current frame
+    // Process-unique instance id: a destroyed ctx's address is recycled by
+    // the allocator, so consumers keying caches on the ctx pointer collide
+    // with a later ctx at the same address. Serials never repeat.
+    uint64_t serial = 0;
     // Row atlas: ONE persistent surface every retained subtree rasterizes
     // into — kills the per-row texture alloc+upload (the dominant scroll
     // cost on Graphite) and lets N row blits batch into one drawVertices.
@@ -582,12 +592,53 @@ uint64_t kx_text_cache_tick = 0;
 // (Honest bound: blob draw == paragraph paint for single-run text; the
 // goldens + KX_TEXT_VERIFY self-check cover equivalence.)
 
-// Printable ASCII, single line — the fast-path domain.
+// Single-line LTR text — the fast-path domain. Controls and RTL-script
+// codepoints bail to the paragraph (bidi needs its reorder pipeline);
+// everything else — CJK, emoji, combining marks, any LTR script — shapes
+// through the real iterators below (FontMgr fallback + per-run script
+// detection), so multi-run strings still get correct faces and features.
 static bool kx_text_simple(const char* text, size_t len) {
-    if (len == 0 || len > 512) return false;
-    for (size_t i = 0; i < len; ++i) {
-        const uint8_t c = static_cast<uint8_t>(text[i]);
-        if (c < 0x20 || c > 0x7E) return false;
+    // 8KB caps the per-miss shaping work (a text field's buffer grows as
+    // you type — 1500 chars ≈ 4.5KB is a normal edit session's size).
+    if (len == 0 || len > 8192) return false;
+    const char* p = text;
+    const char* const end = text + len;
+    while (p < end) {
+        const SkUnichar u = SkUTF::NextUTF8(&p, end);
+        if (u < 0) return false;                 // malformed UTF-8
+        if (u < 0x20 || u == 0x7F) return false; // controls incl. \n \t
+        // Bidi controls / embeddings force the real bidi pipeline.
+        if (u == 0x200E || u == 0x200F ||
+            (u >= 0x202A && u <= 0x202E) || (u >= 0x2066 && u <= 0x2069))
+            return false;
+        // RTL-script blocks — bidi reordering is the paragraph's job.
+        if ((u >= 0x0590 && u <= 0x08FF) ||   // Hebrew, Arabic, Syriac,
+                                              // Thaana, NKo, Samaritan,
+                                              // Mandaic, Arabic Extended
+            (u >= 0xFB1D && u <= 0xFB4F) ||   // Hebrew presentation forms
+            (u >= 0xFB50 && u <= 0xFDFF) ||   // Arabic presentation A
+            (u >= 0xFE70 && u <= 0xFEFF) ||   // Arabic presentation B
+            (u >= 0x10800 && u <= 0x10FFF) || // Imperial Aramaic … Elymaic
+            (u >= 0x1E800 && u <= 0x1E9FF))   // Mende Kikakui, Adlam …
+            return false;
+        // Emoji-sequence starters take a DIFFERENT fallback in the
+        // paragraph (defaultEmojiFallback prefers the color-emoji face)
+        // than the fontmgr's plain matchFamilyStyleCharacter. The faces
+        // only diverge when a NON-emoji font also covers the codepoint —
+        // i.e. the BMP symbol/dingbat zone (▶ lived there: a text face at
+        // 21px vs the emoji face at 24px). SMP emoji (≥0x1F000) are only
+        // covered by the color-emoji face, so both paths resolve the same
+        // typeface. Reject the ambiguous BMP emoji zone; keep the rest.
+        SkUnicode* uni = kx_unicode().get();
+        if (!uni) return false; // no classifier → can't screen, stay safe
+        if (u < 0x10000 && uni->isEmoji(u) && !uni->isEmojiComponent(u))
+            return false;                     // BMP emoji start (ambiguous)
+        if (uni->isRegionalIndicator(u)) return false; // flag pairs
+        if (u == 0x200D ||                    // ZWJ — sequence glue
+            (u >= 0xFE00 && u <= 0xFE0F) ||   // variation selectors
+            (u >= 0xE0100 && u <= 0xE01EF) || // supplementary VS
+            u == 0x20E3)                      // keycap mark
+            return false;
     }
     return true;
 }
@@ -644,27 +695,35 @@ static std::unique_ptr<SkShaper>& kx_simple_shaper() {
 static bool kx_shape_simple(const char* text, size_t len, float size, bool bold,
                             KxTextSlot& slot) {
     if (!kx_simple_shaper()) return false;
-    SkFont font = kx_make_font(text, size, bold);
+    // The PRIMARY face only — kx_make_font's single-fallback swap would pin
+    // a face the FontCollection doesn't order first (its fallback walks the
+    // full matchFamilyStyleCharacter chain). Uncovered runs instead go
+    // through FontMgrRunIterator, whose per-run resolution IS the same call
+    // the paragraph's collection makes — identical faces, identical ink.
+    SkFont font;
+    if (kx_fonts()) {
+        font.setTypeface(kx_resolve_typeface(kx::platform_font_family(), bold));
+    }
+    font.setSize(size);
     if (!font.getTypeface()) return false;
     // Match the paragraph pipeline's metrics space: linear advances +
     // subpixel positions (defaults quantize to whole pixels — 'ui'@10
     // measured 8.00 vs 7.78 and broke parity).
     font.setSubpixel(true);
     font.setLinearMetrics(true);
-    // Coverage: every char must map to a real glyph in this typeface —
-    // otherwise the paragraph path's per-cluster fallback is required.
-    std::vector<SkGlyphID> glyphs(len);
-    font.textToGlyphs(text, len, SkTextEncoding::kUTF8, SkSpan<SkGlyphID>(glyphs));
-    for (size_t i = 0; i < len; ++i) {
-        if (glyphs[i] == 0) return false;
-    }
-    SkShaper::TrivialFontRunIterator fonts(font, len);
-    SkShaper::TrivialBiDiRunIterator bidi(0, len);
-    const SkFourByteTag latn = SkSetFourByteTag('L', 'a', 't', 'n');
-    SkShaper::TrivialScriptRunIterator script(latn, len);
+    // FontMgrRunIterator covers the primary face first and falls back
+    // per-run through matchFamilyStyleCharacter — the SAME call the
+    // paragraph's FontCollection makes for non-emoji codepoints (emoji
+    // starters are screened upstream). No separate coverage scan: the
+    // iterator already walks each codepoint for run boundaries.
+    auto fonts = SkShaper::MakeFontMgrRunIterator(text, len, font, kx_fonts());
+    if (!fonts) return false;
+    SkShaper::TrivialBiDiRunIterator bidi(0, len); // RTL is screened out
+    auto script = SkShapers::HB::ScriptRunIterator(text, len);
+    if (!script) return false;
     SkShaper::TrivialLanguageRunIterator lang("en", len);
     KxSimpleShapeHandler handler;
-    kx_simple_shaper()->shape(text, len, fonts, bidi, script, lang,
+    kx_simple_shaper()->shape(text, len, *fonts, bidi, *script, lang,
                               nullptr, 0, 1e9f, &handler);
     slot.blob = handler.blob();
     if (!slot.blob) return false;
@@ -795,6 +854,7 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
         }
     }
     if (!built) {
+        const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
         s.paragraph = kx_build_paragraph(text, len, size,
                                          bold ? SkFontStyle::kBold_Weight
                                               : SkFontStyle::kNormal_Weight,
@@ -806,6 +866,7 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
             s.metrics.height = s.paragraph->getHeight();
             s.metrics.descent = s.metrics.height - s.metrics.ascent;
         }
+        kx_prof("para_build", T0);
     }
     s.state = KxTextSlotState::kOccupied;
     ++kx_text_cache_used;
@@ -1222,6 +1283,12 @@ static bool kx_make_raster(kx_ctx* ctx, int width, int height) {
     return ctx->raster != nullptr;
 }
 
+// Live ctx serials — process-unique ids so caches keyed on a ctx cannot
+// confuse a destroyed ctx with a later one reusing its address.
+static std::atomic<uint64_t> g_ctx_serial_next{1};
+static std::mutex g_ctx_serial_mu;
+static std::vector<uint64_t> g_ctx_serials;
+
 kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
     if (width <= 0 || height <= 0) return nullptr;
 
@@ -1254,7 +1321,12 @@ kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
         } else {
             ok = kx::gpu_init(&ctx->gpu, sdl_window, width, height, attempt);
         }
-        if (ok) return ctx;
+        if (ok) {
+            ctx->serial = g_ctx_serial_next.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(g_ctx_serial_mu);
+            g_ctx_serials.push_back(ctx->serial);
+            return ctx;
+        }
         delete ctx;
     }
     return nullptr;
@@ -1262,6 +1334,12 @@ kx_ctx* kx_create(void* sdl_window, int width, int height, kx_backend backend) {
 
 void kx_destroy(kx_ctx* ctx) {
     if (!ctx) return;
+    {
+        std::lock_guard<std::mutex> lock(g_ctx_serial_mu);
+        auto& v = g_ctx_serials;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (v[i] == ctx->serial) { v[i] = v.back(); v.pop_back(); break; }
+    }
     // Drop GPU-bound resources while the recorder/context are still alive:
     // surfaces (atlas, pool) and texture images release their proxies into
     // the resource provider — after gpu_shutdown those pointers dangle.
@@ -1733,6 +1811,15 @@ void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
 // collect into the sprite batch and flush as a single textured mesh.
 
 uint32_t kx_atlas_gen(kx_ctx* ctx) { return ctx ? ctx->atlas_gen : 0; }
+int kx_in_nested_pass(const kx_ctx* ctx) {
+    return ctx && (ctx->atlas_prev != nullptr || ctx->offscreen_prev_canvas != nullptr);
+}
+uint64_t kx_ctx_serial(const kx_ctx* ctx) { return ctx ? ctx->serial : 0; }
+int kx_ctx_serial_alive(uint64_t serial) {
+    std::lock_guard<std::mutex> lock(g_ctx_serial_mu);
+    for (uint64_t s : g_ctx_serials) if (s == serial) return 1;
+    return 0;
+}
 
 // Shelf-allocate a w×h slot. Shelves are keyed by exact height (lists of
 // same-height rows pack perfectly); horizontal bump within the shelf.
@@ -1942,9 +2029,12 @@ void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
         return;
     }
     const SkRect src = SkRect::MakeXYWH(sx, sy, sw, sh);
-    // Batch: atlas blits under an open batch collect instead of drawing.
+    // Batch: atlas blits under an open batch collect instead of drawing —
+    // only while on the batch's OWN canvas: inside a nested pass (atlas
+    // slot, offscreen strip) dst would map in the wrong surface space.
     static const bool no_batch = std::getenv("KX_NO_SPRITE_BATCH") != nullptr;
-    if (ctx->sprite_batch_open && it->second.atlas && ctx->gpu && !no_batch) {
+    if (ctx->sprite_batch_open && it->second.atlas && ctx->gpu && !no_batch &&
+        ctx->canvas == ctx->sprite_target) {
         kx_ctx::KxPendingSprite sp;
         sp.src = src;
         const SkPoint corners[4] = {{dx, dy}, {dx + dw, dy},

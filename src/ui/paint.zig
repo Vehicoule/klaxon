@@ -300,6 +300,26 @@ pub fn atlasImage(ctx: *kx.Ctx) u64 {
 pub fn atlasFree(ctx: *kx.Ctx, slot: [4]f32) void {
     kx.c.kx_atlas_free(ctx, slot[0], slot[1], slot[2], slot[3]);
 }
+/// Atlas generation — bumps on every recreate, so a cached slot is stale
+/// when the current gen differs (the texture it was written into is gone).
+pub fn atlasGen(ctx: *kx.Ctx) u32 {
+    return kx.c.kx_atlas_gen(ctx);
+}
+/// True while a nested pass owns the canvas (atlas slot / offscreen) —
+/// image blits must not run there (self-sampling + wrong sprite target).
+pub fn inNestedPass(ctx: *kx.Ctx) bool {
+    return kx.c.kx_in_nested_pass(ctx) != 0;
+}
+/// Process-unique ctx id — a freed ctx's address is recycled, so caches
+/// must key on the serial, never the pointer.
+pub fn ctxSerial(ctx: *kx.Ctx) u64 {
+    return kx.c.kx_ctx_serial(ctx);
+}
+/// True while the ctx owning `serial` is still alive — entries for a dead
+/// ctx are dropped (its teardown freed their resources), never freed twice.
+pub fn ctxSerialAlive(serial: u64) bool {
+    return kx.c.kx_ctx_serial_alive(serial) != 0;
+}
 /// Blit a sub-rect of an image to a dst rect (atlas slots included).
 pub fn imageDrawRegion(ctx: *kx.Ctx, id: u64, sx: f32, sy: f32, sw: f32, sh: f32, dx: f32, dy: f32, dw: f32, dh: f32) void {
     kx.c.kx_draw_image_region(ctx, id, sx, sy, sw, sh, dx, dy, dw, dh);
