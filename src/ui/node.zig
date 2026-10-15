@@ -374,6 +374,10 @@ pub const Node = struct {
     fn markDirtyUp(node: *Node) void {
         var n = node;
         while (true) {
+            // No early-out on n.dirty: paint/layout clear the flag per
+            // visited node, so a pruned subtree can keep dirty descendants
+            // under clean ancestors — the walk must re-mark the whole
+            // chain or a retained ancestor would blit its stale image.
             n.dirty = true;
             const p = n.parent orelse return;
             n = p;
@@ -453,6 +457,9 @@ pub const Node = struct {
     }
 
     pub fn markLayoutDirty(node: *Node) void {
+        // No early-out either — same reason as markDirtyUp: a dirty
+        // descendant under a clean ancestor must re-mark the chain or the
+        // scoped-layout prune would strand the pending relayout.
         node.layout_dirty = true;
         if (node.parent) |p| p.markLayoutDirty();
     }
