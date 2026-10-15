@@ -2,7 +2,7 @@
 
 > Updated at the end of every session. Photo of where we are right now.
 
-**Last updated**: 2026-10-12 (MERGE CASCADE — 12 PRs integrated green on the 7-job matrix: backend contract #81, AT-SPI2 #93, UIA #92, Graphite-WebGPU wasm #98, conformance suite #96, packaging linux/matrix/msi #87/#89/#86, text cache #88, web-app selector #85, android font #95, docs #84; Windows CI now green end-to-end incl. UIA; deps republished deps-899ee32c549c with dawn headers; graphite-vulkan #112 merged green — see "Merge cascade + CI stabilization" below; earlier: Phase 4e.1 PERF HOT-SPOTS — GPU warmup, TTFF timing, size-report; Phase 3 iOS five-backend matrix + Android ~150 fps; Phase 4c benchmarks + report.html; 723 unit + 144 golden tests green; 80 widgets; Phases 0-2 complete)
+**Last updated**: 2026-10-12 (M3E COMPLETENESS PASS — HiDPI desktop rendering fixed (Retina-sharp, canvas+texture at native pixel size, all SDL events divided by display_scale); flex layout fix: unbounded-measured flex layouts natural children with infinite main axis so Center/Align no longer inflate to viewport height in scroll content; new widgets: ButtonGroup (connected morph), FABMenu, SearchView, Toolbar, full-screen Dialog, expressive Container shapes via presetShape→kx_fill_path, Switch icon variant; M3 shadows wired on elevated button/card/FAB/dialog/menu/snackbar/sheets; app_bar scrolled state; partial-damage present on raster desktop. 879 tests + 156 goldens green; earlier: MERGE CASCADE 12 PRs, Phase 4e.1 PERF HOT-SPOTS, Phase 3 iOS/Android matrix; Phases 0-2 complete)
 
 ## Current phase
 
