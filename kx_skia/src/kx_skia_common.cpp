@@ -237,9 +237,11 @@ struct kx_ctx {
         uint64_t image_id = 0; // registry id (eviction erases it)
         float pad = 0;         // outset the image extends past the shape
         uint64_t tick = 0;     // LRU
+        size_t bytes = 0;      // raster footprint, for the byte budget
     };
     std::unordered_map<uint64_t, KxShadowEntry> shadow_cache;
     uint64_t shadow_tick = 0;
+    size_t shadow_bytes = 0; // sum over live cache entries
     // Draw-op counter (0.14.0): incremented on the EMIT path of every draw
     // entry (fills, strokes, text, images, clear, saveLayer emits) — an op
     // recorded into a layer counts once, when its replay issues it. State
@@ -2807,17 +2809,25 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
         if (ctx->gpu) img = kx::gpu_image_upload(ctx->gpu, std::move(img));
         const uint64_t id = ctx->next_image_id++;
         ctx->images.emplace(id, kx_ctx::KxImg{img, false});
-        // Bound the set: evict the LRU entry (its image leaves the registry).
-        if (ctx->shadow_cache.size() >= 32) {
+        const size_t bytes = static_cast<size_t>(iw) * ih * 4;
+        // Bound the set by count AND bytes — 32 entries at the 4096² dim cap
+        // would hold ~2GB of shadow rasters. Evict LRU until under both.
+        const size_t kMaxShadowBytes = 64u * 1024 * 1024;
+        while (ctx->shadow_cache.size() >= 32 ||
+               ctx->shadow_bytes + bytes > kMaxShadowBytes) {
             uint64_t oldest_key = 0, oldest_tick = ~0ull;
-            for (auto& [k, e] : ctx->shadow_cache) {
-                if (e.tick < oldest_tick) { oldest_tick = e.tick; oldest_key = k; }
+            for (auto& [k, e2] : ctx->shadow_cache) {
+                if (e2.tick < oldest_tick) { oldest_tick = e2.tick; oldest_key = k; }
             }
+            if (!oldest_key) break; // cache empty — the entry itself is huge
+            ctx->shadow_bytes -= ctx->shadow_cache[oldest_key].bytes;
             ctx->images.erase(ctx->shadow_cache[oldest_key].image_id);
             ctx->shadow_cache.erase(oldest_key);
         }
         kx_ctx::KxShadowEntry e;
         e.img = std::move(img); e.image_id = id; e.pad = pad; e.tick = tick;
+        e.bytes = bytes;
+        ctx->shadow_bytes += bytes;
         it = ctx->shadow_cache.emplace(key, std::move(e)).first;
     } else {
         it->second.tick = tick;
