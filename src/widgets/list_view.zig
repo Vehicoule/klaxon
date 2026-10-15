@@ -31,6 +31,11 @@ fn stateOf(comptime T: type, n: *Node) *T {
     return @ptrCast(@alignCast(n.state.?));
 }
 
+// Env-gates latched once — getenv on the per-frame scroll path was costing
+// real microseconds (see churn_card's latch for the same pattern).
+var scrollcopy_off: ?bool = null;
+var dbg_list: ?bool = null;
+
 pub const ItemFactory = scroll_util.ItemFactory;
 
 pub const ListViewOptions = struct {
@@ -143,7 +148,9 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     // backing-store path's offscreen pass + two viewport-sized blits.
     // Raster/GLES keep scroll-copy (their per-op cost is low, uploads are
     // not).
-    if (std.c.getenv("KLAXON_NO_SCROLLCOPY") != null) return false;
+    if (scrollcopy_off == null) scrollcopy_off = std.c.getenv("KLAXON_NO_SCROLLCOPY") != null;
+    if (dbg_list == null) dbg_list = std.c.getenv("KLAXON_DBG_LIST") != null;
+    if (scrollcopy_off.?) return false;
     // Skip the backing pass outright once the majority of visible rows
     // self-blit: their retained slots already encode the shifted content,
     // so the offscreen composite would be a second cache paying for what
@@ -158,7 +165,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
             if (c.retained_ctx == ctx and (c.retained_atlas or c.retained_image != 0))
                 cached += 1;
         }
-        if (std.c.getenv("KLAXON_DBG_LIST") != null)
+        if (dbg_list.?)
             std.debug.print("  scrollcp cached={d}/{d}\n", .{ cached, n.children.items.len });
         if (cached * 2 >= n.children.items.len) return false;
     }
@@ -191,7 +198,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     // deliberately NOT part of the check).
     var repaint = Rect{ .x = 0, .y = 0, .w = w, .h = h };
     var any_dirty = false;
-    if (std.c.getenv("KLAXON_DBG_LIST") != null) std.debug.print("  scrollcp: backing={} usable={} dy={d:.0} sig={x} stored={x}\n", .{ s.backing, usable, dy, childrenSig(s, n), s.backing_sig });
+    if (dbg_list.?) std.debug.print("  scrollcp: backing={} usable={} dy={d:.0} sig={x} stored={x}\n", .{ s.backing, usable, dy, childrenSig(s, n), s.backing_sig });
     if (have) {
         repaint = if (dy > 0)
             .{ .x = 0, .y = h - dy, .w = w, .h = dy }

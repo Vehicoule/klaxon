@@ -777,10 +777,23 @@ pub const Node = struct {
         return !atlas_off.?;
     }
 
+    // Debug env-gates latched once — getenv walks environ on every call and
+    // paintContent/paintRetained run per node per frame.
+    var dbg_paint_child: ?bool = null;
+    fn dbgPaintChild() bool {
+        if (dbg_paint_child == null) dbg_paint_child = std.c.getenv("KLAXON_DBG_PAINT_CHILD") != null;
+        return dbg_paint_child.?;
+    }
+    var dbg_retained: ?bool = null;
+    fn dbgRetained() bool {
+        if (dbg_retained == null) dbg_retained = std.c.getenv("KLAXON_DBG_RETAINED") != null;
+        return dbg_retained.?;
+    }
+
     /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
     /// shared by the direct path and the retained rasterization.
     fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
-        const dbg = std.c.getenv("KLAXON_DBG_PAINT_CHILD") != null;
+        const dbg = dbgPaintChild();
         if (own_hit) {
             if (dbg) {
                 const t0 = sdl.c.SDL_GetTicksNS();
@@ -829,7 +842,7 @@ pub const Node = struct {
         // rasterized origin shifted by the node's move — but only on an
         // exact pixel boundary (a fractional blit would sample-shift the
         // cached content off the direct-paint pixels).
-        if (std.c.getenv("KLAXON_DBG_RETAINED") != null and !subtree_dirty and node.vtable.auto_retain) {
+        if (dbgRetained() and !subtree_dirty and node.vtable.auto_retain) {
             std.debug.print("  retainchk {*} img={} atlas={} prw={d:.0}/{d:.0} prh={d:.0}/{d:.0} bx={d} by={d}\n", .{ node, node.retained_image, node.retained_atlas, node.retained_pr.w, pr.w, node.retained_pr.h, pr.h, node.bounds.x, node.bounds.y });
         }
         if (!subtree_dirty and (node.retained_image != 0 or node.retained_atlas) and
@@ -879,7 +892,7 @@ pub const Node = struct {
             node.clearRetained(); // drop any stale image (smaller extent before)
             return false;
         }
-        if (std.c.getenv("KLAXON_DBG_RETAINED") != null) std.debug.print("retained miss: {*} dirty={} img={} {d}x{d} ext={d:.0}x{d:.0} y={d:.0}\n", .{ node, subtree_dirty, node.retained_image, iw, ih, ext.w, ext.h, node.bounds.y });
+        if (dbgRetained()) std.debug.print("retained miss: {*} dirty={} img={} {d}x{d} ext={d:.0}x{d:.0} y={d:.0}\n", .{ node, subtree_dirty, node.retained_image, iw, ih, ext.w, ext.h, node.bounds.y });
         // Drop the stale image first so a failed pass can't resurrect a
         // stale blit on a later frame.
         node.clearRetained();
@@ -958,7 +971,7 @@ pub const Node = struct {
     /// retained_blocked is NOT cleared here — it belongs to the auto-retain
     /// policy, which resets it on the next dirty frame.
     fn clearRetained(node: *Node) void {
-        if (std.c.getenv("KLAXON_DBG_RETAINED") != null and (node.retained_atlas or node.retained_image != 0))
+        if (dbgRetained() and (node.retained_atlas or node.retained_image != 0))
             std.debug.print("  clearRetained {*} atlas={} img={} y={d:.0} h={d:.0}\n", .{ node, node.retained_atlas, node.retained_image, node.bounds.y, node.bounds.h });
         if (node.retained_image != 0) {
             if (node.retained_ctx) |ctx| kx.c.kx_image_destroy(ctx, node.retained_image);
