@@ -82,7 +82,6 @@ pub const WINDOW_H: i32 = 640;
 
 /// The status lines (gestures / echo / dropdown pick) ride growable
 /// TextSignals — no fixed capacity.
-const dropdown_items = [_][]const u8{ "Alpha", "Beta", "Gamma" };
 const radio_labels = [_][]const u8{ "One", "Two", "Three" };
 
 /// Widget references into the current tree (refreshed on every rebuild).
@@ -123,7 +122,6 @@ const Refs = struct {
     list_10k: *Node,
     grid: *Node,
     text_field: *Node,
-    dropdown: *Node,
     chip: *Node,
     nav_bar: *Node,
     tabs: *Node,
@@ -214,7 +212,7 @@ pub const Gallery = struct {
     desktop_mode: *state.Signal(bool), // false = mobile presets, true = desktop presets
     bg_sig: *state.Signal(Color),
     press_count: *state.Signal(u32),
-    radio_group: *state.Signal(u32),
+    radio_group: *state.Signal(usize),
     slider_sig: *state.Signal(f32),
     feat_toggle: *state.Signal(bool),
     feat_check: *state.Signal(bool),
@@ -225,7 +223,6 @@ pub const Gallery = struct {
     scale_sig: *state.Signal(f32),
     status_sig: *state.TextSignal,
     echo_sig: *state.TextSignal,
-    pick_sig: *state.TextSignal,
     nav_selected: *state.Signal(usize),
     tabs_selected: *state.Signal(usize),
     drawer_open: *state.Signal(bool),
@@ -241,7 +238,6 @@ pub const Gallery = struct {
     // scroll positions). Text is saved in growable buffers — entries of any
     // length round-trip untruncated.
     saved_tf: std.array_list.Managed(u8),
-    saved_dd: usize = 0,
     saved_scroll: f32 = 0,
     saved_list: f32 = 0,
     saved_grid: f32 = 0,
@@ -262,7 +258,6 @@ pub const Gallery = struct {
         g.on_platform_changed = null; // same: undefined would NOT pick up the default
         g.saved_tf = std.array_list.Managed(u8).init(allocator);
         errdefer g.saved_tf.deinit();
-        g.saved_dd = 0;
         g.saved_scroll = 0;
         g.saved_list = 0;
         g.saved_grid = 0;
@@ -390,7 +385,7 @@ pub const Gallery = struct {
         errdefer g.bg_sig.deinit();
         g.press_count = try state.Signal(u32).init(allocator, 0);
         errdefer g.press_count.deinit();
-        g.radio_group = try state.Signal(u32).init(allocator, 0);
+        g.radio_group = try state.Signal(usize).init(allocator, 0);
         errdefer g.radio_group.deinit();
         g.slider_sig = try state.Signal(f32).init(allocator, 0.5);
         errdefer g.slider_sig.deinit();
@@ -412,8 +407,6 @@ pub const Gallery = struct {
         errdefer g.status_sig.deinit();
         g.echo_sig = try state.TextSignal.init(allocator, "");
         errdefer g.echo_sig.deinit();
-        g.pick_sig = try state.TextSignal.init(allocator, "");
-        errdefer g.pick_sig.deinit();
         g.nav_selected = try state.Signal(usize).init(allocator, 0);
         errdefer g.nav_selected.deinit();
         g.tabs_selected = try state.Signal(usize).init(allocator, 0);
@@ -453,10 +446,9 @@ pub const Gallery = struct {
         g.list_ctx.theme = theme;
         const had_tree = g.tree != null;
         if (had_tree) {
-            const tf_text = input_w.textFieldText(g.refs.text_field);
+            const tf_text = text_field_w.text(g.refs.text_field);
             g.saved_tf.clearRetainingCapacity();
             g.saved_tf.appendSlice(tf_text) catch @panic("klaxon: out of memory");
-            g.saved_dd = input_w.dropdownSelected(g.refs.dropdown);
             g.saved_scroll = widgets.scroll_view.scrollOffset(g.refs.scroll_view);
             g.saved_list = widgets.list_view.scrollOffset(g.refs.list_10k);
             g.saved_grid = widgets.grid_view.scrollOffset(g.refs.grid);
@@ -563,7 +555,6 @@ pub const Gallery = struct {
         g.scale_sig.deinit();
         g.status_sig.deinit();
         g.echo_sig.deinit();
-        g.pick_sig.deinit();
         g.nav_selected.deinit();
         g.tabs_selected.deinit();
         g.drawer_open.deinit();
@@ -659,22 +650,12 @@ fn buildHeader(g: *Gallery, theme: Theme) !*Node {
     titles.add(try text_w.text(a, "31 widgets · dark/light themes · gestures · animations · scroll 10k", .{ .size = 12, .color = theme.colors.on_surface_variant }));
     row.add(titles);
     const right = try layout.row(a, .{ .gap = 8, .cross_align = .center });
-    const toggle = try input_w.toggle(a, g.dark_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{
-        .track_on = theme.colors.primary,
-        .track_off = theme.colors.surface_container_highest,
-        .knob_on = theme.colors.on_primary,
-        .knob_off = theme.colors.outline,
-    });
+    const toggle = try switch_w.@"switch"(a, g.dark_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{ .theme = theme });
     g.refs.theme_toggle = toggle;
     right.add(toggle);
     right.add(try text_w.BoundText(bool).text(a, g.dark_mode, fmtMode, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     // Density switch (Phase 2d-0.5): mobile presets ↔ desktop presets.
-    const dtoggle = try input_w.toggle(a, g.desktop_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{
-        .track_on = theme.colors.primary,
-        .track_off = theme.colors.surface_container_highest,
-        .knob_on = theme.colors.on_primary,
-        .knob_off = theme.colors.outline,
-    });
+    const dtoggle = try switch_w.@"switch"(a, g.desktop_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{ .theme = theme });
     g.refs.desktop_toggle = dtoggle;
     right.add(dtoggle);
     right.add(try text_w.BoundText(bool).text(a, g.desktop_mode, fmtDensity, .{ .size = 13, .color = theme.colors.on_surface_variant }));
@@ -687,81 +668,49 @@ fn buildInputSection(g: *Gallery, theme: Theme) !*Node {
     const col = try layout.column(a, .{ .gap = 10 });
     // Button + bound press count
     const r1 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
-    const btn = try input_w.button(a, .{ .fn_ptr = pressCb, .userdata = g }, .{ .bg = theme.colors.primary, .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover), .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed) });
-    btn.add(try text_w.text(a, "Press me", .{ .size = 14, .color = theme.colors.on_primary }));
+    const btn = try button_w.button(a, .{ .fn_ptr = pressCb, .userdata = g }, .{ .label = "Press me", .theme = theme });
     g.refs.demo_button = btn;
     r1.add(btn);
     const press_text = try text_w.BoundText(u32).text(a, g.press_count, fmtPress, .{ .size = 13, .color = theme.colors.on_surface });
     g.refs.press_text = press_text;
     r1.add(press_text);
     col.add(r1);
-    // Toggle + Checkbox + Chip
+    // Switch + Checkbox + Chip (M3E widgets on the same signals)
     const r2 = try layout.row(a, .{ .gap = 16, .cross_align = .center });
-    r2.add(try input_w.toggle(a, g.feat_toggle, null, .{ .track_on = theme.colors.primary, .track_off = theme.colors.surface_container_highest, .knob_on = theme.colors.on_primary, .knob_off = theme.colors.outline }));
-    r2.add(try text_w.text(a, "Toggle", .{ .size = 13, .color = theme.colors.on_surface }));
-    r2.add(try input_w.checkbox(a, g.feat_check, null, .{
-        .box_color = theme.colors.surface_container_high,
-        .border = theme.colors.outline_variant,
-        .check = theme.colors.on_primary,
-        .accent = theme.colors.primary,
-    }));
+    r2.add(try switch_w.@"switch"(a, g.feat_toggle, null, .{ .theme = theme }));
+    r2.add(try text_w.text(a, "Switch", .{ .size = 13, .color = theme.colors.on_surface }));
+    r2.add(try checkbox_w.checkbox(a, g.feat_check, null, .{ .theme = theme }));
     r2.add(try text_w.text(a, "Checkbox", .{ .size = 13, .color = theme.colors.on_surface }));
-    const chip = try input_w.chip(a, "Chip", g.chip_sel, .{ .fn_ptr = chipCb, .userdata = g }, null, .{
-        .bg = theme.colors.surface_container_high,
-        .bg_selected = theme.colors.primary_container,
-        .color = theme.colors.on_surface,
-        .color_selected = theme.colors.on_primary_container,
-    });
+    const chip = try chip_w.chip(a, g.chip_sel, null, .{ .variant = .filter, .label = "Chip", .theme = theme });
     g.refs.chip = chip;
     r2.add(chip);
     col.add(r2);
     // Radio group
     const r3 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
     for (radio_labels, 0..) |label, i| {
-        r3.add(try input_w.Radio(u32).radio(a, g.radio_group, @intCast(i), .{
-            .ring = theme.colors.outline_variant,
-            .track = theme.colors.surface_container_high,
-            .dot = theme.colors.primary,
-        }));
+        r3.add(try radio_w.radio(a, g.radio_group, @intCast(i), .{ .theme = theme }));
         r3.add(try text_w.text(a, label, .{ .size = 13, .color = theme.colors.on_surface }));
     }
-    r3.add(try text_w.BoundText(u32).text(a, g.radio_group, fmtRadio, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    r3.add(try text_w.BoundText(usize).text(a, g.radio_group, fmtRadio, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     col.add(r3);
     // Slider
     const r4 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
-    r4.add(try input_w.slider(a, g.slider_sig, null, .{
-        .track = theme.colors.surface_container_high,
-        .fill = theme.colors.primary,
-        .knob = theme.colors.on_surface,
-        .default_width = 160,
-    }));
+    r4.add(try slider_w.slider(a, g.slider_sig, null, .{ .theme = theme, .default_width = 160 }));
     r4.add(try text_w.BoundText(f32).text(a, g.slider_sig, fmtSlider, .{ .size = 13, .color = theme.colors.on_surface }));
     col.add(r4);
-    // TextField + echo
+    // TextField + echo (echo_sig doubles as the field's live text model)
     const r5 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
-    const tf = try input_w.textField(a, .{
-        .color = theme.colors.on_surface,
-        .hint = theme.colors.on_surface_variant,
-        .bg = theme.colors.surface_container_high,
+    const tf = try text_field_w.textField(a, g.echo_sig, null, null, .{
+        .variant = .outlined,
+        .label = "Note",
         .placeholder = "Type here...",
         .initial = g.saved_tf.items, // restored across theme switches (any length)
-    }, .{ .fn_ptr = echoCb, .userdata = g }, null);
+        .theme = theme,
+    });
     g.refs.text_field = tf;
     r5.add(tf);
     r5.add(try text_w.BoundText([:0]const u8).text(a, g.echo_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     col.add(r5);
-    // Dropdown + picked item
-    const r6 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
-    const dd = try input_w.dropdown(a, &dropdown_items, .{
-        .bg = theme.colors.surface_container_high,
-        .menu_bg = theme.colors.surface_container,
-        .color = theme.colors.on_surface,
-        .initial_selected = g.saved_dd, // restored across theme switches
-    }, .{ .fn_ptr = pickCb, .userdata = g });
-    g.refs.dropdown = dd;
-    r6.add(dd);
-    r6.add(try text_w.BoundText([:0]const u8).text(a, g.pick_sig, fmtStatus, .{ .size = 13, .color = theme.colors.on_surface_variant }));
-    col.add(r6);
     return col;
 }
 
@@ -1087,13 +1036,7 @@ fn buildSearchBarSection(g: *Gallery, theme: Theme) !*Node {
     // SearchView (M3E): the expanded full-screen variant — the collapsed bar
     // opens it (a tap on the trailing arrow here). Demos in a phone-sized
     // frame: the view fills its bounds when the open signal flips.
-    const sv_btn = try input_w.button(a, .{ .fn_ptr = svOpenCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    sv_btn.add(try text_w.text(a, "Open search view", .{ .size = 14, .color = theme.colors.on_primary }));
-    col.add(sv_btn);
+    col.add(try button_w.button(a, .{ .fn_ptr = svOpenCb, .userdata = g }, .{ .label = "Open search view", .theme = theme }));
     const sv = try search_view_w.searchView(a, &.{
         .{ .label = "Recent searches", .icon = .search },
         .{ .label = "klaxon gallery", .icon = .search, .trailing_icon = .arrow_up },
@@ -1506,14 +1449,7 @@ fn buildNavSection(g: *Gallery, theme: Theme) !*Node {
     // AppBar (small): leading menu button, title (title_large), trailing actions.
     const icon_btn = struct {
         fn make(alloc: std.mem.Allocator, ic: icon_w.IconName, t: Theme) !*Node {
-            const b = try input_w.button(alloc, null, .{
-                .bg = t.colors.surface,
-                .bg_hover = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.hover),
-                .bg_pressed = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.pressed),
-                .padding = EdgeInsets.all(12),
-            });
-            b.add(try icon_w.icon(alloc, ic, .{ .size = 24, .color = t.colors.on_surface }));
-            return b;
+            return icon_button_w.iconButton(alloc, null, null, .{ .icon = ic, .a11y_label = "action", .theme = t });
         }
     }.make;
     const actions = try layout.row(a, .{});
@@ -1559,12 +1495,7 @@ fn buildNavSection(g: *Gallery, theme: Theme) !*Node {
     col.add(tabs);
     col.add(try text_w.BoundText(usize).text(a, g.tabs_selected, fmtTabsSel, .{ .size = 12, .color = theme.colors.on_surface_variant }));
     // Drawer (modal): an open button + the drawer itself (body + panel).
-    const open_btn = try input_w.button(a, .{ .fn_ptr = drawerOpenCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    open_btn.add(try text_w.text(a, "Open drawer", .{ .size = 14, .color = theme.colors.on_primary }));
+    const open_btn = try button_w.button(a, .{ .fn_ptr = drawerOpenCb, .userdata = g }, .{ .label = "Open drawer", .theme = theme });
     g.refs.drawer_btn = open_btn;
     const drawer_row = try layout.row(a, .{ .gap = 12, .cross_align = .center });
     drawer_row.add(open_btn);
@@ -1623,21 +1554,11 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     badge_row.add(try badge_w.badgedBox(a, menu_ic, try badge_w.badge(a, .{ .label = "99+", .theme = theme }), .{}));
     col.add(badge_row);
     // Tooltip: hover the button to show the bubble.
-    const tip_btn = try input_w.button(a, null, .{
-        .bg = theme.colors.secondary_container,
-        .bg_hover = theme_mod.stateLayer(theme.colors.secondary_container, theme.colors.on_secondary_container, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.secondary_container, theme.colors.on_secondary_container, theme.state.pressed),
-    });
-    tip_btn.add(try text_w.text(a, "Hover me", .{ .size = 14, .color = theme.colors.on_secondary_container }));
+    const tip_btn = try button_w.button(a, null, .{ .variant = .filled_tonal, .label = "Hover me", .theme = theme });
     g.refs.tooltip_btn = tip_btn;
     col.add(try tooltip_w.tooltip(a, tip_btn, .{ .text = "Save", .theme = theme }));
     // Bottom sheet (modal): an open button + the sheet in a bounded box.
-    const sheet_btn = try input_w.button(a, .{ .fn_ptr = sheetOpenCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    sheet_btn.add(try text_w.text(a, "Open bottom sheet", .{ .size = 14, .color = theme.colors.on_primary }));
+    const sheet_btn = try button_w.button(a, .{ .fn_ptr = sheetOpenCb, .userdata = g }, .{ .label = "Open bottom sheet", .theme = theme });
     g.refs.sheet_btn = sheet_btn;
     col.add(sheet_btn);
     const sheet_body = try container_w.container(a, .{ .color = theme.colors.surface_container_high, .radius = 8, .padding = EdgeInsets.all(16) });
@@ -1653,12 +1574,7 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     sheet_box.add(sh);
     col.add(sheet_box);
     // Dialog (modal): an open button + the dialog in a bounded box.
-    const dialog_btn = try input_w.button(a, .{ .fn_ptr = dialogOpenCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    dialog_btn.add(try text_w.text(a, "Open dialog", .{ .size = 14, .color = theme.colors.on_primary }));
+    const dialog_btn = try button_w.button(a, .{ .fn_ptr = dialogOpenCb, .userdata = g }, .{ .label = "Open dialog", .theme = theme });
     g.refs.dialog_btn = dialog_btn;
     col.add(dialog_btn);
     const dlg = try dialog_w.dialog(a, g.dialog_open, null, .{
@@ -1673,20 +1589,8 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     col.add(dialog_box);
     // Full-screen dialog variant (M3E): a full-bleed surface + 64dp top bar
     // (close icon · expanded title · end action). Demos in a phone frame.
-    const fs_btn = try input_w.button(a, .{ .fn_ptr = dialogFsOpenCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    fs_btn.add(try text_w.text(a, "Open full-screen dialog", .{ .size = 14, .color = theme.colors.on_primary }));
-    col.add(fs_btn);
-    const fs_save = try input_w.button(a, null, .{
-        .bg = 0x00000000,
-        .bg_hover = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.pressed),
-        .padding = EdgeInsets.symmetric(8, 4),
-    });
-    fs_save.add(try text_w.text(a, "Save", .{ .size = theme.type_scale.label_large.size, .color = theme.colors.primary }));
+    col.add(try button_w.button(a, .{ .fn_ptr = dialogFsOpenCb, .userdata = g }, .{ .label = "Open full-screen dialog", .theme = theme }));
+    const fs_save = try button_w.button(a, null, .{ .variant = .text, .label = "Save", .theme = theme });
     const fs_dlg = try dialog_w.dialog(a, g.dialog_fs_open, null, .{
         .variant = .full_screen,
         .theme = theme,
@@ -1698,12 +1602,7 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     fs_frame.add(fs_dlg);
     col.add(fs_frame);
     // SnackBar: the show button (the snackbar itself overlays the window).
-    const snack_btn = try input_w.button(a, .{ .fn_ptr = snackShowCb, .userdata = g }, .{
-        .bg = theme.colors.primary,
-        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
-    });
-    snack_btn.add(try text_w.text(a, "Show snackbar", .{ .size = 14, .color = theme.colors.on_primary }));
+    const snack_btn = try button_w.button(a, .{ .fn_ptr = snackShowCb, .userdata = g }, .{ .label = "Show snackbar", .theme = theme });
     g.refs.snack_btn = snack_btn;
     col.add(snack_btn);
     return col;
@@ -1713,20 +1612,8 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
 /// label_large, end-aligned, 8dp gap).
 fn dialogActionsRow(a: std.mem.Allocator, theme: Theme) !*Node {
     const row = try layout.row(a, .{ .gap = 8 });
-    const cancel = try input_w.button(a, null, .{
-        .bg = 0x00000000,
-        .bg_hover = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.pressed),
-        .padding = EdgeInsets.symmetric(8, 4),
-    });
-    cancel.add(try text_w.text(a, "Cancel", .{ .size = theme.type_scale.label_large.size, .color = theme.colors.primary }));
-    const del = try input_w.button(a, null, .{
-        .bg = 0x00000000,
-        .bg_hover = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.hover),
-        .bg_pressed = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.pressed),
-        .padding = EdgeInsets.symmetric(8, 4),
-    });
-    del.add(try text_w.text(a, "Delete", .{ .size = theme.type_scale.label_large.size, .color = theme.colors.primary }));
+    const cancel = try button_w.button(a, null, .{ .variant = .text, .label = "Cancel", .theme = theme });
+    const del = try button_w.button(a, null, .{ .variant = .text, .label = "Delete", .theme = theme });
     row.add(cancel);
     row.add(del);
     return row;
@@ -1774,8 +1661,7 @@ fn buildAnimSection(g: *Gallery, theme: Theme) !*Node {
     const slide_box = try container_w.container(a, .{ .color = theme.colors.primary, .radius = 8 });
     slide_box.add(try layout.constrainedBox(a, .{ .min_w = 64, .min_h = 44, .max_w = 64, .max_h = 44 }));
     slide.add(slide_box);
-    const slide_btn = try input_w.button(a, .{ .fn_ptr = slideCb, .userdata = g }, .{ .bg = theme.colors.surface_container_high, .bg_hover = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.on_surface, theme.state.hover), .bg_pressed = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.on_surface, theme.state.pressed) });
-    slide_btn.add(try text_w.text(a, "Slide", .{ .size = 13, .color = theme.colors.on_surface }));
+    const slide_btn = try button_w.button(a, .{ .fn_ptr = slideCb, .userdata = g }, .{ .variant = .filled_tonal, .label = "Slide", .theme = theme });
     const slide_col = try layout.column(a, .{ .gap = 6, .cross_align = .center });
     slide_col.add(slide);
     slide_col.add(slide_btn);
@@ -1785,7 +1671,7 @@ fn buildAnimSection(g: *Gallery, theme: Theme) !*Node {
     const scale_box = try container_w.container(a, .{ .color = theme.colors.@"error", .radius = 8 });
     scale_box.add(try layout.constrainedBox(a, .{ .min_w = 48, .min_h = 48, .max_w = 48, .max_h = 48 }));
     scale.add(scale_box);
-    const big = try input_w.toggle(a, g.scale_toggle, .{ .fn_ptr = bigToggleCb, .userdata = g }, .{ .track_on = theme.colors.primary, .track_off = theme.colors.surface_container_highest, .knob_on = theme.colors.on_primary, .knob_off = theme.colors.outline });
+    const big = try switch_w.@"switch"(a, g.scale_toggle, .{ .fn_ptr = bigToggleCb, .userdata = g }, .{ .theme = theme });
     const scale_col = try layout.column(a, .{ .gap = 6, .cross_align = .center });
     scale_col.add(scale);
     scale_col.add(big);
@@ -2076,11 +1962,6 @@ fn ptrRefreshCb(userdata: ?*anyopaque) void {
     // completion explicitly (a real app clears it when the data arrives).
 }
 
-fn chipCb(userdata: ?*anyopaque) void {
-    const g = galleryOf(userdata);
-    g.chip_sel.set(!g.chip_sel.peek()); // the Chip widget only fires callbacks
-}
-
 fn themeToggleCb(userdata: ?*anyopaque) void {
     const g = galleryOf(userdata);
     // the platform layer may have changed: sync the focus ring tokens
@@ -2091,17 +1972,6 @@ fn themeToggleCb(userdata: ?*anyopaque) void {
     g.rebuild() catch @panic("klaxon: out of memory");
     // notify the app (density presets changed: host.cursors, …)
     if (g.on_platform_changed) |cb| cb.fn_ptr(cb.userdata);
-}
-
-fn echoCb(userdata: ?*anyopaque) void {
-    const g = galleryOf(userdata);
-    statusSet(g.echo_sig, input_w.textFieldText(g.refs.text_field));
-}
-
-fn pickCb(userdata: ?*anyopaque) void {
-    const g = galleryOf(userdata);
-    const i = @min(input_w.dropdownSelected(g.refs.dropdown), dropdown_items.len - 1);
-    statusSet(g.pick_sig, dropdown_items[i]);
 }
 
 fn slideCb(userdata: ?*anyopaque) void {
@@ -2191,7 +2061,7 @@ fn statusSet(sig: *state.TextSignal, str: []const u8) void {
 fn fmtPress(v: u32, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "Pressed {d} times", .{v}) catch null;
 }
-fn fmtRadio(v: u32, buf: []u8) ?[]const u8 {
+fn fmtRadio(v: usize, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "Selected: {d}", .{v + 1}) catch null;
 }
 fn fmtSlider(v: f32, buf: []u8) ?[]const u8 {
@@ -2296,7 +2166,7 @@ test "gallery: clicking the theme toggle rebuilds the tree in the other theme" {
     router.dispatchPointer(g.root, .{ .phase = .down, .x = tf.x + 10, .y = tf.y + tf.h / 2 });
     router.dispatchPointer(g.root, .{ .phase = .up, .x = tf.x + 10, .y = tf.y + tf.h / 2 });
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "hello" });
-    try std.testing.expectEqualStrings("hello", input_w.textFieldText(g.refs.text_field));
+    try std.testing.expectEqualStrings("hello", text_field_w.text(g.refs.text_field));
     _ = widgets.scroll_view.setScrollOffset(g.refs.scroll_view, 120);
     _ = widgets.list_view.setScrollOffset(g.refs.list_10k, 200);
     // toggle the theme
@@ -2312,7 +2182,7 @@ test "gallery: clicking the theme toggle rebuilds the tree in the other theme" {
     g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(WINDOW_W), .h = @floatFromInt(WINDOW_H) });
     try std.testing.expect(g.refs.list_10k.children.items.len < 20);
     // the transient state survived the rebuild
-    try std.testing.expectEqualStrings("hello", input_w.textFieldText(g.refs.text_field));
+    try std.testing.expectEqualStrings("hello", text_field_w.text(g.refs.text_field));
     try std.testing.expectEqual(@as(f32, 120), widgets.scroll_view.scrollOffset(g.refs.scroll_view));
     try std.testing.expectEqual(@as(f32, 200), widgets.list_view.scrollOffset(g.refs.list_10k));
 }

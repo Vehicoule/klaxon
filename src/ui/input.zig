@@ -421,7 +421,16 @@ fn sendPointerExcept(node: *Node, ev: PointerEvent, except: ?*Node) bool {
     while (n) |cur| : (n = cur.parent) {
         if (cur == except or cur.zombie) continue;
         if (cur.vtable.on_pointer) |h| {
-            if (h(cur, ev)) {
+            // Each handler sees the point in ITS OWN parent space (the space
+            // its bounds live in). The delivered event otherwise carries the
+            // captured/deepest node's parent space — ancestors with children
+            // would compare it against their bounds and never match, which is
+            // why clicks on chips/cards/list items silently did nothing.
+            var local = ev;
+            const p = Node.mapPointToParentSpace(cur, ev.raw_x, ev.raw_y);
+            local.x = p.x;
+            local.y = p.y;
+            if (h(cur, local)) {
                 handled = true;
                 if (!notify) return true;
             }
