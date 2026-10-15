@@ -2475,7 +2475,9 @@ static const SkPath& kx_cached_stroke(kx_ctx* ctx, const float* xs, const float*
 }
 
 void kx_stroke_polyline(kx_ctx* ctx, const float* xs, const float* ys, int count, float stroke_w, bool round_cap, uint32_t rgba) {
-    if (!ctx || !ctx->canvas || !xs || !ys || count < 2 || stroke_w <= 0) return;
+    // 1M points = 8 MB of floats — past that, count*4 overflows int in the
+    // hash loops and no real polyline needs more.
+    if (!ctx || !ctx->canvas || !xs || !ys || count < 2 || count > 0x100000 || stroke_w <= 0) return;
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::StrokePolyline};
         op.xs.assign(xs, xs + count);
@@ -2495,7 +2497,7 @@ void kx_stroke_polyline(kx_ctx* ctx, const float* xs, const float* ys, int count
 }
 
 void kx_fill_polygon(kx_ctx* ctx, const float* xs, const float* ys, int count, uint32_t rgba) {
-    if (!ctx || !ctx->canvas || !xs || !ys || count < 3) return;
+    if (!ctx || !ctx->canvas || !xs || !ys || count < 3 || count > 0x100000) return;
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::FillPolygon};
         op.xs.assign(xs, xs + count);
@@ -2887,7 +2889,7 @@ void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h) {
 }
 
 void kx_clip_path(kx_ctx* ctx, const float* xs, const float* ys, int count, int aa) {
-    if (!ctx || !ctx->canvas || !xs || !ys || count < 3) return;
+    if (!ctx || !ctx->canvas || !xs || !ys || count < 3 || count > 0x100000) return;
     if (kx_recording(ctx)) {
         KxRecLayer* L = ctx->layers.back().get();
         L->depth++;

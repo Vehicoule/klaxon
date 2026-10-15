@@ -119,14 +119,20 @@ pub fn strokeRRectCorners(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, tl: f32,
 /// Stroke a polyline through (xs, ys) (ABI 0.5.0) — arcs and wavy progress
 /// indicators are polylines generated in Zig; no path type crosses the ABI.
 pub fn strokePolyline(ctx: *kx.Ctx, xs: []const f32, ys: []const f32, stroke_w: f32, round_cap: bool, color: Color) void {
-    kx.c.kx_stroke_polyline(ctx, xs.ptr, ys.ptr, @intCast(xs.len), stroke_w, round_cap, color);
+    // Mismatched arrays would make C++ read past the shorter one.
+    const n = @min(xs.len, ys.len);
+    std.debug.assert(n == xs.len);
+    kx.c.kx_stroke_polyline(ctx, xs.ptr, ys.ptr, @intCast(n), stroke_w, round_cap, color);
 }
 
 /// Fill a closed polygon through (xs, ys) (ABI 0.9.0) — the M3E loading
 /// indicator's shapes are polygons generated in Zig; no path type crosses
 /// the ABI.
 pub fn fillPolygon(ctx: *kx.Ctx, xs: []const f32, ys: []const f32, color: Color) void {
-    kx.c.kx_fill_polygon(ctx, xs.ptr, ys.ptr, @intCast(xs.len), color);
+    // Mismatched arrays would make C++ read past the shorter one.
+    const n = @min(xs.len, ys.len);
+    std.debug.assert(n == xs.len);
+    kx.c.kx_fill_polygon(ctx, xs.ptr, ys.ptr, @intCast(n), color);
 }
 
 /// Fill an rrect with a linear gradient (ABI 0.10.0): 2..8 evenly-spaced
