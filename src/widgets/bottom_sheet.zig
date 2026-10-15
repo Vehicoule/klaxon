@@ -388,11 +388,24 @@ fn applyProgress(n: *Node, s: *SheetState, progress: f32, scrim_alpha: f32) void
     s.progress = progress;
     scrimStateOf(s.scrim).alpha = scrim_alpha;
     s.scrim.setVisible(scrim_alpha > 0.001);
-    // the panel slides DOWN out of view when closed (bottom-anchored)
+    // The panel slides DOWN out of view when closed (bottom-anchored). The
+    // slide is paint-time translation — a fully closed panel still sat in
+    // its bounds and painted/hit-tested below them (a ghost over whatever
+    // follows the sheet in the layout). Hide the subtree outright: a closed
+    // sheet paints nothing.
     panelStateOf(s.panel).offset_y = s.panel_h * (1 - progress);
-    s.panel.markDirty();
-    s.scrim.markDirty();
+    s.panel.setVisible(progress > 0.001);
+    markInternalsDirty(n, s);
+}
+
+/// Repaint the panel (covering the swept region) and the scrim.
+fn markInternalsDirty(n: *Node, s: *SheetState) void {
     _ = n;
+    const b = s.panel.bounds;
+    const dy = panelStateOf(s.panel).offset_y;
+    const visual = Rect{ .x = b.x, .y = b.y + dy, .w = b.w, .h = b.h };
+    s.panel.markDirtyRect(node_mod.rectUnion(b, visual));
+    s.scrim.markDirty();
 }
 
 fn sheetAnimUpdateCb(userdata: ?*anyopaque, value: anim.Vec4) void {
@@ -515,8 +528,10 @@ test "bottom_sheet: closed by default — the scrim is hidden, the panel off-scr
     const s = stateOf(d);
     try std.testing.expect(!s.scrim.visible);
     try std.testing.expectEqual(@as(f32, 0), s.progress);
-    // closed: the panel is translated fully below its laid-out position
+    // closed: the panel is translated fully below its laid-out position AND
+    // hidden — translation alone would still paint/hit-test past the edge
     try std.testing.expectEqual(s.panel_h, panelStateOf(s.panel).offset_y);
+    try std.testing.expect(!s.panel.visible);
 }
 
 test "bottom_sheet: measure/layout fill the parent; the panel is bottom-anchored, capped at 640" {
@@ -558,10 +573,12 @@ test "bottom_sheet: without a timeline the panel snaps open/closed on the signal
     d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
     try std.testing.expectEqual(@as(f32, 1), s.progress);
     try std.testing.expectEqual(@as(f32, 0), panelStateOf(s.panel).offset_y);
+    try std.testing.expect(s.panel.visible);
     open.set(false);
     d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
     try std.testing.expectEqual(@as(f32, 0), s.progress);
     try std.testing.expectEqual(s.panel_h, panelStateOf(s.panel).offset_y);
+    try std.testing.expect(!s.panel.visible);
 }
 
 test "bottom_sheet: the content fills what the handle block leaves (no overlap, no phantom offset)" {
@@ -675,4 +692,27 @@ test "golden: bottom sheet paints the body, the scrim and the panel (open)" {
     defer f2.deinit();
     try std.testing.expect(f2.countColorIn(.{ .x = pb.x, .y = pb.y + 40, .w = pb.w, .h = 40 }, t.colors.surface_container_low) == 0);
     try std.testing.expect(f2.countColorIn(.{ .x = 200, .y = 20, .w = 80, .h = 60 }, 0x112233FF) > 80 * 60 - 40);
+}
+
+test "golden: a closed bottom sheet paints nothing past its bounds — no ghost over siblings" {
+    const t = theme_mod.light;
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const bg: Color = 0x445566FF;
+    const d = try bottomSheet(std.testing.allocator, open, null, .{
+        .theme = t,
+        .body = try golden.solidBox(std.testing.allocator, 480, 200, 0x112233FF),
+        .content = try text_w.text(std.testing.allocator, "Sheet", .{ .color = t.colors.on_surface }),
+    });
+    defer d.deinit();
+    // The sheet lives in a bounded box (gallery demo style) with room below:
+    // the closed panel's translated pixels must never land outside its box.
+    var r = try golden.Renderer.init(std.testing.allocator, 480, 320);
+    defer r.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 480, .h = 200 });
+    r.paint(d, bg);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const below = Rect{ .x = 0, .y = 200, .w = 480, .h = 120 };
+    try std.testing.expectEqual(@as(u64, 0), f.countNotIn(below, bg));
 }

@@ -246,6 +246,11 @@ fn applyProgress(n: *Node, s: *DrawerState, progress: f32, alpha: f32) void {
     panelStateOf(s.panel).offset_x = hideSign() * (s.panel_w * (1 - progress));
     scrimStateOf(s.scrim).alpha = alpha;
     s.scrim.setVisible(progress > 0.01);
+    // The slide is paint-time translation — a fully closed panel still sat
+    // in its bounds and painted/hit-tested past the sheet edge (a ghost
+    // over sibling content). Hide the subtree outright: a closed drawer
+    // paints nothing.
+    s.panel.setVisible(progress > 0.001);
     markInternalsDirty(n, s);
 }
 
@@ -261,12 +266,7 @@ fn markInternalsDirty(n: *Node, s: *DrawerState) void {
 
 fn drawerAnimUpdateCb(userdata: ?*anyopaque, v: anim.Vec4) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
-    const s = stateOf(n);
-    s.progress = v[0];
-    panelStateOf(s.panel).offset_x = hideSign() * (s.panel_w * (1 - v[0]));
-    scrimStateOf(s.scrim).alpha = v[1];
-    s.scrim.setVisible(v[0] > 0.01);
-    markInternalsDirty(n, s);
+    applyProgress(n, stateOf(n), v[0], v[1]);
 }
 
 /// Springs settle within 0.1 units — snap to the exact target so no residue
@@ -462,6 +462,8 @@ test "drawer: closed by default — the scrim is hidden, the panel off-screen" {
     try std.testing.expectEqual(@as(f32, 0), s.progress);
     try std.testing.expect(!s.scrim.visible);
     try std.testing.expectEqual(@as(f32, -320), panelStateOf(s.panel).offset_x); // panel_w = min(360, 320) = 320
+    // hidden too — translation alone would still paint/hit-test past the edge
+    try std.testing.expect(!s.panel.visible);
     try std.testing.expectEqual(@as(f32, 0), scrimStateOf(s.scrim).alpha);
 }
 
@@ -497,10 +499,12 @@ test "drawer: without a timeline the panel snaps open/closed on the signal" {
     try std.testing.expectEqual(@as(f32, 1), s.progress);
     try std.testing.expectEqual(@as(f32, 0), panelStateOf(s.panel).offset_x);
     try std.testing.expect(s.scrim.visible);
+    try std.testing.expect(s.panel.visible);
     open.set(false);
     try std.testing.expectEqual(@as(f32, 0), s.progress);
     try std.testing.expectEqual(@as(f32, -320), panelStateOf(s.panel).offset_x);
     try std.testing.expect(!s.scrim.visible);
+    try std.testing.expect(!s.panel.visible);
 }
 
 test "drawer: with a timeline the panel slides (spatial spring) and the scrim fades" {
@@ -627,4 +631,27 @@ test "golden: drawer paints the body, the scrim and the panel (open)" {
     defer f2.deinit();
     try std.testing.expect(f2.countColorIn(.{ .x = 0, .y = 0, .w = 360, .h = 200 }, t.colors.surface_container_low) == 0);
     try std.testing.expect(f2.countColorIn(.{ .x = 400, .y = 100, .w = 60, .h = 80 }, 0x112233FF) > 60 * 80 - 40);
+}
+
+test "golden: a closed drawer paints nothing past its bounds — no ghost over siblings" {
+    const t = theme_mod.light;
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const bg: Color = 0x445566FF;
+    const d = try drawer(std.testing.allocator, open, null, .{
+        .theme = t,
+        .body = try golden.solidBox(std.testing.allocator, 360, 200, 0x112233FF),
+        .content = try text_w.text(std.testing.allocator, "Drawer", .{ .color = t.colors.on_surface }),
+    });
+    defer d.deinit();
+    // The drawer lives in a bounded box inset from the frame's left edge:
+    // the closed panel's translated pixels must never land left of the box.
+    var r = try golden.Renderer.init(std.testing.allocator, 480, 200);
+    defer r.deinit();
+    d.layout(.{ .x = 120, .y = 0, .w = 360, .h = 200 });
+    r.paint(d, bg);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const left = Rect{ .x = 0, .y = 0, .w = 120, .h = 200 };
+    try std.testing.expectEqual(@as(u64, 0), f.countNotIn(left, bg));
 }

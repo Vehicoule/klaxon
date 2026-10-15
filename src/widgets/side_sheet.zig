@@ -395,8 +395,12 @@ fn applyProgress(n: *Node, s: *SideSheetState, progress: f32, scrim_alpha: f32) 
     scrimStateOf(s.scrim).alpha = scrim_alpha;
     // the scrim shows only for a modal sheet (standard sheets are coplanar)
     s.scrim.setVisible(s.opts.modal and scrim_alpha > 0.001);
-    // the panel slides towards its anchored edge when closed
+    // The slide is paint-time translation — a fully closed panel still sat
+    // in its bounds and painted/hit-tested past the sheet edge (a ghost
+    // over sibling content). Hide the subtree outright: a closed sheet
+    // paints nothing.
     panelStateOf(s.panel).offset_x = hideSign(s.opts) * (s.panel_w * (1 - progress));
+    s.panel.setVisible(progress > 0.001);
     markInternalsDirty(n, s);
 }
 
@@ -523,8 +527,10 @@ test "side_sheet: closed by default — the scrim is hidden, the panel off-scree
     const s = stateOf(d);
     try std.testing.expect(!s.scrim.visible);
     try std.testing.expectEqual(@as(f32, 0), s.progress);
-    // closed: the panel (end side, LTR) is translated fully off the right edge
+    // closed: the panel (end side, LTR) is translated fully off the right
+    // edge AND hidden — translation alone would still paint/hit-test past it
     try std.testing.expectEqual(s.panel_w, panelStateOf(s.panel).offset_x);
+    try std.testing.expect(!s.panel.visible);
 }
 
 test "side_sheet: the panel docks to the side edge, full height, width capped" {
@@ -588,10 +594,12 @@ test "side_sheet: without a timeline the panel snaps open/closed on the signal" 
     d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
     try std.testing.expectEqual(@as(f32, 1), s.progress);
     try std.testing.expectEqual(@as(f32, 0), panelStateOf(s.panel).offset_x);
+    try std.testing.expect(s.panel.visible);
     open.set(false);
     d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
     try std.testing.expectEqual(@as(f32, 0), s.progress);
     try std.testing.expectEqual(s.panel_w, panelStateOf(s.panel).offset_x); // off-screen again
+    try std.testing.expect(!s.panel.visible);
 }
 
 test "side_sheet: a modal sheet shows the scrim; a scrim click + Escape close it; a standard sheet never scrims" {
@@ -721,4 +729,28 @@ test "golden: a standard sheet paints a square Surface panel, no scrim" {
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(11, 11));
     // no scrim: the body right of the panel is untouched white
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(300, 100));
+}
+
+test "golden: a closed side sheet paints nothing past its bounds — no ghost over siblings" {
+    const t = theme_mod.light;
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const bg: Color = 0x445566FF;
+    const d = try sideSheet(std.testing.allocator, open, null, .{
+        .modal = true,
+        .theme = t,
+        .body = try golden.solidBox(std.testing.allocator, 320, 200, 0x112233FF),
+        .content = try text_w.text(std.testing.allocator, "Filters", .{ .color = t.colors.on_surface }),
+    });
+    defer d.deinit();
+    // The sheet lives in a bounded box inset from the frame's right edge:
+    // the closed panel's translated pixels must never land right of the box.
+    var r = try golden.Renderer.init(std.testing.allocator, 480, 200);
+    defer r.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
+    r.paint(d, bg);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const right = Rect{ .x = 320, .y = 0, .w = 160, .h = 200 };
+    try std.testing.expectEqual(@as(u64, 0), f.countNotIn(right, bg));
 }
