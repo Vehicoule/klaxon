@@ -6,6 +6,7 @@ const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const golden = @import("../golden.zig");
 const layout_w = @import("layout.zig");
+const shapes = @import("../ui/shapes.zig");
 
 const Node = ui.node.Node;
 const Rect = ui.node.Rect;
@@ -17,12 +18,26 @@ const Color = ui.paint.Color;
 pub const ContainerOptions = struct {
     color: ?Color = null,
     radius: f32 = 0,
+    /// M3E expressive shape (a ui.shapes RoundedPolygon preset) — replaces
+    /// `radius`: the normalized unit-box outline scales to the bounds at
+    /// paint time through kx_fill_path. A non-uniform bounds stretches the
+    /// shape (and the border width along with it).
+    shape: ?shapes.Preset = null,
     border_color: ?Color = null,
     border_width: f32 = 0,
     padding: EdgeInsets = .{},
 };
 
-const ContainerState = struct { opts: ContainerOptions };
+const ContainerState = struct {
+    opts: ContainerOptions,
+    /// The emitted unit-space path for `opts.shape` — built lazily on the
+    /// first paint (the widget may be created off-allocator in tests where
+    /// no canvas exists), reused for the widget's life: paint allocates
+    /// nothing. The emitted slices cover the whole allocations — deinit
+    /// frees them directly.
+    path_pts: []f32 = &.{},
+    path_verbs: []i32 = &.{},
+};
 
 fn containerMeasure(n: *Node, c: Constraints) Size {
     const s: *ContainerState = @ptrCast(@alignCast(n.state.?));
@@ -48,6 +63,10 @@ fn containerPaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *ContainerState = @ptrCast(@alignCast(n.state.?));
     const b = n.bounds;
     const bw = s.opts.border_width;
+    if (s.opts.shape != null) {
+        paintShaped(n, s, ctx, b);
+        return;
+    }
     if (s.opts.border_color) |border| {
         // Border = outer shape in the border color; the fill covers the inside.
         if (s.opts.radius > 0) {
@@ -72,8 +91,45 @@ fn containerPaint(n: *Node, ctx: *kx.Ctx) void {
     }
     // Children paint after (Node.paint), on top of the decoration.
 }
+
+/// Expressive-shape decoration: the preset's emitted unit-box path fills (and
+/// strokes) through the canvas transform — bounds-space raster, zero per-frame
+/// allocation (the path is emitted once into owned scratch).
+fn paintShaped(n: *Node, s: *ContainerState, ctx: *kx.Ctx, b: Rect) void {
+    if (s.path_pts.len == 0) {
+        var poly = shapes.presetShape(n.allocator, s.opts.shape.?) catch return;
+        defer poly.deinit();
+        const counts = shapes.pathCounts(poly.cubics.len);
+        const pts = n.allocator.alloc(f32, counts.pts) catch return;
+        const verbs = n.allocator.alloc(i32, counts.verbs) catch {
+            n.allocator.free(pts);
+            return;
+        };
+        const emitted = poly.emitPath(pts, verbs);
+        s.path_pts = @constCast(emitted.pts);
+        s.path_verbs = @constCast(emitted.verbs);
+    }
+    ui.paint.save(ctx);
+    ui.paint.translate(ctx, b.x + b.w / 2, b.y + b.h / 2);
+    ui.paint.scale(ctx, b.w, b.h);
+    ui.paint.translate(ctx, -0.5, -0.5);
+    if (s.opts.border_color) |border| {
+        // The border strokes inside the scaled space: a non-square bounds
+        // stretches its width along the long axis (documented on the option).
+        const sw = s.opts.border_width / @min(b.w, b.h);
+        ui.paint.strokePath(ctx, s.path_pts, s.path_verbs, sw, border, false);
+        if (s.opts.color) |fill|
+            ui.paint.fillPath(ctx, s.path_pts, s.path_verbs, fill, false);
+    } else if (s.opts.color) |fill| {
+        ui.paint.fillPath(ctx, s.path_pts, s.path_verbs, fill, false);
+    }
+    ui.paint.restore(ctx);
+}
 fn containerDeinit(n: *Node) void {
-    n.allocator.destroy(@as(*ContainerState, @ptrCast(@alignCast(n.state.?))));
+    const s: *ContainerState = @ptrCast(@alignCast(n.state.?));
+    if (s.path_pts.len > 0) n.allocator.free(s.path_pts);
+    if (s.path_verbs.len > 0) n.allocator.free(s.path_verbs);
+    n.allocator.destroy(s);
 }
 // auto_retain: the decoration paints strictly inside bounds and the child
 // layout is deterministic — a clean Container subtree can replay its cached
@@ -141,4 +197,33 @@ test "golden: container with a child paints the child on top of the fill" {
     try std.testing.expectEqual(green, frame.pixelAt(5, 5)); // child (fills the container)
     try std.testing.expectEqual(@as(u64, 40 * 40), frame.countColor(green));
     try std.testing.expectEqual(@as(u64, 0), frame.countColor(red)); // fully covered
+}
+
+test "golden: container shape fills the preset outline, not the rect" {
+    const bg = 0x000000FF;
+    const red = 0xFF0000FF;
+    const root = try container(std.testing.allocator, .{ .color = red, .shape = .diamond });
+    var frame = try golden.render(std.testing.allocator, root, 60, 60, bg);
+    defer frame.deinit();
+    // Diamond: the center is filled, the corner is background — a rounded
+    // rect would cover the corner; the polygon path must not.
+    try std.testing.expectEqual(red, frame.pixelAt(30, 30));
+    try std.testing.expectEqual(bg, frame.pixelAt(2, 2));
+    try std.testing.expectEqual(bg, frame.pixelAt(57, 2));
+    // Edge midpoint is the diamond's vertex — covered.
+    try std.testing.expectEqual(red, frame.pixelAt(30, 1));
+}
+
+test "golden: container shape + border strokes the outline" {
+    const bg = 0x000000FF;
+    const red = 0xFF0000FF;
+    const blue = 0x0000FFFF;
+    const root = try container(std.testing.allocator, .{ .color = red, .shape = .diamond, .border_color = blue, .border_width = 4 });
+    var frame = try golden.render(std.testing.allocator, root, 60, 60, bg);
+    defer frame.deinit();
+    try std.testing.expectEqual(red, frame.pixelAt(30, 30));
+    try std.testing.expectEqual(bg, frame.pixelAt(2, 2));
+    // The outline stroke is anti-aliased — count any blue ink rather than
+    // probing a single pixel (the stroke ring is non-empty).
+    try std.testing.expect(frame.countColor(blue) > 0);
 }

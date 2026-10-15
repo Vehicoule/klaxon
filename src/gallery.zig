@@ -22,6 +22,7 @@ const input_mod = ui.input;
 const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 const EdgeInsets = ui.layout.EdgeInsets;
+const shapes = ui.shapes;
 const layout = widgets.layout;
 const text_w = widgets.text;
 const icon_w = widgets.icon;
@@ -1273,6 +1274,26 @@ fn buildAvatarSection(g: *Gallery, theme: Theme) !*Node {
         row.add(label);
         col.add(row);
     }
+    // M3E expressive shapes (RoundedPolygon presets through kx_fill_path) —
+    // containers paint the normalized unit-box outline scaled to bounds.
+    const shape_row = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    const shape_presets = [_]struct { p: shapes.Preset, name: []const u8 }{
+        .{ .p = .cookie9, .name = "cookie9" },
+        .{ .p = .clover8, .name = "clover8" },
+        .{ .p = .sunny, .name = "sunny" },
+        .{ .p = .soft_burst, .name = "soft_burst" },
+        .{ .p = .pentagon, .name = "pentagon" },
+    };
+    for (shape_presets) |sp| {
+        const box = try layout.constrainedBox(a, .{ .min_w = 56, .max_w = 56, .min_h = 56, .max_h = 56 });
+        box.add(try container_w.container(a, .{ .color = theme.colors.tertiary_container, .shape = sp.p }));
+        const item = try layout.column(a, .{ .gap = 4, .cross_align = .center });
+        item.add(box);
+        item.add(try text_w.text(a, sp.name, .{ .size = 11, .color = theme.colors.on_surface_variant }));
+        shape_row.add(item);
+    }
+    col.add(shape_row);
+    col.add(try text_w.text(a, "Expressive shapes — RoundedPolygon presets", .{ .size = 12, .color = theme.colors.on_surface_variant }));
     return col;
 }
 
