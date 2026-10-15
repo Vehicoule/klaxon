@@ -7,11 +7,14 @@
 //   - circular: 40dp, stroke 4dp, round caps, primary on secondary_container
 //   - motion: determinate progress animates with the M3E spring in Compose;
 //     v1 renders the value statically (a live Signal(?f32) variant is the
-//     documented extension). Indeterminate loops: linear sweeps a segment
-//     (Compose runs a two-segment 1750ms cycle — v1 uses one segment,
-//     deviation documented), circular rotates a fixed arc (Compose grows/
-//     shrinks a 270dp arc over a 6000ms cycle with 1080deg global rotation —
-//     v1 keeps the sweep fixed and rotates, deviation documented).
+//     documented extension) — except the WAVY variant, whose wave scrolls
+//     continuously per M3E even when determinate. Indeterminate loops:
+//     linear sweeps a segment (Compose runs a two-segment 1750ms cycle —
+//     v1 uses one segment, deviation documented), circular rotates a fixed
+//     arc (Compose grows/shrinks a 270dp arc over a 6000ms cycle with
+//     1080deg global rotation — v1 keeps the sweep fixed and rotates,
+//     deviation documented). The loop drives a shared 0..1 phase: the wave
+//     scroll + the sweep/rotation advance together on one tween.
 //
 // Painting: flat linear uses rounded rects (radius = thickness/2 = round
 // caps); wavy linear and circular use kx_stroke_polyline (ABI 0.5.0) with
@@ -58,7 +61,8 @@ pub const ProgressOptions = struct {
 
 const ProgressState = struct {
     opts: ProgressOptions,
-    phase: f32 = 0, // indeterminate animation phase 0..1 (loops)
+    phase: f32 = 0, // animation phase 0..1 (loops)
+    loop_running: bool = false, // the phase loop is registered on the timeline
     anim_channel: u8 = 0, // channel marker (stable address)
 };
 
@@ -73,9 +77,23 @@ fn progressMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = w, .h = h });
 }
 
+/// The phase loop runs while the widget lives when anything moves:
+/// indeterminate sweeps/rotates on it, and the M3E wave scrolls on it even
+/// when determinate. Flat determinate + determinate circular stay static —
+/// nothing moves between value writes, so no animation is registered and
+/// the host idles.
+fn wantsPhaseLoop(s: *const ProgressState) bool {
+    return s.opts.progress == null or (s.opts.kind == .linear and s.opts.wavy);
+}
+
 fn progressLayout(n: *Node, bounds: Rect) void {
-    _ = n;
     _ = bounds;
+    const s = stateOf(n);
+    // The loop starts at the first layout that has a timeline — a widget
+    // built before the host installs it (golden tests, conformance, bench
+    // scenes) renders its phase-0 state; once a timeline exists this retry
+    // kicks the loop off. Same pattern as loading_indicator's liLayout.
+    if (wantsPhaseLoop(s) and !s.loop_running) startPhaseLoop(n, s);
 }
 
 /// One point of an arc, in degrees, centered at (cx, cy) with radius r.
@@ -200,10 +218,11 @@ const progress_vtable = ui.node.VTable{
     .deinit = progressDeinit,
 };
 
-/// Indeterminate animation: loop a 0..1 phase tween (linear easing). Without
-/// a timeline the indicator renders its phase-0 state (tests).
-fn startIndeterminate(n: *Node, s: *ProgressState) void {
-    const tl = anim.timeline() orelse return;
+/// Phase loop: play a 0..1 tween (linear easing) that re-arms itself on
+/// completion — the indeterminate sweep/rotation and the wavy wave scroll.
+/// Without a timeline the indicator renders its phase-0 state (tests).
+fn startPhaseLoop(n: *Node, s: *ProgressState) void {
+    const tl = anim.timeline() orelse return; // loop_running stays false → the layout retry can kick it off later
     const duration: u32 = if (s.opts.kind == .linear) linear_indet_ms else circular_indet_ms;
     _ = tl.play(.{
         .kind = anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, duration, .{ .ease = .linear }),
@@ -212,6 +231,7 @@ fn startIndeterminate(n: *Node, s: *ProgressState) void {
         .on_update = .{ .fn_ptr = progressPhaseCb, .userdata = n },
         .on_complete = .{ .fn_ptr = progressLoopCb, .userdata = n },
     });
+    s.loop_running = true;
 }
 
 fn progressPhaseCb(userdata: ?*anyopaque, value: anim.Vec4) void {
@@ -224,7 +244,7 @@ fn progressPhaseCb(userdata: ?*anyopaque, value: anim.Vec4) void {
 fn progressLoopCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
-    if (s.opts.progress == null) startIndeterminate(n, s); // loop forever
+    if (wantsPhaseLoop(s)) startPhaseLoop(n, s); // loop forever
 }
 
 /// Linear + circular progress indicators (M3E).
@@ -236,11 +256,81 @@ pub fn progressIndicator(allocator: std.mem.Allocator, opts: ProgressOptions) !*
     s.* = .{ .opts = opts };
     node.state = s;
     ui.semantics.attach(node, .{ .role = .progress, .label = "Progress" }); // Phase 2c
-    if (opts.progress == null) startIndeterminate(node, s);
+    if (wantsPhaseLoop(s)) startPhaseLoop(node, s); // layout retries when no timeline exists yet
     return node;
 }
 
 // --- tests ---
+
+test "progress: the indeterminate phase advances on timeline ticks and loops" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const n = try progressIndicator(std.testing.allocator, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
+    try std.testing.expect(tl.hasActive());
+    tl.tick(0); // lazy start: start_ms = 0
+    tl.tick(500);
+    const p1 = stateOf(n).phase;
+    try std.testing.expectApproxEqAbs(@as(f32, 500) / @as(f32, @floatFromInt(linear_indet_ms)), p1, 1e-3);
+    tl.tick(1000);
+    try std.testing.expect(stateOf(n).phase > p1);
+    // the tween re-arms on completion — the loop restarts (lazy start at
+    // the tick after the 1750ms cycle ended)
+    tl.tick(1800);
+    tl.tick(1900);
+    try std.testing.expect(tl.hasActive());
+    try std.testing.expect(stateOf(n).phase < 0.2);
+}
+
+test "progress: the phase loop starts at layout when no timeline existed at construction" {
+    // Built before the host installs its timeline (bench scene, conformance):
+    // no animation is registered, the phase-0 state renders.
+    const n = try progressIndicator(std.testing.allocator, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    try std.testing.expect(!tl.hasActive());
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    // A later layout (different bounds → the vtable runs) kicks the loop off.
+    n.layout(.{ .x = 0, .y = 0, .w = 220, .h = 4 });
+    try std.testing.expect(tl.hasActive());
+    tl.tick(0);
+    tl.tick(400);
+    try std.testing.expect(stateOf(n).phase > 0);
+}
+
+test "progress: determinate wavy runs the phase loop too (the wave scrolls); flat determinate stays static" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const wavy = try progressIndicator(std.testing.allocator, .{ .progress = 0.6, .wavy = true });
+    defer wavy.deinit();
+    wavy.layout(.{ .x = 0, .y = 0, .w = 200, .h = 10 });
+    try std.testing.expect(tl.hasActive());
+    tl.tick(0);
+    tl.tick(500);
+    try std.testing.expect(stateOf(wavy).phase > 0);
+    // the phase scrolls the wave: two samples at the same x differ
+    var xs: [8]f32 = undefined;
+    var ys_a: [8]f32 = undefined;
+    var ys_b: [8]f32 = undefined;
+    _ = wavePolyline(&xs, &ys_a, 0, 160, 5, wave_amplitude, wave_wavelength, stateOf(wavy).phase);
+    tl.tick(600);
+    _ = wavePolyline(&xs, &ys_b, 0, 160, 5, wave_amplitude, wave_wavelength, stateOf(wavy).phase);
+    try std.testing.expect(!std.meta.eql(ys_a, ys_b));
+    // flat determinate: nothing moves — no animation is registered at all
+    const flat = try progressIndicator(std.testing.allocator, .{ .progress = 0.5 });
+    defer flat.deinit();
+    flat.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
+    try std.testing.expect(!stateOf(flat).loop_running);
+    try std.testing.expectEqual(@as(usize, 1), tl.animations.items.len); // only the wavy loop
+}
 
 test "progress: linear measures full width x 4 (flat) / 10 (wavy); circular 40x40" {
     const lin = try progressIndicator(std.testing.allocator, .{});
