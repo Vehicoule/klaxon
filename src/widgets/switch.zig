@@ -29,6 +29,7 @@ const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
+const icon_w = @import("icon.zig");
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -55,6 +56,11 @@ pub const SwitchOptions = struct {
     /// The accessible name (a switch is usually paired with a visible label
     /// built by the app; this is the control's own name).
     a11y_label: []const u8 = "",
+    /// M3E icon variant: a 16dp check glyph in the checked handle, a close
+    /// glyph in the unchecked one — painted in the track color (the token
+    /// contrast pair: onPrimary handle carries the primary icon, and the
+    /// outline handle carries the surfaceContainerHighest one).
+    show_icons: bool = false,
     theme: Theme = theme_mod.light,
 };
 
@@ -146,6 +152,13 @@ fn switchPaint(n: *Node, ctx: *kx.Ctx) void {
     const hr = handleRect(n, s);
     const h = Rect{ .x = b.x + hr.x, .y = b.y + hr.y, .w = hr.w, .h = hr.h };
     ui.paint.fillRRect(ctx, h.x, h.y, h.w, h.h, h.w / 2, cc.handle);
+    // M3E icon variant: a 16dp glyph centered in the handle, drawn in the
+    // track color — the token contrast pair in both states.
+    if (s.opts.show_icons and s.opts.enabled) {
+        const icon_size: f32 = 16;
+        const icon_name: icon_w.IconName = if (isChecked(s)) .check else .close;
+        icon_w.drawIcon(ctx, icon_name, h.x + (h.w - icon_size) / 2, h.y + (h.h - icon_size) / 2, icon_size / 24.0, cc.track);
+    }
     // state layer (enabled only): a 40dp circle centered on the handle
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)

@@ -157,6 +157,7 @@ pub const Gallery = struct {
     cb_dis: *state.Signal(bool), // checkbox, disabled
     cb_err: *state.Signal(bool), // checkbox, error + checked
     sw_m3e: *state.Signal(bool), // switch, clickable (off)
+    sw_icon: *state.Signal(bool), // the icon-variant switch
     sw_on: *state.Signal(bool), // switch, on
     sw_dis: *state.Signal(bool), // switch, disabled
     sl_m3e: *state.Signal(f32), // slider, 0.25
@@ -294,6 +295,8 @@ pub const Gallery = struct {
         errdefer g.cb_err.deinit();
         g.sw_m3e = try state.Signal(bool).init(allocator, false);
         errdefer g.sw_m3e.deinit();
+        g.sw_icon = try state.Signal(bool).init(allocator, true);
+        errdefer g.sw_icon.deinit();
         g.sw_on = try state.Signal(bool).init(allocator, true);
         errdefer g.sw_on.deinit();
         g.sw_dis = try state.Signal(bool).init(allocator, false);
@@ -499,6 +502,7 @@ pub const Gallery = struct {
         g.cb_dis.deinit();
         g.cb_err.deinit();
         g.sw_m3e.deinit();
+        g.sw_icon.deinit();
         g.sw_on.deinit();
         g.sw_dis.deinit();
         g.sl_m3e.deinit();
@@ -862,6 +866,8 @@ fn buildSelectionSection(g: *Gallery, theme: Theme) !*Node {
     r3.add(try switch_w.@"switch"(a, g.sw_m3e, null, .{ .a11y_label = "Off", .theme = theme }));
     r3.add(try switch_w.@"switch"(a, g.sw_on, null, .{ .a11y_label = "On", .theme = theme }));
     r3.add(try switch_w.@"switch"(a, g.sw_dis, null, .{ .enabled = false, .a11y_label = "Disabled", .theme = theme }));
+    // M3E icon variant: check/close glyphs inside the handle.
+    r3.add(try switch_w.@"switch"(a, g.sw_icon, null, .{ .show_icons = true, .a11y_label = "Icon switch", .theme = theme }));
     col.add(r3);
     // Sliders + value labels
     const r4 = try layout.column(a, .{ .gap = 8 });
