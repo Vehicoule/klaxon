@@ -139,6 +139,7 @@ struct kx_ctx {
     // Sprite batch: atlas-region draws accumulate device-space quads here
     // and flush as one textured mesh when the batch closes.
     bool sprite_batch_open = false;
+    SkCanvas* sprite_target = nullptr; // canvas the open batch collected on
     struct KxPendingSprite { SkPoint dst[4]; SkRect src; };
     std::vector<KxPendingSprite> sprite_batch;
     bool sprite_flushing = false;
@@ -1791,7 +1792,11 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     // Nesting inside an offscreen pass is fine: the atlas is a SEPARATE
     // surface — the flush below lands pending sprites on the strip canvas,
     // the pass writes atlas, end restores the strip canvas.
-    kx_sprite_flush(ctx); // pending sprites belong to the MAIN canvas
+    // No sprite flush here: pending sprites hold DEVICE-mapped dst points
+    // and keep collecting while we write into the atlas — they flush at
+    // batch end onto the (restored) target canvas, in submission order
+    // after these writes, sampling the freshly-written slots. Splitting
+    // the batch per row-rasterize was ~3 meshes/frame for scroll_10k.
     // Writing to the atlas invalidates its image view (makeTemporaryImage
     // is only valid until the next surface write) — re-alias lazily.
     if (ctx->atlas_view) { ctx->atlas_view.reset(); ctx->atlas_image_id = 0; }
@@ -1849,6 +1854,8 @@ uint64_t kx_atlas_image(kx_ctx* ctx) {
         // surface; command ordering keeps reads/writes correct on GPU.
         ctx->atlas_view = ctx->atlas->makeTemporaryImage();
         if (!ctx->atlas_view) return 0;
+    }
+    if (!ctx->atlas_image_id) {
         const uint64_t id = ctx->next_image_id++;
         ctx->images.emplace(id, kx_ctx::KxImg{ctx->atlas_view, false, true,
                                               SkRect::MakeEmpty()});
@@ -1863,9 +1870,18 @@ uint64_t kx_atlas_image(kx_ctx* ctx) {
 void kx_sprite_flush(kx_ctx* ctx) {
     const int n = (int)ctx->sprite_batch.size();
     if (n == 0) return;
+    // Defer while a nested pass owns ctx->canvas (atlas row rasterize,
+    // offscreen): the sprites target the COLLECT canvas — flushing now
+    // would draw them into the wrong surface and split the batch. They
+    // flush when the caller's canvas is current again.
+    if (ctx->sprite_target && ctx->canvas != ctx->sprite_target) return;
     const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
     std::vector<kx_ctx::KxPendingSprite> sprites;
     sprites.swap(ctx->sprite_batch);
+    // Writes since the last view invalidate atlas_view (makeTemporaryImage
+    // contract) — kx_atlas_image re-aliases AND refreshes the registered
+    // image id rather than dropping the sprites.
+    if (!ctx->atlas_view) (void)kx_atlas_image(ctx);
     sk_sp<SkImage> atlas_img = ctx->atlas_view;
     if (!atlas_img) return;
     SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * n, 6 * n,
@@ -1885,10 +1901,14 @@ void kx_sprite_flush(kx_ctx* ctx) {
     }
     SkPaint paint;
     paint.setShader(atlas_img->makeShader(SkSamplingOptions()));
-    ctx->canvas->save();
-    ctx->canvas->setMatrix(SkMatrix::I());
-    ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
-    ctx->canvas->restore();
+    // Draw onto the canvas the batch collected on — a flush can fire while
+    // ctx->canvas is the ATLAS canvas (sprites stay pending across an
+    // entering row's rasterize so the batch isn't split per row).
+    SkCanvas* target = ctx->sprite_target ? ctx->sprite_target : ctx->canvas;
+    target->save();
+    target->setMatrix(SkMatrix::I());
+    target->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
+    target->restore();
     ctx->frame_ops++;
     kx_prof("sprite_mesh", t0);
 }
@@ -1897,10 +1917,12 @@ void kx_sprite_batch_begin(kx_ctx* ctx) {
     if (!ctx || !ctx->gpu || kx_recording(ctx)) return; // batch is a GPU win;
                                                         // raster per-sprite wins
     ctx->sprite_batch_open = true;
+    ctx->sprite_target = ctx->canvas;
 }
 void kx_sprite_batch_end(kx_ctx* ctx) {
     if (!ctx || !ctx->sprite_batch_open) return;
     ctx->sprite_batch_open = false;
+    ctx->sprite_target = nullptr;
     kx_sprite_flush(ctx);
 }
 
@@ -1921,7 +1943,8 @@ void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
     }
     const SkRect src = SkRect::MakeXYWH(sx, sy, sw, sh);
     // Batch: atlas blits under an open batch collect instead of drawing.
-    if (ctx->sprite_batch_open && it->second.atlas && ctx->gpu) {
+    static const bool no_batch = std::getenv("KX_NO_SPRITE_BATCH") != nullptr;
+    if (ctx->sprite_batch_open && it->second.atlas && ctx->gpu && !no_batch) {
         kx_ctx::KxPendingSprite sp;
         sp.src = src;
         const SkPoint corners[4] = {{dx, dy}, {dx + dw, dy},

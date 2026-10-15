@@ -113,25 +113,37 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
     return state->frame_surface->getCanvas();
 }
 
+static uint64_t kx_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static bool kx_prof_on() { static const bool on = getenv("KX_PROF") != nullptr; return on; }
+#define KX_PROF(name, t0) do { if (kx_prof_on()) fprintf(stderr, "  PROF %-16s %lldus\n", name, (long long)((kx_ns() - t0) / 1000)); } while (0)
+
 void gpu_end_frame(GpuState* state) {
     if (!state || !state->context) return;
+    const uint64_t t0 = kx_prof_on() ? kx_ns() : 0;
     if (state->recorder) {
         std::unique_ptr<skgpu::graphite::Recording> recording = state->recorder->snap();
+        KX_PROF("snap", t0);
         if (recording) {
             skgpu::graphite::InsertRecordingInfo info;
             info.fRecording = recording.get();
             info.fTargetSurface = state->frame_surface.get();
             state->context->insertRecording(info);
         }
+        KX_PROF("insert", t0);
         // Keep the recorder: surfaces created on it (offscreen pool, row
         // atlas) stay alive across frames — snap() already reset the
         // per-recording state.
     }
     state->context->submit();
+    KX_PROF("submit", t0);
     if (state->drawable) {
         [state->drawable present];
         state->drawable = nil;
     }
+    KX_PROF("present", t0);
     state->frame_surface = nullptr;
 }
 
