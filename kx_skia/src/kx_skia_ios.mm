@@ -145,7 +145,11 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
     // BackendTextures::MakeMetal does NOT retain the texture — keep our own
     // strong reference alive until the frame surface is released.
     state->drawable_texture = state->drawable.texture;
-    state->recorder = state->context->makeRecorder();
+    // The recorder persists across frames (snap() leaves it reusable) —
+    // pooled offscreen surfaces and atlas slots created on it stay valid.
+    // Per-frame reset orphaned those surfaces on a dead recorder (crash in
+    // RecorderPriv::popOrCreateKeyAndDataBuilder on the next pooled draw).
+    if (!state->recorder) state->recorder = state->context->makeRecorder();
     if (!state->recorder) return nullptr;
     const skgpu::graphite::BackendTexture backend_tex = skgpu::graphite::BackendTextures::MakeMetal(
         SkISize::Make(state->width, state->height),
@@ -174,7 +178,9 @@ void gpu_end_frame(GpuState* state) {
             info.fTargetSurface = state->frame_surface.get();
             state->context->insertRecording(info);
         }
-        state->recorder.reset();
+        // Keep the recorder (macOS parity): surfaces created on it —
+        // offscreen pool, row atlas — outlive the frame, snap() already
+        // reset the per-recording state.
     }
 #if TARGET_OS_SIMULATOR
     // Synchronous submit: the simulator's Metal is software-emulated and may
