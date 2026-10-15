@@ -481,6 +481,10 @@ pub const Node = struct {
                 // repaint) — not the whole parent. The parent chain is
                 // still intact for the damage walk.
                 child.markDirty();
+                // A pointer captured inside the leaving subtree transfers
+                // to this node — the gesture keeps bubbling to scrollable
+                // ancestors instead of dying at the next event.
+                input_mod.captureOnDetach(child, node);
                 child.parent = null;
                 node.markLayoutDirty();
                 return true;
@@ -501,6 +505,7 @@ pub const Node = struct {
             // Damage each leaving rect (the parent chain is still intact
             // for the walk); dedup makes the repeated ancestor marks cheap.
             c.markDirty();
+            input_mod.captureOnDetach(c, node); // see remove()
             c.parent = null;
             slot.* = c;
         }
@@ -1849,8 +1854,11 @@ test "deinit releases the node's router references (capture/hover/focus/popup)" 
     router.open_popup = child;
     try std.testing.expect(router.capturedNode(0) == child);
     try std.testing.expect(root.remove(child)); // detach first: the root must not double-free
+    // A captured subtree hands its capture to the surviving parent on
+    // detach — the gesture continues bubbling instead of dying mid-drag.
+    try std.testing.expect(router.capturedNode(0) == root);
     child.deinit();
-    try std.testing.expect(router.capturedNode(0) == null);
+    try std.testing.expect(router.capturedNode(0) == root); // no dangling ref to the dead child
     try std.testing.expect(router.hovered == null);
     try std.testing.expect(router.focused == null);
     try std.testing.expect(router.open_popup == null);

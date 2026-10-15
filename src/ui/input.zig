@@ -369,6 +369,23 @@ pub const InputRouter = struct {
         self.hovered = null;
     }
 
+    /// A subtree is being detached (remove/removeRange): a pointer captured
+    /// INSIDE it would die with the node — the capture moves to the surviving
+    /// parent so the gesture keeps bubbling (a list row virtualized away
+    /// mid-drag must not freeze the scroll). Runs while the child's parent
+    /// chain is still intact, before it is cut. Teardown's own drain still
+    /// clears slots via releaseNode — a dying parent gets no transfer.
+    pub fn captureOnDetach(self: *InputRouter, node: *Node, parent: ?*Node) void {
+        const live_parent: ?*Node = if (parent) |p| (if (p.zombie or p.torn_down) null else p) else null;
+        for (&self.captured) |*slot| {
+            if (slot.*) |*c| {
+                if (isDescendant(c.node, node)) {
+                    if (live_parent) |p| c.node = p else slot.* = null;
+                }
+            }
+        }
+    }
+
     /// Release every reference to a node being destroyed. No GC: widgets with
     /// input handlers call this from their deinit (dangling pointers are fatal).
     pub fn releaseNode(self: *InputRouter, node: *Node) void {
@@ -546,6 +563,12 @@ pub fn setOpenPopup(node: ?*Node) void {
 
 pub fn releaseNode(node: *Node) void {
     if (current_router) |r| r.releaseNode(node);
+}
+
+/// Process-global helper used by Node.remove/removeRange — same convention
+/// as releaseNode. `parent` = the node the subtree is being detached from.
+pub fn captureOnDetach(node: *Node, parent: ?*Node) void {
+    if (current_router) |r| r.captureOnDetach(node, parent);
 }
 
 // --- tests (recording stub widget) ---
