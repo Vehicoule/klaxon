@@ -106,7 +106,7 @@ The benchmark-driven audit that replaced every fake/approximate path with the re
 - **Vector icons** (`icon.zig`): all built-in `IconName`s render as geometry (fill/stroke paths, pline) — the Unicode-glyph path hit Apple Color Emoji through the new fallback (blue buttons with white cutouts instead of theme ink). Every duplicated glyph helper (avatar, calendar, date_picker, list_item, menu, navigation_rail, search_bar, segmented_button, split_button, text_field) routes through it.
 - **Dynamic color**: `deps/mcu/` = vendored material-color-utilities C++ (the repo's `version` file renamed `VENDORED.md` — it shadowed the C++ `<version>` header) + `src/dynamic_color.zig` HCT/SchemeExpressive binding.
 - **Shapes**: `src/ui/shapes.zig` — port of androidx.graphics.shapes (RoundedPolygon → normalized cubics, morph by control-point lerp incl. overshoot t>1), 9 tests, pending `kx_fill_path` wiring.
-- Test totals: ~830 tests + 155 goldens, all green. Raster bench highlights: `elevation_grid` 0.42ms (real shadows+cache), `text_ramp` 0.61ms @ 3201 shaped instances, `backdrop_scroll` ~7ms (honest CPU σ12 — GPU backends differ), static scenes ~0 (retained blit).
+- Test totals: ~830 tests + 155 goldens, all green. Raster bench highlights: `elevation_grid` 0.42ms (real shadows+cache), `text_ramp` 0.61ms @ 3201 shaped instances, `backdrop_scroll` ~3.3ms (real σ12 blur rendered at half res — `MatrixTransform→Blur→MatrixTransform`, adaptive σ≥8→½ / σ≥20→¼ on bands ≥32k px), static scenes ~0 (retained blit). Minified image draws sample bilinear+mip (lazy pyramid per image); upscales keep the documented nearest contract.
 
 ## M3E completion pass (2026-10-14, cont.)
 
