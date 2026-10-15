@@ -1124,8 +1124,24 @@ void kx_layer_close(kx_ctx* ctx) {
         // bounds grow by the kernel extent (~3σ) or the blur clips visibly.
         SkPaint paint;
         paint.setAlphaf(L->alpha);
-        paint.setImageFilter(SkImageFilters::Blur(
-                L->blur_sigma, L->blur_sigma, nullptr, nullptr));
+        // Same adaptive downscale as the backdrop path — a blurred layer
+        // has no content above ~1/sigma cycles/px.
+        float scale = 1.f;
+        if (b.width() * b.height() >= 32.f * 1024.f) {
+            if (L->blur_sigma >= 20.f) scale = 0.25f;
+            else if (L->blur_sigma >= 8.f) scale = 0.5f;
+        }
+        if (scale < 1.f) {
+            const SkSamplingOptions linear(SkFilterMode::kLinear);
+            paint.setImageFilter(SkImageFilters::MatrixTransform(
+                SkMatrix::Scale(1.f / scale, 1.f / scale), linear,
+                SkImageFilters::Blur(L->blur_sigma * scale, L->blur_sigma * scale,
+                    SkImageFilters::MatrixTransform(
+                        SkMatrix::Scale(scale, scale), linear, nullptr))));
+        } else {
+            paint.setImageFilter(SkImageFilters::Blur(
+                    L->blur_sigma, L->blur_sigma, nullptr, nullptr));
+        }
         SkRect bb = b;
         if (L->bounds_valid && !L->unbounded) bb.outset(3.0f * L->blur_sigma, 3.0f * L->blur_sigma);
         ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(
@@ -1664,6 +1680,25 @@ static void kx_prof(const char* name, uint64_t t0) {
                  (long long)((kx_prof_ns() - t0) / 1000));
 }
 
+// Scaled draws of transient pixel buffers (kx_draw_pixels) get plain
+// bilinear — no persistent image exists to amortize a mip pyramid over.
+static const SkSamplingOptions kx_linear_sampling(SkFilterMode::kLinear);
+
+// Sampling by scale: 1:1 blits and upscales stay nearest (pixel-exact +
+// the documented crisp-upscale contract); a real minification gets
+// bilinear + a lazily built mip pyramid — nearest under 2x+ shrink both
+// aliases and strides across far-apart source rows. Mips generate once
+// per image (~+1/3 memory) then amortize over every later scaled draw.
+static SkSamplingOptions kx_scaled_sampling(sk_sp<SkImage>& img,
+                                            float sw, float sh,
+                                            float dw, float dh) {
+    if (dw >= sw * 0.999f && dh >= sh * 0.999f) return SkSamplingOptions();
+    if (!img->hasMipmaps())
+        if (sk_sp<SkImage> mip = img->withDefaultMipmaps()) img = std::move(mip);
+    return SkSamplingOptions(SkFilterMode::kLinear,
+        img->hasMipmaps() ? SkMipmapMode::kLinear : SkMipmapMode::kNone);
+}
+
 void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float h) {
     const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || !ctx->canvas || !image || w <= 0 || h <= 0) return;
@@ -1745,9 +1780,12 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
         kx_prof("draw_image1", T0);
         return;
     }
-    ctx->canvas->drawImageRect(img, SkRect::MakeIWH(img->width(), img->height()),
+    const float iw = (float)img->width(), ih = (float)img->height();
+    const SkSamplingOptions smp =
+        kx_scaled_sampling(it->second.img, iw, ih, w, h);
+    ctx->canvas->drawImageRect(it->second.img.get(), SkRect::MakeIWH(iw, ih),
                                SkRect::MakeXYWH(x, y, w, h),
-                               SkSamplingOptions(), nullptr,
+                               smp, nullptr,
                                SkCanvas::kFast_SrcRectConstraint);
     kx_prof("draw_image", T0);
 }
@@ -2217,7 +2255,8 @@ void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
     }
     ctx->canvas->drawImageRect(it->second.img.get(), src,
                                SkRect::MakeXYWH(dx, dy, dw, dh),
-                               SkSamplingOptions(), pp,
+                               kx_scaled_sampling(it->second.img,
+                                   src.width(), src.height(), dw, dh), pp,
                                SkCanvas::kFast_SrcRectConstraint);
 }
 
@@ -2264,7 +2303,7 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
             if (ctx->pixels_view) {
                 ctx->canvas->drawImageRect(
                     ctx->pixels_view.get(), SkRect::MakeIWH(w, h),
-                    SkRect::MakeXYWH(x, y, dw, dh), SkSamplingOptions(), nullptr,
+                    SkRect::MakeXYWH(x, y, dw, dh), kx_linear_sampling, nullptr,
                     SkCanvas::kFast_SrcRectConstraint);
                 return;
             }
@@ -2277,7 +2316,7 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
             ctx->canvas->drawImage(img.get(), x, y);
         } else {
             ctx->canvas->drawImageRect(img.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
-                                       SkSamplingOptions(), nullptr,
+                                       kx_linear_sampling, nullptr,
                                        SkCanvas::kFast_SrcRectConstraint);
         }
         return;
@@ -2290,7 +2329,7 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
         ctx->canvas->drawImage(src.get(), x, y);
     } else {
         ctx->canvas->drawImageRect(src.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
-                                   SkSamplingOptions(), nullptr,
+                                   kx_linear_sampling, nullptr,
                                    SkCanvas::kFast_SrcRectConstraint);
     }
 }
@@ -2686,8 +2725,30 @@ void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sig
     // contents under the bounds; nothing is drawn inside, so the restore
     // composites just the blurred backdrop — the glass-panel primitive.
     SkRect r = SkRect::MakeXYWH(x, y, w, h);
-    auto filter = SkImageFilters::Blur(sigma, sigma, nullptr, nullptr);
-    ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, filter.get(), 0));
+    // Adaptive downscale: Skia's CPU blur only rescales when sigma > 135,
+    // so a mid-sigma band pays the full-res GaussianPass — yet a blurred
+    // source has no content above ~1/sigma cycles/px. Half res makes a
+    // sigma>=8 blur ~4x cheaper + visually indistinguishable (the panel
+    // on top covers any edge softness); sigma>=20 quarters it. On GPU the
+    // same chain trades full-res fragments for two extra render targets —
+    // still a win once the band is large.
+    float scale = 1.f;
+    if (w * h >= 32.f * 1024.f) {
+        if (sigma >= 20.f) scale = 0.25f;
+        else if (sigma >= 8.f) scale = 0.5f;
+    }
+    if (scale < 1.f) {
+        const SkSamplingOptions linear(SkFilterMode::kLinear);
+        auto chain = SkImageFilters::MatrixTransform(
+            SkMatrix::Scale(1.f / scale, 1.f / scale), linear,
+            SkImageFilters::Blur(sigma * scale, sigma * scale,
+                SkImageFilters::MatrixTransform(
+                    SkMatrix::Scale(scale, scale), linear, nullptr)));
+        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, chain.get(), 0));
+    } else {
+        auto filter = SkImageFilters::Blur(sigma, sigma, nullptr, nullptr);
+        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, filter.get(), 0));
+    }
     ctx->canvas->restore();
 }
 

@@ -449,6 +449,39 @@ test "cached paragraph recolors across draws (white then dark)" {
     try std.testing.expect(f.countColorIn(.{ .x = 0, .y = 50, .w = 100, .h = 30 }, 0x21005DFF) > 0);
 }
 
+test "backdrop_blur large-sigma path produces a true blur, not shifted content" {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 200, 120);
+    defer r.deinit();
+    r.beginFrame();
+    // Sharp boundary the blur must smear: black top half, white bottom.
+    kx.c.kx_clear(r.ctx, 0xFFFFFFFF);
+    kx.c.kx_fill_rect(r.ctx, 0, 0, 200, 60, 0x000000FF);
+    // sigma=12 over a 200x60 band engages the half-res chain — a wrong
+    // transform would leave sharp or misplaced pixels.
+    kx.c.kx_backdrop_blur(r.ctx, 0, 30, 200, 60, 12.0);
+    r.endFrame();
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const chan = struct {
+        fn r_(c: u32) u8 {
+            return @intCast((c >> 24) & 0xFF);
+        }
+    }.r_;
+    // Outside the band: untouched (black above y=30 is composited-away? —
+    // no: the band only rewrites [30,90) — y=10 stays pure black).
+    try std.testing.expectEqual(@as(u8, 0), chan(f.pixelAt(100, 10)));
+    try std.testing.expectEqual(@as(u8, 255), chan(f.pixelAt(100, 100)));
+    // Deep inside the black zone of the band: still dark.
+    try std.testing.expect(chan(f.pixelAt(100, 40)) < 80);
+    // Just below the boundary: white blurred toward black — light grey.
+    const below = chan(f.pixelAt(100, 75));
+    try std.testing.expect(below > 100 and below < 255);
+    // At the boundary: a real smear — mid grey, neither pure black nor white.
+    const mid = chan(f.pixelAt(100, 60));
+    try std.testing.expect(mid > 40 and mid < 220);
+}
+
 test "CJK + Arabic resolve through font fallback (nonzero ink + real advances)" {
     const golden = @import("../golden.zig");
     var r = try golden.Renderer.init(std.testing.allocator, 400, 80);
