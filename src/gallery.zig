@@ -3068,3 +3068,75 @@ test "gallery: tree rows expand/collapse on tap; Slide + scale animate over tick
     tl.tick(3200); // mid-flight: the spring writes a new color → repaint
     try std.testing.expect(pulse_box.dirty); // an animation tick repainted it
 }
+
+fn findByRole(n: *Node, role: ui.semantics.Role) ?*Node {
+    if (n.semantics) |s| {
+        if (s.role == role) return n;
+    }
+    for (n.children.items) |ch| {
+        if (findByRole(ch, role)) |f| return f;
+    }
+    return null;
+}
+
+test "zz2: slider value changes must not leave ghost thumbs" {
+    var router = input_mod.InputRouter{};
+    input_mod.setCurrent(&router);
+    defer input_mod.setCurrent(null);
+    var r = try golden.Renderer.init(std.testing.allocator, WINDOW_W, WINDOW_H);
+    defer r.deinit();
+    var g = try Gallery.init(std.testing.allocator);
+    defer g.deinit();
+    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(WINDOW_W), .h = @floatFromInt(WINDOW_H) });
+    const slider = findByRole(g.root, .slider).?;
+    const sw = findByLabel(g.root, "Switch").?; // the text label next to it
+    const sb = slider.bounds;
+    const wb = sw.bounds;
+    _ = wb;
+    // initial full paint, then step the value like a drag does — each step
+    // repaints through the damage path onto the retained surface
+    r.paint(g.root, 0x000000FF);
+    for ([_]f32{ 0.30, 0.45, 0.55, 0.68 }) |v| {
+        g.slider_sig.set(v);
+        r.paintDamage(g.root, 0x000000FF);
+    }
+    // a switch hover afterwards (the reported trigger)
+    router.dispatchPointer(g.root, .{ .phase = .enter, .x = 60, .y = 236 });
+    router.dispatchPointer(g.root, .{ .phase = .hover_move, .x = 60, .y = 236 });
+    r.paintDamage(g.root, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const t = theme_mod.dark;
+    // scan a horizontal line through the slider center; count primary runs
+    const cy: i32 = @intFromFloat(sb.y + 3); // above the 16px track — only the 44px thumb reaches
+    var runs: u32 = 0;
+    var in_run = false;
+    var x: i32 = @intFromFloat(sb.x);
+    const x_end: i32 = @intFromFloat(sb.x + sb.w);
+    while (x < x_end) : (x += 1) {
+        const px = f.pixelAt(x, cy);
+        const is_thumb = px == t.colors.primary;
+        if (is_thumb and !in_run) { runs += 1; in_run = true; }
+        if (!is_thumb) in_run = false;
+    }
+    std.debug.print("slider bounds=({d:.0},{d:.0} {d:.0}x{d:.0}) primary-runs={d}\n", .{ sb.x, sb.y, sb.w, sb.h, runs });
+    try std.testing.expectEqual(@as(u32, 1), runs); // exactly one thumb bar
+}
+
+test "zz3: theme rebuild stays cheap (perf regression guard)" {
+    // The dark/light toggle rebuilds the whole tree — a slow path that once
+    // felt laggy in Debug builds. Guard it: even the debug test binary must
+    // stay under ~2s (ReleaseFast measures ~1.5ms).
+    var g = try Gallery.init(std.testing.allocator);
+    defer g.deinit();
+    g.root.layout(.{ .x = 0, .y = 0, .w = 960, .h = 640 });
+    const sdl_c = @import("sdl.zig").c;
+    const t0 = sdl_c.SDL_GetTicksNS();
+    for (0..3) |_| {
+        g.dark_mode.set(!g.dark_mode.peek());
+        try g.rebuild();
+        g.root.layout(.{ .x = 0, .y = 0, .w = 960, .h = 640 });
+    }
+    const elapsed = sdl_c.SDL_GetTicksNS() - t0;
+    try std.testing.expect(elapsed < 2_000_000_000); // 3 rebuilds < 2s even in Debug
+}

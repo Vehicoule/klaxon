@@ -45,6 +45,14 @@ const state_layer_size: f32 = 40;
 const keyboard_step: f32 = 0.05;
 /// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
 const min_target: f32 = 48;
+/// TrackCornerSize — CornerFull on a 16dp track.
+const track_corner: f32 = track_h / 2;
+/// TrackInsideCornerSize — the corners facing the handle gap.
+const inside_corner: f32 = 2;
+/// ThumbTrackGapSize — the gap between handle edge and track segment end.
+const track_gap: f32 = 6;
+/// TrackStopIndicatorSize — the dot at the inactive track's outer end.
+const stop_d: f32 = 4;
 
 pub const SliderOptions = struct {
     enabled: bool = true,
@@ -69,6 +77,11 @@ const SliderState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The handle width — 4dp resting, morphs to 2dp pressed/focused via the
+    /// theme's fast spatial spring (M3E SliderTokens ActiveHandleWidth).
+    handle_w: f32 = thumb_w,
+    handle_target: f32 = thumb_w,
+    anim_channel: u8 = 0, // channel marker (stable address)
     /// The semantic value string ("42%") — borrowed by the semantics.
     value_buf: [16]u8 = std.mem.zeroes([16]u8),
     value_len: usize = 0,
@@ -115,20 +128,63 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
     const cc = currentColors(s);
     const v = clampedValue(s);
+    const rtl = ui.i18n.direction() == .rtl;
     // track: 16dp high, vertically centered, inset by half the thumb width
     const ty = b.y + (b.h - track_h) / 2;
     const tx = b.x + inset;
     const tw = @max(0, b.w - inset * 2);
-    ui.paint.fillRRect(ctx, tx, ty, tw, track_h, track_h / 2, cc.inactive);
-    const active_w = tw * v;
-    if (active_w > 0) {
-        ui.paint.fillRRect(ctx, tx, ty, active_w, track_h, track_h / 2, cc.active);
+    const cy = b.y + b.h / 2;
+    // The handle narrows pressed/focused — the morph is sprung (M3E). Focus
+    // has no widget callback, so the target is detected lazily here (paint
+    // runs on every dirty → a focus change re-arms it the next frame).
+    const want: f32 = if (s.pressed or input.isFocused(n)) thumb_w_active else thumb_w;
+    if (want != s.handle_target) {
+        s.handle_target = want;
+        morphHandle(n, s, want);
     }
-    // thumb: a vertical bar centered on the value position
-    const tw_thumb: f32 = if (s.pressed or input.isFocused(n)) thumb_w_active else thumb_w;
-    const thumb_x = tx + active_w - tw_thumb / 2;
-    ui.paint.fillRRect(ctx, thumb_x, b.y, tw_thumb, b.h, tw_thumb / 2, cc.thumb);
-    // state layer (enabled only): a 40dp circle centered on the thumb
+    const thw = s.handle_w;
+    // Compose drawTrack: the track splits into an ACTIVE segment
+    // (value-start → handle) and an INACTIVE segment (handle → value-end)
+    // separated by a gap = handleW/2 + 6dp measured from the handle center.
+    const value_x = tw * v; // handle center in the track's value space
+    const gap = thw / 2 + track_gap;
+    // Map a value-space x to a screen x (RTL mirrors the value direction).
+    const vx = struct {
+        fn f(tx0: f32, tw0: f32, xv: f32, flip: bool) f32 {
+            return tx0 + (if (flip) tw0 - xv else xv);
+        }
+    }.f;
+    const cx = vx(tx, tw, value_x, rtl);
+    // Active segment: [0, value_x - gap] in value space — outer (value-start)
+    // corner full, inner (handle side) corner 2dp. Painted only when wider
+    // than its outer corner (Compose activeTrackThreshold).
+    const a_w = value_x - gap;
+    if (a_w > track_corner) {
+        if (rtl) {
+            ui.paint.fillRRectCorners(ctx, tx + tw - a_w, ty, a_w, track_h, inside_corner, track_corner, track_corner, inside_corner, cc.active);
+        } else {
+            ui.paint.fillRRectCorners(ctx, tx, ty, a_w, track_h, track_corner, inside_corner, inside_corner, track_corner, cc.active);
+        }
+    }
+    // Inactive segment: [value_x + gap .. tw] — inner (handle side) 2dp,
+    // outer (value-end) corner full. Painted only past cornerSize + gap.
+    const i_x = value_x + gap;
+    const i_w = tw - i_x;
+    if (i_w > track_corner) {
+        if (rtl) {
+            ui.paint.fillRRectCorners(ctx, tx, ty, i_w, track_h, track_corner, inside_corner, inside_corner, track_corner, cc.inactive);
+        } else {
+            ui.paint.fillRRectCorners(ctx, tx + i_x, ty, i_w, track_h, inside_corner, track_corner, track_corner, inside_corner, cc.inactive);
+        }
+        // Stop indicator: a 4dp dot in the ACTIVE color, centered
+        // inside-corner-inset from the track's value-end.
+        const stop_x = vx(tx, tw, tw - track_corner, rtl);
+        ui.paint.fillRRect(ctx, stop_x - stop_d / 2, cy - stop_d / 2, stop_d, stop_d, stop_d / 2, cc.active);
+    }
+    // Handle: a 4x44 vertical bar (2dp while pressed/focused) centered on
+    // the value position, CornerFull.
+    ui.paint.fillRRect(ctx, cx - thw / 2, b.y, thw, b.h, thw / 2, cc.thumb);
+    // state layer (enabled only): a 40dp circle centered on the handle
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)
             s.opts.theme.state.pressed
@@ -139,20 +195,19 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         else
             0;
         if (alpha > 0) {
-            const cx = thumb_x + tw_thumb / 2;
-            const cy = b.y + b.h / 2;
             ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.thumb, alpha));
         }
     }
 }
 
 /// The value for a pointer x (window coords): the track spans
-/// [b.x + inset, b.x + w - inset].
+/// [b.x + inset, b.x + w - inset]. RTL mirrors the value direction.
 fn valueAt(s: *SliderState, b: Rect, x: f32) f32 {
     _ = s;
     const tw = @max(0, b.w - inset * 2);
     if (tw <= 0) return 0;
-    return std.math.clamp((x - b.x - inset) / tw, 0, 1);
+    const f = std.math.clamp((x - b.x - inset) / tw, 0, 1);
+    return if (ui.i18n.direction() == .rtl) 1 - f else f;
 }
 
 fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -222,19 +277,23 @@ fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
     return false;
 }
 
-/// Keyboard (Phase 2c): arrows adjust the value.
+/// Keyboard (Phase 2c): arrows adjust the value. Left/right follow the
+/// VALUE direction — in RTL "right" decreases (a11y matches the drag).
 fn sliderOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
+    const rtl = ui.i18n.direction() == .rtl;
     switch (ev.key) {
         .left, .down => {
-            s.sig.set(std.math.clamp(s.sig.peek() - keyboard_step, 0, 1));
+            const d: f32 = if (ev.key == .left and rtl) keyboard_step else -keyboard_step;
+            s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
         .right, .up => {
-            s.sig.set(std.math.clamp(s.sig.peek() + keyboard_step, 0, 1));
+            const d: f32 = if (ev.key == .right and rtl) -keyboard_step else keyboard_step;
+            s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -245,6 +304,30 @@ fn sliderOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 /// Repaint + keep the semantic value in sync (Phase 2c). The announced value
 /// is clamped — an out-of-range signal must not announce beyond 0-100.
+/// The handle-width morph: 4dp resting ↔ 2dp pressed/focused, sprung with
+/// the theme spatial spring (M3E fast-spatial handle morph). No timeline →
+/// snap (headless tests render the target state).
+fn morphHandle(n: *Node, s: *SliderState, target: f32) void {
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ s.handle_w, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .from = from,
+            .channel = @ptrCast(&s.anim_channel),
+            .on_update = .{ .fn_ptr = handleWCb, .userdata = n },
+        });
+    } else {
+        s.handle_w = target;
+        n.markDirty();
+    }
+}
+
+fn handleWCb(userdata: ?*anyopaque, value: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).handle_w = value[0];
+    n.markDirty();
+}
+
 fn sliderSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
@@ -257,6 +340,7 @@ fn sliderSyncCb(userdata: ?*anyopaque) void {
 
 fn sliderDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = sliderSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -480,10 +564,9 @@ test "golden: disabled slider paints the OnSurface@0.38 active track" {
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the active track (OnSurface@0.38) is painted OVER the inactive track
-    // (OnSurface@0.12 over white) — blend both layers
-    const inactive_over_white = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF);
-    try golden.expectPixelApprox(f, 40, 24, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), inactive_over_white));
+    // the active track (OnSurface@0.38) is its own segment — no inactive
+    // track beneath the gap-split layout, so it blends straight onto white
+    try golden.expectPixelApprox(f, 40, 24, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), 0xFFFFFFFF));
 }
 
 test "slider: paintBounds covers the thumb state layer at the track ends" {

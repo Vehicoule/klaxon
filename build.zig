@@ -16,7 +16,10 @@ pub fn build(b: *std.Build) void {
         else
             .{},
     });
-    const optimize = b.standardOptimizeOption(.{});
+    // Default ReleaseFast: the interactive demos (gallery, navigator, …) are
+    // what people run — a Debug build makes a theme rebuild ~450ms instead of
+    // ~1.5ms and misrepresents the framework. -Doptimize=Debug still works.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     // Phase 3f: wasm32-emscripten web target (docs/specs/phase-3f-wasm-plan.md).
     const is_wasm = target.result.os.tag == .emscripten;
