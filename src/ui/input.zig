@@ -477,9 +477,17 @@ fn hitTestSubtree(node: *Node, px: f32, py: f32) ?*Node {
         cy = p.y;
     }
     var i = node.children.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (hitTestSubtree(node.children.items[i], cx, cy)) |hit| return hit;
+    // hit_child delegates child routing (grid's O(1) spatial index) — same
+    // contract as Node.hitTest: a null answer means the parent takes it.
+    if (node.vtable.hit_child) |hc| {
+        if (hc(node, cx, cy)) |child| {
+            if (hitTestSubtree(child, cx, cy)) |hit| return hit;
+        }
+    } else {
+        while (i > 0) {
+            i -= 1;
+            if (hitTestSubtree(node.children.items[i], cx, cy)) |hit| return hit;
+        }
     }
     const b = if (node.vtable.hit_bounds) |hb| hb(node) else node.bounds;
     if (b.contains(px, py)) return node;
