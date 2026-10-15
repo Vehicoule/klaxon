@@ -50,6 +50,16 @@ const Rect = ui.node.Rect;
 const Constraints = ui.layout.Constraints;
 const Size = ui.layout.Size;
 const Color = ui.paint.Color;
+
+/// getenv is a linear environ scan — never call it per frame inside a tick.
+/// `name` is comptime so each call site gets its own cached answer.
+fn latchEnv(comptime name: [*:0]const u8) bool {
+    const S = struct {
+        var v: ?bool = null;
+    };
+    if (S.v == null) S.v = std.c.getenv(name) != null;
+    return S.v.?;
+}
 const EdgeInsets = ui.layout.EdgeInsets;
 const input_mod = ui.input;
 const anim_mod = ui.anim;
@@ -498,7 +508,7 @@ const SceneRunner = struct {
             .anim_100 => {
                 // Retarget every widget (phase-offset per widget) and advance
                 // the timeline 8 ms/frame — 100 concurrent spring animations.
-                const prof = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+                const prof = latchEnv("KLAXON_BENCH_PHASES");
                 const ta = sdl.c.SDL_GetTicksNS();
                 for (&r.anim_heights, 0..) |sig, i| {
                     const phase = @as(f32, @floatFromInt(frame)) * 0.06 + @as(f32, @floatFromInt(i)) * 0.17;
@@ -562,7 +572,7 @@ const SceneRunner = struct {
             .mount_churn => {
                 // Steady-state pool of 500: retire the 50 oldest, create 50 new.
                 const parent = r.churn_parent.?;
-                const prof = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+                const prof = latchEnv("KLAXON_BENCH_PHASES");
                 var trm: u64 = 0;
                 var tde: u64 = 0;
                 var tcr: u64 = 0;
@@ -896,7 +906,7 @@ const SceneRunner = struct {
         if (opts.warmup_frames == 0) ttff_ms = @as(f64, @floatFromInt(o1 - start_ns)) / 1e6;
         i = 0;
         if (opts.windowed) wall_start = sdl.c.SDL_GetTicksNS();
-        const dbg_loop = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+        const dbg_loop = latchEnv("KLAXON_BENCH_PHASES");
         while (i < measured) : (i += 1) {
             const t0 = sdl.c.SDL_GetTicksNS();
             r.tick(renderer, i);
