@@ -166,6 +166,9 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
     // the bg child has no state: reach the dialog through the panel (parent)
     const s = stateOf(panelStateOf(n.parent.?).dialog);
     const b = n.bounds;
+    // M3 dialog elevation = 6dp — the panel floats over the scrim.
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 6,
+        s.opts.theme.colors.shadow);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner, s.opts.theme.colors.surface_container_high);
 }
 
@@ -239,10 +242,13 @@ fn dialogMeasure(n: *Node, c: Constraints) Size {
 fn dialogLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     s.scrim.layout(bounds);
-    // Panel: content-sized, clamped to [280, 560] wide, centered.
+    // Panel: content-sized, clamped to [280, 560] wide, centered. A host
+    // narrower than 280 makes the lower bound unreachable — let the panel
+    // take the full width instead of asserting inside clamp.
     const panel = s.panel;
     const cs = panel.measure(.{ .max_w = bounds.w, .max_h = bounds.h });
-    const pw = std.math.clamp(cs.w, min_width, @min(max_width, bounds.w));
+    const max_w = @min(max_width, bounds.w);
+    const pw = std.math.clamp(cs.w, @min(min_width, max_w), max_w);
     const ph = @min(cs.h, bounds.h);
     panel.layout(.{
         .x = bounds.x + (bounds.w - pw) / 2,

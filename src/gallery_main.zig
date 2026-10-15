@@ -53,6 +53,7 @@ const Options = struct {
     width: c_int = gallery_mod.WINDOW_W,
     height: c_int = gallery_mod.WINDOW_H,
     ppm: ?[:0]const u8 = null,
+    light: bool = false,
 };
 
 fn optsFromArgs(args: std.process.Args) !Options {
@@ -65,6 +66,7 @@ fn optsFromArgs(args: std.process.Args) !Options {
     var ppm: ?[:0]const u8 = null;
     var width: c_int = gallery_mod.WINDOW_W;
     var height: c_int = gallery_mod.WINDOW_H;
+    var light = false;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
@@ -84,9 +86,11 @@ fn optsFromArgs(args: std.process.Args) !Options {
             width = std.fmt.parseInt(c_int, arg["--width=".len..], 10) catch width;
         } else if (std.mem.startsWith(u8, arg, "--height=")) {
             height = std.fmt.parseInt(c_int, arg["--height=".len..], 10) catch height;
+        } else if (std.mem.eql(u8, arg, "--light")) {
+            light = true;
         }
     }
-    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm };
+    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm, .light = light };
 }
 
 fn lerpChannel(a: u32, b: u32, shift: u5, t: f32) u32 {
@@ -136,6 +140,10 @@ fn galleryMain(opts: Options) !void {
 
     const g = try gallery_mod.Gallery.init(allocator);
     defer g.deinit();
+    if (opts.light) {
+        g.dark_mode.set(false);
+        try g.rebuild(); // the signal alone doesn't swap the baked theme tree
+    }
 
     // the focus ring follows the theme's platform tokens (Phase 2d-0.5);
     // themeToggleCb re-syncs them on every density/theme switch

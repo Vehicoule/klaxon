@@ -155,7 +155,9 @@ fn panelBgStateOf(n: *Node) *PanelBgState {
 fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(panelBgStateOf(n).sheet);
     const b = n.bounds;
-    // CornerExtraLargeTop: 28dp on the top corners only
+    // CornerExtraLargeTop: 28dp on the top corners only; modal sheet = 1dp.
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner_top, 1,
+        s.opts.theme.colors.shadow);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner_top, s.opts.theme.colors.surface_container_low);
 }
 

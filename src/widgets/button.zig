@@ -30,10 +30,7 @@
 //     end side); the children paint clipped to the button's bounds (a
 //     constrained button never lets label ink cross the container edge)
 //
-// v1 deviations (documented, fixed later):
-//   - Elevation: v1 draws flat colors (the raster shadow pass lands Phase 3)
-//     — elevated renders SurfaceContainerLow without a shadow; the hover
-//     elevation change is a visual no-op.
+//   - Elevated casts the real M3 level-1 shadow (level-3 on hover).
 //   - Shape morph on press is instant (the animated morph lands with the
 //     animation system, Phase 3).
 //   - Text button label = Primary per the m3.material.io spec (the Compose
@@ -299,6 +296,13 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
         b.h / 2 // CornerFull = pill
     else
         d.square_corner;
+    // Elevated variant: real M3 elevation shadow (rest level 1, hover
+    // level 2 — the spec's resting→hover lift). Painted under the
+    // container so the state layer composites on top of it.
+    if (s.opts.variant == .elevated and s.opts.enabled) {
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, radius,
+            if (s.hovered) 3 else 1, t.colors.shadow);
+    }
     // container
     const container = if (s.opts.enabled) vc.container else vc.disabled_container;
     if (container & 0xFF != 0) {

@@ -378,6 +378,9 @@ fn menuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     const ph = panel_v_pad * 2 + @as(f32, @floatFromInt(s.items.items.len)) * item_h;
     const rtl = ui.i18n.direction() == .rtl;
     const px = if (rtl) b.x + b.w - pw else b.x;
+    // M3 menu elevation = 2dp.
+    ui.paint.elevationShadow(ctx, px, b.y + b.h, pw, ph, panel_radius, 2,
+        t.colors.shadow);
     ui.paint.fillRRect(ctx, px, b.y + b.h, pw, ph, panel_radius, t.colors.surface_container);
     for (n.children.items[1..]) |child| { // [0] = the anchor
         if (child.visible) itemPaint(child, ctx);
@@ -709,8 +712,9 @@ test "golden: open menu paints the SurfaceContainer panel + item labels" {
     // the panel: SurfaceContainer, its top at the anchor's bottom edge
     // (20 + 40 = 60; the 8dp vertical padding is inside the panel)
     try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(80, 70));
-    // the panel's rounded corner (radius 4): the exact corner stays background
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(20, 60));
+    // the panel's rounded corner (radius 4): no container ink — the 2dp
+    // elevation shadow may tint it but never with the panel color
+    try std.testing.expect(f.pixelAt(20, 60) != t.colors.surface_container);
     // the first item's label ink (on_surface) in its row
     try std.testing.expect(f.countColorIn(.{ .x = 32, .y = 68 + 8 + 12, .w = 80, .h = 24 }, t.colors.on_surface) > 0);
     // the second item's leading icon ink (on_secondary_container — the menu quirk)

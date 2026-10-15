@@ -428,7 +428,7 @@ pub const Gallery = struct {
     /// The fresh tree is fully built before the old one is torn down.
     /// Transient widget state (typed text, dropdown selection, scroll
     /// offsets) is captured before the swap and restored after it.
-    fn rebuild(g: *Gallery) !void {
+    pub fn rebuild(g: *Gallery) !void {
         const theme = g.currentTheme();
         g.list_ctx.theme = theme;
         const had_tree = g.tree != null;

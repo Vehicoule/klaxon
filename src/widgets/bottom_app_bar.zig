@@ -224,8 +224,9 @@ test "golden: bottom_app_bar paints the surface_container and the docked FAB" {
     r.paint(bar, 0x000000FF);
     var fr = try r.readback(std.testing.allocator);
     defer fr.deinit();
-    // the bar is the surface_container except the action/FAB ink
-    try std.testing.expect(fr.countColor(t.colors.surface_container) > 400 * 80 - 8000);
+    // the bar is the surface_container except the action/FAB ink — sample
+    // the middle strip so the FAB's elevation shadow can't dilute the count
+    try std.testing.expect(fr.countColorIn(.{ .x = 120, .y = 10, .w = 180, .h = 60 }, t.colors.surface_container) > 180 * 60 - 500);
     // the FAB's primary_container squircle shows at the end edge
     try std.testing.expect(fr.countColorIn(.{ .x = 400 - 16 - 56, .y = 12, .w = 56, .h = 56 }, t.colors.primary_container) > 1500);
     // nothing past the end margin

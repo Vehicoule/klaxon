@@ -224,7 +224,10 @@ const snack_vtable = ui.node.VTable{
 
 fn bgPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
-    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner, stateOf(n.parent.?).opts.theme.colors.inverse_surface);
+    const t = stateOf(n.parent.?).opts.theme;
+    // Snackbar elevation = 6dp — it must read over whatever it covers.
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 6, t.colors.shadow);
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner, t.colors.inverse_surface);
 }
 
 const bg_vtable = ui.node.VTable{

@@ -186,6 +186,10 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
         const tr: f32 = if (right_anchored) 0 else corner;
         const br: f32 = if (right_anchored) 0 else corner;
         const bl: f32 = if (right_anchored) corner else 0;
+        // Modal side sheet = 1dp — corner radii are one-sided but the rrect
+        // shadow approximation is indistinguishable at this elevation.
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 1,
+            t.colors.shadow);
         ui.paint.fillRRectCorners(ctx, b.x, b.y, b.w, b.h, tl, tr, br, bl, t.colors.surface_container_low);
     } else {
         // standard: Surface, CornerNone (flush to the edge)

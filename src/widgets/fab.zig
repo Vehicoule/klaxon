@@ -24,8 +24,8 @@
 //   - disabled: container OnSurface@0.12, content OnSurface@0.38
 //   - state layers: the content color @ hover 0.08 / focus 0.10 /
 //     pressed 0.12 over the container
-//   - elevation level3 (hover level4) — v1 paints flat colors (no shadow
-//     pass — Phase 3; the state layer is the only elevation cue)
+//   - elevation level3 (hover level4): the real ambient+spot shadow —
+//     6dp rest, 8dp hovered/focused
 //   - toggle (ToggleFloatingActionButton): unchecked = the plain FAB;
 //     checked morphs to 56dp CornerFull, the family's solid/on-solid pair,
 //     icon 20 (FabMenuBaselineTokens.CloseButton*)
@@ -248,6 +248,11 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     const cc = currentColors(s);
     const r = fabContainerRect(n, s);
     const radius = currentDims(s).radius;
+    // M3 elevation level 3 (level 4 hovered) — the FAB's signature lift.
+    if (s.opts.enabled) {
+        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius,
+            if (s.hovered) 8 else 6, t.colors.shadow);
+    }
     // container
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, cc.container);
@@ -554,6 +559,10 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
     const d = extDims(t, s.opts.size);
     const cc = extCurrentColors(s);
     const b = n.bounds;
+    if (s.opts.enabled) {
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius,
+            if (s.hovered) 8 else 6, t.colors.shadow);
+    }
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, cc.container);
     }

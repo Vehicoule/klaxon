@@ -393,6 +393,17 @@ pub fn shadowRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, el
     kx.c.kx_shadow_rrect(ctx, x, y, w, h, radius, elevation, ambient, spot, @intFromBool(transparent_occluder));
 }
 
+/// M3 elevation under a rounded container — the real ambient+spot pair
+/// (SkShadowUtils) at the theme's shadow color. `level` is the M3
+/// elevation in dp: 1 elevated button/card rest, 2 menu/snackbar,
+/// 3 dialog/FAB. The 15%/38% ambient/spot split matches the tuned
+/// elevation_grid values.
+pub fn elevationShadow(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, level: f32, shadow_color: Color) void {
+    if (!(level > 0)) return; // NaN/0 = flat
+    shadowRRect(ctx, x, y, w, h, radius, level,
+        withAlphaScaled(shadow_color, 0.15), withAlphaScaled(shadow_color, 0.38), false);
+}
+
 /// Path verbs for fillPath/strokePath — pts consumed per verb.
 pub const PathVerb = enum(i32) { move = 0, line = 1, quad = 2, cubic = 3, close = 4 };
 

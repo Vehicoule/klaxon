@@ -116,6 +116,12 @@ fn cardPaint(n: *Node, ctx: *kx.Ctx) void {
         .elevated => cs.surface_container_low,
         .outlined => cs.surface,
     };
+    // Elevated variant: M3 elevation 1 at rest — the card reads above the
+    // surface through its shadow, not a tint change.
+    if (s.opts.variant == .elevated and s.opts.enabled) {
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, card_radius,
+            1, cs.shadow);
+    }
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, container);
     }
