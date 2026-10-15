@@ -105,10 +105,12 @@ pub fn rgbToHsv(r: u8, g: u8, b: u8) Hsv {
 
 /// HSV (h 0..360, s 0..1, v 0..1) -> RGB (0..255 each).
 pub fn hsvToRgb(h: f32, s: f32, v: f32) struct { r: u8, g: u8, b: u8 } {
-    const hh = @mod(h, 360);
-    const c = v * s;
+    const ss = if (std.math.isNan(s)) 0 else std.math.clamp(s, 0, 1);
+    const vv = if (std.math.isNan(v)) 0 else std.math.clamp(v, 0, 1);
+    const hh = @mod(if (std.math.isNan(h)) 0 else h, 360);
+    const c = vv * ss;
     const x = c * (1 - @abs(@mod(hh / 60, 2) - 1));
-    const m = v - c;
+    const m = vv - c;
     var rf: f32 = 0;
     var gf: f32 = 0;
     var bf: f32 = 0;

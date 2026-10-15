@@ -87,7 +87,14 @@ fn arcPoint(cx: f32, cy: f32, r: f32, deg: f32) struct { x: f32, y: f32 } {
 
 /// Fill xs/ys with an arc from `start_deg` sweeping `sweep_deg` (clockwise).
 /// Returns the point count (<= max).
+/// NaN-safe progress clamp — a signal holding NaN would otherwise crash the
+/// int casts in the arc/wave builders.
+fn clamp01(v: f32) f32 {
+    return if (std.math.isNan(v)) 0 else std.math.clamp(v, 0, 1);
+}
+
 fn arcPolyline(xs: []f32, ys: []f32, cx: f32, cy: f32, r: f32, start_deg: f32, sweep_deg: f32) usize {
+    if (!std.math.isFinite(sweep_deg)) return 0;
     const n: usize = @intFromFloat(@ceil(@abs(sweep_deg) / 360 * arc_segments));
     const count = @min(@max(n, 2), xs.len);
     for (0..count) |i| {
@@ -101,7 +108,7 @@ fn arcPolyline(xs: []f32, ys: []f32, cx: f32, cy: f32, r: f32, start_deg: f32, s
 /// Fill xs/ys with a sine wave over [x0, x1]: y = yc + amp * sin(...).
 /// `phase` scrolls the wave (indeterminate). Returns the point count.
 fn wavePolyline(xs: []f32, ys: []f32, x0: f32, x1: f32, yc: f32, amp: f32, wavelength: f32, phase: f32) usize {
-    const width = @max(0, x1 - x0);
+    const width = if (std.math.isFinite(x1 - x0)) @max(0, x1 - x0) else 0;
     if (width <= 0) {
         xs[0] = x0;
         ys[0] = yc + amp * @sin(2 * std.math.pi * (x0 - phase * wavelength) / wavelength);
@@ -139,7 +146,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 const seg = b.w * 0.4;
                 const pos = s.phase * (b.w + seg) - seg;
                 const x0: f32 = if (s.opts.progress) |_| b.x else b.x + std.math.clamp(pos, 0, b.w);
-                const x1: f32 = if (s.opts.progress) |p| b.x + b.w * std.math.clamp(p, 0, 1) else b.x + std.math.clamp(pos + seg, 0, b.w);
+                const x1: f32 = if (s.opts.progress) |p| b.x + b.w * clamp01(p) else b.x + std.math.clamp(pos + seg, 0, b.w);
                 if (x1 > x0) ui.paint.fillRRect(ctx, x0, cy - linear_thickness / 2, x1 - x0, linear_thickness, linear_thickness / 2, active);
             } else {
                 var xs: [wave_points]f32 = undefined;
@@ -151,7 +158,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 const seg = b.w * 0.4;
                 const pos = s.phase * (b.w + seg) - seg;
                 const x0: f32 = if (s.opts.progress) |_| b.x else b.x + std.math.clamp(pos, 0, b.w);
-                const x1: f32 = if (s.opts.progress) |p| b.x + b.w * std.math.clamp(p, 0, 1) else b.x + std.math.clamp(pos + seg, 0, b.w);
+                const x1: f32 = if (s.opts.progress) |p| b.x + b.w * clamp01(p) else b.x + std.math.clamp(pos + seg, 0, b.w);
                 if (x1 > x0) {
                     const n_active = wavePolyline(&xs, &ys, x0, x1, cy, wave_amplitude, wave_wavelength, s.phase);
                     ui.paint.strokePolyline(ctx, xs[0..n_active], ys[0..n_active], linear_thickness, true, active);
@@ -170,7 +177,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
             // active: determinate = arc from the top spanning progress*360;
             // indeterminate = fixed arc rotating (v1 deviation — header)
             const start: f32 = -90;
-            const sweep: f32 = if (s.opts.progress) |p| 360 * std.math.clamp(p, 0, 1) else circular_indet_sweep;
+            const sweep: f32 = if (s.opts.progress) |p| 360 * clamp01(p) else circular_indet_sweep;
             const rotation: f32 = if (s.opts.progress == null) s.phase * circular_indet_rotation else 0;
             if (sweep > 0) {
                 const n_active = arcPolyline(&xs, &ys, cx, cy, r, start + rotation, sweep);
