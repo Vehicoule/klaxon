@@ -123,18 +123,7 @@ fn listPaint(n: *Node, ctx: *kx.Ctx) void {
 /// compositor translating a layer. Returns false → the normal per-child
 /// pass runs (first paint, a slid virtualization window, a stale backing,
 /// or a nested offscreen pass where none is available).
-// KLAXON_BENCH_PHASES: split the scroll-copy frame into offscreen
-// begin/strip/snapshot/screen-blit so the residual cost is attributable.
-const sdl_probe = @import("../sdl.zig");
-var g_t0: u64 = 0;
-inline fn probe(comptime name: []const u8) void {
-    const t = sdl_probe.c.SDL_GetTicksNS();
-    if (g_t0 != 0) std.debug.print("  sc {s}: {d}us\n", .{ name, (t - g_t0) / 1000 });
-    g_t0 = t;
-}
-
 fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
-    probe("enter");
     const s = stateOf(ListState, n);
     // GPU + row atlas: every retained row is a slot blit that joins the
     // sprite batch (ONE mesh for the viewport) — cheaper than the
@@ -200,9 +189,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         dropBacking(s);
         return false;
     }
-    probe("begin");
     if (have) ui.paint.imageDraw(ctx, s.backing, 0, -dy, w, h);
-    probe("backing-blit");
     if (repaint.w > 0 and repaint.h > 0) {
         ui.paint.clipRect(ctx, repaint.x, repaint.y, repaint.w, repaint.h);
         // Image space → content space: a child's own bounds place it at
@@ -221,9 +208,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         ui.paint.spriteBatchEnd(ctx); // flush BEFORE clipReset reorders it
         ui.paint.clipReset(ctx);
     }
-    probe("strip");
     const img = ui.paint.offscreenEndImage(ctx);
-    probe("snapshot");
     dropBacking(s);
     if (img != 0) {
         s.backing = img;
@@ -232,9 +217,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         s.backing_w = iw;
         s.backing_h = ih;
         ui.paint.imageDraw(ctx, img, ix, iy, w, h);
-        probe("screen-blit");
     }
-    g_t0 = 0;
     return true;
 }
 

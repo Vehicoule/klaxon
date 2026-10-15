@@ -413,11 +413,10 @@ fn tweenValue(from: Vec4, to: Vec4, curve: Curve, t_ms: u64, duration_ms: u32) V
 pub const Timeline = struct {
     animations: std.array_list.Managed(Animation),
     tickers: std.array_list.Managed(Ticker),
-    /// Channel ptr → newest live animation id. Retargeting used to scan
-    /// `animations` linearly per play() — with N live channels an app that
-    /// retargets all of them per frame paid O(N²) (anim_100: ~40k compares
-    /// per tick). The map makes play() O(1); superseded entries stay in the
-    /// list and are dropped by tick's existing compaction.
+    /// Channel ptr → index in `animations` of the live animation. A retarget
+    /// REPLACES the entry in place (no append+swapRemove churn per frame —
+    /// anim_100 plays 200 retargets/tick) and the map keeps pointing at the
+    /// same slot; swapRemove fixups keep indices valid on compaction.
     channel_map: std.AutoHashMap(usize, u32),
     next_id: u32 = 1,
     last_now_ms: u64 = 0,
@@ -474,37 +473,54 @@ pub const Timeline = struct {
         return false;
     }
 
-    /// Drop a channel_map entry when the animation it points at goes away
-    /// (cancel/complete/compaction). Prevents a stale id from marking a
+    /// Drop a channel_map entry when the animation at `idx` goes away
+    /// (cancel/complete/compaction). Prevents a stale index from marking a
     /// future animation on the same channel as superseded.
-    fn clearChannelRef(tl: *Timeline, a: *const Animation) void {
-        const ch = a.channel orelse return;
+    fn clearChannelRef(tl: *Timeline, ch: *anyopaque, idx: u32) void {
         const key = @intFromPtr(ch);
-        if (tl.channel_map.get(key) == a.id) _ = tl.channel_map.remove(key);
+        if (tl.channel_map.get(key) == idx) _ = tl.channel_map.remove(key);
+    }
+
+    /// A swapRemove dropped slot i: the former last element moved into it —
+    /// repoint its channel entry so retarget lookups stay valid.
+    fn fixSwapIndex(tl: *Timeline, i: usize) void {
+        if (i < tl.animations.items.len) {
+            if (tl.animations.items[i].channel) |ch|
+                tl.channel_map.put(@intFromPtr(ch), @intCast(i)) catch @panic("klaxon: out of memory");
+        }
     }
 
     /// Register an animation. A previous animation on the same channel is
-    /// superseded (retargeting mid-flight): the map points at the new id and
-    /// tick drops the old entry on its next pass. Returns the animation id
-    /// (for cancel). The start is lazy: the first tick assigns start_ms
+    /// superseded — replaced IN PLACE at its slot (retargeting mid-flight):
+    /// no list growth, no per-frame compaction churn. Returns the animation
+    /// id (for cancel). The start is lazy: the first tick assigns start_ms
     /// (fresh clock).
     pub fn play(tl: *Timeline, a: Animation) u32 {
         var anim = a;
         anim.id = tl.next_id;
         tl.next_id += 1;
-        tl.animations.append(anim) catch @panic("klaxon: out of memory");
         if (a.channel) |ch| {
-            tl.channel_map.put(@intFromPtr(ch), anim.id) catch @panic("klaxon: out of memory");
+            const key = @intFromPtr(ch);
+            if (tl.channel_map.get(key)) |idx| {
+                if (idx < tl.animations.items.len and !tl.animations.items[idx].done) {
+                    tl.animations.items[idx] = anim;
+                    return anim.id;
+                }
+            }
+            tl.animations.append(anim) catch @panic("klaxon: out of memory");
+            tl.channel_map.put(key, @intCast(tl.animations.items.len - 1)) catch @panic("klaxon: out of memory");
+        } else {
+            tl.animations.append(anim) catch @panic("klaxon: out of memory");
         }
         return anim.id;
     }
 
     /// Cancel by id (no-op if unknown or already done).
     pub fn cancel(tl: *Timeline, id: u32) void {
-        for (tl.animations.items) |*a| {
+        for (tl.animations.items, 0..) |*a, i| {
             if (a.id == id) {
                 a.done = true;
-                tl.clearChannelRef(a);
+                if (a.channel) |ch| tl.clearChannelRef(ch, @intCast(i));
             }
         }
     }
@@ -565,17 +581,18 @@ pub const Timeline = struct {
         while (i < tl.animations.items.len) {
             var a = tl.animations.items[i]; // copy: callbacks may reallocate
             if (!a.done) {
-                // A channel's map entry points at the NEWEST animation —
-                // anything older on that channel was superseded by a later
-                // play() and is dead weight.
+                // A channel's map entry points at the slot OWNING the
+                // channel — a retargeted play() replaced it in place, so a
+                // mismatch means this entry is dead weight.
                 if (a.channel) |ch| {
-                    if (tl.channel_map.get(@intFromPtr(ch))) |live_id| {
-                        if (live_id != a.id) a.done = true;
+                    if (tl.channel_map.get(@intFromPtr(ch))) |live_idx| {
+                        if (live_idx != i) a.done = true;
                     }
                 }
             }
             if (a.done) {
                 _ = tl.animations.swapRemove(i);
+                tl.fixSwapIndex(i);
                 continue;
             }
             if (!a.started) {
@@ -590,9 +607,10 @@ pub const Timeline = struct {
             if (a.isComplete(now_ms)) {
                 // Remove BEFORE the callbacks: they may play/cancel.
                 a.done = true;
-                tl.clearChannelRef(&a);
+                if (a.channel) |ch| tl.clearChannelRef(ch, @intCast(i));
                 tl.animations.items[i] = a;
                 _ = tl.animations.swapRemove(i);
+                tl.fixSwapIndex(i);
                 if (a.on_update) |cb| cb.fn_ptr(cb.userdata, a.finalValue());
                 if (a.on_complete) |cb| cb.fn_ptr(cb.userdata);
                 continue; // swapRemove moved the last element into slot i

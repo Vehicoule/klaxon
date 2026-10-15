@@ -654,6 +654,10 @@ pub const Node = struct {
             const by = node.retained_iy + (pr.y - node.retained_pr.y);
             if (bx == @floor(bx) and by == @floor(by)) {
                 if (node.retained_atlas) {
+                    // Inside a nested pass (this subtree IS being rasterized)
+                    // the atlas blit would self-sample the surface being
+                    // written — paint the content directly instead.
+                    if (paint_mod.inNestedPass(ctx)) return false;
                     const img = paint_mod.atlasImage(ctx);
                     if (img != 0) {
                         paint_mod.imageDrawRegion(ctx, img,
