@@ -172,6 +172,13 @@ struct kx_ctx {
     sk_sp<SkSurface> offscreen_pool;
     int offscreen_pool_w = 0;
     int offscreen_pool_h = 0;
+    // Video-style pixel streaming surface: kx_draw_pixels on GPU writes
+    // into ONE persistent texture (writePixels) instead of alloc'ing a
+    // fresh texture per frame — a real player's present path.
+    sk_sp<SkSurface> pixels_surf;
+    sk_sp<SkImage> pixels_view;
+    int pixels_surf_w = 0;
+    int pixels_surf_h = 0;
     // Ephemeral images registered by kx_draw_pixels inside an alpha layer —
     // destroyed right after the top-level layer's replay (they exist only
     // so the recorded ImageDraw op resolves at replay time).
@@ -1262,6 +1269,8 @@ void kx_destroy(kx_ctx* ctx) {
     ctx->atlas_view.reset();
     ctx->offscreen.reset();
     ctx->offscreen_pool.reset();
+    ctx->pixels_surf.reset();
+    ctx->pixels_view.reset();
     ctx->images.clear();
     ctx->owned_images.clear();
     if (ctx->gpu) kx::gpu_shutdown(ctx->gpu);
@@ -1309,6 +1318,10 @@ void kx_begin_frame(kx_ctx* ctx) {
         ctx->offscreen_pool = nullptr; // stale: those platforms still reset
         ctx->offscreen_pool_w = 0;     //        the recorder per frame
         ctx->offscreen_pool_h = 0;
+        ctx->pixels_surf = nullptr;
+        ctx->pixels_view = nullptr;
+        ctx->pixels_surf_w = 0;
+        ctx->pixels_surf_h = 0;
     }
     // Unbalanced layer records from a previous frame die with it.
     ctx->layers.clear();
@@ -1947,14 +1960,38 @@ void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
     kx_count_op(ctx); // GPU upload+draw or raster borrowed draw: one op
     const SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
     if (ctx->gpu) {
-        // GPU path: own the pixels — the backend upload may defer its read
-        // past this call, so the borrowed buffer can't be relied on.
+        // Persistent staging texture: writePixels streams into the SAME
+        // backing — no per-frame texture alloc or 230KB CPU copy, just the
+        // upload a video player actually needs.
+        if (!ctx->pixels_surf || w > ctx->pixels_surf_w || h > ctx->pixels_surf_h) {
+            const int pw = std::max(w, ctx->pixels_surf_w);
+            const int ph = std::max(h, ctx->pixels_surf_h);
+            sk_sp<SkSurface> surf = kx::gpu_offscreen_surface(ctx->gpu, pw, ph);
+            if (surf) {
+                ctx->pixels_surf = std::move(surf);
+                ctx->pixels_surf_w = pw;
+                ctx->pixels_surf_h = ph;
+                ctx->pixels_view.reset();
+            }
+        }
+        if (ctx->pixels_surf) {
+            SkPixmap src(info, rgba, static_cast<size_t>(w) * 4);
+            ctx->pixels_surf->writePixels(src, 0, 0);
+            ctx->pixels_view.reset(); // writes invalidate the temp view
+            ctx->pixels_view = ctx->pixels_surf->makeTemporaryImage();
+            if (ctx->pixels_view) {
+                ctx->canvas->drawImageRect(
+                    ctx->pixels_view.get(), SkRect::MakeIWH(w, h),
+                    SkRect::MakeXYWH(x, y, dw, dh), SkSamplingOptions(), nullptr,
+                    SkCanvas::kFast_SrcRectConstraint);
+                return;
+            }
+        }
+        // Fallback: one-shot image (e.g. no frame in flight yet).
         sk_sp<SkData> data = SkData::MakeWithCopy(rgba, static_cast<size_t>(w) * h * 4);
         sk_sp<SkImage> img = SkImages::RasterFromData(info, std::move(data), static_cast<size_t>(w) * 4);
         img = kx::gpu_image_upload(ctx->gpu, std::move(img));
         if (dw == w && dh == h) {
-            // 1:1 blit: an unscaled drawImage skips the sampling/filter
-            // machinery a same-size drawImageRect would still walk.
             ctx->canvas->drawImage(img.get(), x, y);
         } else {
             ctx->canvas->drawImageRect(img.get(), SkRect::MakeIWH(w, h), SkRect::MakeXYWH(x, y, dw, dh),
