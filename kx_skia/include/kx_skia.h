@@ -60,6 +60,10 @@
 //            variation design coordinates — SkFontArguments::VariationPosition
 //            via TextStyle::setFontArguments). Struct-append only; existing
 //            zero-initialized callers behave identically (count 0).
+//   0.18.0 — row atlas + sprite batch: kx_atlas_begin/end/free/image/gen,
+//            kx_in_atlas_pass, kx_ctx_serial/alive, kx_draw_image_region_
+//            tinted, kx_sprite_batch_begin/end, kx_draw_image_atlas,
+//            kx_draw_image_set; stackable kx_offscreen passes.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 

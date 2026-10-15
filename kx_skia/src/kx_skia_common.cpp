@@ -90,6 +90,9 @@ struct KxRecOp {
     uint64_t image = 0;
     int count = 0;
     bool flag = false;
+    /// `color` is meaningful only when set — a recorded tint of
+    /// 0x00000000 must replay transparent, not fall back to opaque.
+    bool has_color = false;
     float size = 0;
     std::string text;
     std::vector<float> xs, ys;
@@ -465,6 +468,7 @@ static std::unique_ptr<skia::textlayout::Paragraph> kx_build_paragraph(
     if (letter_spacing != 0.0f) ts.setLetterSpacing(letter_spacing);
     ParagraphStyle ps;
     auto builder = ParagraphBuilder::make(ps, kx_font_collection(), kx_unicode());
+    if (!builder) return nullptr; // no ICU/no font collection — caller falls back
     builder->pushStyle(ts);
     builder->addText(text, len);
     auto p = builder->Build();
@@ -911,9 +915,11 @@ static SkColor kx_to_skcolor(uint32_t rgba) {
 namespace {
 
 bool kx_recording(const kx_ctx* ctx) {
-    // The offscreen pass is a raster target of its own: draws inside it are
-    // not part of an open alpha layer's content.
-    return !ctx->layers.empty() && ctx->offscreen_stack.empty();
+    // A nested pass (offscreen pool OR atlas write) is a raster target of
+    // its own: draws inside it are not part of an open alpha layer's
+    // content — recording them would replay onto the MAIN canvas.
+    return !ctx->layers.empty() && ctx->offscreen_stack.empty() &&
+           ctx->atlas_prev == nullptr;
 }
 
 // One canvas-op emission. Only counted when NOT inside a recorded layer —
@@ -972,6 +978,27 @@ void kx_rec_op(kx_ctx* ctx, KxRecOp op) {
 void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops);
 
 // Emit a folded draw directly on the canvas: `op` is the layer's only op.
+// Paint for a recorded/folded ImageDraw: the closing layer's alpha
+// composes with any already-folded alpha (nested single-op layers
+// multiply), then with the sprite tint — a white-alpha tint folds into
+// paint alphaf; a real color goes through a kModulate filter (its alpha
+// channel multiplies the image's, matching kx_draw_image_region_tinted).
+static SkPaint kx_image_op_paint(const KxRecOp& op, float layer_alpha) {
+    const float a = layer_alpha * (op.flag ? op.size : 1.0f);
+    const uint32_t rgba = op.has_color ? op.color : 0xFFFFFFFFu;
+    SkPaint paint;
+    const SkColor c = kx_to_skcolor(rgba);
+    if (SkColorGetR(c) == 0xFF && SkColorGetG(c) == 0xFF &&
+        SkColorGetB(c) == 0xFF)
+        paint.setAlphaf(a * (SkColorGetA(c) / 255.0f));
+    else {
+        paint.setAlphaf(a);
+        paint.setColorFilter(
+            SkColorFilters::Blend(c, SkBlendMode::kModulate));
+    }
+    return paint;
+}
+
 void kx_emit_folded(kx_ctx* ctx, const KxRecOp& op, float alpha) {
     SkCanvas* c = ctx->canvas;
     SkPaint paint;
@@ -1016,9 +1043,12 @@ void kx_emit_folded(kx_ctx* ctx, const KxRecOp& op, float alpha) {
         case KxRecOp::K::ImageDraw: {
             auto it = ctx->images.find(op.image);
             if (it == ctx->images.end()) break;
-            paint.setAlphaf(alpha);
+            paint = kx_image_op_paint(op, alpha);
             const SkImage* img = it->second.img.get();
-            c->drawImageRect(img, SkRect::MakeIWH(img->width(), img->height()),
+            const SkRect src = op.xs.size() == 4
+                ? SkRect::MakeXYWH(op.xs[0], op.xs[1], op.xs[2], op.xs[3])
+                : SkRect::MakeIWH(img->width(), img->height());
+            c->drawImageRect(img, src,
                              SkRect::MakeXYWH(op.f[0], op.f[1], op.f[2], op.f[3]),
                              SkSamplingOptions(), &paint,
                              SkCanvas::kStrict_SrcRectConstraint);
@@ -1049,8 +1079,11 @@ void kx_layer_close(kx_ctx* ctx) {
                     for (auto& c : op.cols) c = kx_fold_color(c, L->alpha);
                     break;
                 case KxRecOp::K::ImageDraw:
-                    op.size = L->alpha; // folded alpha rides in `size`
-                    op.flag = true;     // marks the fold (alpha can be 0)
+                    // Folded alpha rides in `size` — MULTIPLY into a
+                    // previously folded value (nested single-op layers
+                    // compose: {0.5 {0.5 img}} draws at 0.25).
+                    op.size = L->alpha * (op.flag ? op.size : 1.0f);
+                    op.flag = true; // marks the fold (alpha can be 0)
                     break;
                 default:
                     op.color = kx_fold_color(op.color, L->alpha);
@@ -1082,6 +1115,10 @@ void kx_layer_close(kx_ctx* ctx) {
     SkRect b = L->bounds;
     b.outset(1.0f, 1.0f); // AA fringe allowance — never clip content edges
     ctx->frame_ops++; // the saveLayer itself is one submitted op (contents count at replay)
+    // A caller may record unbalanced Save/ClipRect ops — restoreToCount
+    // unwinds them with the saveLayer, instead of leaking the layer open
+    // (every later draw would rasterize into it, never compositing).
+    const int save_count = ctx->canvas->getSaveCount();
     if (L->blur_sigma > 0.0f) {
         // Content blur: the layer's composite paint carries the image
         // filter — contents rasterize once, blur applies at restore. The
@@ -1100,7 +1137,7 @@ void kx_layer_close(kx_ctx* ctx) {
                                      L->alpha);
     }
     kx_replay_ops(ctx, L->ops);
-    ctx->canvas->restore();
+    ctx->canvas->restoreToCount(save_count);
     // Ephemeral kx_draw_pixels uploads live only until their layer replays.
     for (uint64_t id : ctx->owned_images) ctx->images.erase(id);
     ctx->owned_images.clear();
@@ -1181,23 +1218,26 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 break;
             case KxRecOp::K::ImageDraw: {
                 // `flag` marks a folded op: `size` then carries the layer
-                // alpha and the draw replays with an alpha paint.
+                // alpha and the draw replays with an alpha paint. Both
+                // paths honor the recorded src-rect (`xs`) and tint.
                 if (!op.flag) {
                     if (op.xs.size() == 4) // recorded region draw (atlas slot)
                         kx_draw_image_region_tinted(ctx, op.image, op.xs[0],
                                              op.xs[1], op.xs[2], op.xs[3],
                                              op.f[0], op.f[1], op.f[2], op.f[3],
-                                             op.color ? op.color : 0xFFFFFFFFu);
+                                             op.has_color ? op.color : 0xFFFFFFFFu);
                     else
                         kx_draw_image(ctx, op.image, op.f[0], op.f[1], op.f[2], op.f[3]);
                 } else {
                     auto it = ctx->images.find(op.image);
                     if (it != ctx->images.end()) {
-                        SkPaint paint;
-                        paint.setAlphaf(op.size);
+                        SkPaint paint = kx_image_op_paint(op, 1.0f);
                         const SkImage* img = it->second.img.get();
+                        const SkRect src = op.xs.size() == 4
+                            ? SkRect::MakeXYWH(op.xs[0], op.xs[1], op.xs[2], op.xs[3])
+                            : SkRect::MakeIWH(img->width(), img->height());
                         ctx->canvas->drawImageRect(
-                            img, SkRect::MakeIWH(img->width(), img->height()),
+                            img, src,
                             SkRect::MakeXYWH(op.f[0], op.f[1], op.f[2], op.f[3]),
                             SkSamplingOptions(), &paint,
                             SkCanvas::kStrict_SrcRectConstraint);
@@ -1274,6 +1314,11 @@ static const kx_backend* kx_platform_chain(size_t* count) {
 // pages it already owns (fresh SkSurfaces::Raster mallocs a full buffer
 // whose first writes page-fault per pixel).
 static bool kx_make_raster(kx_ctx* ctx, int width, int height) {
+    // Cap dimensions: w*h*4 must fit size_t on 32-bit targets (arm32
+    // Android) — 32768² wraps to 0 and WrapPixels would expose a huge
+    // "surface" backed by a 0-byte heap buffer.
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384)
+        return false;
     const size_t need = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
     if (ctx->raster_capacity < need) {
         const size_t cap = std::max(need, ctx->raster_capacity * 2);
@@ -1355,6 +1400,9 @@ void kx_destroy(kx_ctx* ctx) {
     ctx->pixels_view.reset();
     ctx->images.clear();
     ctx->owned_images.clear();
+    // Texture-backed shadow rasters release proxies into the resource
+    // provider — drop them BEFORE gpu_shutdown, like the images above.
+    ctx->shadow_cache.clear();
     if (ctx->gpu) kx::gpu_shutdown(ctx->gpu);
     delete ctx;
 }
@@ -1403,14 +1451,41 @@ void kx_begin_frame(kx_ctx* ctx) {
         ctx->pixels_view = nullptr;
         ctx->pixels_surf_w = 0;
         ctx->pixels_surf_h = 0;
+        // The atlas is the same surface kind — its device dies at flush
+        // too. Reset it fully and bump gen so Zig-side slots re-rasterize.
+        if (ctx->atlas_image_id) {
+            ctx->images.erase(ctx->atlas_image_id);
+            ctx->atlas_image_id = 0;
+        }
+        ctx->atlas.reset();
+        ctx->atlas_view.reset();
+        ctx->atlas_shelves.clear();
+        ctx->atlas_next_y = 0;
+        ctx->atlas_gen++;
     }
-    // Unbalanced layer records from a previous frame die with it.
+    // Unbalanced layer records from a previous frame die with it — and so
+    // does any leaked batch/pass state (a stray sprite_target pointing at
+    // a dead pooled canvas would misroute a whole frame of blits).
     ctx->layers.clear();
+    ctx->sprite_batch.clear();
+    ctx->sprite_batch_open = false;
+    ctx->sprite_target = nullptr;
+    ctx->atlas_prev = nullptr;
+    ctx->offscreen_stack.clear();
+    ctx->owned_images.clear();
     ctx->frame_ops = 0;
     if (ctx->raster) {
         ctx->canvas = ctx->raster->getCanvas();
     } else if (ctx->gpu) {
         ctx->canvas = kx::gpu_begin_frame(ctx->gpu);
+    }
+    // One unbalanced save/clip by a caller must not leak into every later
+    // frame — the persistent raster canvas and the GPU frame canvas both
+    // carry their save stack across frames. (restoreToCount can't undo
+    // base-level matrix pollution — reset it too.)
+    if (ctx->canvas) {
+        ctx->canvas->restoreToCount(1);
+        ctx->canvas->setMatrix(SkMatrix::I());
     }
 }
 
@@ -1541,7 +1616,9 @@ static bool kx_image_content_opaque(const SkImage* img) {
 }
 
 uint64_t kx_image_create(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h) {
-    if (!ctx || !rgba || w <= 0 || h <= 0) return 0;
+    // Dim cap — 32-bit size_t wraps w*h*4 (arm32 Android), undersizing the
+    // copy while the image claims the full extent.
+    if (!ctx || !rgba || w <= 0 || h <= 0 || w > 16384 || h > 16384) return 0;
     const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
     sk_sp<SkData> data = SkData::MakeWithCopy(rgba, bytes);
     if (!data) return 0;
@@ -1558,7 +1635,14 @@ uint64_t kx_image_create(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h)
 }
 
 void kx_image_destroy(kx_ctx* ctx, uint64_t image) {
-    if (ctx && image) ctx->images.erase(image);
+    if (!ctx || !image) return;
+    ctx->images.erase(image);
+    // Destroying the live atlas view id must not leave a stale id behind —
+    // kx_atlas_image would return the dead id and every blit would no-op.
+    if (ctx->atlas_image_id == image) {
+        ctx->atlas_image_id = 0;
+        ctx->atlas_view.reset();
+    }
 }
 
 uint8_t kx_image_is_opaque(kx_ctx* ctx, uint64_t image) {
@@ -1612,7 +1696,11 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
             if (ctm.getType() <= SkMatrix::kTranslate_Mask) {
                 SkPixmap src, dst;
                 const bool sp = img->peekPixels(&src), dp = ctx->canvas->peekPixels(&dst);
-                if (sp && dp &&
+                // getDeviceClipBounds is only a BOUNDING box — under a
+                // non-rect clip (clip_path/rrect) the raw copy would write
+                // pixels the clip excludes. Rect-only clips make the
+                // bounds intersect exact.
+                if (sp && dp && ctx->canvas->isClipRect() &&
                     src.info().colorType() == dst.info().colorType() &&
                     src.info().bytesPerPixel() == 4) {
                     const int dx = (int)std::lround(x + ctm.getTranslateX());
@@ -1678,7 +1766,10 @@ static SkRect kx_sprite_bounds(const kx_sprite_xform& xf, float sw, float sh) {
 
 void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xforms,
                          const float* tex_xywh, int32_t count) {
-    if (!ctx || !ctx->canvas || !image || !xforms || count <= 0) return;
+    // Count cap: 4*count overflows int past ~536M, and 16M sprites is
+    // already 256MB of xform data — reject rather than wrap.
+    if (!ctx || !ctx->canvas || !image || !xforms || count <= 0 ||
+        count > (1 << 24)) return;
     auto it = ctx->images.find(image);
     if (it == ctx->images.end()) return;
     const int iw = it->second.img->width(), ih = it->second.img->height();
@@ -1716,11 +1807,11 @@ void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xfo
                                    tex_xywh[4 * i + 2], tex_xywh[4 * i + 3])
                 : SkRect::MakeIWH(iw, ih);
             kx_count_op(ctx);
-            if (x.ssin == 0.0f) { // axis-aligned scale+translate
+            if (x.ssin == 0.0f && x.scos >= 0.0f) { // axis-aligned scale+translate
                 ctx->canvas->drawImageRect(img, src,
                     SkRect::MakeXYWH(x.tx, x.ty, x.scos * src.width(), x.scos * src.height()),
                     SkSamplingOptions(), nullptr, SkCanvas::kFast_SrcRectConstraint);
-            } else {
+            } else { // rotated OR mirrored — a negative scos dst rect draws nothing
                 ctx->canvas->save();
                 SkMatrix m;
                 m.setAll(x.scos, -x.ssin, x.tx, x.ssin, x.scos, x.ty, 0, 0, 1);
@@ -1733,38 +1824,46 @@ void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xfo
         }
         return;
     }
-    SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * count, 6 * count,
-                          SkVertices::kHasTexCoords_BuilderFlag);
-    SkPoint* pos = b.positions();
-    SkPoint* tc = b.texCoords();
-    uint16_t* idx = b.indices();
-    for (int i = 0; i < count; ++i) {
-        const SkRect src = tex_xywh
-            ? SkRect::MakeXYWH(tex_xywh[4 * i], tex_xywh[4 * i + 1],
-                               tex_xywh[4 * i + 2], tex_xywh[4 * i + 3])
-            : SkRect::MakeIWH(iw, ih);
-        const kx_sprite_xform& x = xforms[i];
-        const float sw = src.width(), sh = src.height();
-        pos[4 * i + 0] = {x.tx, x.ty};
-        pos[4 * i + 1] = {x.tx + x.scos * sw, x.ty + x.ssin * sw};
-        pos[4 * i + 2] = {x.tx + x.scos * sw - x.ssin * sh, x.ty + x.ssin * sw + x.scos * sh};
-        pos[4 * i + 3] = {x.tx - x.ssin * sh, x.ty + x.scos * sh};
-        tc[4 * i + 0] = {src.fLeft, src.fTop};
-        tc[4 * i + 1] = {src.fRight, src.fTop};
-        tc[4 * i + 2] = {src.fRight, src.fBottom};
-        tc[4 * i + 3] = {src.fLeft, src.fBottom};
-        const uint16_t v = (uint16_t)(4 * i);
-        idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
-        idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
+    // uint16 indices cap one mesh at 16383 quads (4*16383 = 65532 verts).
+    // Chunk rather than wrap — wrapped indices reference earlier vertices
+    // and silently corrupt the triangles.
+    for (int base = 0; base < count; base += 16383) {
+        const int chunk = std::min(count - base, 16383);
+        SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * chunk, 6 * chunk,
+                              SkVertices::kHasTexCoords_BuilderFlag);
+        SkPoint* pos = b.positions();
+        SkPoint* tc = b.texCoords();
+        uint16_t* idx = b.indices();
+        for (int i = 0; i < chunk; ++i) {
+            const int s = base + i;
+            const SkRect src = tex_xywh
+                ? SkRect::MakeXYWH(tex_xywh[4 * s], tex_xywh[4 * s + 1],
+                                   tex_xywh[4 * s + 2], tex_xywh[4 * s + 3])
+                : SkRect::MakeIWH(iw, ih);
+            const kx_sprite_xform& x = xforms[s];
+            const float sw = src.width(), sh = src.height();
+            pos[4 * i + 0] = {x.tx, x.ty};
+            pos[4 * i + 1] = {x.tx + x.scos * sw, x.ty + x.ssin * sw};
+            pos[4 * i + 2] = {x.tx + x.scos * sw - x.ssin * sh, x.ty + x.ssin * sw + x.scos * sh};
+            pos[4 * i + 3] = {x.tx - x.ssin * sh, x.ty + x.scos * sh};
+            tc[4 * i + 0] = {src.fLeft, src.fTop};
+            tc[4 * i + 1] = {src.fRight, src.fTop};
+            tc[4 * i + 2] = {src.fRight, src.fBottom};
+            tc[4 * i + 3] = {src.fLeft, src.fBottom};
+            const uint16_t v = (uint16_t)(4 * i);
+            idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
+            idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
+        }
+        SkPaint paint;
+        paint.setShader(img->makeShader(SkSamplingOptions()));
+        kx_count_op(ctx); // the whole set is ONE draw
+        ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
     }
-    SkPaint paint;
-    paint.setShader(img->makeShader(SkSamplingOptions()));
-    kx_count_op(ctx); // the whole set is ONE draw
-    ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
 }
 
 void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
-    if (!ctx || !ctx->canvas || !quads || count <= 0) return;
+    if (!ctx || !ctx->canvas || !quads || count <= 0 ||
+        count > (1 << 24)) return; // int-overflow guard — see draw_image_atlas
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::ImageSet};
         op.count = count;
@@ -1832,6 +1931,7 @@ int kx_ctx_serial_alive(uint64_t serial) {
 // Shelf-allocate a w×h slot. Shelves are keyed by exact height (lists of
 // same-height rows pack perfectly); horizontal bump within the shelf.
 static bool kx_atlas_alloc(kx_ctx* ctx, int w, int h, int* sx, int* sy) {
+    if (w > ctx->atlas_w || h > ctx->atlas_h) return false; // can never fit
     for (auto& sh : ctx->atlas_shelves) {
         if (h <= sh.h) {
             for (size_t fi = 0; fi < sh.free_x.size(); ++fi) {
@@ -1861,29 +1961,31 @@ static void kx_atlas_recreate(kx_ctx* ctx, int w, int h) {
         ? kx::gpu_offscreen_surface(ctx->gpu, w, h)
         : SkSurfaces::Raster(SkImageInfo::MakeN32Premul(w, h));
     if (!surf) return;
-    if (ctx->atlas) {
-        // Carry the old content across — every slot stays valid.
-        sk_sp<SkImage> old = ctx->atlas->makeTemporaryImage();
-        if (old) surf->getCanvas()->drawImage(old, 0, 0);
-        ctx->atlas_shelves.clear();
-        ctx->atlas_next_y = ctx->atlas_h; // old content occupies the top
-        // Re-shelf the old footprint so new slots never overlap it — the
-        // old rows' slots were compacted away; simplest: treat the whole
-        // old region as one full-width shelf.
-        ctx->atlas_shelves.push_back({0, ctx->atlas_h, ctx->atlas_w, {}, {}});
+    if (ctx->atlas_image_id) {
+        // The registry entry for the previous view holds a dead surface's
+        // image — erase it, not just the id (every recreate used to orphan
+        // one entry: an unbounded leak on scroll/grow).
+        ctx->images.erase(ctx->atlas_image_id);
+        ctx->atlas_image_id = 0;
     }
     ctx->atlas = std::move(surf);
     ctx->atlas_w = w;
     ctx->atlas_h = h;
+    ctx->atlas_shelves.clear();
+    ctx->atlas_next_y = 0;
     ctx->atlas_view.reset();
-    ctx->atlas_image_id = 0;
+    // gen bump = every existing slot is dead (the shelf layout reset and
+    // the pixels are gone). Callers re-rasterize on mismatch; frees of
+    // stale-gen slots are ignored so they can't corrupt the new layout.
+    // (Carrying pixels across used to cost an ~8MB blit yet STILL bumped
+    // gen — pure dead work.)
     ctx->atlas_gen++;
 }
 
 bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
-    if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || ctx->atlas_prev ||
-        kx_recording(ctx)) return false;
+    if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
+        ctx->atlas_prev || kx_recording(ctx)) return false;
     // Nesting inside an offscreen pass is fine: the atlas is a SEPARATE
     // surface — the flush below lands pending sprites on the strip canvas,
     // the pass writes atlas, end restores the strip canvas.
@@ -1894,7 +1996,13 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     // the batch per row-rasterize was ~3 meshes/frame for scroll_10k.
     // Writing to the atlas invalidates its image view (makeTemporaryImage
     // is only valid until the next surface write) — re-alias lazily.
-    if (ctx->atlas_view) { ctx->atlas_view.reset(); ctx->atlas_image_id = 0; }
+    if (ctx->atlas_view) {
+        ctx->atlas_view.reset();
+        if (ctx->atlas_image_id) {
+            ctx->images.erase(ctx->atlas_image_id);
+            ctx->atlas_image_id = 0;
+        }
+    }
     if (!ctx->atlas) {
         // Start modest — ~2MB — and grow on demand: a wide-but-short atlas
         // fits list rows; a tall screen-sized atlas would waste 8MB of RAM
@@ -1906,8 +2014,12 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     }
     int sx, sy;
     if (!kx_atlas_alloc(ctx, w, h, &sx, &sy)) {
-        if (ctx->atlas_h >= 16384) return false; // cap — fall back
-        kx_atlas_recreate(ctx, ctx->atlas_w, ctx->atlas_h * 2);
+        // Grow both axes as needed — a slot wider than the atlas can never
+        // be shelved by height growth alone.
+        const int nw = std::max(ctx->atlas_w, w);
+        const int nh = std::max(ctx->atlas_h * 2, h * 2);
+        if (nw > 16384 || nh > 16384) return false; // cap — fall back
+        kx_atlas_recreate(ctx, nw, nh);
         if (!ctx->atlas || !kx_atlas_alloc(ctx, w, h, &sx, &sy)) return false;
         kx_prof("atlas_grow", t0);
     }
@@ -1935,6 +2047,11 @@ void kx_atlas_free(kx_ctx* ctx, float sx, float sy, float sw, float sh) {
     if (!ctx || !ctx->atlas) return;
     for (auto& shelf : ctx->atlas_shelves) {
         if ((int)sy == shelf.y && (int)sh <= shelf.h) {
+            // Reject a double-free: re-adding a live range would allocate
+            // it twice — two rows painting into one slot.
+            for (size_t i = 0; i < shelf.free_x.size(); ++i)
+                if (shelf.free_x[i] == (int)sx && shelf.free_w[i] == (int)sw)
+                    return;
             shelf.free_x.push_back((int)sx);
             shelf.free_w.push_back((int)sw);
             return;
@@ -1966,10 +2083,12 @@ void kx_sprite_flush(kx_ctx* ctx) {
     const int n = (int)ctx->sprite_batch.size();
     if (n == 0) return;
     // Defer while a nested pass owns ctx->canvas (atlas row rasterize,
-    // offscreen): the sprites target the COLLECT canvas — flushing now
-    // would draw them into the wrong surface and split the batch. They
-    // flush when the caller's canvas is current again.
-    if (ctx->sprite_target && ctx->canvas != ctx->sprite_target) return;
+    // offscreen): the sprites target the COLLECT canvas — flushing mid-
+    // pass would split the batch. They flush when the caller's canvas is
+    // current again — or when the batch ENDS mid-pass (the flush then
+    // draws onto sprite_target directly: a live, separate canvas).
+    if (ctx->sprite_batch_open && ctx->sprite_target &&
+        ctx->canvas != ctx->sprite_target) return;
     const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
     std::vector<kx_ctx::KxPendingSprite> sprites;
     sprites.swap(ctx->sprite_batch);
@@ -1979,52 +2098,62 @@ void kx_sprite_flush(kx_ctx* ctx) {
     if (!ctx->atlas_view) (void)kx_atlas_image(ctx);
     sk_sp<SkImage> atlas_img = ctx->atlas_view;
     if (!atlas_img) return;
-    SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * n, 6 * n,
-                          SkVertices::kHasTexCoords_BuilderFlag |
-                          SkVertices::kHasColors_BuilderFlag);
-    SkPoint* pos = b.positions();
-    SkPoint* tc = b.texCoords();
-    SkColor* cols = b.colors();
-    uint16_t* idx = b.indices();
-    for (int i = 0; i < n; ++i) {
-        for (int c = 0; c < 4; ++c) {
-            pos[4 * i + c] = sprites[i].dst[c];
-            cols[4 * i + c] = sprites[i].color;
-        }
-        tc[4 * i + 0] = {sprites[i].src.fLeft, sprites[i].src.fTop};
-        tc[4 * i + 1] = {sprites[i].src.fRight, sprites[i].src.fTop};
-        tc[4 * i + 2] = {sprites[i].src.fRight, sprites[i].src.fBottom};
-        tc[4 * i + 3] = {sprites[i].src.fLeft, sprites[i].src.fBottom};
-        const uint16_t v = (uint16_t)(4 * i);
-        idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
-        idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
-    }
-    SkPaint paint;
-    paint.setShader(atlas_img->makeShader(SkSamplingOptions()));
     // Draw onto the canvas the batch collected on — a flush can fire while
     // ctx->canvas is the ATLAS canvas (sprites stay pending across an
     // entering row's rasterize so the batch isn't split per row).
-    // kModulate: the per-vertex tint multiplies the sampled texel.
     SkCanvas* target = ctx->sprite_target ? ctx->sprite_target : ctx->canvas;
-    target->save();
-    target->setMatrix(SkMatrix::I());
-    target->drawVertices(b.detach(), SkBlendMode::kModulate, paint);
-    target->restore();
-    ctx->frame_ops++;
+    // uint16 indices cap one mesh at 16383 quads — chunk rather than wrap.
+    for (int base = 0; base < n; base += 16383) {
+        const int chunk = std::min(n - base, 16383);
+        SkVertices::Builder b(SkVertices::kTriangles_VertexMode, 4 * chunk, 6 * chunk,
+                              SkVertices::kHasTexCoords_BuilderFlag |
+                              SkVertices::kHasColors_BuilderFlag);
+        SkPoint* pos = b.positions();
+        SkPoint* tc = b.texCoords();
+        SkColor* cols = b.colors();
+        uint16_t* idx = b.indices();
+        for (int i = 0; i < chunk; ++i) {
+            const kx_ctx::KxPendingSprite& sp = sprites[base + i];
+            for (int c = 0; c < 4; ++c) {
+                pos[4 * i + c] = sp.dst[c];
+                cols[4 * i + c] = sp.color;
+            }
+            tc[4 * i + 0] = {sp.src.fLeft, sp.src.fTop};
+            tc[4 * i + 1] = {sp.src.fRight, sp.src.fTop};
+            tc[4 * i + 2] = {sp.src.fRight, sp.src.fBottom};
+            tc[4 * i + 3] = {sp.src.fLeft, sp.src.fBottom};
+            const uint16_t v = (uint16_t)(4 * i);
+            idx[6 * i + 0] = v;     idx[6 * i + 1] = v + 1; idx[6 * i + 2] = v + 2;
+            idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
+        }
+        SkPaint paint;
+        paint.setShader(atlas_img->makeShader(SkSamplingOptions()));
+        // kModulate: the per-vertex tint multiplies the sampled texel.
+        target->save();
+        target->setMatrix(SkMatrix::I());
+        target->drawVertices(b.detach(), SkBlendMode::kModulate, paint);
+        target->restore();
+        ctx->frame_ops++;
+    }
     kx_prof("sprite_mesh", t0);
 }
 
 void kx_sprite_batch_begin(kx_ctx* ctx) {
-    if (!ctx || !ctx->gpu || kx_recording(ctx)) return; // batch is a GPU win;
-                                                        // raster per-sprite wins
+    if (!ctx || !ctx->gpu || kx_recording(ctx) || kx_in_nested_pass(ctx))
+        return; // batch is a GPU win; raster per-sprite wins. A batch
+                // opened inside a nested pass could never flush to its
+                // own (soon-destroyed) canvas.
     ctx->sprite_batch_open = true;
     ctx->sprite_target = ctx->canvas;
 }
 void kx_sprite_batch_end(kx_ctx* ctx) {
     if (!ctx || !ctx->sprite_batch_open) return;
     ctx->sprite_batch_open = false;
-    ctx->sprite_target = nullptr;
+    // Flush BEFORE dropping the target — with the batch closed the defer
+    // guard no longer holds and the flush draws onto sprite_target (the
+    // live collect canvas), even while a nested pass owns ctx->canvas.
     kx_sprite_flush(ctx);
+    ctx->sprite_target = nullptr;
 }
 
 void kx_draw_image_region(kx_ctx* ctx, uint64_t image,
@@ -2050,6 +2179,7 @@ void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
         op.image = image;
         op.xs = {sx, sy, sw, sh};
         op.color = rgba;
+        op.has_color = true; // a 0x00000000 tint is a real (invisible) tint
         op.local_bounds = kx_xywh(dx, dy, dw, dh, 0.5f);
         kx_rec_op(ctx, std::move(op));
         return;
@@ -2094,7 +2224,8 @@ void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
 
 void kx_draw_pixels(kx_ctx* ctx, const uint8_t* rgba, int32_t w, int32_t h,
                     float x, float y, float dw, float dh) {
-    if (!ctx || !ctx->canvas || !rgba || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) return;
+    if (!ctx || !ctx->canvas || !rgba || w <= 0 || h <= 0 ||
+        w > 16384 || h > 16384 || dw <= 0 || dh <= 0) return;
     if (kx_recording(ctx)) {
         // A layer replays after the call — the borrowed pixels can't outlive
         // it, so this path registers like kx_image_create (one copy, only on
@@ -2634,15 +2765,31 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
     ctx->canvas->drawImage(e.img, x - e.pad, y - e.pad, SkSamplingOptions(), nullptr);
 }
 
+// Points consumed by a verb stream — 0 move(2f), 1 line(2f), 2 quad(4f),
+// 3 cubic(6f), 4 close(0f). Computed BEFORE building so the build can
+// bound every read (the ABI passes no separate pts length).
+static int kx_path_npts(const int* verbs, int n_verbs) {
+    int n = 0;
+    for (int i = 0; i < n_verbs; ++i)
+        n += (verbs[i] == 0 || verbs[i] == 1) ? 2 : (verbs[i] == 2) ? 4
+            : (verbs[i] == 3) ? 6 : 0;
+    return n;
+}
+
 // Shared path build for fill/stroke: the verb stream consumes `pts`
-// sequentially — 0 move(2f), 1 line(2f), 2 quad(4f), 3 cubic(6f), 4 close(0f).
-static SkPath kx_build_path(const float* pts, const int* verbs, int n_verbs,
+// sequentially, never past `pts_end` — a hostile verb stream can no longer
+// read past the caller's point buffer.
+static SkPath kx_build_path(const float* pts, const float* pts_end,
+                            const int* verbs, int n_verbs,
                             bool* ok, SkRect* ctrl_bounds) {
     SkPathBuilder b;
     const float* p = pts;
     *ok = true;
     *ctrl_bounds = SkRect::MakeEmpty();
     for (int i = 0; i < n_verbs && *ok; ++i) {
+        const int need = (verbs[i] == 0 || verbs[i] == 1) ? 2
+            : (verbs[i] == 2) ? 4 : (verbs[i] == 3) ? 6 : 0;
+        if (pts_end - p < need) { *ok = false; break; }
         switch (verbs[i]) {
             case 0: b.moveTo(p[0], p[1]); p += 2; break;
             case 1: b.lineTo(p[0], p[1]); p += 2; break;
@@ -2667,16 +2814,15 @@ static SkPath kx_build_path(const float* pts, const int* verbs, int n_verbs,
 void kx_fill_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
                   uint32_t rgba, int fill_rule) {
     if (!ctx || !ctx->canvas || !pts || !verbs || n_verbs <= 0) return;
+    const int npts = kx_path_npts(verbs, n_verbs);
     bool ok;
     SkRect cb;
-    SkPath path = kx_build_path(pts, verbs, n_verbs, &ok, &cb);
+    SkPath path = kx_build_path(pts, pts + npts, verbs, n_verbs, &ok, &cb);
     if (!ok) return;
     if (fill_rule) path.setFillType(SkPathFillType::kEvenOdd);
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::FillPath};
         op.color = rgba; op.flag = fill_rule != 0; op.count = n_verbs;
-        int npts = 0;
-        for (int i = 0; i < n_verbs; ++i) npts += (verbs[i] == 0 || verbs[i] == 1) ? 2 : (verbs[i] == 2) ? 4 : (verbs[i] == 3) ? 6 : 0;
         op.xs.assign(pts, pts + npts);
         op.cols.assign(verbs, verbs + n_verbs);
         op.local_bounds = cb;
@@ -2694,21 +2840,22 @@ void kx_fill_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
 void kx_stroke_path(kx_ctx* ctx, const float* pts, const int* verbs, int n_verbs,
                     float stroke_w, uint32_t rgba, int fill_rule) {
     if (!ctx || !ctx->canvas || !pts || !verbs || n_verbs <= 0 || !(stroke_w > 0.0f)) return;
+    const int npts = kx_path_npts(verbs, n_verbs);
     bool ok;
     SkRect cb;
-    SkPath path = kx_build_path(pts, verbs, n_verbs, &ok, &cb);
+    SkPath path = kx_build_path(pts, pts + npts, verbs, n_verbs, &ok, &cb);
     if (!ok) return;
     if (fill_rule) path.setFillType(SkPathFillType::kEvenOdd);
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::StrokePath};
         op.color = rgba; op.size = stroke_w; op.flag = fill_rule != 0;
         op.count = n_verbs;
-        int npts = 0;
-        for (int i = 0; i < n_verbs; ++i) npts += (verbs[i] == 0 || verbs[i] == 1) ? 2 : (verbs[i] == 2) ? 4 : (verbs[i] == 3) ? 6 : 0;
         op.xs.assign(pts, pts + npts);
         op.cols.assign(verbs, verbs + n_verbs);
         op.local_bounds = cb;
-        op.local_bounds.outset(stroke_w / 2.0f + 1.0f, stroke_w / 2.0f + 1.0f);
+        // Miter joins reach miter_limit*stroke_w/2 = 2*stroke_w at the
+        // default limit 4 — /2 alone would clip join tips in the layer.
+        op.local_bounds.outset(2.0f * stroke_w + 1.0f, 2.0f * stroke_w + 1.0f);
         kx_rec_op(ctx, std::move(op));
         return;
     }
@@ -2768,7 +2915,10 @@ void kx_clip_reset(kx_ctx* ctx) {
 // the snapshot so kx_draw_image/kx_image_destroy work on the returned id.
 bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
-    if (!ctx || !ctx->canvas || w <= 0 || h <= 0) return false;
+    // Dim cap — int w*h overflows past ~46k and a 16384² surface is
+    // already 1GB of raster. Zig-side extents are snap-bounded well below.
+    if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || w > 16384 || h > 16384)
+        return false;
     kx_sprite_flush(ctx); // pending sprites belong to the enclosing canvas
     // Pool the surface PER DEPTH: a fresh RenderTarget per pass was the
     // dominant retained-raster cost on GPU (Metal measured ~0.2ms per list
@@ -2787,7 +2937,8 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
         // CPU raster + one texture upload is far cheaper (the registry's
         // lazy upload still lands the blit GPU→GPU). Large passes stay on
         // the GPU surface — CPU raster of a viewport-sized layer loses.
-        const bool small = pw * ph <= 192 * 1024;
+        // int64 product — int w*h overflows on huge (capped) extents.
+        const bool small = (int64_t)pw * ph <= 192 * 1024;
         sk_sp<SkSurface> pool = (ctx->gpu && !small)
             ? kx::gpu_offscreen_surface(ctx->gpu, pw, ph)
             : SkSurfaces::Raster(SkImageInfo::MakeN32Premul(pw, ph));
@@ -2823,6 +2974,13 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
 uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
     const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || ctx->offscreen_stack.empty()) return 0;
+    // A sprite batch opened on an OUTER canvas kept collecting while this
+    // pass ran — sprites targeting the pass canvas itself can't exist
+    // (begin rejects nested passes), so nothing to flush here. But a stale
+    // pending batch MUST not draw into the pooled surface next reuse: its
+    // sprites hold device coords of their collect canvas — drawing them
+    // there is always legal, so flush whatever is pending for THIS canvas.
+    if (ctx->sprite_target == ctx->canvas) kx_sprite_flush(ctx);
     const size_t depth = ctx->offscreen_stack.size() - 1;
     const kx_ctx::OffscreenPass pass = ctx->offscreen_stack.back();
     ctx->canvas->restore(); // balance the begin's save — unwinds the pass's
@@ -2899,7 +3057,7 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.17.0";
+    return "0.18.0";
 }
 
 // --- Text layout handle (0.15.0) ----------------------------------------
