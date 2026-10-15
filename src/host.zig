@@ -1149,11 +1149,11 @@ pub const Host = struct {
                 // unless a widget holds the pointer capture (an active drag):
                 // the captured node keeps receiving moves even outside its
                 // bounds, and dropping them would leave a stale drag whose
-                // release lands later as an accidental click.
-                // Mobile: mouse coordinates arrive in pixels — convert to
-                // the point (dp) layout space via the display scale.
-                const sx = event.motion.x / host.display_scale;
-                const sy = event.motion.y / host.display_scale;
+                // release lands later as an accidental click. SDL reports
+                // pointer coords in logical window units on every platform
+                // (the tree's own layout space) — no scaling needed.
+                const sx = event.motion.x;
+                const sy = event.motion.y;
                 const has_capture = host.input.capturedNode(0) != null;
                 if (host.inspector.enabled and !has_capture and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
                     host.input.clearHover();
@@ -1172,9 +1172,8 @@ pub const Host = struct {
                 // (tree: select/expand, props: no-op); a click on the canvas
                 // passively selects the hit node (routing continues normally).
                 if (host.inspector.enabled) {
-                    // Mobile: pixels → points before the zone test/click.
-                    const px = event.button.x / host.display_scale;
-                    const py = event.button.y / host.display_scale;
+                    const px = event.button.x;
+                    const py = event.button.y;
                     const z = host.inspector.hitZone(px, py, host.width, host.height);
                     if (z != .none) {
                         host.inspector.clickAt(root, px, py, host.width, host.height);
@@ -1184,9 +1183,9 @@ pub const Host = struct {
                     host.inspector.pickAt(root, px, py); // passive selection
                 }
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
-                    // Mobile: pixels → points (layout space), like motion.
-                    const sx = event.button.x / host.display_scale;
-                    const sy = event.button.y / host.display_scale;
+                    // Logical window units — the tree's layout space.
+                    const sx = event.button.x;
+                    const sy = event.button.y;
                     host.input.dispatchPointer(root, .{
                         .phase = .down,
                         .x = sx,
@@ -1202,15 +1201,15 @@ pub const Host = struct {
                 // `.up` it never saw `.down` for.
                 if (host.inspector.enabled and host.input.capturedNode(0) == null and
                     host.inspector.hitZone(
-                        event.button.x / host.display_scale,
-                        event.button.y / host.display_scale,
+                        event.button.x,
+                        event.button.y,
                         host.width,
                         host.height,
                     ) != .none)
                     return false;
                 if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
-                    const sx = event.button.x / host.display_scale;
-                    const sy = event.button.y / host.display_scale;
+                    const sx = event.button.x;
+                    const sy = event.button.y;
                     host.input.dispatchPointer(root, .{
                         .phase = .up,
                         .x = sx,
@@ -1245,9 +1244,9 @@ pub const Host = struct {
             // Wheel → scroll event (Phase 1f): routed like pointer input.
             // The content may scroll under a stationary pointer: refresh hover.
             sdl.c.SDL_EVENT_MOUSE_WHEEL => {
-                // Mobile: pixels → points (layout space), like motion.
-                const sx = event.wheel.mouse_x / host.display_scale;
-                const sy = event.wheel.mouse_y / host.display_scale;
+                // Logical window units — the tree's layout space.
+                const sx = event.wheel.mouse_x;
+                const sy = event.wheel.mouse_y;
                 // Inspector (Phase 4a.2): wheel over the panel scrolls the
                 // tree view (consumed — no widget scroll).
                 if (host.inspector.enabled and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
