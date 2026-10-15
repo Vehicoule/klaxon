@@ -102,6 +102,20 @@ const TextFieldState = struct {
     on_changed: ?Callback = null,
     on_submitted: ?Callback = null,
     hovered: bool = false,
+    /// Incremental measure rope: each committed piece is measured ONCE
+    /// (its text lands in the text cache by content, so later frames hash
+    /// only this segment's bytes) — a growing IME buffer used to re-shape
+    /// the whole string on every frame (measured ~290µs/frame at ~1500
+    /// CJK chars). `segs` covers buf[0..segs_len] in order; a tail outside
+    /// that prefix — appended mid-frame or unsafe to split — measures
+    /// whole and merges into the last segment.
+    segs: std.array_list.Managed(Seg) = undefined,
+
+    const Seg = struct {
+        text: [:0]u8, // owned
+        size: f32, // the measure font size (theme moves invalidate)
+        m: ui.paint.TextMetrics,
+    };
 
     fn text(s: *TextFieldState) [:0]const u8 {
         // Sentinel slice via the many-item pointer (see input.zig).
@@ -276,11 +290,112 @@ fn currentColors(s: *TextFieldState, focused: bool) FieldColors {
     };
 }
 
+/// Last scalar strictly before `cut` (decodes the UTF-8 sequence backwards).
+fn lastCpBefore(str: []const u8, cut: usize) u21 {
+    var i = cut;
+    while (i > 0 and (str[i - 1] & 0xC0) == 0x80) i -= 1;
+    if (i == 0) return 0;
+    return std.unicode.utf8Decode(str[i - 1 .. cut]) catch 0xFFFD;
+}
+fn firstCpAt(str: []const u8, i: usize) u21 {
+    if (i >= str.len) return 0;
+    const l = std.unicode.utf8ByteSequenceLength(str[i]) catch return 0xFFFD;
+    return std.unicode.utf8Decode(str[i..@min(str.len, i + l)]) catch 0xFFFD;
+}
+/// A segment boundary must never sit where shaping could join across it:
+/// combining marks, joiners, emoji modifiers/pairers and Hangul jamo reject
+/// the split; ASCII rejects too (liga/kern could bind a Latin pair — e.g.
+/// f|i). Whitespace never joins, so it's allowed.
+fn atomicBoundary(cp: u21) bool {
+    if (cp < 0x80) return cp == ' ' or cp == '\t' or cp == 0;
+    if (cp == 0x200D or (cp >= 0xFE0E and cp <= 0xFE0F)) return false;
+    if ((cp >= 0x0300 and cp < 0x0370) or (cp >= 0x1AB0 and cp < 0x1AFF) or
+        (cp >= 0x1DC0 and cp < 0x1DFF) or (cp >= 0x20D0 and cp < 0x20FF) or
+        (cp >= 0xFE20 and cp < 0xFE30)) return false;
+    if (cp >= 0x1F1E6 and cp <= 0x1F1FF) return false;
+    if (cp >= 0x1100 and cp <= 0x11FF) return false;
+    if ((cp >= 0xA960 and cp <= 0xA97C) or (cp >= 0xD7B0 and cp <= 0xD7FB)) return false;
+    // RTL scripts reorder across run boundaries — a split inside one must
+    // fold so the whole run shapes as a single paragraph, as before.
+    if ((cp >= 0x0590 and cp < 0x0800) or (cp >= 0xFB1D and cp < 0xFE00) or
+        (cp >= 0xFE70 and cp < 0xFF00) or cp == 0x061C or
+        (cp >= 0x200E and cp <= 0x200F) or (cp >= 0x202A and cp <= 0x202E) or
+        (cp >= 0x2066 and cp <= 0x2069) or (cp >= 0x10800 and cp < 0x10FFF) or
+        (cp >= 0x1E800 and cp < 0x1EFFF)) return false;
+    return true;
+}
+fn segSplitSafe(str: []const u8, cut: usize) bool {
+    return atomicBoundary(lastCpBefore(str, cut)) and atomicBoundary(firstCpAt(str, cut));
+}
+
+/// The field's measured+shaped rope: `segs` cover buf[0..segs.items end)
+/// in order. Each measure reconciles the tail against the buffer — a seg
+/// whose stored end or bytes no longer match the tail is dropped (covers
+/// every edit path without per-site sync), then the leftover suffix is
+/// measured once and pushed (or the whole buffer re-measures when the cut
+/// isn't shaping-safe). Steady-state cost: O(#segs + tail bytes).
+fn fieldMetrics(s: *TextFieldState) ui.paint.TextMetrics {
+    const str = s.text();
+    const size = bodyLarge(s.opts.theme).size;
+    // Reconcile: segs must form an exact prefix of the buffer, each piece
+    // still matching the bytes at its position and measured at the live
+    // font size. The first mismatch drops that seg and everything after.
+    var covered: usize = 0;
+    var keep: usize = 0;
+    for (s.segs.items) |seg| {
+        if (seg.size != size or covered + seg.text.len > str.len or
+            !std.mem.eql(u8, str[covered .. covered + seg.text.len], seg.text)) break;
+        covered += seg.text.len;
+        keep += 1;
+    }
+    while (s.segs.items.len > keep) freeSeg(s, s.segs.pop().?);
+    if (covered < str.len) {
+        const tail: [:0]const u8 = str.ptr[covered..str.len :0];
+        if (s.segs.items.len == 0 or segSplitSafe(str, covered)) {
+            segPush(s, tail, size);
+        } else {
+            // Unsafe cut (a joined sequence spans it): fold the tail into
+            // the previous segment — re-measure that span, still O(tail).
+            const last = &s.segs.items[s.segs.items.len - 1];
+            const merged = s.segs.allocator.alloc(u8, last.text.len + tail.len + 1) catch @panic("klaxon: out of memory");
+            @memcpy(merged[0..last.text.len], last.text);
+            @memcpy(merged[last.text.len ..][0..tail.len], tail);
+            merged[last.text.len + tail.len] = 0;
+            s.segs.allocator.free(@constCast(last.text.ptr)[0 .. last.text.len + 1]);
+            last.text = merged[0 .. last.text.len + tail.len :0];
+            last.size = size;
+            last.m = ui.paint.measureText(last.text, size, false);
+        }
+    }
+    var m = ui.paint.TextMetrics{};
+    for (s.segs.items) |seg| {
+        m.width += seg.m.width;
+        m.height = seg.m.height; // same size → identical line metrics
+        m.ascent = seg.m.ascent;
+        m.descent = seg.m.descent;
+    }
+    return m;
+}
+fn segPush(s: *TextFieldState, piece: [:0]const u8, size: f32) void {
+    const seg = s.segs.addOne() catch @panic("klaxon: out of memory");
+    const buf = s.segs.allocator.alloc(u8, piece.len + 1) catch @panic("klaxon: out of memory");
+    @memcpy(buf[0..piece.len], piece);
+    buf[piece.len] = 0;
+    seg.* = .{ .text = buf[0..piece.len :0], .size = size,
+        .m = ui.paint.measureText(buf[0..piece.len :0], size, false) };
+}
+fn freeSeg(s: *TextFieldState, seg: TextFieldState.Seg) void {
+    s.segs.allocator.free(@constCast(seg.text.ptr)[0 .. seg.text.len + 1]);
+}
+fn segsReset(s: *TextFieldState) void {
+    while (s.segs.pop()) |seg| freeSeg(s, seg);
+}
+
 fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
     const str = if (s.buf.items.len > 0) s.text() else s.placeholder;
-    const m = ui.paint.measureText(str, bodyLarge(t).size, false);
+    const m = if (s.buf.items.len > 0) fieldMetrics(s) else ui.paint.measureText(str, bodyLarge(t).size, false);
     const label_w = if (hasLabel(s)) ui.paint.measureText(s.label, bodyLarge(t).size, false).width else 0;
     const w = leftOffset(s) + @max(m.width, label_w) + rightOffset(s);
     const h = container_h + (if (hasSupporting(s)) supporting_top + bodySmall(t).line_height else 0);
@@ -353,9 +468,17 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, container_h);
     if (s.buf.items.len > 0) {
         const style = bodyLarge(t);
-        const m = ui.paint.measureText(s.text(), style.size, false);
+        const m = fieldMetrics(s);
         const tx = mx(b.x, b.w, tr.x, m.width, rtl);
-        ui.paint.text(ctx, s.text(), tx, tr.y + m.ascent, style.size, false, fc.input);
+        // Draw segment-by-segment: each piece's shaped blob is text-cache
+        // resident — drawing the whole buffer would shape it fresh every
+        // frame (the cache key is the full string, which always changes).
+        var sx = tx;
+        const baseline = tr.y + m.ascent;
+        for (s.segs.items) |seg| {
+            ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
+            sx += seg.m.width;
+        }
         if (focused) {
             // the caret at the end of the text
             ui.paint.fillRect(ctx, tx + m.width, tr.y, caret_w, m.height, fc.caret);
@@ -499,6 +622,8 @@ fn textFieldDeinit(n: *Node) void {
     n.allocator.free(s.placeholder);
     n.allocator.free(s.supporting);
     s.buf.deinit();
+    segsReset(s);
+    s.segs.deinit();
     n.allocator.destroy(s);
 }
 
@@ -534,6 +659,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     errdefer allocator.free(supporting);
     s.* = .{
         .buf = std.array_list.Managed(u8).init(allocator),
+        .segs = std.array_list.Managed(TextFieldState.Seg).init(allocator),
         .label = label,
         .placeholder = placeholder,
         .supporting = supporting,
@@ -547,6 +673,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
         allocator.free(s.placeholder);
         allocator.free(s.supporting);
         s.buf.deinit();
+        s.segs.deinit();
     }
     s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
