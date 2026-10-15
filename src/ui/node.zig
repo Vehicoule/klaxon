@@ -614,6 +614,12 @@ pub const Node = struct {
         return b == kx.c.KX_BACKEND_GANESH_GLES or b == kx.c.KX_BACKEND_GANESH_WEBGL2;
     }
 
+    var atlas_off: ?bool = null; // env latch — KX_NO_ATLAS for A/B
+    fn atlasEnabled() bool {
+        if (atlas_off == null) atlas_off = std.c.getenv("KX_NO_ATLAS") != null;
+        return !atlas_off.?;
+    }
+
     /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
     /// shared by the direct path and the retained rasterization.
     fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
@@ -706,6 +712,7 @@ pub const Node = struct {
         const backend = kx.c.kx_backend_of(ctx);
         const use_atlas = backend != kx.c.KX_BACKEND_RASTER and
             iw * ih <= 512 * 1024 and
+            atlasEnabled() and
             !autoRetainOffscreenExpensive(ctx) and
             paint_mod.atlasBegin(ctx, iw, ih, &node.retained_slot);
         if (!use_atlas and !kx.c.kx_offscreen_begin(ctx, iw, ih)) {

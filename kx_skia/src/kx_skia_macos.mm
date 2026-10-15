@@ -65,12 +65,24 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
     // No ARC: CFRetain produces the +1 reference that sk_cfp adopts (and releases).
     mtl_ctx.fDevice = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)device));
     mtl_ctx.fQueue = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)queue));
-    state->context = skgpu::graphite::ContextFactory::MakeMetal(mtl_ctx, skgpu::graphite::ContextOptions{});
+    skgpu::graphite::ContextOptions opts;
+    // Single recorder, recordings snapped+inserted in order each frame — lets
+    // Graphite skip the per-recording cache flushes it needs for unordered
+    // insertion.
+    opts.fRequireOrderedRecordings = true;
+    state->context = skgpu::graphite::ContextFactory::MakeMetal(mtl_ctx, opts);
     if (!state->context) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
 
     *out = state;
     return true;
 }
+
+static uint64_t kx_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static bool kx_prof_on() { static const bool on = getenv("KX_PROF") != nullptr; return on; }
+#define KX_PROF(name, t0) do { if (kx_prof_on()) fprintf(stderr, "  PROF %-16s %lldus\n", name, (long long)((kx_ns() - t0) / 1000)); } while (0)
 
 void gpu_shutdown(GpuState* state) {
     if (!state) return;
@@ -93,8 +105,11 @@ void gpu_resize(GpuState* state, int width, int height) {
 
 SkCanvas* gpu_begin_frame(GpuState* state) {
     if (!state || !state->context || !state->layer) return nullptr;
+    uint64_t t0 = kx_prof_on() ? kx_ns() : 0;
     state->drawable = [state->layer nextDrawable];
     if (!state->drawable) return nullptr;
+    KX_PROF("nextdraw", t0);
+    t0 = kx_prof_on() ? kx_ns() : 0;
     // One recorder for the ctx lifetime: Recorder::snap() leaves it
     // reusable (it drains the task list and resets the buffer managers).
     // Resetting it per frame killed every RenderTarget surface created on
@@ -110,22 +125,17 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
     state->frame_surface = SkSurfaces::WrapBackendTexture(
         state->recorder.get(), backend_tex, kBGRA_8888_SkColorType, nullptr, nullptr);
     if (!state->frame_surface) return nullptr;
+    KX_PROF("wrap", t0);
     return state->frame_surface->getCanvas();
 }
 
-static uint64_t kx_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-static bool kx_prof_on() { static const bool on = getenv("KX_PROF") != nullptr; return on; }
-#define KX_PROF(name, t0) do { if (kx_prof_on()) fprintf(stderr, "  PROF %-16s %lldus\n", name, (long long)((kx_ns() - t0) / 1000)); } while (0)
-
 void gpu_end_frame(GpuState* state) {
     if (!state || !state->context) return;
-    const uint64_t t0 = kx_prof_on() ? kx_ns() : 0;
+    uint64_t t0 = kx_prof_on() ? kx_ns() : 0;
     if (state->recorder) {
         std::unique_ptr<skgpu::graphite::Recording> recording = state->recorder->snap();
         KX_PROF("snap", t0);
+        t0 = kx_prof_on() ? kx_ns() : 0;
         if (recording) {
             skgpu::graphite::InsertRecordingInfo info;
             info.fRecording = recording.get();
@@ -133,12 +143,14 @@ void gpu_end_frame(GpuState* state) {
             state->context->insertRecording(info);
         }
         KX_PROF("insert", t0);
+        t0 = kx_prof_on() ? kx_ns() : 0;
         // Keep the recorder: surfaces created on it (offscreen pool, row
         // atlas) stay alive across frames — snap() already reset the
         // per-recording state.
     }
     state->context->submit();
     KX_PROF("submit", t0);
+    t0 = kx_prof_on() ? kx_ns() : 0;
     if (state->drawable) {
         [state->drawable present];
         state->drawable = nil;
