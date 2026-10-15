@@ -29,7 +29,6 @@ const icon_w = widgets.icon;
 const image_w = widgets.image;
 const container_w = widgets.container;
 const divider_w = widgets.divider;
-const input_w = widgets.input;
 const button_w = widgets.button;
 const button_group_w = widgets.button_group;
 const fab_menu_w = widgets.fab_menu;
