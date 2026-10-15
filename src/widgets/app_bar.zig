@@ -2,9 +2,10 @@
 //
 // Spec: m3.material.io/components/top-app-bar (M3E) + Compose
 // AppBarSmallTokens / matraic m3e-app-bar:
-//   - container height 64, container color surface — the M3E small app bar
-//     rests on `surface`; `surface_container` applies only in the scrolled
-//     state, which v1 does not implement (fixed bar, no collapse, elevation 0),
+//   - container height 64, container color surface at rest; the M3E small
+//     app bar shifts to `surface_container` in the scrolled state (content
+//     sliding under the bar — set via `setScrolled`, M3E keeps elevation 0
+//     and signals the lift through the container color, not a shadow),
 //   - title type style title_large,
 //   - horizontal padding 4 (TopAppBarHorizontalPadding); leading icon slot
 //     48x48 at start+4; the title starts at 16 without a leading slot and at
@@ -38,9 +39,10 @@ pub const AppBarOptions = struct {
     leading: ?*Node = null, // 48x48 slot (navigation icon button)
     title: ?*Node = null, // title_large content
     actions: ?*Node = null, // trailing content (a row of icon buttons)
+    scrolled: bool = false, // content scrolled under the bar (initial state)
 };
 
-const AppBarState = struct { opts: AppBarOptions };
+const AppBarState = struct { opts: AppBarOptions, scrolled: bool };
 
 fn stateOf(n: *Node) *AppBarState {
     return @ptrCast(@alignCast(n.state.?));
@@ -91,7 +93,8 @@ fn appBarLayout(n: *Node, bounds: Rect) void {
 fn appBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
-    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, s.opts.theme.colors.surface);
+    const c = s.opts.theme.colors;
+    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, if (s.scrolled) c.surface_container else c.surface);
 }
 
 fn appBarDeinit(n: *Node) void {
@@ -113,13 +116,27 @@ pub fn appBar(allocator: std.mem.Allocator, opts: AppBarOptions) !*Node {
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(AppBarState);
     errdefer allocator.destroy(s);
-    s.* = .{ .opts = opts };
+    s.* = .{ .opts = opts, .scrolled = opts.scrolled };
     node.state = s;
     if (opts.leading) |leading| node.add(leading);
     if (opts.title) |title| node.add(title);
     if (opts.actions) |actions| node.add(actions);
     ui.semantics.attach(node, .{ .role = .group, .label = "App bar" }); // Phase 2c
     return node;
+}
+
+/// Scrolled state: M3E lifts the bar through the container color (surface →
+/// surface_container), not elevation. The host calls this when the content
+/// scrolls under/away from the bar — e.g. wired to a scroll view's offset.
+pub fn setScrolled(n: *Node, scrolled: bool) void {
+    const s = stateOf(n);
+    if (s.scrolled == scrolled) return;
+    s.scrolled = scrolled;
+    n.markDirty();
+}
+
+pub fn isScrolled(n: *Node) bool {
+    return stateOf(n).scrolled;
 }
 
 // --- tests ---
@@ -174,4 +191,20 @@ test "golden: app_bar paints the M3 surface container color" {
     // the whole bar is the surface color except the text ink
     try std.testing.expect(f.countColor(surface) > 128 * 64 - 800);
     try std.testing.expect(f.countNot(surface) > 0); // the title's ink
+}
+
+test "golden: scrolled app_bar paints surface_container" {
+    const text_w = @import("text.zig");
+    const bar = try appBar(std.testing.allocator, .{ .title = try text_w.text(std.testing.allocator, "Hi", .{ .color = theme_mod.light.colors.on_surface }) });
+    defer bar.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 128, 64);
+    defer r.deinit();
+    bar.layout(.{ .x = 0, .y = 0, .w = 128, .h = 64 });
+    setScrolled(bar, true);
+    r.paint(bar, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const cs = theme_mod.light.colors;
+    try std.testing.expect(f.countColor(cs.surface_container) > 128 * 64 - 800);
+    try std.testing.expectEqual(@as(u32, 0), f.countColor(cs.surface));
 }
