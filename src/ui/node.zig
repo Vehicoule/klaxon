@@ -301,6 +301,10 @@ pub const Node = struct {
     dirty_mark_gen: u32 = 0,
     dirty_self_gen: u32 = 0,
     layout_mark_gen: u32 = 0,
+    /// The paint rect unioned into root damage by the last markDirty this
+    /// epoch — a repeat mark after the rect moved must damage BOTH
+    /// positions (the old pixels need erasing).
+    damage_src: Rect = .{},
     // Dirty-rect (Phase 1e): the root accumulates the damaged region — the
     // union of every dirty mark's rect — and the host repaints the tree
     // clipped to it (the surface is retained between frames).
@@ -567,12 +571,21 @@ pub const Node = struct {
     /// unioned into the root's damage region.
     pub fn markDirty(node: *Node) void {
         // A repeat markDirty on the same node within one mark epoch is
-        // fully idempotent — flag chain marked and the same paint rect
-        // already unioned (hot signal fan-out marks a node once per
-        // signal, e.g. 3x/frame in anim_100).
-        if (in_clearing_pass == 0 and node.dirty_self_gen == mark_epoch) return;
+        // idempotent ONLY while the paint rect is unchanged — a node moved
+        // by layout mid-epoch must union the new rect AND re-damage the
+        // old one (its pixels are stale) instead of early-outing.
+        const pr = node.paintRect();
+        if (in_clearing_pass == 0 and node.dirty_self_gen == mark_epoch) {
+            const o = node.damage_src;
+            if (o.x == pr.x and o.y == pr.y and o.w == pr.w and o.h == pr.h) return;
+            damageRectUp(node, o);
+            damageRectUp(node, pr);
+            node.damage_src = pr;
+            return;
+        }
         markDirtyUp(node);
-        damageRectUp(node, node.paintRect());
+        damageRectUp(node, pr);
+        node.damage_src = pr;
         node.dirty_self_gen = mark_epoch;
     }
 
