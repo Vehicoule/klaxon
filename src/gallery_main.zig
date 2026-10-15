@@ -45,13 +45,13 @@ fn androidProp(name: [*:0]const u8) bool {
     return __system_property_get(name, @ptrCast(&buf)) > 0 and buf[0] == '1';
 }
 
-const width: c_int = gallery_mod.WINDOW_W;
-const height: c_int = gallery_mod.WINDOW_H;
 const max_frames: u64 = 600;
 
 const Options = struct {
     backend: kx.c.kx_backend,
     max_frames: u64 = max_frames,
+    width: c_int = gallery_mod.WINDOW_W,
+    height: c_int = gallery_mod.WINDOW_H,
     ppm: ?[:0]const u8 = null,
 };
 
@@ -63,6 +63,8 @@ fn optsFromArgs(args: std.process.Args) !Options {
     // backend keywords force a backend (kx_create still falls back to raster).
     var backend: kx.c.kx_backend = kx.c.KX_BACKEND_AUTO;
     var ppm: ?[:0]const u8 = null;
+    var width: c_int = gallery_mod.WINDOW_W;
+    var height: c_int = gallery_mod.WINDOW_H;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
@@ -78,9 +80,13 @@ fn optsFromArgs(args: std.process.Args) !Options {
             // On Windows the iterator owns the converted arg storage — dupe
             // the retained path so it survives `it.deinit()` (process-lifetime).
             ppm = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}", .{arg["--ppm=".len..]}, 0);
+        } else if (std.mem.startsWith(u8, arg, "--width=")) {
+            width = std.fmt.parseInt(c_int, arg["--width=".len..], 10) catch width;
+        } else if (std.mem.startsWith(u8, arg, "--height=")) {
+            height = std.fmt.parseInt(c_int, arg["--height=".len..], 10) catch height;
         }
     }
-    return .{ .backend = backend, .ppm = ppm };
+    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm };
 }
 
 fn lerpChannel(a: u32, b: u32, shift: u5, t: f32) u32 {
@@ -121,7 +127,7 @@ fn galleryMain(opts: Options) !void {
     else
         debug_alloc.allocator();
 
-    var host = try host_mod.Host.init(allocator, width, height, opts.backend, opts.ppm);
+    var host = try host_mod.Host.init(allocator, opts.width, opts.height, opts.backend, opts.ppm);
     defer host.deinit();
     // Host.init's desktop window is titled "klaxon hello" — rename for the gallery.
     _ = sdl.c.SDL_SetWindowTitle(host.window, "klaxon gallery");
@@ -148,9 +154,9 @@ fn galleryMain(opts: Options) !void {
         }
     }.cb, .userdata = &platform_ctx };
 
-    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) });
+    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) });
 
-    std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d}\n", .{ host.stats.backend, countNodes(g.root), width, height });
+    std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d}\n", .{ host.stats.backend, countNodes(g.root), opts.width, opts.height });
     try host.run(g.root, opts.max_frames, onFrame, g);
     std.debug.print("rendered {d} frames, last frame {d:.2} ms, done\n", .{ host.stats.frames, host.stats.frame_time_ms });
 }
