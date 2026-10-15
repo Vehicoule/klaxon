@@ -47,7 +47,7 @@ mergeInto(LibraryManager.library, {
         canvas.setAttribute('aria-label', 'Klaxon application');
         canvas.setAttribute('aria-owns', 'kx-a11y-root');
         if (document.activeElement === document.body) {
-          try { canvas.focus({ preventScroll: true }); } catch (e) {}
+          try { canvas.focus({ preventScroll: true }); } catch (e) { }
         }
       }
 
@@ -95,8 +95,12 @@ mergeInto(LibraryManager.library, {
       if (!KX_A11Y.rootNodePtr) return null;
       var ptr = ccall('kx_a11y_dump_tree', 'number', ['number'], [KX_A11Y.rootNodePtr]);
       if (!ptr) return null;
+      // Bounded: past the heap end HEAPU8[i] is undefined (still !== 0) — a
+      // missing NUL would spin forever without the cap.
       var len = 0;
-      while (HEAPU8[ptr + len] !== 0) len++;
+      var end = Math.min(ptr + 4 * 1024 * 1024, HEAPU8.length); // 4 MB dump cap
+      while (ptr + len < end && HEAPU8[ptr + len] !== 0) len++;
+      if (HEAPU8[ptr + len] !== 0) return null;
       var text = KX_A11Y.decode(ptr, len);
       ccall('kx_a11y_free_string', null, ['number'], [ptr]);
       return text;
@@ -131,7 +135,7 @@ mergeInto(LibraryManager.library, {
       }
       KX_A11Y.nodes = nodes;
       if (KX_A11Y.focusedIndex >= 0 && KX_A11Y.focusedIndex < nodes.length) {
-        try { nodes[KX_A11Y.focusedIndex].el.focus({ preventScroll: true }); } catch (e) {}
+        try { nodes[KX_A11Y.focusedIndex].el.focus({ preventScroll: true }); } catch (e) { }
       }
     },
 
@@ -211,7 +215,7 @@ mergeInto(LibraryManager.library, {
           var idx = KX_A11Y.ptrToIndex[nodeId];
           if (idx !== undefined && idx >= 0 && idx < KX_A11Y.nodes.length) {
             KX_A11Y.focusedIndex = idx;
-            try { KX_A11Y.nodes[idx].el.focus({ preventScroll: true }); } catch (e) {}
+            try { KX_A11Y.nodes[idx].el.focus({ preventScroll: true }); } catch (e) { }
           }
           break;
         }
