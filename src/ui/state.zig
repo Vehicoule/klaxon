@@ -286,8 +286,15 @@ pub const TextSignal = struct {
 pub const Effect = struct {
     fn_ptr: *const fn (userdata: ?*anyopaque) void,
     userdata: ?*anyopaque,
-    dependencies: std.array_list.Managed(*SignalBase),
+    /// Tracked deps carry the run's generation: a stable dep is re-stamped
+    /// in place (no unsub/resub churn — a widget effect on a hot signal ran
+    /// the full un/resubscribe pair per set). Only deps the run did NOT
+    /// re-track get unsubscribed afterwards.
+    dependencies: std.array_list.Managed(Dep),
+    run_gen: u64,
     allocator: std.mem.Allocator,
+
+    const Dep = struct { base: *SignalBase, gen: u64 };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -298,35 +305,48 @@ pub const Effect = struct {
         effect.* = .{
             .fn_ptr = fn_ptr,
             .userdata = userdata,
-            .dependencies = std.array_list.Managed(*SignalBase).init(allocator),
+            .dependencies = std.array_list.Managed(Dep).init(allocator),
+            .run_gen = 0,
             .allocator = allocator,
         };
         return effect;
     }
 
-    /// Run (or re-run) the effect: unsubscribes from stale dependencies, then
-    /// re-tracks by running the fn with this effect as the current observer.
+    /// Run (or re-run) the effect with this effect as the current observer:
+    /// re-tracked deps keep their subscription, stale ones unsubscribe.
     pub fn run(effect: *Effect) void {
-        for (effect.dependencies.items) |dep| dep.unsubscribe(.{ .effect = effect });
-        effect.dependencies.clearRetainingCapacity();
+        effect.run_gen += 1;
+        const gen = effect.run_gen;
         const prev = current_effect;
         current_effect = effect;
         defer current_effect = prev;
         effect.fn_ptr(effect.userdata);
+        var i = effect.dependencies.items.len;
+        while (i > 0) {
+            i -= 1;
+            const dep = effect.dependencies.items[i];
+            if (dep.gen != gen) {
+                dep.base.unsubscribe(.{ .effect = effect });
+                _ = effect.dependencies.swapRemove(i);
+            }
+        }
     }
 
     fn track(effect: *Effect, base: *SignalBase) void {
         // Reading the same signal twice in one run must not subscribe twice
         // (a duplicate dep made the effect re-run once per duplicate entry).
-        for (effect.dependencies.items) |dep| {
-            if (dep == base) return;
+        for (effect.dependencies.items) |*dep| {
+            if (dep.base == base) {
+                dep.gen = effect.run_gen;
+                return;
+            }
         }
-        effect.dependencies.append(base) catch @panic("klaxon: out of memory");
+        effect.dependencies.append(.{ .base = base, .gen = effect.run_gen }) catch @panic("klaxon: out of memory");
         base.subscribe(.{ .effect = effect });
     }
 
     pub fn deinit(effect: *Effect) void {
-        for (effect.dependencies.items) |dep| dep.unsubscribe(.{ .effect = effect });
+        for (effect.dependencies.items) |dep| dep.base.unsubscribe(.{ .effect = effect });
         effect.dependencies.deinit();
         effect.allocator.destroy(effect);
     }
