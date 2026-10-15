@@ -21,6 +21,7 @@
 //     the app can mark the root layout-dirty (RTL re-mirrors the layout).
 const std = @import("std");
 const state_mod = @import("state.zig");
+const node_mod = @import("node.zig");
 
 /// Text direction (drives the layout mirror, Phase 2b.2).
 pub const Direction = enum { ltr, rtl };
@@ -642,6 +643,9 @@ pub const I18n = struct {
         i18n.current = loc;
         i18n.locale_sig.set(loc.tag); // notifies → widgets re-render
         if (i18n.direction() != old_dir) {
+            // Direction is process-global: every layout mirrors off it —
+            // bump the epoch so clean subtrees re-lay once even untouched.
+            node_mod.bumpLayoutEpoch();
             if (i18n.on_direction_changed) |cb| cb.fn_ptr(cb.userdata);
         }
     }

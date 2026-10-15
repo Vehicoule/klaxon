@@ -39,6 +39,15 @@ pub const Rect = struct {
     }
 };
 
+/// Global layout epoch: bumped by process-global layout-affecting changes
+/// (the i18n direction flip). `Node.layout()`'s clean-skip requires the
+/// current epoch, so a bump re-lays the whole tree once.
+pub var layout_epoch: u64 = 1;
+
+pub fn bumpLayoutEpoch() void {
+    layout_epoch += 1;
+}
+
 /// Bounding box of two rects (the swept region of a monotonic translation).
 pub fn rectUnion(a: Rect, b: Rect) Rect {
     const x0 = @min(a.x, b.x);
@@ -197,6 +206,10 @@ pub const Node = struct {
     bounds: Rect = .{},
     dirty: bool = true,
     layout_dirty: bool = true,
+    /// Last global layout epoch this node was laid out in. A global
+    /// layout-affecting switch (text direction flip) bumps the epoch so a
+    /// clean subtree at unchanged bounds still re-runs once.
+    layout_gen: u64 = 0,
     visible: bool = true, // invisible subtrees are neither painted nor hit-tested
     /// Flex weight on the parent's main axis (0 = natural size). Set by the
     /// Expanded wrapper (widgets/layout.zig); the flex algorithms distribute
@@ -436,6 +449,14 @@ pub const Node = struct {
     }
 
     pub fn layout(node: *Node, bounds: Rect) void {
+        // Damage-scoped layout: a clean subtree at unchanged bounds produces
+        // the same child positions — every layout is a pure function of its
+        // bounds + children, and layout_dirty propagates UP, so a dirty leaf
+        // re-lays its ancestors but skips clean siblings entirely.
+        if (!node.layout_dirty and node.layout_gen == layout_epoch and
+            node.bounds.x == bounds.x and node.bounds.y == bounds.y and
+            node.bounds.w == bounds.w and node.bounds.h == bounds.h) return;
+        node.layout_gen = layout_epoch;
         // A bounds change is a visual mutation: damage old ∪ new paint rect
         // so the next frame repaints the moved/resized region — without
         // this a relayout could shift content with zero damage (a clean

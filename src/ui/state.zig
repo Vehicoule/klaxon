@@ -55,24 +55,33 @@ pub const Subscriber = union(enum) {
 
 pub const SignalBase = struct {
     version: u64 = 0,
-    subscribers: std.array_list.Managed(Subscriber),
+    /// Stamp handed out by notify(): entries whose `fired_gen` already
+    /// equals the current notify generation were visited this round. Lets
+    /// notify iterate the LIVE list in place — no per-notify dupe, no
+    /// revalidation scan — while (un)subscribes mid-notify stay correct.
+    notify_gen: u64 = 0,
+    subscribers: std.array_list.Managed(Entry),
     allocator: std.mem.Allocator,
+
+    const Entry = struct { sub: Subscriber, fired_gen: u64 };
 
     pub fn init(allocator: std.mem.Allocator) SignalBase {
         return .{
-            .subscribers = std.array_list.Managed(Subscriber).init(allocator),
+            .subscribers = std.array_list.Managed(Entry).init(allocator),
             .allocator = allocator,
         };
     }
 
     pub fn subscribe(base: *SignalBase, sub: Subscriber) void {
-        base.subscribers.append(sub) catch @panic("klaxon: out of memory");
+        // Subscribing mid-notify must not fire this round: stamp the entry
+        // as already-visited for the in-flight generation.
+        base.subscribers.append(.{ .sub = sub, .fired_gen = base.notify_gen }) catch @panic("klaxon: out of memory");
     }
 
     pub fn unsubscribe(base: *SignalBase, sub: Subscriber) void {
         var i: usize = 0;
         while (i < base.subscribers.items.len) {
-            if (Subscriber.same(base.subscribers.items[i], sub)) {
+            if (Subscriber.same(base.subscribers.items[i].sub, sub)) {
                 _ = base.subscribers.orderedRemove(i);
             } else {
                 i += 1;
@@ -86,18 +95,22 @@ pub const SignalBase = struct {
         // traversal freeze defers those deinits to a safe point.
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
-        // Iterate a snapshot: subscribers may (un)subscribe during notify.
-        const snapshot = base.allocator.dupe(Subscriber, base.subscribers.items) catch @panic("klaxon: out of memory");
-        defer base.allocator.free(snapshot);
-        for (snapshot) |sub| {
-            // Revalidate: a subscriber earlier in the snapshot may have
-            // destroyed a later subscriber's node/effect — the widget
-            // deinit unsubscribes, but the STALE SNAPSHOT ENTRY still
-            // points at freed memory. Skip anything no longer subscribed.
-            const live = for (base.subscribers.items) |s| {
-                if (Subscriber.same(s, sub)) break true;
-            } else false;
-            if (live) sub.notify();
+        base.notify_gen += 1;
+        const gen = base.notify_gen;
+        // Rescan from the top after every callback: (un)subscribes inside a
+        // subscriber may reorder the list, and an element moved to an
+        // earlier index must still fire. The fired_gen stamp prevents
+        // double-firing; the loop ends on a full pass with nothing left.
+        while (true) {
+            var fired = false;
+            for (base.subscribers.items) |*entry| {
+                if (entry.fired_gen == gen) continue;
+                entry.fired_gen = gen;
+                entry.sub.notify();
+                fired = true;
+                break; // items may have moved — restart the scan
+            }
+            if (!fired) break;
         }
     }
 

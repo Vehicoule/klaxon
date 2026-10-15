@@ -528,12 +528,12 @@ test "animatedContainer: retargeting mid-flight cancels the previous animation" 
     tl.tick(50); // mid-flight at 25
     try std.testing.expectApproxEqAbs(@as(f32, 25), root.measure(.{}).w, 0.01);
     w.set(10); // retarget back: the size animation is replaced, not stacked
+    tl.tick(50); // the new tween starts here; the retargeted one drops out
     var active: usize = 0;
     for (tl.animations.items) |a| {
         if (!a.done) active += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), active);
-    tl.tick(50); // the new tween starts here
     tl.tick(100); // 50 ms into the new tween (25 → 10)
     try std.testing.expectApproxEqAbs(@as(f32, 17.5), root.measure(.{}).w, 0.01);
 }
