@@ -17,6 +17,13 @@ const Node = ui.node.Node;
 pub const ItemFactory = struct {
     fn_ptr: *const fn (userdata: ?*anyopaque, index: usize) *Node,
     userdata: ?*anyopaque,
+    /// Row recycling (RecyclerView-style): rebind a leaving item node to a
+    /// new index instead of destroy+create. Return false to decline — the
+    /// caller destroys the node and rebuilds through fn_ptr. The rebound
+    /// node must repaint identically to a fresh one: mark the subtree dirty
+    /// inside (a retained node's cached image re-rasterizes on the next
+    /// paint — the dirty flag drives that).
+    rebind: ?*const fn (userdata: ?*anyopaque, index: usize, node: *Node) bool = null,
 };
 
 /// Drag-to-scroll + wheel input, embedded in a scrollable's state.
@@ -103,38 +110,76 @@ pub fn syncItemWindow(
     range: scroll_mod.Range,
     layout_item: *const fn (n: *Node, child: *Node, index: usize) void,
 ) void {
-    // Non-overlapping windows (or an empty window): drop everything and
-    // re-anchor — a large jump must NOT materialize the intervening items.
+    // Non-overlapping windows (or an empty window): re-anchor — a large
+    // jump must NOT materialize the intervening items. With a rebind-capable
+    // factory the live rows recycle in place (a jump still has zero
+    // creates); a decline mid-window drops the stale tail and the fill
+    // loop rebuilds the rest.
     const old_last = first.* + n.children.items.len;
     const overlaps = first.* < range.last and range.first < old_last;
     if (!overlaps) {
-        // Detach-then-deinit from the back — deinit() may DEFER the destroy
-        // (zombie), and the sweep's parent.detach would shift the array
-        // under a for-loop's captured slice.
-        while (n.children.items.len > 0) {
+        var recycled: usize = 0;
+        if (factory.rebind) |rebind| {
+            while (recycled < n.children.items.len and
+                range.first + recycled < range.last)
+            {
+                const child = n.children.items[recycled];
+                if (!rebind(factory.userdata, range.first + recycled, child)) break;
+                layout_item(n, child, range.first + recycled);
+                recycled += 1;
+            }
+        }
+        // Drop the un-recycled tail — detach-then-deinit from the back:
+        // deinit() may DEFER the destroy (zombie), and the sweep's
+        // parent.detach would shift the array under a for-loop's captured
+        // slice.
+        while (n.children.items.len > recycled) {
             const child = n.children.items[n.children.items.len - 1];
             _ = n.remove(child);
             child.deinit();
         }
         first.* = range.first;
     }
-    // Trim items that left the window (front): destroy the child and
-    // advance `first` — advancing continues past an empty window (the
-    // children were never created or are already gone).
+    // Trim items that left the window (front): when the factory can rebind
+    // and the window still needs rows at the back, the leaving row recycles
+    // straight into the entering slot — remove+rebind+add, zero create/
+    // destroy (the scroll tick's dominant cost was one row lifecycle per
+    // frame). Otherwise destroy and advance `first` — advancing continues
+    // past an empty window (the children were never created or are already
+    // gone).
     while (first.* < range.first) {
         if (n.children.items.len > 0) {
             const child = n.children.items[0];
-            _ = n.remove(child); // detach then deinit — never the reverse
-            child.deinit();
+            // After removing the front row the children span [first+1,
+            // first+len): the fresh back slot is index first+len — computed
+            // against the PRE-removal length.
+            const recycle_to = first.* + n.children.items.len;
+            _ = n.remove(child); // detach first — a rebind may mark dirty
+            if (factory.rebind != null and recycle_to < range.last and
+                factory.rebind.?(factory.userdata, recycle_to, child))
+            {
+                n.add(child);
+                layout_item(n, child, recycle_to);
+            } else {
+                child.deinit();
+            }
         }
         first.* += 1;
     }
-    // Trim items that left the window (back).
+    // Trim items that left the window (back) — symmetric recycling into a
+    // needed front slot.
     while (first.* + n.children.items.len > range.last and n.children.items.len > 0) {
         const last = n.children.items.len - 1;
         const child = n.children.items[last];
+        const recycle = factory.rebind != null and first.* > range.first;
         _ = n.remove(child); // detach then deinit — never the reverse
-        child.deinit();
+        if (recycle and factory.rebind.?(factory.userdata, first.* - 1, child)) {
+            first.* -= 1;
+            n.insert(0, child);
+            layout_item(n, child, first.*);
+        } else {
+            child.deinit();
+        }
     }
     // Items entering at the front (scrolled up): prepend. Route through
     // insert() — NOT a raw children.insert: the parent pointer, the

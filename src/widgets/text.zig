@@ -209,6 +209,34 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
     return node;
 }
 
+/// Replace the string on a live text (row recycling, counters, live labels):
+/// re-measures — the bounds may change → layout dirty. The semantics label
+/// follows the new bytes (it borrowed the old buffer, which may be freed).
+/// The buffer is reused in place when the new string fits.
+pub fn setText(n: *Node, str: []const u8) void {
+    const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    if (std.mem.eql(u8, s.text, str)) return;
+    if (str.len <= s.text.len) {
+        const buf = @constCast(s.text.ptr)[0 .. str.len + 1];
+        @memcpy(buf[0..str.len], str);
+        buf[str.len] = 0;
+        s.text = buf[0..str.len :0];
+    } else {
+        const buf = n.allocator.alloc(u8, str.len + 1) catch @panic("klaxon: out of memory");
+        @memcpy(buf[0..str.len], str);
+        buf[str.len] = 0;
+        n.allocator.free(@constCast(s.text.ptr)[0 .. s.text.len + 1]);
+        s.text = buf[0..str.len :0];
+    }
+    s.m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
+    s.vt.layout_dirty = s.vt.needsLayout();
+    if (n.semantics) |sem| {
+        if (sem.role == .text) sem.label = s.text;
+    }
+    n.markLayoutDirty();
+    n.markDirty();
+}
+
 /// Recolor a live text (signal-driven widgets recolor their label on state
 /// change — e.g. the M3E chip's selected state).
 pub fn setColor(n: *Node, color: Color) void {

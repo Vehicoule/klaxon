@@ -497,15 +497,20 @@ const SceneRunner = struct {
             .anim_100 => {
                 // Retarget every widget (phase-offset per widget) and advance
                 // the timeline 8 ms/frame — 100 concurrent spring animations.
+                const prof = std.c.getenv("KLAXON_BENCH_PHASES") != null;
+                const ta = sdl.c.SDL_GetTicksNS();
                 for (&r.anim_heights, 0..) |sig, i| {
                     const phase = @as(f32, @floatFromInt(frame)) * 0.06 + @as(f32, @floatFromInt(i)) * 0.17;
                     sig.set(24 + 16 * @sin(phase));
                 }
+                const tb = sdl.c.SDL_GetTicksNS();
                 for (&r.anim_colors, 0..) |sig, i| {
                     const phase = @as(f32, @floatFromInt(frame)) * 0.06 + @as(f32, @floatFromInt(i)) * 0.17;
                     sig.set(anim_mod.lerpColor(0x3F51B5FF, 0xE91E63FF, (@sin(phase) + 1) / 2));
                 }
+                const tc = sdl.c.SDL_GetTicksNS();
                 r.timeline.?.tick(frame * 8);
+                if (prof) std.debug.print("  tick h={d}us c={d}us tl={d}us\n", .{ (tb - ta) / 1000, (tc - tb) / 1000, sdl.c.SDL_GetTicksNS() -| tc });
             },
             .resize => {
                 // Cycle the viewport: resize the surface + relayout the tree.
@@ -1372,13 +1377,26 @@ fn benchListItem(userdata: ?*anyopaque, index: usize) *Node {
     return card;
 }
 
+/// Row recycling for benchListItem rows: card → row → (icon, text) — only
+/// the label differs per index; re-set it in place (the card's dirty mark
+/// re-rasterizes its retained image on the next paint).
+fn benchListRebind(userdata: ?*anyopaque, index: usize, node: *Node) bool {
+    _ = userdata;
+    const row = node.children.items[0];
+    const label = row.children.items[1];
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch return false;
+    widgets.text.setText(label, s);
+    return true;
+}
+
 fn buildScrollList(r: *SceneRunner, item_count: usize, title: []const u8) !*Node {
     const a = r.allocator;
     const col = try widgets.layout.column(a, .{ .gap = 12, .padding = 16 });
     col.add(try widgets.text.text(a, title, .{ .size = 14, .color = 0xCCCCCCFF }));
     const list = try widgets.list_view.listView(a, .{
         .item_count = item_count,
-        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx },
+        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx, .rebind = benchListRebind },
         .item_height = 36,
     });
     r.scroll_list = list;
@@ -1550,7 +1568,7 @@ fn buildResize(r: *SceneRunner) !*Node {
     col.add(cards);
     const list = try widgets.list_view.listView(a, .{
         .item_count = 2_000,
-        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx },
+        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx, .rebind = benchListRebind },
         .item_height = 32,
     });
     const box = try widgets.layout.constrainedBox(a, .{ .max_w = 880, .max_h = 200 });
@@ -1733,6 +1751,13 @@ fn listOpsItem(userdata: ?*anyopaque, index: usize) *Node {
     return row;
 }
 
+/// list_ops rows recycle: row → (text, box) — the box is index-independent.
+fn listOpsRebind(userdata: ?*anyopaque, index: usize, node: *Node) bool {
+    const ctx: *ListOpsCtx = @ptrCast(@alignCast(userdata.?));
+    widgets.text.setText(node.children.items[0], ctx.labels[index]);
+    return true;
+}
+
 fn buildListOps(r: *SceneRunner, empty: bool) !void {
     const a = r.allocator;
     r.list_ops.count = 0;
@@ -1740,7 +1765,7 @@ fn buildListOps(r: *SceneRunner, empty: bool) !void {
     const box = try widgets.layout.constrainedBox(a, .{ .max_w = 640, .max_h = 480 });
     const list = try widgets.list_view.listView(a, .{
         .item_count = r.list_ops.count,
-        .factory = .{ .fn_ptr = listOpsItem, .userdata = &r.list_ops },
+        .factory = .{ .fn_ptr = listOpsItem, .userdata = &r.list_ops, .rebind = listOpsRebind },
         .item_height = 48,
     });
     r.scroll_list = list;
@@ -2245,12 +2270,25 @@ fn scrollAnimItem(userdata: ?*anyopaque, index: usize) *Node {
     return row;
 }
 
+/// scroll_anim rows recycle: update the dot's phase index + the label.
+fn scrollAnimRebind(userdata: ?*anyopaque, index: usize, node: *Node) bool {
+    _ = userdata;
+    const dot = node.children.items[0];
+    const s: *PulseState = @ptrCast(@alignCast(dot.state.?));
+    s.i = index;
+    var buf: [32]u8 = undefined;
+    const str = std.fmt.bufPrint(&buf, "Item #{d}", .{index}) catch return false;
+    widgets.text.setText(node.children.items[1], str);
+    dot.markDirty(); // phase moved — the pulse repaint must refresh
+    return true;
+}
+
 fn buildScrollAnim(r: *SceneRunner) !*Node {
     const a = r.allocator;
     const col = try widgets.layout.column(a, .{ .gap = 8 });
     const list = try widgets.list_view.listView(a, .{
         .item_count = 10_000,
-        .factory = .{ .fn_ptr = scrollAnimItem, .userdata = &r.pulse_ctx },
+        .factory = .{ .fn_ptr = scrollAnimItem, .userdata = &r.pulse_ctx, .rebind = scrollAnimRebind },
         .item_height = 16,
     });
     r.scroll_list = list;
@@ -2523,7 +2561,7 @@ fn buildBackdropScroll(r: *SceneRunner) !*Node {
     const stack = try widgets.layout.stack(a, .{ .fit = .expand });
     const list = try widgets.list_view.listView(a, .{
         .item_count = 200,
-        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx },
+        .factory = .{ .fn_ptr = benchListItem, .userdata = &r.list_ctx, .rebind = benchListRebind },
         .item_height = 36,
     });
     r.scroll_list = list;
