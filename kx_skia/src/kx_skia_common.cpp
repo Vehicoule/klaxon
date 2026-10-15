@@ -156,7 +156,6 @@ struct kx_ctx {
     SkCanvas* sprite_target = nullptr; // canvas the open batch collected on
     struct KxPendingSprite { SkPoint dst[4]; SkRect src; SkColor color; };
     std::vector<KxPendingSprite> sprite_batch;
-    bool sprite_flushing = false;
     // Image registry (per-ctx; images are plain pixel data, shared by all draws).
     struct KxImg {
         sk_sp<SkImage> img;
@@ -2988,10 +2987,11 @@ uint64_t kx_offscreen_end_image(kx_ctx* ctx) {
     ctx->canvas->restore(); // balance the begin's save — unwinds the pass's
                             // matrix/clip mutations before the pool reuses
     // Snapshot the requested corner only — the pooled surface may be larger.
-    sk_sp<SkImage> img = std::getenv("KX_TEMP_IMG")
-        ? ctx->offscreen_pools[depth].surf->makeTemporaryImage()
-        : ctx->offscreen_pools[depth].surf->makeImageSnapshot(
-            SkIRect::MakeWH(pass.w, pass.h));
+    // (A makeTemporaryImage alias would read as a zero-copy win, but the
+    // pooled surface is reused by the next pass — its pixels would mutate
+    // under the returned image. Never alias a pooled surface.)
+    sk_sp<SkImage> img = ctx->offscreen_pools[depth].surf->makeImageSnapshot(
+        SkIRect::MakeWH(pass.w, pass.h));
     ctx->canvas = pass.prev_canvas;
     ctx->offscreen_stack.pop_back();
     if (!img) return 0;
