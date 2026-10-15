@@ -2078,6 +2078,16 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     ctx->canvas->restoreToCount(1);
     ctx->canvas->save();
     ctx->canvas->clipRect(SkRect::MakeXYWH(sx, sy, dw, dh));
+    // Clear the slot: shelf-allocated regions keep the previous tenant's
+    // pixels, and a subtree only repaints where it has content — every
+    // transparent gap would reveal ghost content (e.g. a slider's old
+    // thumbs under the track when the slot recycled its own last raster).
+    {
+        SkPaint clear;
+        clear.setColor(SK_ColorTRANSPARENT);
+        clear.setBlendMode(SkBlendMode::kSrc);
+        ctx->canvas->drawRect(SkRect::MakeXYWH(sx, sy, dw, dh), clear);
+    }
     ctx->canvas->translate(sx, sy);
     // Point-space drawing → device pixels (see the HiDPI note above).
     ctx->canvas->scale(dw / (float)w, dh / (float)h);
