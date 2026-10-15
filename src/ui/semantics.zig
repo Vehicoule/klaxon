@@ -1016,3 +1016,50 @@ test "focus ring: the offset expands the bounds; the tokens carry width + offset
     try std.testing.expectEqual(@as(f32, 2), fm.ring_width);
     try std.testing.expectEqual(@as(f32, 3), fm.ring_offset);
 }
+
+test "semantic tree: virtual children emit as leaves with mapped bounds" {
+    const a = std.testing.allocator;
+    const root = try clickNode(a);
+    defer root.deinit();
+    const host = try clickNode(a);
+    root.add(host);
+    root.bounds = .{ .x = 0, .y = 0, .w = 100, .h = 50 };
+    host.bounds = .{ .x = 10, .y = 5, .w = 80, .h = 40 };
+    var kids = [_]Semantics{
+        .{ .role = .tab, .label = "One", .checked = true, .actions = Actions.initOne(.activate) },
+        .{ .role = .tab, .label = "Two", .checked = false, .disabled = true },
+    };
+    const S = struct {
+        fn childBounds(n: *Node, i: usize) Rect {
+            _ = n;
+            return .{ .x = @floatFromInt(i * 40), .y = 0, .w = 40, .h = 40 };
+        }
+    };
+    attach(host, .{
+        .role = .group,
+        .label = "Tabs",
+        .children = &kids,
+        .child_bounds = S.childBounds,
+    });
+
+    var tree = try buildSemanticTree(a, root);
+    defer tree.deinit(a);
+    // root is transparent and host's group is the sole frontier node — it
+    // IS the returned root (no extra wrapper).
+    const grp = tree;
+    try std.testing.expectEqualStrings("Tabs", grp.label);
+    try std.testing.expectEqual(@as(usize, 2), grp.children.len);
+    const t0 = grp.children[0];
+    try std.testing.expectEqual(Role.tab, t0.role);
+    try std.testing.expectEqualStrings("One", t0.label);
+    try std.testing.expect(t0.checked.?);
+    try std.testing.expect(t0.virtual_index != null);
+    try std.testing.expectEqual(@as(usize, 0), t0.children.len); // leaf
+    // Bounds: child_bounds is node-local → window space via mapRectToRoot.
+    const r0 = t0.bounds_override.?;
+    try std.testing.expectEqual(@as(f32, 10), r0.x); // host.x + item x
+    try std.testing.expectEqual(@as(f32, 5), r0.y);
+    const t1 = grp.children[1];
+    try std.testing.expect(t1.disabled);
+    try std.testing.expectEqual(@as(f32, 50), t1.bounds_override.?.x);
+}
