@@ -2025,6 +2025,15 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     const uint64_t t0 = kx_prof_on() ? kx_prof_ns() : 0;
     if (!ctx || !ctx->canvas || w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
         ctx->atlas_prev || kx_recording(ctx)) return false;
+    // HiDPI: the slot must hold DEVICE pixels — the enclosing canvas may
+    // carry a display/offscreen scale, and a logical-sized slot blitted at
+    // that scale is visibly upscaled (blurred icons/rows on Retina). The
+    // scale factor below fills the allocated slot exactly.
+    const SkMatrix ctm = ctx->canvas->getTotalMatrix();
+    const float eff_sx = std::min(fabsf(ctm.getScaleX()), 16384.0f / w);
+    const float eff_sy = std::min(fabsf(ctm.getScaleY()), 16384.0f / h);
+    const int dw = std::max(1, (int)ceilf(w * eff_sx));
+    const int dh = std::max(1, (int)ceilf(h * eff_sy));
     // Nesting inside an offscreen pass is fine: the atlas is a SEPARATE
     // surface — the flush below lands pending sprites on the strip canvas,
     // the pass writes atlas, end restores the strip canvas.
@@ -2046,20 +2055,20 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
         // Start modest — ~2MB — and grow on demand: a wide-but-short atlas
         // fits list rows; a tall screen-sized atlas would waste 8MB of RAM
         // on apps that never retain anything.
-        const int w0 = std::max(512, std::max(w, ctx->width));
-        const int h0 = std::max(512, h * 2);
+        const int w0 = std::max(512, std::max(dw, ctx->width));
+        const int h0 = std::max(512, dh * 2);
         kx_atlas_recreate(ctx, w0, h0);
         if (!ctx->atlas) return false;
     }
     int sx, sy;
-    if (!kx_atlas_alloc(ctx, w, h, &sx, &sy)) {
+    if (!kx_atlas_alloc(ctx, dw, dh, &sx, &sy)) {
         // Grow both axes as needed — a slot wider than the atlas can never
         // be shelved by height growth alone.
-        const int nw = std::max(ctx->atlas_w, w);
-        const int nh = std::max(ctx->atlas_h * 2, h * 2);
+        const int nw = std::max(ctx->atlas_w, dw);
+        const int nh = std::max(ctx->atlas_h * 2, dh * 2);
         if (nw > 16384 || nh > 16384) return false; // cap — fall back
         kx_atlas_recreate(ctx, nw, nh);
-        if (!ctx->atlas || !kx_atlas_alloc(ctx, w, h, &sx, &sy)) return false;
+        if (!ctx->atlas || !kx_atlas_alloc(ctx, dw, dh, &sx, &sy)) return false;
         kx_prof("atlas_grow", t0);
     }
     ctx->atlas_prev = ctx->canvas;
@@ -2067,10 +2076,12 @@ bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot) {
     // Same isolation as the offscreen pool (base-level mutations persist).
     ctx->canvas->restoreToCount(1);
     ctx->canvas->save();
-    ctx->canvas->clipRect(SkRect::MakeXYWH(sx, sy, w, h));
+    ctx->canvas->clipRect(SkRect::MakeXYWH(sx, sy, dw, dh));
     ctx->canvas->translate(sx, sy);
+    // Point-space drawing → device pixels (see the HiDPI note above).
+    ctx->canvas->scale(dw / (float)w, dh / (float)h);
     out_slot[0] = (float)sx; out_slot[1] = (float)sy;
-    out_slot[2] = (float)w; out_slot[3] = (float)h;
+    out_slot[2] = (float)dw; out_slot[3] = (float)dh;
     kx_prof("atlas_begin", t0);
     return true;
 }
@@ -2998,12 +3009,22 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     // Grow-only surfaces cover every offscreen pass; the snapshot takes
     // only the requested (w,h) corner. GPU keeps a backend render target
     // so the snapshot draws GPU→GPU (Graphite drops raster images).
+    // HiDPI: the pass must rasterize at DEVICE density — the canvas may
+    // carry a display/nested-pass scale, and a logical-sized image blitted
+    // back at that scale is visibly upscaled (blurred text/icons on Retina).
+    // The effective scale fills the snapshotted rect exactly (rounding is
+    // absorbed by the ratio, not the extent).
+    const SkMatrix ctm = ctx->canvas->getTotalMatrix();
+    const float eff_sx = std::min(fabsf(ctm.getScaleX()), 16384.0f / w);
+    const float eff_sy = std::min(fabsf(ctm.getScaleY()), 16384.0f / h);
+    const int dw = std::max(1, (int)ceilf(w * eff_sx));
+    const int dh = std::max(1, (int)ceilf(h * eff_sy));
     const size_t depth = ctx->offscreen_stack.size();
     if (ctx->offscreen_pools.size() <= depth) ctx->offscreen_pools.resize(depth + 1);
     kx_ctx::OffscreenPool& pool_entry = ctx->offscreen_pools[depth];
-    if (!pool_entry.surf || w > pool_entry.w || h > pool_entry.h) {
-        const int pw = std::max(w, pool_entry.w);
-        const int ph = std::max(h, pool_entry.h);
+    if (!pool_entry.surf || dw > pool_entry.w || dh > pool_entry.h) {
+        const int pw = std::max(dw, pool_entry.w);
+        const int ph = std::max(dh, pool_entry.h);
         // Small passes rasterize on CPU even under a GPU ctx: a backend
         // RenderTarget + snapshot costs ~0.2ms on Metal while a row-sized
         // CPU raster + one texture upload is far cheaper (the registry's
@@ -3019,7 +3040,7 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
         pool_entry.w = pw;
         pool_entry.h = ph;
     }
-    ctx->offscreen_stack.push_back({ctx->canvas, w, h});
+    ctx->offscreen_stack.push_back({ctx->canvas, dw, dh});
     ctx->canvas = pool_entry.surf->getCanvas();
     // Isolate the pass: matrix/clip mutations made at the canvas's BASE
     // level (kx_translate has no save) outlive restoreToCount(1) — a reused
@@ -3029,6 +3050,8 @@ bool kx_offscreen_begin(kx_ctx* ctx, int w, int h) {
     // stays as a guard for an unbalanced exit.
     ctx->canvas->restoreToCount(1);
     ctx->canvas->save();
+    // Point-space drawing → device pixels (see the HiDPI note above).
+    ctx->canvas->scale(dw / (float)w, dh / (float)h);
     // Clear ONLY the snapshotted corner — the pool may cover far more
     // (clear() on the whole surface measured +48% on resize-heavy scenes).
     // kSrc + TRANSPARENT: SkPaint defaults to opaque black — an unpainted
@@ -3149,7 +3172,12 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.18.0";
+    return "0.19.0";
+}
+
+float kx_canvas_scale(kx_ctx* ctx) {
+    if (!ctx || !ctx->canvas) return 1.0f;
+    return ctx->canvas->getTotalMatrix().getScaleX();
 }
 
 // --- Text layout handle (0.15.0) ----------------------------------------

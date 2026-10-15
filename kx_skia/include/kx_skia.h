@@ -64,6 +64,10 @@
 //            kx_in_atlas_pass, kx_ctx_serial/alive, kx_draw_image_region_
 //            tinted, kx_sprite_batch_begin/end, kx_draw_image_atlas,
 //            kx_draw_image_set; stackable kx_offscreen passes.
+//   0.19.0 — HiDPI offscreen/atlas passes: kx_offscreen_begin and
+//            kx_atlas_begin now rasterize at the enclosing canvas's device
+//            scale (returned slots/images hold device pixels; callers keep
+//            blitting at logical dst rects). New kx_canvas_scale getter.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -293,6 +297,11 @@ uint32_t kx_atlas_gen(kx_ctx* ctx);
    sprite target); callers paint directly instead. */
 int kx_in_nested_pass(const kx_ctx* ctx);
 int kx_in_atlas_pass(const kx_ctx* ctx);
+/* The current canvas's horizontal device scale (added in 0.19.0) — 1.0 on
+   a 1x display, 2.0 on Retina. Offscreen/atlas raster passes consume it
+   internally; caches keyed on rasterized content should fold it in so a
+   display-scale change regenerates instead of re-blitting stale density. */
+float kx_canvas_scale(kx_ctx* ctx);
 /* Process-unique ctx instance id (monotonic, never reused — a freed ctx's
    address can be reallocated, so cross-ctx caches must key on this, not on
    the pointer). kx_ctx_serial_alive reports whether the owning ctx is still
@@ -300,10 +309,12 @@ int kx_in_atlas_pass(const kx_ctx* ctx);
    into it (the ctx's teardown already released its resources). */
 uint64_t kx_ctx_serial(const kx_ctx* ctx);
 int kx_ctx_serial_alive(uint64_t serial);
-// Begin a paint pass into a fresh slot of at least w×h; on success the ctx
-// canvas targets the atlas region and *out_slot receives {x,y,w,h} — paint
-// in LOCAL space as usual, then kx_atlas_end returns the atlas image id to
-// blit with kx_draw_image_region. Returns false when nested/full.
+// Begin a paint pass into a fresh slot of at least w×h LOGICAL units; on
+// success the ctx canvas targets the atlas region (scaled so point-space
+// drawing lands at device density) and *out_slot receives {x,y,w,h} in
+// ATLAS PIXELS — the slot is w×h times the canvas scale. Blit with
+// kx_draw_image_region using the logical rect as dst. Returns false when
+// nested/full.
 bool kx_atlas_begin(kx_ctx* ctx, int32_t w, int32_t h, float* out_slot);
 void kx_atlas_end(kx_ctx* ctx);
 uint64_t kx_atlas_image(kx_ctx* ctx); // 0 until the first pass ends

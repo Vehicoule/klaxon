@@ -67,6 +67,7 @@ fn optsFromArgs(args: std.process.Args) !Options {
     var ppm: ?[:0]const u8 = null;
     var width: c_int = gallery_mod.WINDOW_W;
     var height: c_int = gallery_mod.WINDOW_H;
+    var frames: u64 = max_frames;
     var light = false;
     var scroll: f32 = 0;
     while (it.next()) |arg| {
@@ -88,13 +89,17 @@ fn optsFromArgs(args: std.process.Args) !Options {
             width = std.fmt.parseInt(c_int, arg["--width=".len..], 10) catch width;
         } else if (std.mem.startsWith(u8, arg, "--height=")) {
             height = std.fmt.parseInt(c_int, arg["--height=".len..], 10) catch height;
+        } else if (std.mem.startsWith(u8, arg, "--frames=")) {
+            // 0 = run forever (interactive use); the default stays the
+            // 600-frame smoke for CI/captures.
+            frames = std.fmt.parseInt(u64, arg["--frames=".len..], 10) catch frames;
         } else if (std.mem.eql(u8, arg, "--light")) {
             light = true;
         } else if (std.mem.startsWith(u8, arg, "--scroll=")) {
             scroll = std.fmt.parseFloat(f32, arg["--scroll=".len..]) catch 0;
         }
     }
-    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm, .light = light, .scroll = scroll };
+    return .{ .backend = backend, .max_frames = frames, .width = width, .height = height, .ppm = ppm, .light = light, .scroll = scroll };
 }
 
 fn lerpChannel(a: u32, b: u32, shift: u5, t: f32) u32 {
@@ -183,7 +188,7 @@ fn galleryMain(opts: Options) !void {
             std.debug.print("  [{d}] y={d:.0} h={d:.0}\n", .{ i, ch.bounds.y, ch.bounds.h });
     }
 
-    std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d}\n", .{ host.stats.backend, countNodes(g.root), opts.width, opts.height });
+    std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d} logical, {d}x{d} px, scale {d:.2}\n", .{ host.stats.backend, countNodes(g.root), opts.width, opts.height, host.pixel_width, host.pixel_height, host.display_scale });
     try host.run(g.root, opts.max_frames, onFrame, g);
     std.debug.print("rendered {d} frames, last frame {d:.2} ms, submit {d:.2} ms, present {d:.2} ms, done\n", .{ host.stats.frames, host.stats.frame_time_ms, host.stats.submit_time_ms, host.stats.present_time_ms });
 }

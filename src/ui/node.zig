@@ -340,8 +340,13 @@ pub const Node = struct {
     /// Atlas generation at alloc time: kx_atlas_recreate resets the shelf
     /// layout — a stale-gen slot freed into it corrupts the allocator.
     retained_gen: u32 = 0,
-    retained_w: i32 = 0, // image pixel size (= the snapped extent)
+    retained_w: i32 = 0, // image extent in logical units (device px inside)
     retained_h: i32 = 0,
+    /// Canvas device scale the retained raster was produced at (ABI 0.19.0
+    /// passes rasterize at device density): quarter-step quantized. A scale
+    /// change (drag to another display, scale animation) invalidates the
+    /// cache — re-blitting it would upscale stale-density pixels.
+    retained_ds: u16 = 0,
     retained_ix: f32 = 0, // image origin in this node's parent space (integer)
     retained_iy: f32 = 0,
     /// The paintRect at rasterize time: a rigid move (same size) re-blit the
@@ -892,8 +897,13 @@ pub const Node = struct {
         if (dbgRetained() and !subtree_dirty and node.vtable.auto_retain) {
             std.debug.print("  retainchk {*} img={} atlas={} prw={d:.0}/{d:.0} prh={d:.0}/{d:.0} bx={d} by={d}\n", .{ node, node.retained_image, node.retained_atlas, node.retained_pr.w, pr.w, node.retained_pr.h, pr.h, node.bounds.x, node.bounds.y });
         }
+        // Device-scale match: the cached raster is only valid at the
+        // density it was rendered for (quarter-step quantized so a scale
+        // animation re-rasterizes a bounded number of times).
+        const ds_now: u16 = @intFromFloat(@ceil(paint_mod.canvasScale(ctx) * 4));
         if (!subtree_dirty and (node.retained_image != 0 or node.retained_atlas) and
-            node.retained_pr.w == pr.w and node.retained_pr.h == pr.h)
+            node.retained_pr.w == pr.w and node.retained_pr.h == pr.h and
+            node.retained_ds == ds_now)
         {
             const bx = node.retained_ix + (pr.x - node.retained_pr.x);
             const by = node.retained_iy + (pr.y - node.retained_pr.y);
@@ -998,6 +1008,7 @@ pub const Node = struct {
         node.retained_gen = if (use_atlas) paint_mod.atlasGen(ctx) else 0;
         node.retained_w = iw;
         node.retained_h = ih;
+        node.retained_ds = ds_now;
         node.retained_ix = ix;
         node.retained_iy = iy;
         node.retained_pr = pr;
@@ -1062,6 +1073,7 @@ pub const Node = struct {
         node.retained_gen = 0;
         node.retained_w = 0;
         node.retained_h = 0;
+        node.retained_ds = 0;
         node.retained_ix = 0;
         node.retained_iy = 0;
         node.retained_pr = .{};

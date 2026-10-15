@@ -318,6 +318,12 @@ pub fn atlasGen(ctx: *kx.Ctx) u32 {
 pub fn inAtlasPass(ctx: *kx.Ctx) bool {
     return kx.c.kx_in_atlas_pass(ctx) != 0;
 }
+/// The canvas's device scale (ABI 0.19.0) — 1.0 at 1x, 2.0 on Retina.
+/// Offscreen/atlas passes rasterize at this density internally; caches of
+/// rasterized content fold it into their key so a scale change regenerates.
+pub fn canvasScale(ctx: *kx.Ctx) f32 {
+    return kx.c.kx_canvas_scale(ctx);
+}
 /// Process-unique ctx id — a freed ctx's address is recycled, so caches
 /// must key on the serial, never the pointer.
 pub fn ctxSerial(ctx: *kx.Ctx) u64 {
@@ -423,8 +429,8 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 
 // --- tests ---
 
-test "kx ABI version reports 0.18.0 (atlas + sprite batch)" {
-    try std.testing.expectEqualStrings("0.18.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.19.0 (HiDPI raster passes)" {
+    try std.testing.expectEqualStrings("0.19.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "shaped text paints ink inside the measured box" {

@@ -134,11 +134,16 @@ fn pline(ctx: *kx.Ctx, ox: f32, oy: f32, k: f32, comptime pts: []const [2]f32, w
 const icon_cache_pad = 1;
 const IconKey = struct {
     name: IconName,
-    tw: i32,
+    tw: i32, // snapped tile extent in LOGICAL units (the blit dst)
     th: i32,
     fx: u16, // fractional origin ×256 inside the tile
     fy: u16,
     color: Color,
+    /// Device scale the tile was rasterized at (ABI 0.19.0: the atlas/
+    /// offscreen pass consumes it internally). Quarter-step quantized —
+    /// always ≥ the true scale so a scale-animating icon re-rasterizes a
+    /// bounded number of times yet never blits undersampled pixels.
+    ds_q: u16,
 };
 const IconEntry = struct {
     key: IconKey,
@@ -167,13 +172,14 @@ fn iconCacheEvict(e: *IconEntry) void {
     e.* = .{ .key = undefined };
 }
 
-/// Blit the cached tile at its snapped integer origin.
+/// Blit the cached tile at its snapped integer origin. The slot/image is
+/// device-sized (scale × logical); the dst stays the LOGICAL tile extent.
 fn iconBlit(e: *const IconEntry, ctx: *kx.Ctx, tx: f32, ty: f32) void {
     if (e.atlas) {
         const img = ui.paint.atlasImage(ctx);
         if (img != 0) {
             ui.paint.imageDrawRegion(ctx, img, e.slot[0], e.slot[1], e.slot[2], e.slot[3],
-                tx, ty, e.slot[2], e.slot[3]);
+                tx, ty, @floatFromInt(e.key.tw), @floatFromInt(e.key.th));
             return;
         }
     }
@@ -203,6 +209,11 @@ pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: C
     const ty = @floor(oy) - icon_cache_pad;
     const tw: i32 = @intFromFloat(@ceil(ox + size) - tx);
     const th: i32 = @intFromFloat(@ceil(oy + size) - ty);
+    // Quarter-step quantized device scale — the tile rasterizes at device
+    // density inside the atlas/offscreen pass (ABI 0.19.0); folding the
+    // scale into the key keeps a Retina tile from serving a 1x display and
+    // vice versa.
+    const ds_q: u16 = @intFromFloat(@ceil(ui.paint.canvasScale(ctx) * 4));
     const key: IconKey = .{
         .name = name,
         .tw = tw,
@@ -210,6 +221,7 @@ pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: C
         .fx = @intFromFloat(@round((ox - tx) * 256)),
         .fy = @intFromFloat(@round((oy - ty) * 256)),
         .color = color,
+        .ds_q = ds_q,
     };
     const gen = ui.paint.atlasGen(ctx);
     const serial = ui.paint.ctxSerial(ctx);
