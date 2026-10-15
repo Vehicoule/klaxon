@@ -54,6 +54,7 @@ const Options = struct {
     height: c_int = gallery_mod.WINDOW_H,
     ppm: ?[:0]const u8 = null,
     light: bool = false,
+    scroll: f32 = 0,
 };
 
 fn optsFromArgs(args: std.process.Args) !Options {
@@ -67,6 +68,7 @@ fn optsFromArgs(args: std.process.Args) !Options {
     var width: c_int = gallery_mod.WINDOW_W;
     var height: c_int = gallery_mod.WINDOW_H;
     var light = false;
+    var scroll: f32 = 0;
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "metal")) {
             backend = kx.c.KX_BACKEND_GRAPHITE_METAL;
@@ -88,9 +90,11 @@ fn optsFromArgs(args: std.process.Args) !Options {
             height = std.fmt.parseInt(c_int, arg["--height=".len..], 10) catch height;
         } else if (std.mem.eql(u8, arg, "--light")) {
             light = true;
+        } else if (std.mem.startsWith(u8, arg, "--scroll=")) {
+            scroll = std.fmt.parseFloat(f32, arg["--scroll=".len..]) catch 0;
         }
     }
-    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm, .light = light };
+    return .{ .backend = backend, .width = width, .height = height, .ppm = ppm, .light = light, .scroll = scroll };
 }
 
 fn lerpChannel(a: u32, b: u32, shift: u5, t: f32) u32 {
@@ -163,6 +167,21 @@ fn galleryMain(opts: Options) !void {
     }.cb, .userdata = &platform_ctx };
 
     g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) });
+    if (opts.scroll != 0) _ = @import("widgets/scroll_view.zig").setScrollOffset(g.refs.scroll_view, opts.scroll);
+    // KLAXON_OPEN_OVERLAYS=1 opens the demo overlays (search view, dialogs,
+    // sheet) before the first frame — capture-time inspection of the states
+    // a static render otherwise hides.
+    if (std.c.getenv("KLAXON_OPEN_OVERLAYS") != null) {
+        g.sv_open.set(true);
+        g.dialog_fs_open.set(true);
+        g.dialog_open.set(true);
+    }
+    if (std.c.getenv("KLAXON_DUMP_TREE") != null) {
+        const sv = g.refs.scroll_view;
+        const content_col = sv.children.items[0];
+        for (content_col.children.items, 0..) |ch, i|
+            std.debug.print("  [{d}] y={d:.0} h={d:.0}\n", .{ i, ch.bounds.y, ch.bounds.h });
+    }
 
     std.debug.print("klaxon gallery (Skia {s}) — widget tree: {d} nodes, {d}x{d}\n", .{ host.stats.backend, countNodes(g.root), opts.width, opts.height });
     try host.run(g.root, opts.max_frames, onFrame, g);

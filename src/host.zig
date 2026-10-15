@@ -112,6 +112,21 @@ fn fullPresentForced() bool {
     return full_present_latched.?;
 }
 
+// KLAXON_DPR=1 forces display_scale = 1 — headless PPM captures and
+// benchmark runs want the logical-size surface (a Retina 2x canvas doubles
+// every pixel cost and the raster surface is capped at 16384²). Latched:
+// getenv is not free in the frame loop.
+var dpr_latched: ?f32 = null;
+fn forcedDpr() f32 {
+    if (dpr_latched == null) {
+        dpr_latched = 0;
+        if (std.c.getenv("KLAXON_DPR")) |v| {
+            dpr_latched = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
+        }
+    }
+    return dpr_latched.?;
+}
+
 fn sdlSystemCursor(c: input_mod.PointerCursor) sdl.c.SDL_SystemCursor {
     const id: c_int = switch (c) {
         .default => sdl.c.SDL_SYSTEM_CURSOR_DEFAULT,
@@ -441,6 +456,13 @@ pub const Host = struct {
         _ = sdl.c.SDL_GetWindowSize(window, &win_w, &win_h);
         _ = sdl.c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
         display_scale = displayScaleOf(window, win_w, pixel_w);
+        // Test/capture override: force the layout:canvas factor (the
+        // pixel buffer/texture stay at logical size below).
+        if (forcedDpr() > 0) {
+            display_scale = forcedDpr();
+            pixel_w = @intFromFloat(@as(f32, @floatFromInt(win_w)) * display_scale);
+            pixel_h = @intFromFloat(@as(f32, @floatFromInt(win_h)) * display_scale);
+        }
 
         // kx_create walks the backend fallback chain internally (explicit
         // request → itself → raster; AUTO → full platform chain → raster).
@@ -1341,6 +1363,13 @@ pub const Host = struct {
     /// on resize — the WINDOW_RESIZED event carries points, the canvas
     /// needs pixels).
     fn refreshPixelSize(host: *Host) void {
+        if (forcedDpr() > 0) {
+            // capture/test override — the canvas stays at the forced DPR
+            host.display_scale = forcedDpr();
+            host.pixel_width = @intFromFloat(@as(f32, @floatFromInt(host.width)) * host.display_scale);
+            host.pixel_height = @intFromFloat(@as(f32, @floatFromInt(host.height)) * host.display_scale);
+            return;
+        }
         var pw: c_int = 0;
         var ph: c_int = 0;
         _ = sdl.c.SDL_GetWindowSizeInPixels(host.window, &pw, &ph);

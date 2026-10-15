@@ -30,6 +30,8 @@ const container_w = widgets.container;
 const divider_w = widgets.divider;
 const input_w = widgets.input;
 const button_w = widgets.button;
+const button_group_w = widgets.button_group;
+const fab_menu_w = widgets.fab_menu;
 const icon_button_w = widgets.icon_button;
 const checkbox_w = widgets.checkbox;
 const radio_w = widgets.radio;
@@ -42,6 +44,8 @@ const list_item_w = widgets.list_item;
 const menu_w = widgets.menu;
 const segmented_button_w = widgets.segmented_button;
 const search_bar_w = widgets.search_bar;
+const search_view_w = widgets.search_view;
+const toolbar_w = widgets.toolbar;
 const navigation_rail_w = widgets.navigation_rail;
 const side_sheet_w = widgets.side_sheet;
 const pull_to_refresh_w = widgets.pull_to_refresh;
@@ -172,6 +176,7 @@ pub const Gallery = struct {
     seg_change: *state.Signal(u32), // the segmented button's change counter
     split_press: *state.Signal(u32), // the split button's leading counter
     split_trail: *state.Signal(u32), // the split button's trailing counter
+    bg_press: *state.Signal(u32), // the button group's press counter
     // the search bar + navigation rails' signals (M3E sections, 2d.3 PR D4)
     sb_text: *state.TextSignal, // the search bar's text (growable, owned)
     sb_change: *state.Signal(u32), // the search bar's change counter
@@ -196,7 +201,8 @@ pub const Gallery = struct {
     ep_expanded: *state.Signal(bool), // the expansion panel's expanded state
     // the FABs + bottom app bar's signals (M3E sections, batch 2d.5)
     fab_toggle: *state.Signal(bool), // the toggle FAB's checked state
-    fab_press: *state.Signal(u32), // the action FAB's press counter
+    fab_press: *state.Signal(u32),
+    fab_menu_open: *state.Signal(bool), // the FAB menu's open state // the action FAB's press counter
     bab_press: *state.Signal(u32), // the bottom app bar's docked FAB counter
     stepper_sig: *state.Signal(usize), // the stepper's current step (M3E section)
     cal_selected: *state.Signal(?i64), // the calendar's selected day (M3E section)
@@ -223,6 +229,8 @@ pub const Gallery = struct {
     drawer_open: *state.Signal(bool),
     sheet_open: *state.Signal(bool),
     dialog_open: *state.Signal(bool),
+    dialog_fs_open: *state.Signal(bool), // the full-screen dialog variant
+    sv_open: *state.Signal(bool), // the expanded search view
     snack_visible: *state.Signal(bool),
     list_ctx: ListItemCtx,
     refs: Refs,
@@ -317,6 +325,8 @@ pub const Gallery = struct {
         errdefer g.split_press.deinit();
         g.split_trail = try state.Signal(u32).init(allocator, 0);
         errdefer g.split_trail.deinit();
+        g.bg_press = try state.Signal(u32).init(allocator, 0);
+        errdefer g.bg_press.deinit();
         g.sb_text = try state.TextSignal.init(allocator, "");
         errdefer g.sb_text.deinit();
         g.sb_change = try state.Signal(u32).init(allocator, 0);
@@ -366,6 +376,8 @@ pub const Gallery = struct {
         errdefer g.fab_toggle.deinit();
         g.fab_press = try state.Signal(u32).init(allocator, 0);
         errdefer g.fab_press.deinit();
+        g.fab_menu_open = try state.Signal(bool).init(allocator, false);
+        errdefer g.fab_menu_open.deinit();
         g.bab_press = try state.Signal(u32).init(allocator, 0);
         errdefer g.bab_press.deinit();
         g.desktop_mode = try state.Signal(bool).init(allocator, false);
@@ -408,6 +420,10 @@ pub const Gallery = struct {
         errdefer g.sheet_open.deinit();
         g.dialog_open = try state.Signal(bool).init(allocator, false);
         errdefer g.dialog_open.deinit();
+        g.dialog_fs_open = try state.Signal(bool).init(allocator, false);
+        errdefer g.dialog_fs_open.deinit();
+        g.sv_open = try state.Signal(bool).init(allocator, false);
+        errdefer g.sv_open.deinit();
         g.snack_visible = try state.Signal(bool).init(allocator, false);
         errdefer g.snack_visible.deinit();
         g.list_ctx = .{ .allocator = allocator, .theme = theme_mod.dark };
@@ -498,6 +514,7 @@ pub const Gallery = struct {
         g.seg_change.deinit();
         g.split_press.deinit();
         g.split_trail.deinit();
+        g.bg_press.deinit();
         g.saved_tf.deinit();
         for (&g.saved_tf_m3e) |*b| b.deinit();
         g.saved_sb.deinit();
@@ -525,6 +542,7 @@ pub const Gallery = struct {
         g.cal_selected.deinit();
         g.fab_toggle.deinit();
         g.fab_press.deinit();
+        g.fab_menu_open.deinit();
         g.bab_press.deinit();
         g.desktop_mode.deinit();
         g.bg_sig.deinit();
@@ -546,6 +564,8 @@ pub const Gallery = struct {
         g.drawer_open.deinit();
         g.sheet_open.deinit();
         g.dialog_open.deinit();
+        g.dialog_fs_open.deinit();
+        g.sv_open.deinit();
         g.snack_visible.deinit();
         g.allocator.destroy(g);
     }
@@ -571,6 +591,7 @@ fn buildTree(g: *Gallery, theme: Theme) !*Node {
     content.add(try section(a, theme, "Menus (M3E)", try buildMenusSection(g, theme)));
     content.add(try section(a, theme, "Segmented buttons (M3E)", try buildSegmentedSection(g, theme)));
     content.add(try section(a, theme, "Split buttons (M3E)", try buildSplitSection(g, theme)));
+    content.add(try section(a, theme, "Button groups (M3E)", try buildButtonGroupSection(g, theme)));
     content.add(try section(a, theme, "Search bar (M3E)", try buildSearchBarSection(g, theme)));
     content.add(try section(a, theme, "Navigation rail (M3E)", try buildNavRailSection(g, theme)));
     content.add(try section(a, theme, "Side sheet (M3E)", try buildSideSheetSection(g, theme)));
@@ -588,6 +609,7 @@ fn buildTree(g: *Gallery, theme: Theme) !*Node {
     content.add(try section(a, theme, "FABs (M3E)", try buildFabsSection(g, theme)));
     content.add(try section(a, theme, "Carousel (M3)", try buildCarouselSection(g, theme)));
     content.add(try section(a, theme, "Bottom app bar (M3E)", try buildBottomAppBarSection(g, theme)));
+    content.add(try section(a, theme, "Toolbar (M3E)", try buildToolbarSection(g, theme)));
     content.add(try section(a, theme, "Navigation chrome", try buildNavSection(g, theme)));
     content.add(try section(a, theme, "Feedback", try buildFeedbackSection(g, theme)));
     content.add(try section(a, theme, "Gestures", try buildGestureSection(g, theme)));
@@ -1000,6 +1022,45 @@ fn buildSplitSection(g: *Gallery, theme: Theme) !*Node {
     return row;
 }
 
+fn bgPressCb(userdata: ?*anyopaque) void {
+    const g = galleryOf(userdata);
+    g.bg_press.set(g.bg_press.peek() + 1);
+}
+
+/// Button groups (M3E): connected buttons — 2dp spacing, collapsed inner
+/// corners, pressed item morphs to full roundness.
+fn buildButtonGroupSection(g: *Gallery, theme: Theme) !*Node {
+    const a = g.allocator;
+    const col = try layout.column(a, .{ .gap = 12 });
+    const cb: state.Callback = .{ .fn_ptr = bgPressCb, .userdata = g };
+    const row1 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    row1.add(try button_group_w.buttonGroup(a, &.{
+        .{ .label = "Copy", .on_press = cb },
+        .{ .label = "Paste", .on_press = cb },
+        .{ .label = "Cut", .on_press = cb },
+    }, .{ .theme = theme }));
+    row1.add(try text_w.BoundText(u32).text(a, g.bg_press, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    col.add(row1);
+    const row2 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    row2.add(try button_group_w.buttonGroup(a, &.{
+        .{ .label = "Day", .icon = .star, .on_press = cb },
+        .{ .label = "Week", .on_press = cb },
+        .{ .label = "Month", .on_press = cb },
+        .{ .label = "Year", .enabled = false },
+    }, .{ .variant = .filled_tonal, .size = .small, .theme = theme }));
+    row2.add(try text_w.text(a, "tonal small + icon + disabled", .{ .size = 12, .color = theme.colors.on_surface_variant }));
+    col.add(row2);
+    const row3 = try layout.row(a, .{ .gap = 12, .cross_align = .center });
+    row3.add(try button_group_w.buttonGroup(a, &.{
+        .{ .label = "Left", .on_press = cb },
+        .{ .label = "Center", .on_press = cb },
+        .{ .label = "Right", .on_press = cb },
+    }, .{ .variant = .outlined, .shape = .square, .size = .xsmall, .theme = theme }));
+    row3.add(try text_w.text(a, "outlined square XS", .{ .size = 12, .color = theme.colors.on_surface_variant }));
+    col.add(row3);
+    return col;
+}
+
 /// Search bar (M3E, batch 2d.3 PR D4): the collapsed pill — click to focus,
 /// type (the text mirrors the signal), Enter submits, the trailing clear
 /// button clears.
@@ -1016,6 +1077,28 @@ fn buildSearchBarSection(g: *Gallery, theme: Theme) !*Node {
     row.add(try text_w.BoundText(u32).text(a, g.sb_change, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     row.add(try text_w.BoundText(u32).text(a, g.sb_submit, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     col.add(row);
+    // SearchView (M3E): the expanded full-screen variant — the collapsed bar
+    // opens it (a tap on the trailing arrow here). Demos in a phone-sized
+    // frame: the view fills its bounds when the open signal flips.
+    const sv_btn = try input_w.button(a, .{ .fn_ptr = svOpenCb, .userdata = g }, .{
+        .bg = theme.colors.primary,
+        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
+        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
+    });
+    sv_btn.add(try text_w.text(a, "Open search view", .{ .size = 14, .color = theme.colors.on_primary }));
+    col.add(sv_btn);
+    const sv = try search_view_w.searchView(a, &.{
+        .{ .label = "Recent searches", .icon = .search },
+        .{ .label = "klaxon gallery", .icon = .search, .trailing_icon = .arrow_up },
+        .{ .label = "material 3 expressive", .icon = .search, .trailing_icon = .arrow_up },
+        .{ .label = "zig ui framework", .icon = .search, .trailing_icon = .arrow_up },
+        .{ .label = "disabled suggestion", .enabled = false },
+    }, g.sv_open, null, null, .{ .fn_ptr = svSelectCb, .userdata = g }, .{ .fn_ptr = sbSubmitCb, .userdata = g }, null, .{ .placeholder = "Search…", .theme = theme });
+    const sv_frame = try layout.constrainedBox(a, .{ .min_w = 360, .max_w = 360, .min_h = 420, .max_h = 420 });
+    const sv_clip = try container_w.container(a, .{ .color = theme.colors.surface, .radius = 16, .border_color = theme.colors.outline_variant, .border_width = 1 });
+    sv_clip.add(sv);
+    sv_frame.add(sv_clip);
+    col.add(sv_frame);
     return col;
 }
 
@@ -1289,6 +1372,18 @@ fn buildFabsSection(g: *Gallery, theme: Theme) !*Node {
     r4.add(try fab_w.extendedFab(a, null, .{ .icon = null, .label = "Text only", .theme = theme }));
     r4.add(try fab_w.extendedFab(a, null, .{ .enabled = false, .icon = .plus, .label = "Disabled", .theme = theme }));
     col.add(r4);
+    // FAB menu (M3E speed dial): the FAB expands into labeled action items.
+    // Headroom at the left: the menu opens upward over its own column.
+    const r5 = try layout.row(a, .{ .gap = 16, .cross_align = .end });
+    const fm = try fab_menu_w.fabMenu(a, &.{
+        .{ .icon = .plus, .label = "Compose", .on_press = .{ .fn_ptr = fabPressCb, .userdata = g } },
+        .{ .icon = .star, .label = "Favorite", .on_press = .{ .fn_ptr = fabPressCb, .userdata = g } },
+        .{ .icon = .arrow_up, .label = "Share", .on_press = .{ .fn_ptr = fabPressCb, .userdata = g } },
+        .{ .icon = .close, .label = "Delete", .enabled = false },
+    }, .{ .open = g.fab_menu_open, .fab_icon = .plus, .close_icon = .close, .theme = theme });
+    r5.add(fm);
+    r5.add(try text_w.text(a, "FAB menu — click to expand", .{ .size = 12, .color = theme.colors.on_surface_variant }));
+    col.add(r5);
     return col;
 }
 
@@ -1344,6 +1439,36 @@ fn buildBottomAppBarSection(g: *Gallery, theme: Theme) !*Node {
     actions2.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .home, .a11y_label = "Home", .theme = theme }));
     actions2.add(try icon_button_w.iconButton(a, null, null, .{ .icon = .heart, .a11y_label = "Favorite", .theme = theme }));
     col.add(try bottom_app_bar_w.bottomAppBar(a, .{ .theme = theme, .actions = actions2 }));
+    return col;
+}
+
+/// Toolbar (M3E): the floating 56dp pill of icon actions — standard variant
+/// with a divider + a disabled item, the vibrant variant, and one with the
+/// docked end FAB. Items report presses on the shared counter.
+fn buildToolbarSection(g: *Gallery, theme: Theme) !*Node {
+    const a = g.allocator;
+    const col = try layout.column(a, .{ .gap = 12 });
+    col.add(try toolbar_w.toolbar(a, &.{
+        .{ .icon = .arrow_left, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g }, .a11y_label = "Back" },
+        .{ .icon = .search, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .star, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .divider = true },
+        .{ .icon = .heart, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .menu, .enabled = false },
+    }, .{ .theme = theme }));
+    col.add(try toolbar_w.toolbar(a, &.{
+        .{ .icon = .check, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .plus, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .minus, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .close, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+    }, .{ .vibrant = true, .theme = theme }));
+    col.add(try toolbar_w.toolbar(a, &.{
+        .{ .icon = .play, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .pause, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+        .{ .icon = .stop, .on_press = .{ .fn_ptr = babFabPressCb, .userdata = g } },
+    }, .{ .fab_icon = .plus, .on_fab_press = .{ .fn_ptr = babFabPressCb, .userdata = g }, .theme = theme }));
+    col.add(try text_w.BoundText(u32).text(a, g.bab_press, fmtPress, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    col.add(try text_w.text(a, "Standard · vibrant · docked FAB — arrow keys move, Enter activates", .{ .size = 12, .color = theme.colors.on_surface_variant }));
     return col;
 }
 
@@ -1519,6 +1644,32 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     const dialog_box = try layout.constrainedBox(a, .{ .min_w = 360, .max_w = 360, .min_h = 240, .max_h = 240 });
     dialog_box.add(dlg);
     col.add(dialog_box);
+    // Full-screen dialog variant (M3E): a full-bleed surface + 64dp top bar
+    // (close icon · expanded title · end action). Demos in a phone frame.
+    const fs_btn = try input_w.button(a, .{ .fn_ptr = dialogFsOpenCb, .userdata = g }, .{
+        .bg = theme.colors.primary,
+        .bg_hover = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.hover),
+        .bg_pressed = theme_mod.stateLayer(theme.colors.primary, theme.colors.on_primary, theme.state.pressed),
+    });
+    fs_btn.add(try text_w.text(a, "Open full-screen dialog", .{ .size = 14, .color = theme.colors.on_primary }));
+    col.add(fs_btn);
+    const fs_save = try input_w.button(a, null, .{
+        .bg = 0x00000000,
+        .bg_hover = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.hover),
+        .bg_pressed = theme_mod.stateLayer(theme.colors.surface_container_high, theme.colors.primary, theme.state.pressed),
+        .padding = EdgeInsets.symmetric(8, 4),
+    });
+    fs_save.add(try text_w.text(a, "Save", .{ .size = theme.type_scale.label_large.size, .color = theme.colors.primary }));
+    const fs_dlg = try dialog_w.dialog(a, g.dialog_fs_open, null, .{
+        .variant = .full_screen,
+        .theme = theme,
+        .title = try text_w.text(a, "New event", .{ .size = theme.type_scale.title_large.size, .color = theme.colors.on_surface }),
+        .action = fs_save,
+        .content = try text_w.text(a, "Full-screen dialogs cover the window — the top bar carries the close icon, the title and the action.", .{ .size = theme.type_scale.body_medium.size, .color = theme.colors.on_surface_variant }),
+    });
+    const fs_frame = try layout.constrainedBox(a, .{ .min_w = 360, .max_w = 360, .min_h = 300, .max_h = 300 });
+    fs_frame.add(fs_dlg);
+    col.add(fs_frame);
     // SnackBar: the show button (the snackbar itself overlays the window).
     const snack_btn = try input_w.button(a, .{ .fn_ptr = snackShowCb, .userdata = g }, .{
         .bg = theme.colors.primary,
@@ -1942,6 +2093,18 @@ fn sheetOpenCb(userdata: ?*anyopaque) void {
 
 fn dialogOpenCb(userdata: ?*anyopaque) void {
     galleryOf(userdata).dialog_open.set(true);
+}
+
+fn dialogFsOpenCb(userdata: ?*anyopaque) void {
+    galleryOf(userdata).dialog_fs_open.set(true);
+}
+
+fn svOpenCb(userdata: ?*anyopaque) void {
+    galleryOf(userdata).sv_open.set(true);
+}
+
+fn svSelectCb(userdata: ?*anyopaque) void {
+    galleryOf(userdata).sb_change.set(galleryOf(userdata).sb_change.get() + 1);
 }
 
 fn snackShowCb(userdata: ?*anyopaque) void {
