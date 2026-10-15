@@ -302,7 +302,7 @@ pub const Host = struct {
         var window: *sdl.c.SDL_Window = if (is_android) blk: {
             var count: c_int = 0;
             if (sdl.c.SDL_GetWindows(&count)) |windows| {
-                defer sdl.c.SDL_free(windows); // the array is a single SDL-owned allocation
+                defer sdl.c.SDL_free(@ptrCast(windows)); // the array is a single SDL-owned allocation
                 if (count > 0) {
                     if (windows[0]) |win| break :blk win;
                 }
