@@ -185,6 +185,12 @@ pub fn measureText(str: [:0]const u8, size: f32, bold: bool) TextMetrics {
     return kx.c.kx_measure_text(str, size, bold);
 }
 
+/// Length-taking measure (ABI 0.22.0) — substring prefixes carry no
+/// sentinel; rides the same (text,size,bold) cache entry.
+pub fn measureTextLen(str: []const u8, size: f32, bold: bool) TextMetrics {
+    return kx.c.kx_measure_text_len(str.ptr, str.len, size, bold);
+}
+
 // --- Multi-style shaped text (ABI 0.15.0) ---
 // A Paragraph laid out once from styled spans — real rich text: per-span
 // weight (100..900), italic, letter-spacing and color, with HarfBuzz
@@ -276,6 +282,12 @@ pub fn textLayoutPaint(ctx: *kx.Ctx, l: *const TextLayout, x: f32, baseline_y: f
 }
 pub fn textLayoutDestroy(l: *TextLayout) void {
     kx.c.kx_text_layout_destroy(l);
+}
+/// UTF-16 code-unit index of the grapheme boundary nearest to (dx, dy) in
+/// the layout's space — click-to-caret (ABI 0.22.0). -1 when the
+/// paragraph could not be built.
+pub fn textLayoutPositionAt(l: *TextLayout, dx: f32, dy: f32) i32 {
+    return kx.c.kx_text_position_at(l, dx, dy);
 }
 
 // --- Images (per-ctx registry; create once, draw many) ---
@@ -486,7 +498,7 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 // --- tests ---
 
 test "kx ABI version reports 0.21.0 (paragraph base direction)" {
-    try std.testing.expectEqualStrings("0.21.0", std.mem.span(kx.c.kx_abi_version()));
+    try std.testing.expectEqualStrings("0.22.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "paragraph base direction setter round-trips (default LTR)" {

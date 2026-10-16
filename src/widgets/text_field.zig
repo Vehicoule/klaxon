@@ -68,10 +68,15 @@
 //     lerps the full TextStyle); label/indicator colors snap on the phase
 //     transition rather than animating FastEffects; the placeholder alpha
 //     snaps instead of the fast/slow effects fade.
-//   - The caret is static (no blink), 1dp wide, always at the text end (no
-//     selection, no click-to-position); text scrolls by clip only.
+//   - The caret is a real editing position: click places it at the nearest
+//     grapheme boundary (SkParagraph getGlyphPositionAtCoordinate through
+//     kx_text_position_at), it blinks at Compose's 500ms cadence while
+//     focused (a timeline ticker re-shows it on every edit/move), and
+//     typing/backspace/delete/left/right apply AT the caret. Still missing:
+//     no selection (no shift-extend, no drag-select, no TextSelectionColors)
+//     and arrows move by codepoint, not grapheme cluster.
 //   - RTL mirrors the chrome; the text run itself stays LTR (no bidi —
-//     same as text.zig). No TextSelectionColors (no selection).
+//     same as text.zig); under RTL arrow keys still move logically.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -123,6 +128,9 @@ const corner: f32 = 4; // CornerExtraSmall (top corners for the filled)
 const outline_w: f32 = 1; // UnfocusedIndicator/BorderThickness
 const outline_w_focus: f32 = 2; // FocusedIndicator/BorderThickness
 const caret_w: f32 = 1;
+/// Upstream TextFieldDefaults caret cadence (Compose's cursor blink is a
+/// fixed 500ms half-period — the caret re-shows on any caret event).
+const blink_half_ms: u64 = 500;
 const cutout_pad: f32 = 4; // OutlinedTextFieldInnerPadding
 const supporting_top: f32 = 4; // SupportingTopPadding
 const min_w: f32 = 280; // TextFieldDefaults.MinWidth / OutlinedTextFieldDefaults.MinWidth
@@ -162,6 +170,23 @@ const TextFieldState = struct {
     /// Never committed to `buf`, the signal, or semantics — platforms that
     /// collapse composition to commits (Android) simply leave it empty.
     comp: std.array_list.Managed(u8) = undefined,
+    /// SDL's cursor offset inside `comp` (bytes, text_editing comp_start);
+    /// the caret draws there while a composition is open.
+    comp_cursor: i32 = 0,
+    /// The caret: a byte offset into `buf` on a codepoint boundary. Every
+    /// committed edit applies at this position; a pointer-down maps to the
+    /// nearest grapheme boundary through the paragraph position lookup.
+    caret: usize = 0,
+    /// The blink clock (Compose's 500ms half-period). `caret_on` is the
+    /// painted phase; `blink_epoch` is the tick-time the ON phase started
+    /// — maxInt = "re-base at the next tick" (set by every caret event,
+    /// whose KeyEvent carries no timestamp).
+    caret_on: bool = true,
+    blink_epoch: u64 = std.math.maxInt(u64),
+    /// The blink ticker — registered lazily at the first paint (a field
+    /// built before the host installs its timeline retries), removed at
+    /// deinit. It only keeps the host awake while the field is focused.
+    ticker: ?ui.anim.Timeline.Ticker = null,
 
     const Seg = struct {
         text: [:0]u8, // owned
@@ -519,6 +544,125 @@ fn segsReset(s: *TextFieldState) void {
     while (s.segs.pop()) |seg| freeSeg(s, seg);
 }
 
+// --- the caret ---
+
+/// The run's visual left edge in node-parent space (the `mx` mirror).
+fn runLeft(n: *Node, run_w: f32) f32 {
+    const c = containerRect(n);
+    const tr = textRect(n);
+    if (ui.i18n.direction() == .rtl) {
+        return c.x + c.w - (tr.x - c.x) - run_w;
+    }
+    return tr.x;
+}
+
+/// UTF-16 position → byte offset. The paragraph reports grapheme-cluster
+/// boundaries in UTF-16 code units (astral chars count 2 — the surrogate
+/// pair); a position mid-cluster clamps back to the codepoint's start.
+fn utf16ToByteIndex(str: []const u8, pos16: usize) usize {
+    var u16n: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        const l = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        const units: usize = if (l == 4) 2 else 1; // astral = surrogate pair
+        if (u16n + units > pos16) break; // inside a codepoint → its start
+        u16n += units;
+        i += l;
+    }
+    return i;
+}
+
+/// Byte offset of the grapheme boundary nearest to the press — the
+/// paragraph's getGlyphPositionAtCoordinate (Compose's
+/// TextLayoutResult.getOffsetForPosition). One layout per click; the
+/// field's own segmented path is paint-only. Falls back to the run's
+/// near edge when the paragraph backend can't build.
+fn caretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
+    const str = s.text();
+    if (str.len == 0) return 0;
+    const m = fieldMetrics(s);
+    const tx = runLeft(n, m.width);
+    const tr = textRect(n);
+    const l = ui.paint.textLayoutBegin(0) orelse { // no wrap — the field clips
+        return if (px <= tx) 0 else str.len;
+    };
+    defer ui.paint.textLayoutDestroy(l);
+    const style = bodyLarge(s.opts.theme);
+    ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(style.size, 400, 0, 0, 0xFF0000FF));
+    const pos = ui.paint.textLayoutPositionAt(l, px - tx, py - tr.y);
+    if (pos < 0) return if (px <= tx) 0 else str.len;
+    return utf16ToByteIndex(str, @intCast(pos));
+}
+
+/// The caret's x inside the run (run-space): whole segments before the
+/// caret + the measured prefix of the straddled segment. The same
+/// segmented sum the paint path draws, so the caret lands exactly where
+/// the glyphs are.
+fn caretRunX(s: *TextFieldState) f32 {
+    const size = bodyLarge(s.opts.theme).size;
+    var x: f32 = 0;
+    var covered: usize = 0;
+    for (s.segs.items) |seg| {
+        // Strict: a caret on a segment's end boundary is the same x as the
+        // next segment's start — falling through skips the prefix measure.
+        if (s.caret < covered + seg.text.len) {
+            return x + ui.paint.measureTextLen(seg.text[0 .. s.caret - covered], size, false).width;
+        }
+        x += seg.m.width;
+        covered += seg.text.len;
+    }
+    return x; // caret at/past the run end — no measure needed
+}
+
+/// A caret event (move/edit/focus): the caret shows for the next half
+/// period. The epoch re-bases at the next tick (KeyEvent has no
+/// timestamp — the ticker's now_ms is the only SDL-epoch clock here).
+fn resetBlink(s: *TextFieldState) void {
+    s.caret_on = true;
+    s.blink_epoch = std.math.maxInt(u64);
+}
+
+fn caretTickCb(userdata: ?*anyopaque, now_ms: u64) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (s.blink_epoch == std.math.maxInt(u64)) s.blink_epoch = now_ms;
+    const on = ((now_ms - s.blink_epoch) / blink_half_ms) % 2 == 0;
+    if (on != s.caret_on) {
+        s.caret_on = on;
+        n.markDirty();
+    }
+}
+
+/// The blink only needs the host awake while the caret is shown — an
+/// unfocused field paints no caret and lets the loop block.
+fn caretPendingCb(userdata: ?*anyopaque) bool {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    return s.opts.enabled and input.isFocused(n);
+}
+
+/// Register the blink ticker once (the scrollbar's lazy pattern: built
+/// before the host installs its timeline → retries at the first paint).
+fn ensureTicker(n: *Node, s: *TextFieldState) void {
+    if (s.ticker != null) return;
+    const tl = ui.anim.timeline() orelse return;
+    const t = ui.anim.Timeline.Ticker{ .fn_ptr = caretTickCb, .userdata = n, .has_pending = caretPendingCb };
+    tl.addTicker(t);
+    s.ticker = t;
+}
+
+/// Move the caret to `pos` clamped onto a codepoint boundary.
+fn moveCaret(n: *Node, s: *TextFieldState, pos: usize) void {
+    var p = @min(pos, s.buf.items.len);
+    // items[len] is the sentinel slot — outside the slice: only scan
+    // continuation bytes strictly inside the text.
+    while (p > 0 and p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p -= 1;
+    if (p == s.caret) return;
+    s.caret = p;
+    resetBlink(s);
+    n.markDirty();
+}
+
 fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
@@ -571,6 +715,7 @@ fn paintIcon(ctx: *kx.Ctx, name: ?icon_w.IconName, x: f32, y: f32, color: Color)
 fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     syncPhase(n, s); // the InputPhase transition drives the label spring
+    ensureTicker(n, s); // the caret blink (focused fields stay awake)
     const c = containerRect(n);
     const t = s.opts.theme;
     const focused = input.isFocused(n) and s.opts.enabled;
@@ -649,18 +794,21 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
             sx += seg.m.width;
         }
-        var caret_x = sx;
+        var caret_x = tx + caretRunX(s);
         if (has_comp) {
             // Preedit: appended visually after the committed text with the
             // platform-conventional underline (Compose marks the composing
-            // range; a 1px underline is the standard visual).
-            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
-            ui.paint.text(ctx, s.composition(), sx, baseline, style.size, false, fc.input);
+            // range; a 1px underline is the standard visual). SDL's
+            // comp_start positions the IME cursor INSIDE the composition.
+            const comp = s.composition();
+            const comp_m = ui.paint.measureText(comp, style.size, false);
+            ui.paint.text(ctx, comp, sx, baseline, style.size, false, fc.input);
             ui.paint.fillRect(ctx, sx, baseline + 1, comp_m.width, 1, fc.input);
-            caret_x = sx + comp_m.width;
+            const at: usize = @intCast(@min(@max(s.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_x = sx + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
         }
-        if (focused) {
-            // the caret at the end of the text (+ composition)
+        if (focused and s.caret_on) {
+            // the caret at its position (inside the composition when open)
             ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         }
     } else {
@@ -674,7 +822,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.text(ctx, s.placeholder, tx, baselineIn(tr.y, tr.h, m), style.size, false, fc.placeholder);
             }
         }
-        if (focused) {
+        if (focused and s.caret_on) {
             // the caret at the start (empty text)
             const m = ui.paint.measureText(" ", bodyLarge(t).size, false);
             ui.paint.fillRect(ctx, mx(c.x, c.w, tr.x, caret_w, rtl), baselineIn(tr.y, tr.h, m) - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
@@ -705,6 +853,11 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             input.requestFocus(n);
+            // Click-to-caret: the press maps to the nearest grapheme
+            // boundary (the pointer arrives in the node's parent space —
+            // the same space containerRect/textRect build in).
+            moveCaret(n, s, caretFromPoint(n, s, ev.x, ev.y));
+            resetBlink(s);
             n.markDirty(); // the label float / caret / colors follow focus
             return true;
         },
@@ -737,14 +890,22 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
             // text_input (commit) then text_editing("") (clear) on the
             // platforms that report preedit at all.
             s.comp.clearRetainingCapacity();
+            s.comp_cursor = 0;
             setSentinel(&s.comp);
             // Reject (never truncate) input that would grow the text past
             // the documented cap — a paste/IME burst is applied whole or
             // not at all.
             if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
-            s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
-            s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+            // Insert AT the caret (mid-text editing, not just appends).
+            const at = s.caret;
+            s.buf.ensureUnusedCapacity(ev.text.len + 1) catch @panic("klaxon: out of memory");
+            const tail = s.buf.items.len - at;
+            std.mem.copyBackwards(u8, s.buf.items.ptr[at + ev.text.len ..][0..tail], s.buf.items[at..][0..tail]);
+            @memcpy(s.buf.items.ptr[at..][0..ev.text.len], ev.text);
+            s.buf.items.len += ev.text.len;
+            s.caret = at + ev.text.len;
             setSentinel(&s.buf);
+            resetBlink(s);
             applyEdit(n, s);
             return true;
         },
@@ -756,22 +917,79 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
             if (ev.text.len <= ui.state.TextSignal.max_len) {
                 s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
             }
+            s.comp_cursor = ev.comp_start;
             setSentinel(&s.comp);
             n.markDirty(); // repaint only — comp is not a committed edit
             return true;
         },
         .key_down => switch (ev.key) {
             .backspace => {
-                // An open composition eats the backspace (codepoint first).
-                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
-                // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (target.items.len > 0) {
-                    const last = target.items[target.items.len - 1];
-                    target.items.len -= 1;
-                    if ((last & 0xC0) != 0x80) break;
+                if (s.comp.items.len > 0) {
+                    // An open composition eats the backspace (codepoint
+                    // first); the platform re-sends text_editing anyway.
+                    while (s.comp.items.len > 0) {
+                        const last = s.comp.items[s.comp.items.len - 1];
+                        s.comp.items.len -= 1;
+                        if ((last & 0xC0) != 0x80) break;
+                    }
+                    s.comp_cursor = @intCast(s.comp.items.len);
+                    setSentinel(&s.comp);
+                    n.markDirty();
+                    return true;
                 }
-                setSentinel(target);
-                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
+                // Delete the codepoint ending AT the caret.
+                if (s.caret == 0) return true;
+                var start = s.caret;
+                while (start > 0 and (s.buf.items[start - 1] & 0xC0) == 0x80) start -= 1;
+                start -= 1;
+                std.mem.copyForwards(u8, s.buf.items.ptr[start .. s.buf.items.len - (s.caret - start)], s.buf.items[s.caret..]);
+                s.buf.items.len -= s.caret - start;
+                s.caret = start;
+                setSentinel(&s.buf);
+                resetBlink(s);
+                applyEdit(n, s);
+                return true;
+            },
+            .delete => {
+                // Forward delete: the codepoint STARTING at the caret.
+                if (s.caret >= s.buf.items.len or s.comp.items.len > 0) return true;
+                const l = std.unicode.utf8ByteSequenceLength(s.buf.items[s.caret]) catch 1;
+                const end = @min(s.buf.items.len, s.caret + l);
+                std.mem.copyForwards(u8, s.buf.items.ptr[s.caret .. s.buf.items.len - (end - s.caret)], s.buf.items[end..]);
+                s.buf.items.len -= end - s.caret;
+                setSentinel(&s.buf);
+                resetBlink(s);
+                applyEdit(n, s);
+                return true;
+            },
+            // Logical caret motion — one codepoint per press (upstream
+            // moves by grapheme cluster; a cluster-aware step needs the
+            // paragraph's break iterator, tracked as a deviation). Under
+            // RTL this moves logically, not visually.
+            .left => {
+                var p = s.caret;
+                while (p > 0) {
+                    p -= 1;
+                    if ((s.buf.items[p] & 0xC0) != 0x80) break;
+                }
+                moveCaret(n, s, p);
+                return true;
+            },
+            .right => {
+                var p = s.caret;
+                if (p < s.buf.items.len) {
+                    p += 1;
+                    while (p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p += 1;
+                }
+                moveCaret(n, s, p);
+                return true;
+            },
+            .home => {
+                moveCaret(n, s, 0); // single line: the run start
+                return true;
+            },
+            .end => {
+                moveCaret(n, s, s.buf.items.len); // the run end
                 return true;
             },
             .enter => {
@@ -780,6 +998,7 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
             },
             .escape => {
                 s.comp.clearRetainingCapacity();
+                s.comp_cursor = 0;
                 setSentinel(&s.comp);
                 input.requestFocus(null);
                 n.markDirty();
@@ -804,6 +1023,10 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
     s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
     s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
+    // The replaced text may be shorter — pull the caret back onto a
+    // codepoint boundary (upstream clamps the selection into the new text).
+    s.caret = @min(s.caret, s.buf.items.len);
+    while (s.caret > 0 and s.caret < s.buf.items.len and (s.buf.items[s.caret] & 0xC0) == 0x80) s.caret -= 1;
     n.markLayoutDirty(); // the measured width is content-driven
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
@@ -811,6 +1034,9 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
 
 fn textFieldDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (s.ticker) |t| {
+        if (ui.anim.timeline()) |tl| tl.removeTicker(t); // the blink callback writes into state
+    }
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.label_channel)); // the channel writes into state
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = textFieldSyncCb, .userdata = n } });
     input.releaseNode(n);
@@ -881,6 +1107,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
         s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
     }
     setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
+    s.caret = s.buf.items.len; // the caret starts at the end (Compose parity)
     node.state = s;
     ui.semantics.attach(node, .{
         .role = .text_field,
@@ -911,6 +1138,8 @@ pub fn setText(n: *Node, str: []const u8) void {
     s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
     setSentinel(&s.buf);
+    s.caret = s.buf.items.len; // programmatic replace → caret at the end
+    resetBlink(s);
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
@@ -1282,4 +1511,170 @@ test "golden: the caret paints at the end of the text when focused" {
     try std.testing.expect(f.countNotIn(.{ .x = caret_x - 0.5, .y = tr.y + 2, .w = 2, .h = m.height - 4 }, 0xFFFFFFFF) > 0);
     // ...and nothing 4dp further right
     try std.testing.expectEqual(@as(u64, 0), f.countNotIn(.{ .x = caret_x + 4, .y = tr.y + 2, .w = 4, .h = m.height - 4 }, 0xFFFFFFFF));
+}
+
+test "text_field: click places the caret; arrows/home/end move it; edits apply at the caret" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "abc" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    try std.testing.expectEqual(@as(usize, 3), s.caret); // starts at the end
+    // a press at the run's left edge → the nearest boundary (0 or 1)
+    router.dispatchPointer(b, .{ .phase = .down, .x = 17, .y = 28 });
+    try std.testing.expect(input.isFocused(b));
+    try std.testing.expect(s.caret <= 1);
+    // a press far past the run end → the end
+    router.dispatchPointer(b, .{ .phase = .down, .x = 250, .y = 28 });
+    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    // arrows move by codepoint; home/end jump to the edges
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 2), s.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .home });
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    // typing inserts AT the caret
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "X" });
+    try std.testing.expectEqualStrings("Xabc", text(b));
+    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    // backspace deletes the codepoint BEFORE the caret
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("abc", text(b));
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    // backspace at 0 is a consumed no-op
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("abc", text(b));
+    // delete removes the codepoint AT the caret
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .delete });
+    try std.testing.expectEqualStrings("bc", text(b));
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
+    try std.testing.expectEqual(@as(usize, 2), s.caret);
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "!" });
+    try std.testing.expectEqualStrings("bc!", text(b));
+}
+
+test "text_field: the caret steps by codepoint through multibyte text" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // "hé" = 3 bytes (é is 2) — boundaries at 0, 1, 3
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "h\xC3\xA9" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    router.focus(b);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 1), s.caret); // é's lead byte
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right });
+    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right });
+    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // clamped
+    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    // insert in the middle of a multibyte buffer lands on the boundary
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "i" });
+    try std.testing.expectEqualStrings("hi\xC3\xA9", text(b));
+    // backspace deletes the whole codepoint before the caret
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("h\xC3\xA9", text(b));
+    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    // an external set clamps the caret onto a boundary
+    const sig_field = try textField(std.testing.allocator, null, null, null, .{ .initial = "long" });
+    defer sig_field.deinit();
+    const s2 = stateOf(sig_field);
+    s2.caret = 4;
+    setText(sig_field, "h\xC3\xA9");
+    try std.testing.expectEqual(@as(usize, 3), s2.caret); // clamped to len
+}
+
+test "text_field: the caret blinks on the 500ms cadence and re-shows on edits" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "x" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    router.focus(b);
+    ensureTicker(b, s); // paint would do it; tests paint nothing
+    try std.testing.expect(s.caret_on);
+    tl.tick(0); // re-bases the epoch
+    tl.tick(600); // one half-period past → off
+    try std.testing.expect(!s.caret_on);
+    tl.tick(1100); // second half-period → on
+    try std.testing.expect(s.caret_on);
+    // an edit re-shows the caret immediately, re-based at the next tick
+    tl.tick(1600);
+    try std.testing.expect(!s.caret_on);
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "y" });
+    try std.testing.expect(s.caret_on); // reset on the edit event
+    tl.tick(1700); // epoch re-based → still on within the half period
+    try std.testing.expect(s.caret_on);
+    tl.tick(2300); // a half-period after the re-base → off
+    try std.testing.expect(!s.caret_on);
+    // unfocused: the ticker stops keeping the loop awake
+    router.focus(null);
+    try std.testing.expect(!caretPendingCb(b));
+    try std.testing.expect(!tl.hasTimedWork());
+}
+
+test "golden: the caret paints at its position mid-text, not just the end" {
+    const t = theme_mod.light;
+    _ = t;
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "Hi", .theme = theme_mod.light });
+    defer b.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    router.focus(b);
+    b.layout(.{ .x = 20, .y = 12, .w = 260, .h = 56 });
+    // caret between the two glyphs (left arrow from the end)
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    const s = stateOf(b);
+    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    var r = try golden.Renderer.init(std.testing.allocator, 300, 80);
+    defer r.deinit();
+    r.paint(b, 0xFFFFFFFF); // caret ON (the blink's shown phase)
+    var f_on = try r.readback(std.testing.allocator);
+    defer f_on.deinit();
+    s.caret_on = false; // the blink's hidden phase
+    r.paint(b, 0xFFFFFFFF);
+    var f_off = try r.readback(std.testing.allocator);
+    defer f_off.deinit();
+    // The caret is the ONLY difference between the two paints — count the
+    // changed pixels in the mid-text band (a 1dp rect at a fractional x
+    // anti-aliases across two columns, so pixel-exact color matching is
+    // unreliable; the diff is the honest assertion).
+    const m_all = ui.paint.measureText("Hi", 16, false);
+    const m_h = ui.paint.measureText("H", 16, false);
+    const tr = textRect(b);
+    const mid_x = 20 + 16 + m_h.width; // the H|i boundary
+    const y0: i32 = @intFromFloat(@ceil(tr.y));
+    const y1: i32 = @intFromFloat(@floor(tr.y + m_all.height));
+    var mid_diff: u32 = 0;
+    var end_diff: u32 = 0;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x: i32 = @intFromFloat(@floor(mid_x - 1));
+        while (x < @as(i32, @intFromFloat(@ceil(mid_x + 2)))) : (x += 1) {
+            if (f_on.pixelAt(x, y) != f_off.pixelAt(x, y)) mid_diff += 1;
+        }
+        const end_x = 20 + 16 + m_all.width; // the run end (old static caret)
+        x = @intFromFloat(@floor(end_x + 1));
+        while (x < @as(i32, @intFromFloat(@ceil(end_x + 4)))) : (x += 1) {
+            if (f_on.pixelAt(x, y) != f_off.pixelAt(x, y)) end_diff += 1;
+        }
+    }
+    try std.testing.expect(mid_diff > 4); // the caret column diffs the line height
+    try std.testing.expectEqual(@as(u32, 0), end_diff); // nothing at the old end position
 }

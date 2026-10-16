@@ -79,6 +79,9 @@
 //            correct side. Applies to every paragraph built afterwards;
 //            the text cache keys on it. Additive, no behavior change until
 //            set (default stays LTR).
+//   0.22.0 — kx_measure_text_len (length-taking measure for sentinel-less
+//            substring prefixes — caret geometry) + kx_text_position_at
+//            (SkParagraph getGlyphPositionAtCoordinate: click-to-caret).
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -165,6 +168,12 @@ float kx_text_layout_height(kx_text_layout* layout);
 float kx_text_layout_baseline(kx_text_layout* layout); // first line, alphabetic
 void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y);
 void kx_text_layout_destroy(kx_text_layout* layout);
+
+// Caret position lookup (0.22.0): the UTF-16 code-unit index of the
+// grapheme-cluster boundary nearest to (dx, dy) in the layout's space
+// (SkParagraph::getGlyphPositionAtCoordinate — the same call Compose's
+// TextLayoutResult.getOffsetForPosition rides). -1 on null/unbuilt.
+int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy);
 
 // Paragraph base direction (0.21.0) — process-global: the bidi base level
 // every paragraph is built against (kx_draw_text* misses AND
@@ -280,6 +289,9 @@ typedef struct kx_text_metrics {
     float descent;
 } kx_text_metrics;
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold);
+// Length-taking variant (0.22.0) — substring prefixes have no sentinel;
+// rides the same cache entry keyed on (ptr,len).
+kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bool bold);
 
 // Images (per-ctx registry). Create once from RGBA pixels (memory order
 // R,G,B,A, unpremultiplied), draw many times — no per-frame allocation.

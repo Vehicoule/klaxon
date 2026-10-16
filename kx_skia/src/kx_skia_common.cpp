@@ -1733,6 +1733,26 @@ kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
     return kx_text_entry(text, std::strlen(text), size, bold)->metrics;
 }
 
+// Length-taking measure (0.22.0) — substring prefixes for caret geometry
+// have no null sentinel; rides the same cache entry keyed on (ptr,len).
+kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bool bold) {
+    kx_text_metrics m = {0, 0, 0, 0};
+    if (!text) return m;
+    if (!(size > 0.0f)) {
+        const SkFont font = kx_make_font(text, size, bold);
+        SkFontMetrics fm;
+        font.getMetrics(&fm);
+        m.ascent = -fm.fAscent;
+        m.descent = fm.fDescent;
+        m.height = m.ascent + m.descent;
+        if (font.getTypeface()) {
+            m.width = font.measureText(text, len, SkTextEncoding::kUTF8);
+        }
+        return m;
+    }
+    return kx_text_entry(text, len, size, bold)->metrics;
+}
+
 // True when every 4-byte pixel's alpha byte (offset 3 for all our 8888
 // formats — N32 BGRA and RGBA alike) is 0xFF. Scanned once at register time
 // because SkImage::isOpaque only reflects the DECLARED alpha type.
@@ -3377,7 +3397,7 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.21.0";
+    return "0.22.0";
 }
 
 // Paragraph base direction (0.21.0) — the bidi base level every paragraph
@@ -3478,6 +3498,15 @@ float kx_text_layout_height(kx_text_layout* layout) {
 float kx_text_layout_baseline(kx_text_layout* layout) {
     auto* p = kx_layout_paragraph(layout);
     return p ? p->getAlphabeticBaseline() : 0;
+}
+
+// Caret position lookup (0.22.0): the UTF-16 code-unit index of the
+// grapheme-cluster boundary nearest to (dx, dy) — the same call Compose's
+// TextLayoutResult.getOffsetForPosition rides. -1 on null/unbuilt.
+int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy) {
+    auto* p = kx_layout_paragraph(layout);
+    if (!p) return -1;
+    return static_cast<int32_t>(p->getGlyphPositionAtCoordinate(dx, dy).position);
 }
 
 void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y) {

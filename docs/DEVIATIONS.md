@@ -30,6 +30,7 @@ code; don't patch it").
 || The IME stack was dormant: `SDL_StartTextInput` never ran outside desktop (no soft keyboard on Android/iOS), composition/preedit events were dropped | focus-gated `SDL_StartTextInput`/`StopTextInput` + `SDL_SetTextInputArea` anchoring on `VTable.wants_text_input`; `SDL_EVENT_TEXT_EDITING` routed through `KeyEvent.text_editing` into TextField/SearchBar/SearchView composition buffers (below) |
 || Char-level font fallback resolved on macOS only — every `SkFontMgr_Custom` family (Android/Linux/Windows/WASM, iOS directory path) returned nullptr from `onMatchFamilyStyleCharacter` → non-Latin codepoints shaped to `.notdef` | `KxCachingFontMgr::scanForCoverage`: bounded covering-scan over the manager's family list (emoji-locale pre-pass for `und-Zsye`), memoized per (family, style, locale, codepoint) (below) |
 || SkParagraph always built paragraphs on an LTR base — trailing neutrals and weak-direction runs landed on the wrong side under an RTL locale | ABI 0.21.0 `kx_set_text_direction` process-global, mirrored from `i18n.direction()`; the text cache keys on it for bidi-relevant strings only (below) |
+|| TextField's caret was static at the text end — no click-to-position, no blink, edits only appended/popped | ABI 0.22.0 `kx_text_position_at` (SkParagraph `getGlyphPositionAtCoordinate`) + `kx_measure_text_len` for prefix geometry; caret = a byte offset that click/arrows/home/end move and edits apply at, blinking at Compose's 500ms cadence via a focus-gated ticker; the IME cursor (`comp_start`) positions inside the composition (below) |
 
 ## Open — needs design work, not a one-liner
 
@@ -48,9 +49,12 @@ Each widget's header carries the same list; these are the tracked ones
 - `switch.zig` — mid-flight re-press restarts the spring from 0 velocity.
 - `slider.zig` — continuous only: no steps/ticks, no value indicator.
 - `split_button.zig` — trailing half is pointer-only (a11y activation pending).
-- `text_field.zig` — single-line only; static caret at text end (no blink/
-  selection/click-to-position); label lerps size, not weight/tracking; the
-  text run stays LTR under RTL chrome.
+- `text_field.zig` — single-line only; no selection (no shift-extend,
+  drag-select or TextSelectionColors); arrows move by codepoint, not
+  grapheme cluster; label lerps size, not weight/tracking; the text run
+  stays LTR under RTL chrome (arrows move logically under RTL); caret is
+  real: click-to-position via the paragraph hit test, 500ms blink, edits
+  at the caret. `search_bar.zig`/`search_view.zig` still end-caret.
 - `time_picker.zig` — no text-input variant; en-only strings.
 - `table.zig` — no sorting/selection/scroll/sticky header; text-only cells.
 - `tree.zig` — no keyboard nav/lazy loading/drag-drop/icons.

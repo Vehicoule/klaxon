@@ -65,6 +65,8 @@ pub const Key = enum(u32) {
     back = 0x102, // synthetic: hardware back (Android) / Escape (desktop)
     up = 0x103, // synthetic (host-mapped)
     down = 0x104,
+    home = 0x105,
+    end = 0x106,
     space = 0x20, // the space bar (key_down, not text input)
     _,
 };
