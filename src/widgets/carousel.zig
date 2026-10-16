@@ -16,7 +16,8 @@
 //   - keylines: items morph by where their center lands between the
 //     blended keyline sizes (a static start-aligned list lerps toward the
 //     mirrored end-aligned list as the scroll approaches the content end —
-//     v1 approximates Compose's stepped endKeylineSteps)
+//     the same stepped endKeylineSteps sequence Compose builds, step
+//     interpolation weighted by each step's shift distance)
 //   - scroll: drag (raw_x, finger drags the content), wheel (delta_x or
 //     delta_y), snap to the nearest item-focal alignment on release
 //   - keyboard: left/right move by one item stride (mirrored in RTL —

@@ -1,6 +1,7 @@
 // Text widgets (Phase 1b P0) — Text (single line) and RichText (styled spans).
 // Metrics come from the kx_skia ABI (kx_measure_text — real font metrics, not
-// approximations). Shaped text / ellipsis / overflow land with SkParagraph later.
+// approximations); rich text shapes through kx_text_layout (SkParagraph —
+// HarfBuzz + ICU bidi + fallback, ABI 0.15.0).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
