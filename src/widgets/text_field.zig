@@ -587,6 +587,13 @@ fn caretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
         return if (px <= tx) 0 else str.len;
     };
     defer ui.paint.textLayoutDestroy(l);
+    // The paint path draws the segments in LOGICAL order (the text-run-LTR
+    // deviation). The hit test must agree with what's on screen, so the
+    // probe paragraph builds under LTR regardless of the locale's base
+    // direction — single-threaded UI; the global is restored right after.
+    const prev_rtl = ui.paint.textDirectionRtl();
+    ui.paint.setTextDirection(false);
+    defer ui.paint.setTextDirection(prev_rtl);
     const style = bodyLarge(s.opts.theme);
     ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(style.size, 400, 0, 0, 0xFF0000FF));
     const pos = ui.paint.textLayoutPositionAt(l, px - tx, py - tr.y);
