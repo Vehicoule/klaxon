@@ -2350,19 +2350,21 @@ test "gallery: the M3E text field takes focus, floats its label and accepts text
     const sv = g.refs.scroll_view;
     _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, b.y - sv.bounds.y));
     const sy = widgets.scroll_view.scrollOffset(sv);
-    // the label starts expanded (centered in the 56dp container; labelRect is
-    // in tree coordinates → relative to the field's y)
-    try std.testing.expectEqual(@as(f32, 16), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
-    // click → focus → the label floats into the cutout
+    // the label starts expanded (centered in the container — the outlined
+    // field reserves 8dp above it for the cutout: topPaddingForLabelCutout;
+    // labelRect is in tree coordinates → relative to the field's y)
+    try std.testing.expectEqual(@as(f32, 24), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
+    // click → focus → the label floats into the cutout (box straddles the
+    // container's top edge at y=8 → the box top is the field's top)
     router.dispatchPointer(g.root, .{ .phase = .down, .x = b.x + b.w / 2, .y = b.y + b.h / 2 - sy });
     try std.testing.expect(input_mod.isFocused(g.refs.tf_m3e[0]));
-    try std.testing.expectEqual(@as(f32, -8), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
+    try std.testing.expectEqual(@as(f32, 0), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
     // type: the text + the a11y value follow
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "Hi" });
     try std.testing.expectEqualStrings("Hi", text_field_w.text(g.refs.tf_m3e[0]));
     try std.testing.expectEqualStrings("Hi", g.refs.tf_m3e[0].semantics.?.value);
     // the label stays floated (the field holds text)
-    try std.testing.expectEqual(@as(f32, -8), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
+    try std.testing.expectEqual(@as(f32, 0), text_field_w.labelRect(g.refs.tf_m3e[0]).?.y - b.y);
 }
 
 test "gallery: the M3E text field's entry survives a theme switch" {
