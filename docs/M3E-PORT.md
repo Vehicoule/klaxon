@@ -32,7 +32,7 @@ Port contract per widget:
 | chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | ported |
 | date_picker | DatePicker.kt | DatePickerModalTokens | pending |
 | divider | Divider.kt | DividerTokens | **ported** |
-| drawer | NavigationDrawer.kt | — | pending |
+| drawer | NavigationDrawer.kt | NavigationDrawerTokens | ported (modal/dismissible/permanent) |
 | fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | **ported** |
 | fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | **ported** |
 | icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | **ported** |
@@ -51,9 +51,9 @@ Port contract per widget:
 | split_button | SplitButton.kt | SplitButtonTokens | **ported** |
 | switch | Switch.kt | SwitchTokens | ported |
 | tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | ported |
-| text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | pending |
+| text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt + TextFieldImpl.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | ported |
 | time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | pending |
-| toolbar | FloatingToolbar.kt / DockedToolbarTokens | DockedToolbarTokens | pending |
+| toolbar | FloatingToolbar.kt | FloatingToolbarTokens, FabBaseline/MediumTokens | ported |
 | tooltip | Tooltip.kt | PlainTooltipTokens, RichTooltipTokens | pending |
 
 No upstream counterpart (Klaxon-native, M3-styled): avatar, calendar,
