@@ -1730,7 +1730,7 @@ kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
         }
         return m;
     }
-    return kx_text_entry(text, std::strlen(text), size, bold)->metrics;
+    return kx_measure_text_len(text, std::strlen(text), size, bold);
 }
 
 // Length-taking measure (0.22.0) — substring prefixes for caret geometry
@@ -1738,14 +1738,17 @@ kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
 kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bool bold) {
     kx_text_metrics m = {0, 0, 0, 0};
     if (!text) return m;
-    if (!(size > 0.0f)) {
+    // An empty string degenerates the paragraph path (SkParagraph reports
+    // -FLT_MAX-scale metrics on no text) — the font's own metrics with a
+    // zero width are the honest answer (the caret/selection prefix case).
+    if (len == 0 || !(size > 0.0f)) {
         const SkFont font = kx_make_font(text, size, bold);
         SkFontMetrics fm;
         font.getMetrics(&fm);
         m.ascent = -fm.fAscent;
         m.descent = fm.fDescent;
         m.height = m.ascent + m.descent;
-        if (font.getTypeface()) {
+        if (len > 0 && font.getTypeface()) {
             m.width = font.measureText(text, len, SkTextEncoding::kUTF8);
         }
         return m;
