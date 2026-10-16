@@ -64,8 +64,11 @@ fn columnWidth(s: *const GridState, viewport_w: f32) f32 {
 }
 
 fn gridMeasure(n: *Node, c: Constraints) Size {
-    _ = n;
-    return c.constrain(.{ .w = c.max_w, .h = c.max_h }); // fill the viewport
+    const s = stateOf(GridState, n);
+    // Unbounded height (inside a ScrollView): report the natural content
+    // height — see list_view's measure for the contract.
+    const h = if (std.math.isFinite(c.max_h)) c.max_h else contentHeight(s);
+    return c.constrain(.{ .w = c.max_w, .h = h });
 }
 
 fn layoutItem(n: *Node, child: *Node, index: usize) void {

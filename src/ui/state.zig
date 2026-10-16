@@ -219,6 +219,11 @@ pub fn Signal(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Already enqueued for deferred destruction: a second deinit
+            // would enqueue a SECOND zombie → subscribers.deinit() +
+            // destroy() run twice (double-free). dying is only ever set
+            // before the defer path, so this check covers both branches.
+            if (self.base.dying) return;
             self.base.deinit();
             if (self.base.dying) {
                 SignalBase.deferSignalDestroy(self, &self.base, struct {
@@ -331,18 +336,23 @@ pub const TextSignal = struct {
     }
 
     pub fn deinit(self: *TextSignal) void {
-        // Nodes unsubscribe in their own deinit, which always runs first.
-        self.buf.deinit(); // buf is not walked by notify — free it now
+        // Already enqueued — a repeat call would double-free buf + self.
+        if (self.base.dying) return;
         self.base.deinit();
         if (self.base.dying) {
             SignalBase.deferSignalDestroy(self, &self.base, struct {
                 fn f(owner: *anyopaque) void {
                     const s: *TextSignal = @ptrCast(@alignCast(owner));
+                    // buf is freed at the sweep, AFTER the notify pass ends
+                    // — freeing it up-front let the remaining subscribers
+                    // peek()/set() a deallocated buffer (UAF).
+                    s.buf.deinit();
                     s.base.allocator.destroy(s);
                 }
             }.f);
             return;
         }
+        self.buf.deinit(); // buf is not walked by notify — free it now
         self.base.allocator.destroy(self);
     }
 };
@@ -467,6 +477,7 @@ pub fn Memo(comptime T: type, comptime compute: fn () T) type {
 
         pub fn init(allocator: std.mem.Allocator) !*Self {
             const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
             self.* = .{
                 .base = SignalBase.init(allocator),
                 .cache = undefined,
@@ -494,6 +505,7 @@ pub fn Memo(comptime T: type, comptime compute: fn () T) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.base.dying) return; // already enqueued (see Signal.deinit)
             self.effect.deinit();
             self.base.deinit();
             if (self.base.dying) {
@@ -816,4 +828,54 @@ test "text signal: set from a borrowed subslice across a capacity realloc" {
     try std.testing.expectEqual(@as(usize, big.len * 3), sig.peek().len);
     try sig.set(sig.peek()[big.len .. big.len * 2]);
     try std.testing.expectEqualStrings(big, sig.peek());
+}
+
+// --- regression: deferred-destruction reentrancy ---
+
+var dying_sig: *Signal(u32) = undefined;
+var dying_sig_calls: u32 = 0;
+
+fn deinitSelfTwiceCb(userdata: ?*anyopaque) void {
+    _ = userdata;
+    dying_sig_calls += 1;
+    // First call marks the signal dying and enqueues the zombie; the second
+    // must no-op. Before the guard, it enqueued a second zombie and the
+    // sweep freed subscribers + the struct twice (double-free).
+    dying_sig.deinit();
+    dying_sig.deinit();
+}
+
+test "signal deinit twice inside a subscriber enqueues exactly one zombie" {
+    dying_sig_calls = 0;
+    dying_sig = try Signal(u32).init(std.testing.allocator, 0);
+    dying_sig.subscribe(.{ .callback = .{ .fn_ptr = deinitSelfTwiceCb, .userdata = null } });
+    dying_sig.set(1); // callback deinits the signal mid-notify; the sweep frees it
+    try std.testing.expectEqual(@as(u32, 1), dying_sig_calls);
+    // no defer — the signal was destroyed by the zombie sweep
+}
+
+var dying_text: *TextSignal = undefined;
+var peeked_after_deinit: usize = 0;
+
+fn deinitTextCb(userdata: ?*anyopaque) void {
+    _ = userdata;
+    // deinit mid-notify: buf must stay alive until the sweep so the
+    // remaining subscribers below still read a valid buffer.
+    dying_text.deinit();
+    dying_text.deinit(); // repeat call must no-op (was a double-free)
+}
+
+fn peekTextCb(userdata: ?*anyopaque) void {
+    _ = userdata;
+    peeked_after_deinit = dying_text.peek().len;
+}
+
+test "text signal deinit during notify keeps buf alive for remaining subscribers" {
+    peeked_after_deinit = 0;
+    dying_text = try TextSignal.init(std.testing.allocator, "hello");
+    dying_text.subscribe(.{ .callback = .{ .fn_ptr = deinitTextCb, .userdata = null } });
+    dying_text.subscribe(.{ .callback = .{ .fn_ptr = peekTextCb, .userdata = null } });
+    try dying_text.set("world!"); // deinit fires first, then peek reads live memory
+    try std.testing.expectEqual(@as(usize, 6), peeked_after_deinit);
+    // no defer — freed by the zombie sweep
 }

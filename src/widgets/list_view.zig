@@ -93,8 +93,13 @@ fn contentHeight(s: *const ListState) f32 {
 }
 
 fn listMeasure(n: *Node, c: Constraints) Size {
-    _ = n;
-    return c.constrain(.{ .w = c.max_w, .h = c.max_h }); // fill the viewport
+    const s = stateOf(ListState, n);
+    // Unbounded height (inside a ScrollView): report the natural content
+    // height — filling max_h would propagate `inf` into bounds and crash
+    // the backing-image compositor's pixel casts (and defeat the point:
+    // the outer scroll is what scrolls a nested list).
+    const h = if (std.math.isFinite(c.max_h)) c.max_h else contentHeight(s);
+    return c.constrain(.{ .w = c.max_w, .h = h });
 }
 
 fn layoutItem(n: *Node, child: *Node, index: usize) void {
@@ -170,6 +175,10 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         if (cached * 2 >= n.children.items.len) return false;
     }
     const b = n.bounds;
+    // Non-finite bounds (a parent that loosened the measure constraint):
+    // no pixel rect exists — fall through to normal child painting rather
+    // than trapping in the casts below.
+    if (!std.math.isFinite(b.w) or !std.math.isFinite(b.h)) return false;
     const ix = @floor(b.x);
     const iy = @floor(b.y);
     const iw: i32 = @intFromFloat(@ceil(b.x + b.w) - ix);
