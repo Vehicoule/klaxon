@@ -1,0 +1,63 @@
+# M3E 1:1 port index
+
+Every M3E widget in `src/widgets/` is ported verbatim from its upstream
+Compose material3 source (draw math, measure logic, state layers, tokens) —
+not approximated. The vendored Kotlin sources live in `.ref/material3/`
+(Apache-2.0, `androidx/androidx` androidx-main); re-fetch with
+`scripts/fetch-m3e-ref.sh`.
+
+Port contract per widget:
+
+- Same public factory signature + options + signal/semantics API (existing
+  tests and goldens keep passing; intentional pixel changes get regenerated
+  goldens and a note in the port header).
+- Header comment lists the upstream file(s) and the functions ported.
+- Replace approximated draw/measure code; don't patch it.
+- What does NOT port: composable/modifier machinery, coroutines, predictive
+  back, Compose semantics nodes (we have our own a11y model).
+
+| Klaxon widget | Upstream source | Tokens | Status |
+|---|---|---|---|
+| slider | Slider.kt | SliderTokens | ported (gap/corners/stop dot/handle morph/RTL) |
+| dialog | AlertDialog.kt | DialogTokens | audited — layout conforme |
+| app_bar | AppBar.kt | AppBarTokens + Small/Medium/Large(Flexible) | pending |
+| bottom_app_bar | AppBar.kt | BottomAppBarTokens | pending |
+| badge | Badge.kt | BadgeTokens | pending |
+| bottom_sheet | ModalBottomSheet.kt + SheetDefaults.kt + DragHandle.kt | SheetBottomTokens, DragHandleTokens | pending |
+| button | Button.kt | Button(S-XL)Tokens, Filled/Tonal/Outlined/TextButtonTokens | pending |
+| button_group | ButtonGroup.kt | ButtonGroupSmallTokens, ConnectedButtonGroupSmallTokens | pending |
+| card | Card.kt | FilledCardTokens, ElevatedCardTokens | pending |
+| carousel | carousel/Carousel.kt + Keylines.kt + KeylineList.kt | — | pending |
+| checkbox | Checkbox.kt | CheckboxTokens | pending |
+| chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | pending |
+| date_picker | DatePicker.kt | DatePickerModalTokens | pending |
+| divider | Divider.kt | DividerTokens | pending |
+| drawer | NavigationDrawer.kt | — | pending |
+| fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | pending |
+| fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | pending |
+| icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | pending |
+| list_item | ListItem.kt | ListTokens | pending |
+| loading_indicator | LoadingIndicator.kt | LoadingIndicatorTokens | pending |
+| menu | Menu.kt | MenuTokens, StandardMenuTokens | pending |
+| nav_bar | NavigationBar.kt | NavigationBarTokens | pending |
+| navigation_rail | NavigationRail.kt | NavigationRailTokens | pending |
+| progress | ProgressIndicator.kt + WavyProgressIndicator.kt | (Linear|Circular)ProgressIndicatorTokens | pending |
+| pull_to_refresh | pulltorefresh/PullToRefresh.kt | — | pending |
+| radio | RadioButton.kt | RadioButtonTokens | pending |
+| search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | pending |
+| segmented_button | SegmentedButton.kt | SegmentedButtonTokens | pending |
+| side_sheet | NavigationDrawer.kt (side-sheet variant) | SheetBottomTokens | pending |
+| snackbar | Snackbar.kt | SnackbarTokens | pending |
+| split_button | SplitButton.kt | SplitButtonTokens | pending |
+| switch | Switch.kt | SwitchTokens | pending |
+| tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | pending |
+| text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | pending |
+| time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | pending |
+| toolbar | FloatingToolbar.kt / DockedToolbarTokens | DockedToolbarTokens | pending |
+| tooltip | Tooltip.kt | PlainTooltipTokens, RichTooltipTokens | pending |
+
+No upstream counterpart (Klaxon-native, M3-styled): avatar, calendar,
+color_picker, expansion_panel, stepper, table, tree.
+
+Framework primitives (not widgets): anim, container, gestures, grid_view,
+i18n, image, input, layout, list_view, navigator, scroll_*, scrollbar, text.
