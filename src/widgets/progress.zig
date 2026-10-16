@@ -48,10 +48,10 @@
 //     innerRounding 0.5) — via ui.shapes (the androidx.graphics.shapes
 //     port).
 //
-// Deliberate deviations: upstream animates progress changes with a spring
-// (ProgressAnimationSpec) — Klaxon takes progress as a construction-time
-// value; the wave offset/amplitude micro-animations on attach are skipped
-// (amplitude starts at target). The circle->star Morph exists upstream only
+// Deliberate deviations: upstream reads progress as a lambda and animates
+// changes with ProgressAnimationSpec — here `progress_sig` carries the live
+// value and the same spring spec drives it; the wave offset/amplitude
+// micro-animations on attach are skipped (amplitude starts at target). The circle->star Morph exists upstream only
 // for intermediate amplitudes (0<amp<1 during the 450ms amplitude
 // cross-fade); the API here produces amplitude in {0,1} only, so the
 // progress path is the star or the track ring exactly like upstream's
@@ -104,6 +104,12 @@ pub const ProgressOptions = struct {
     kind: ProgressKind = .linear,
     /// 0..1 determinate; null = indeterminate (loops forever).
     progress: ?f32 = null,
+    /// Live determinate value — overrides `progress`. Changes animate
+    /// between values with upstream's ProgressAnimationSpec spring
+    /// (dampingRatio 1.0 = DampingRatioNoBouncy, stiffness 50 =
+    /// StiffnessVeryLow) instead of snapping; null = indeterminate is a
+    /// static `progress`, not a signal state.
+    progress_sig: ?*ui.state.Signal(f32) = null,
     wavy: bool = false, // linear + circular (M3E)
     theme: Theme = theme_mod.light,
 };
@@ -159,6 +165,12 @@ const ProgressState = struct {
     circ_verts: usize = 0, // star vertex count (the wave offset period base)
     circ_prog: RingTable = .{},
     circ_trk: RingTable = .{},
+    // Signal-driven progress (ProgressAnimationSpec): an Effect springs
+    // `displayed` toward the source's target — the OffsetState pattern.
+    prog_effect: ?*ui.state.Effect = null,
+    prog_channel: u8 = 0, // timeline channel marker (stable address)
+    displayed: f32 = 0, // current animated value (read at paint)
+    node: ?*Node = null, // back-pointer for the update callback's markDirty
 };
 
 fn stateOf(n: *Node) *ProgressState {
@@ -179,8 +191,14 @@ fn progressMeasure(n: *Node, c: Constraints) Size {
 /// when determinate. Flat determinate + determinate circular stay static —
 /// nothing moves between value writes, so no animation is registered and
 /// the host idles.
+/// The value paint/schedule code reads: the animated display value when a
+/// progress signal drives the widget, else the static option.
+fn effProgress(s: *const ProgressState) ?f32 {
+    return if (s.opts.progress_sig != null) s.displayed else s.opts.progress;
+}
+
 fn wantsPhaseLoop(s: *const ProgressState) bool {
-    return s.opts.progress == null or s.opts.wavy;
+    return effProgress(s) == null or s.opts.wavy;
 }
 
 fn progressLayout(n: *Node, bounds: Rect) void {
@@ -587,7 +605,7 @@ fn drawFlatStop(ctx: *kx.Ctx, b: Rect, color: Color, rtl: bool) void {
 fn drawWavyLinear(n: *Node, s: *ProgressState, ctx: *kx.Ctx, b: Rect, fractions: []const f32, amp: f32, wave_offset: f32, active: Color, track: Color, rtl: bool) void {
     const w = b.w;
     const half_h = b.h / 2;
-    const lambda: f32 = if (s.opts.progress != null) wave_len_det else wave_len_indet;
+    const lambda: f32 = if (effProgress(s) != null) wave_len_det else wave_len_indet;
     ensureWavePath(n, s, w, b.h, lambda);
     const cap_w = linear_thickness / 2; // both strokes are 4dp Round
     const wave_shift: f32 = if (amp != 0) wave_offset * lambda else 0;
@@ -701,7 +719,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
             if (!s.opts.wavy) {
                 // ---- flat linear (ProgressIndicator.kt draw blocks) ----
                 const gap_f = (track_gap + linear_thickness) / b.w; // round cap -> + strokeWidth
-                if (s.opts.progress) |p_raw| {
+                if (effProgress(s)) |p_raw| {
                     const p = clamp01(p_raw);
                     const track_start = p + @min(p, gap_f);
                     if (track_start <= 1) drawLinearSeg(ctx, b, track_start, 1, track, rtl);
@@ -737,7 +755,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 var fr: [4]f32 = undefined;
                 var n_frac: usize = 2;
                 var amp: f32 = 1;
-                if (s.opts.progress) |p_raw| {
+                if (effProgress(s)) |p_raw| {
                     const p = clamp01(p_raw);
                     fr[0] = 0;
                     fr[1] = p;
@@ -747,7 +765,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                     n_frac = 4;
                 }
                 drawWavyLinear(n, s, ctx, b, fr[0..n_frac], amp, wave_offset, active, track, rtl);
-                if (s.opts.progress) |p_raw| {
+                if (effProgress(s)) |p_raw| {
                     // wavy stop dot — determinate only. Upstream draws it in
                     // rotate(ltr?0:180): compute in LTR space, mirror the
                     // final rect in RTL.
@@ -778,7 +796,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 const pcy = b.h / 2; // size center after processPath
                 var xs: [wave_seg_cap]f32 = undefined;
                 var ys: [wave_seg_cap]f32 = undefined;
-                if (s.opts.progress) |p_raw| {
+                if (effProgress(s)) |p_raw| {
                     const p = clamp01(p_raw);
                     const amp = wavyAmplitude(p); // indicatorAmplitude
                     ensureCircPaths(n, s, b.w, b.h, amp);
@@ -824,7 +842,7 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 const r = (@min(b.w, b.h) - circular_stroke) / 2;
                 var xs: [arc_segments]f32 = undefined;
                 var ys: [arc_segments]f32 = undefined;
-                if (s.opts.progress) |p_raw| {
+                if (effProgress(s)) |p_raw| {
                     // ---- determinate circular ----
                     const sweep = clamp01(p_raw) * 360;
                     const start: f32 = 270;
@@ -859,7 +877,11 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
 
 fn progressDeinit(n: *Node) void {
     const s = stateOf(n);
-    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
+    if (anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
+        tl.cancelChannel(@ptrCast(&s.prog_channel));
+    }
+    if (s.prog_effect) |e| e.deinit();
     if (s.path_x.len > 0) {
         n.allocator.free(s.path_x);
         n.allocator.free(s.path_y);
@@ -910,7 +932,7 @@ fn progressPhaseCb(userdata: ?*anyopaque, value: anim.Vec4) void {
 
 fn loopPeriodMs(s: *const ProgressState) u32 {
     if (s.opts.kind == .circular) return circular_indet_ms;
-    if (s.opts.progress == null) return linear_indet_ms;
+    if (effProgress(s) == null) return linear_indet_ms;
     return @intFromFloat(wave_offset_ms); // determinate wavy: only the wave scrolls
 }
 
@@ -920,13 +942,53 @@ fn progressLoopCb(userdata: ?*anyopaque) void {
     if (wantsPhaseLoop(s)) startPhaseLoop(n, s); // loop forever
 }
 
+/// Upstream ProgressAnimationSpec (ProgressIndicator.kt:862):
+/// spring(dampingRatio = DampingRatioNoBouncy, stiffness = StiffnessVeryLow).
+const progress_spring = anim.Spring.fromDampingRatio(50, 1.0, 1);
+
+fn progressUpdateCb(userdata: ?*anyopaque, v: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.displayed = v[0];
+    n.markDirty();
+}
+
+/// Source moved → spring the display value to the new target (or snap when
+/// no timeline exists — goldens/bench build before the host installs it).
+fn progressEffectCb(userdata: ?*anyopaque) void {
+    const s: *ProgressState = @ptrCast(@alignCast(userdata.?));
+    const target = s.opts.progress_sig.?.get(); // tracked
+    if (target == s.displayed) {
+        if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.prog_channel));
+        return;
+    }
+    const tl = anim.timeline() orelse {
+        s.displayed = target; // no timeline: snap
+        return;
+    };
+    _ = tl.play(.{
+        .kind = anim.Animation.kindOf(.{ .spring = progress_spring }, .{ s.displayed, 0, 0, 0 }, .{ target, 0, 0, 0 }),
+        .from = .{ s.displayed, 0, 0, 0 },
+        .channel = @ptrCast(&s.prog_channel),
+        .on_update = .{ .fn_ptr = progressUpdateCb, .userdata = s.node.? },
+    });
+}
+
 /// Linear + circular progress indicators (M3E).
 pub fn progressIndicator(allocator: std.mem.Allocator, opts: ProgressOptions) !*Node {
     const node = try Node.create(allocator, &progress_vtable);
     errdefer allocator.destroy(node);
     const s = try allocator.create(ProgressState);
     errdefer allocator.destroy(s);
-    s.* = .{ .opts = opts };
+    s.* = .{ .opts = opts, .node = node };
+    if (opts.progress_sig) |sig| {
+        // Starts at the source so the first run() snaps (no retro intro
+        // animation); later source moves spring to the new target.
+        s.displayed = clamp01(sig.peek());
+        s.prog_effect = try ui.state.Effect.init(allocator, progressEffectCb, s);
+        errdefer if (s.prog_effect) |e| e.deinit();
+        s.prog_effect.?.run(); // subscribe
+    }
     node.state = s;
     ui.semantics.attach(node, .{ .role = .progress, .label = "Progress" }); // Phase 2c
     if (wantsPhaseLoop(s)) startPhaseLoop(node, s); // layout retries when no timeline exists yet
@@ -956,6 +1018,32 @@ test "progress: the indeterminate phase advances on timeline ticks and loops" {
     tl.tick(1900);
     try std.testing.expect(tl.hasActive());
     try std.testing.expect(stateOf(n).phase < 0.2);
+}
+
+test "progress: a bound signal drives displayed — snap without timeline, spring with" {
+    var sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.4);
+    defer sig.deinit();
+    const n = try progressIndicator(std.testing.allocator, .{ .progress_sig = sig });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
+    try std.testing.expectEqual(@as(f32, 0.4), stateOf(n).displayed);
+    try std.testing.expectEqual(@as(?f32, 0.4), effProgress(stateOf(n)));
+    // No timeline → the effect snaps the display to the target.
+    sig.set(0.9);
+    try std.testing.expectEqual(@as(f32, 0.9), stateOf(n).displayed);
+    // With a timeline the same write springs instead of snapping.
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    sig.set(0.2);
+    const d0 = stateOf(n).displayed;
+    tl.tick(0);
+    tl.tick(50);
+    const d50 = stateOf(n).displayed;
+    try std.testing.expect(d50 > 0.2 and d50 < d0); // mid-flight, not snapped
+    tl.tick(60000); // spring settle: ζ=1/k=50 decays under 0.1 in ~3s; generous cap
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), stateOf(n).displayed, 1e-3);
 }
 
 test "progress: the phase loop starts at layout when no timeline existed at construction" {

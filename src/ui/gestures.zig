@@ -32,6 +32,17 @@ const input = @import("input.zig");
 // --- Tuned constants (1d.6) ---
 
 pub const SLOP: f32 = 12; // movement tolerance before a gesture claims
+/// Pan/drag engagement for precision pointers (mouse/stylus — pointer id
+/// 0). Flutter's kPrecisePointerPanSlop: a pixel-accurate device engages a
+/// drag almost immediately (~2dp); fingers keep the generous dead zone.
+/// Tap/press dead zones stay at SLOP for every pointer kind — matching
+/// Flutter, where a click within the dead zone still taps.
+pub const PRECISE_PAN_SLOP: f32 = 2;
+
+pub fn panSlop(pointer: u64) f32 {
+    return if (pointer == 0) PRECISE_PAN_SLOP else SLOP;
+}
+
 /// Max duration of a tap. Upstream (Compose detectTapGestures) bounds the
 /// tap by the long-press timeout — a press released any time before it still
 /// taps; a separate shorter timeout would swallow 200–499 ms presses.
@@ -432,7 +443,7 @@ fn feedPan(rec: *Recognizer, ev: input.PointerEvent) ?Fire {
         },
         .move => {
             if (rec.state == .possible) {
-                if (dist(ev.x, ev.y, rec.start_x, rec.start_y) > SLOP) {
+                if (dist(ev.x, ev.y, rec.start_x, rec.start_y) > panSlop(ev.pointer)) {
                     rec.state = .accepted;
                     rec.last_x = ev.x; // the claiming move is the delta origin
                     rec.last_y = ev.y;
@@ -721,20 +732,34 @@ test "long press fires after the hold threshold" {
 
 test "pan: start on slop, update deltas, end with velocity + final delta" {
     var r = Recognizer{ .kind = .pan };
-    _ = r.feed(pev(.down, 0, 0, 0, 0));
-    try std.testing.expect(r.feed(pev(.move, 5, 0, 10, 0)) == null); // within slop
+    _ = r.feed(pev(.down, 0, 0, 0, 1)); // touch pointer
+    try std.testing.expect(r.feed(pev(.move, 5, 0, 10, 1)) == null); // within slop
     // claiming move: reports the down → claim displacement (20, 0)
-    const start = r.feed(pev(.move, 20, 0, 20, 0)).?;
+    const start = r.feed(pev(.move, 20, 0, 20, 1)).?;
     try std.testing.expectEqual(@as(f32, 20), start.pan_start.dx);
     try std.testing.expectEqual(@as(f32, 0), start.pan_start.dy);
-    const upd = r.feed(pev(.move, 30, 0, 30, 0)).?;
+    const upd = r.feed(pev(.move, 30, 0, 30, 1)).?;
     try std.testing.expectEqual(@as(f32, 10), upd.pan_update.dx);
     try std.testing.expectEqual(@as(f32, 0), upd.pan_update.dy);
-    const end = r.feed(pev(.up, 40, 0, 40, 0)).?;
+    const end = r.feed(pev(.up, 40, 0, 40, 1)).?;
     // 40 px in 40 ms → 1000 px/s; final displacement 30 → 40 = 10
     try std.testing.expectApproxEqAbs(@as(f32, 1000), end.pan_end.vx, 1);
     try std.testing.expectApproxEqAbs(@as(f32, 0), end.pan_end.vy, 0.001);
     try std.testing.expectEqual(@as(f32, 10), end.pan_end.dx);
+}
+
+test "pan: a precision pointer engages at the precise slop, touch keeps SLOP" {
+    // mouse (pointer 0): a 5px move already claims — Flutter
+    // kPrecisePointerPanSlop semantics
+    var m = Recognizer{ .kind = .pan };
+    _ = m.feed(pev(.down, 0, 0, 0, 0));
+    const start = m.feed(pev(.move, 5, 0, 10, 0)).?;
+    try std.testing.expectEqual(@as(f32, 5), start.pan_start.dx);
+    // touch (pointer 1): the same 5px is still inside the dead zone
+    var t = Recognizer{ .kind = .pan };
+    _ = t.feed(pev(.down, 0, 0, 0, 1));
+    try std.testing.expect(t.feed(pev(.move, 5, 0, 10, 1)) == null);
+    try std.testing.expect(t.feed(pev(.move, 13, 0, 20, 1)) != null);
 }
 
 test "swipe fires on a fast fling with the dominant direction" {
