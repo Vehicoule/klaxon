@@ -64,6 +64,13 @@ pub const Actions = std.enums.EnumSet(Action);
 
 pub const LiveRegion = enum { off, polite, assertive };
 
+/// The numeric range of a value-bearing role (slider, progress, scrollbar).
+/// `value` remains the display string; min/max/now are what AtkValue and
+/// ARIA aria-valuemin/max/now report. Convention: the emitting widgets
+/// express percent (0–100), matching their "{d}%" value strings — a widget
+/// with a different unit fills its true range instead.
+pub const ValueRange = struct { min: f64, max: f64, now: f64 };
+
 /// The per-node accessibility descriptor (attached by the widget factory;
 /// the node owns it — string fields are borrowed: literals or app-lifetime
 /// data).
@@ -72,6 +79,8 @@ pub const Semantics = struct {
     label: []const u8 = "",
     hint: []const u8 = "",
     value: []const u8 = "",
+    /// Numeric value range (see ValueRange). Null = display string only.
+    value_range: ?ValueRange = null,
     checked: ?bool = null,
     disabled: bool = false,
     focusable: bool = false,
@@ -105,6 +114,7 @@ pub const SemanticNode = struct {
     label: []const u8,
     hint: []const u8,
     value: []const u8,
+    value_range: ?ValueRange = null,
     checked: ?bool,
     disabled: bool,
     focusable: bool,
@@ -183,6 +193,7 @@ inline fn semanticValue(n: *Node, sem: *const Semantics) SemanticNode {
         .label = if (sem.label.len > 0) sem.label else firstDescendantLabel(n) orelse "",
         .hint = sem.hint,
         .value = sem.value,
+        .value_range = sem.value_range,
         .checked = sem.checked,
         .disabled = sem.disabled,
         .focusable = sem.focusable,
@@ -209,6 +220,7 @@ fn virtualValue(parent: *Node, vc: *const Semantics, index: usize, bounds_cb: ?*
         .label = vc.label,
         .hint = vc.hint,
         .value = vc.value,
+        .value_range = vc.value_range,
         .checked = vc.checked,
         .disabled = vc.disabled,
         .focusable = vc.focusable,

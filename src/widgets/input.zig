@@ -442,7 +442,11 @@ fn sliderSyncCb(userdata: ?*anyopaque) void {
     // Clamped like the M3E slider — an out-of-range signal stays formattable.
     const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(s.sig.peek(), 0, 1) * 100}) catch return;
     s.value_len = str.len;
-    if (n.semantics) |sem| sem.value = s.value_buf[0..s.value_len];
+    if (n.semantics) |sem| {
+        sem.value = s.value_buf[0..s.value_len];
+        // Percent units, matching the "{d}%" display string (Semantics.value_range).
+        sem.value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(s.sig.peek(), 0, 1) * 100 };
+    }
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }

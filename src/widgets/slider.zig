@@ -335,7 +335,12 @@ fn sliderSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{clampedValue(s) * 100}) catch return;
     s.value_len = str.len;
-    if (n.semantics) |sem| sem.value = s.value_buf[0..s.value_len];
+    if (n.semantics) |sem| {
+        sem.value = s.value_buf[0..s.value_len];
+        // The numeric range is in percent units, matching the "{d}%"
+        // display string (see Semantics.value_range).
+        sem.value_range = .{ .min = 0, .max = 100, .now = clampedValue(s) * 100 };
+    }
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
@@ -401,6 +406,7 @@ pub fn slider(allocator: std.mem.Allocator, sig: *ui.state.Signal(f32), on_chang
         .focusable = opts.enabled,
         .disabled = !opts.enabled,
         .value = s.value_buf[0..s.value_len],
+        .value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(sig.peek(), 0, 1) * 100 },
         .actions = ui.semantics.Actions.init(.{ .increment = true, .decrement = true }),
     });
     sig.subscribe(.{ .callback = .{ .fn_ptr = sliderSyncCb, .userdata = node } }); // visual + semantic updates on set

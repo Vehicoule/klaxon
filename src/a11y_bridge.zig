@@ -9,13 +9,17 @@
 //     iOS bridge calls them when VoiceOver focuses/activates an element)
 //
 // The dump format (one line per visible semantic node):
-//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
+//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow\n"
 // depth is the indentation level (0 = root). ptr is the Node pointer in
 // decimal — bridges match it against the node_id of focus_changed /
 // control_changed events. checked is 0 = null, 1 = false, 2 = true.
 // x/y/w/h are the node's bounds mapped to window space (mapRectToRoot) —
 // the native bridges position their accessibility elements from these
 // (the macOS parser reads them positionally; the web parser ignores them).
+// vmin/vmax/vnow are the optional numeric value range (Semantics
+// .value_range — all three empty when absent); the percent convention is
+// 0–100. Parsers that only know the first 11 fields ignore the extras —
+// every bridge splits positionally with a field cap.
 const std = @import("std");
 const ui = @import("ui.zig");
 const kx = @import("kx.zig");
@@ -114,6 +118,24 @@ export fn kx_a11y_activate_node(root: ?*anyopaque, ptr: u64) callconv(.c) void {
     router.dispatchPointer(root_node, .{ .phase = .up, .x = cx, .y = cy });
 }
 
+/// AT action codes for the SDL user event the Linux ATK bridge pushes
+/// (kx_a11y_linux.cpp pushAtAction): grab_focus / do_action are invoked on
+/// the a11y thread, which must not touch the render-thread-owned node
+/// tree — they're marshalled through SDL's event queue instead.
+pub const AT_ACTION_FOCUS: i32 = 1;
+pub const AT_ACTION_ACTIVATE: i32 = 2;
+
+/// Dispatch a marshalled AT action on the render thread. host.zig calls
+/// this when an SDL user event of kx_a11y_action_event_type() arrives
+/// (Linux ATK bridge); `root`/`ptr` mirror kx_a11y_focus_node's arguments.
+pub fn dispatchAtAction(code: i32, root: ?*anyopaque, ptr: u64) void {
+    switch (code) {
+        AT_ACTION_FOCUS => kx_a11y_focus_node(root, ptr),
+        AT_ACTION_ACTIVATE => kx_a11y_activate_node(root, ptr),
+        else => {},
+    }
+}
+
 /// Depth-first search for the node whose pointer is `ptr` (the dump's ptr
 /// field — semantic nodes only, but the raw tree is walked so any node
 /// matches).
@@ -145,7 +167,7 @@ fn sanitizeA11yField(in: []const u8, out: []u8) []const u8 {
 }
 
 fn dumpNode(sn: *sem.SemanticNode, depth: usize, buf: *std.array_list.Managed(u8)) !void {
-    // Format: "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
+    // Format: "depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow\n"
     const role_str = @tagName(sn.role);
     var label_buf: [512]u8 = undefined;
     var value_buf: [512]u8 = undefined;
@@ -166,10 +188,24 @@ fn dumpNode(sn: *sem.SemanticNode, depth: usize, buf: *std.array_list.Managed(u8
     // carry their own item rect.
     const r = sn.bounds_override orelse sn.node.mapRectToRoot(sn.node.bounds);
 
+    // Fields 12-14: the optional numeric value range — empty strings when
+    // the widget only carries the display text (Semantics.value_range).
+    var vmin_buf: [32]u8 = undefined;
+    var vmax_buf: [32]u8 = undefined;
+    var vnow_buf: [32]u8 = undefined;
+    var vmin: []const u8 = "";
+    var vmax: []const u8 = "";
+    var vnow: []const u8 = "";
+    if (sn.value_range) |vr| {
+        vmin = std.fmt.bufPrint(&vmin_buf, "{d}", .{vr.min}) catch "";
+        vmax = std.fmt.bufPrint(&vmax_buf, "{d}", .{vr.max}) catch "";
+        vnow = std.fmt.bufPrint(&vnow_buf, "{d}", .{vr.now}) catch "";
+    }
+
     var line_buf: [2048]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{d}|{s}|{s}|{s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
-        depth, role_str, label, value, focusable, ptr, checked, r.x, r.y, r.w, r.h,
-    }) catch std.fmt.bufPrint(&line_buf, "{d}|{s}|||{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
+    const line = std.fmt.bufPrint(&line_buf, "{d}|{s}|{s}|{s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{s}|{s}|{s}\n", .{
+        depth, role_str, label, value, focusable, ptr, checked, r.x, r.y, r.w, r.h, vmin, vmax, vnow,
+    }) catch std.fmt.bufPrint(&line_buf, "{d}|{s}|||{d}|{d}|{d}|{d}|{d}|{d}|{d}|||\n", .{
         depth, role_str, focusable, ptr, checked, r.x, r.y, r.w, r.h,
     }) catch unreachable; // numeric fallback always fits — and the
     // subtree is NEVER dropped: an overlong label used to `return` here,
@@ -247,7 +283,7 @@ fn countFields(line: []const u8) usize {
     return n;
 }
 
-test "dump tree: 11 positional fields with real window-space rects" {
+test "dump tree: 14 positional fields with real window-space rects" {
     const a = std.testing.allocator;
     const root = try tNode(a);
     defer root.deinit();
@@ -279,7 +315,7 @@ test "dump tree: 11 positional fields with real window-space rects" {
     try std.testing.expectEqual(@as(usize, 3), n_lines);
 
     // Wrapper group: empty label/value, the root's rect (0,0,640,480).
-    try std.testing.expectEqual(@as(usize, 11), countFields(lines[0]));
+    try std.testing.expectEqual(@as(usize, 14), countFields(lines[0]));
     try std.testing.expectEqualStrings("0", fieldAt(lines[0], 0).?);
     try std.testing.expectEqualStrings("group", fieldAt(lines[0], 1).?);
     try std.testing.expectEqualStrings("0", fieldAt(lines[0], 4).?);
@@ -290,7 +326,7 @@ test "dump tree: 11 positional fields with real window-space rects" {
     try std.testing.expectEqualStrings("480", fieldAt(lines[0], 10).?);
 
     // Button: label, focusable, its real rect — not 0|0|0|0.
-    try std.testing.expectEqual(@as(usize, 11), countFields(lines[1]));
+    try std.testing.expectEqual(@as(usize, 14), countFields(lines[1]));
     try std.testing.expectEqualStrings("1", fieldAt(lines[1], 0).?);
     try std.testing.expectEqualStrings("button", fieldAt(lines[1], 1).?);
     try std.testing.expectEqualStrings("OK", fieldAt(lines[1], 2).?);
@@ -303,7 +339,7 @@ test "dump tree: 11 positional fields with real window-space rects" {
     try std.testing.expectEqualStrings("40", fieldAt(lines[1], 10).?);
 
     // Toggle: checked = 2 (true), its real rect.
-    try std.testing.expectEqual(@as(usize, 11), countFields(lines[2]));
+    try std.testing.expectEqual(@as(usize, 14), countFields(lines[2]));
     try std.testing.expectEqualStrings("toggle", fieldAt(lines[2], 1).?);
     try std.testing.expectEqualStrings("2", fieldAt(lines[2], 6).?);
     try std.testing.expectEqualStrings("10", fieldAt(lines[2], 7).?);
@@ -391,7 +427,7 @@ test "dump tree: checked=false serializes as 1 and the value lands at field 3" {
     // a single semantic node is the root itself — no synthetic wrapper group
     var it = std.mem.splitScalar(u8, dump, '\n');
     const line = it.next().?;
-    try std.testing.expectEqual(@as(usize, 11), countFields(line));
+    try std.testing.expectEqual(@as(usize, 14), countFields(line));
     try std.testing.expectEqualStrings("0", fieldAt(line, 0).?); // depth
     try std.testing.expectEqualStrings("toggle", fieldAt(line, 1).?);
     try std.testing.expectEqualStrings("Wi-Fi", fieldAt(line, 2).?); // label
@@ -488,6 +524,65 @@ test "set_bridge registers the C bridge callback; clearing stops the events" {
     kx_a11y_set_bridge(null, null); // clear
     sem.notifyTreeDirty();
     try std.testing.expectEqual(@as(u32, 1), bridge_events); // no more events
+}
+
+test "dump tree: value_range serializes to fields 12-14 (empty when absent)" {
+    const a = std.testing.allocator;
+    const root = try tNode(a);
+    defer root.deinit();
+    const slider_node = try tNode(a);
+    sem.attach(slider_node, .{
+        .role = .slider,
+        .label = "Volume",
+        .value = "42%",
+        .value_range = .{ .min = 0, .max = 100, .now = 42.5 },
+        .focusable = true,
+    });
+    root.add(slider_node);
+    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    slider_node.layout(.{ .x = 0, .y = 0, .w = 200, .h = 24 });
+
+    const dump_ptr = kx_a11y_dump_tree(@ptrCast(root)) orelse return error.TestUnexpectedResult;
+    defer kx_a11y_free_string(dump_ptr);
+    const dump: [:0]const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(dump_ptr)));
+
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    const line = it.next().?; // the slider is the single semantic node
+    try std.testing.expectEqual(@as(usize, 14), countFields(line));
+    try std.testing.expectEqualStrings("slider", fieldAt(line, 1).?);
+    try std.testing.expectEqualStrings("42%", fieldAt(line, 3).?); // display string intact
+    try std.testing.expectEqualStrings("0", fieldAt(line, 11).?); // vmin
+    try std.testing.expectEqualStrings("100", fieldAt(line, 12).?); // vmax
+    try std.testing.expectEqualStrings("42.5", fieldAt(line, 13).?); // vnow
+}
+
+test "dispatchAtAction: marshalled codes drive focus + activate on this thread" {
+    const a = std.testing.allocator;
+    var router = ui.input.InputRouter{};
+    ui.input.setCurrent(&router);
+    defer ui.input.setCurrent(null);
+    const fm = try sem.FocusManager.init(a);
+    defer fm.deinit();
+    sem.setCurrentFocus(fm);
+    defer sem.setCurrentFocus(null);
+
+    const root = try tNode(a);
+    defer root.deinit();
+    const btn = try tNode(a);
+    sem.attach(btn, .{ .role = .button, .label = "OK", .focusable = true });
+    root.add(btn);
+    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    btn.layout(.{ .x = 10, .y = 20, .w = 100, .h = 40 });
+    fm.setRoot(root);
+    const clicks = &@as(*ClickState, @ptrCast(@alignCast(btn.state.?))).clicks;
+
+    const root_any: ?*anyopaque = @ptrCast(root);
+    dispatchAtAction(AT_ACTION_FOCUS, root_any, @intFromPtr(btn));
+    try std.testing.expect(fm.focused == btn);
+    dispatchAtAction(AT_ACTION_ACTIVATE, root_any, @intFromPtr(btn));
+    try std.testing.expectEqual(@as(u32, 1), clicks.*);
+    dispatchAtAction(99, root_any, @intFromPtr(btn)); // unknown code: no-op
+    try std.testing.expectEqual(@as(u32, 1), clicks.*);
 }
 
 test "activate_node without a router is a no-op" {

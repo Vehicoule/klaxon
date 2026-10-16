@@ -18,6 +18,7 @@ comptime {
     _ = @import("a11y_bridge.zig");
 }
 const sdl = @import("sdl.zig");
+const a11y_bridge = @import("a11y_bridge.zig");
 const kx = @import("kx.zig");
 const ui = @import("ui.zig");
 const input_mod = @import("ui/input.zig");
@@ -1079,6 +1080,19 @@ pub const Host = struct {
             return false;
         }
         if (event.type == sdl.c.SDL_EVENT_QUIT) return true;
+        // Linux AT-SPI bridge (Phase 3a): AT-initiated actions (AtkAction
+        // "click", AtkComponent grab_focus) are invoked on the bridge's a11y
+        // thread, which must not touch the render-thread-owned node tree —
+        // the C++ side marshals them through this registered SDL user event
+        // (kx_a11y_linux.cpp; user.code picks the action, user.data1/data2
+        // carry the root and target node pointers). Dispatch here on the
+        // render thread. The getter returns 0 when the bridge is down — no
+        // real event has type 0.
+        if (is_linux and event.type == kx.a11yActionEventType()) {
+            const ptr: u64 = if (event.user.data2) |p| @intFromPtr(p) else 0;
+            a11y_bridge.dispatchAtAction(event.user.code, event.user.data1, ptr);
+            return false;
+        }
         // Mobile lifecycle (Phase 3d/3e): background/foreground gating plus
         // the low-memory / terminating notifications. On iOS these arrive
         // through SDL_AppEvent (SDL_main_callbacks dispatches the watch-only

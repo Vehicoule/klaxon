@@ -9,6 +9,11 @@ pub const c_extern = struct {
     extern fn kx_a11y_init(root_node: ?*anyopaque) void;
     extern fn kx_a11y_shutdown() void;
     extern fn kx_a11y_root_element() ?*anyopaque;
+    /// Desktop Linux only (kx_a11y_linux.cpp): the SDL user-event type AT
+    /// actions are marshalled through — 0 when the bridge is uninitialized.
+    /// Only referenced from is_linux-gated code; the other platform bridges
+    /// do not export it.
+    extern fn kx_a11y_action_event_type() u32;
     /// iOS: true when the UIWindow's root view is attached (presents before
     /// mapping are silently lost — see klaxon-spikes kx_metal.mm).
     extern fn kx_ios_window_mapped(uiwindow: ?*anyopaque) bool;
@@ -20,6 +25,12 @@ pub fn a11yInit(root: *anyopaque) void {
 
 pub fn a11yShutdown() void {
     c_extern.kx_a11y_shutdown();
+}
+
+/// Desktop Linux only: the SDL user-event type the ATK bridge pushes AT
+/// actions on (0 = unregistered). See kx_a11y_linux.cpp's threading notes.
+pub fn a11yActionEventType() u32 {
+    return c_extern.kx_a11y_action_event_type();
 }
 
 /// iOS: true when the UIWindow's root view is attached (presents before

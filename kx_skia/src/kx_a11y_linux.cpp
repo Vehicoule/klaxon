@@ -30,20 +30,23 @@
 //   never iterates. kx_a11y_init therefore spawns a dedicated "kx-a11y"
 //   thread running g_main_context_iteration; every AtkObject is created,
 //   queried and signalled on THAT thread (droute D-Bus handlers run there
-//   too, so no locking is needed). Bridge events arrive on the SDL/render
-//   thread (the same caller-thread assumption macOS/iOS make) and are
-//   marshalled to the a11y thread with g_idle_add; the tree dump is pulled
-//   on the caller thread first (the Zig tree is only safe to read there).
-//   Screen-reader actions (AtkAction "click", AtkComponent grab_focus)
-//   call into Zig straight from the a11y thread — the same cross-thread
-//   caveat as the Android bridge (kx_a11y_activate_node /
-//   kx_a11y_focus_node; an SDL-user-event queue is the follow-up).
+//   too, so the object map needs no locking). Bridge events arrive on the
+//   SDL/render thread (the same caller-thread assumption macOS/iOS make)
+//   and are marshalled to the a11y thread with g_idle_add; the tree dump
+//   is pulled on the caller thread first (the Zig tree is only safe to
+//   read there).
+//   AT-initiated actions (AtkAction "click", AtkComponent grab_focus)
+//   can't touch the render-thread-owned Zig tree either, so they are
+//   marshalled the other way: do_action/grab_focus push a registered SDL
+//   user event (SDL_PushEvent is thread-safe and non-blocking — a D-Bus
+//   handler can never wedge the render loop) and host.zig's event drain
+//   dispatches kx_a11y_{focus,activate}_node on the render thread.
 //
 //   Zig (SDL thread)                  a11y thread (default GMainContext)
 //   ────────────────                  ────────────────────────────────
 //   kx_a11y_init ─► AtkUtilClass patch + app root + adaptor_init + thread
 //   bridge events ─► dump / g_strndup ──g_idle_add──► rebuild, focus, announce
-//   AT actions    ◄── do_action / grab_focus ──► kx_a11y_{activate,focus}_node
+//   AT actions    ◄── SDL user event ──SDL_PushEvent── do_action / grab_focus
 //
 // ABI note: the bridge callback receives BridgeEventC BY VALUE (extern
 // struct) — the field order below mirrors ui/semantics.zig. Do NOT flatten
@@ -58,6 +61,8 @@
 // AtkImage, AtkKeySnoopFunc (AT-side key grabs into SDL events).
 #include <atk/atk.h>
 #include <atk-bridge.h>
+#include <SDL3/SDL.h> // SDL_RegisterEvents / SDL_PushEvent — AT actions marshal
+                      // to the render thread through SDL's event queue.
 
 #include <algorithm>
 #include <cmath>
@@ -103,7 +108,9 @@ void kx_a11y_activate_node(void* root, uint64_t ptr);
 
 // --- Parsed semantic tree (the dump's flat form) ---
 // One line per visible semantic node:
-//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
+//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow\n"
+// The last three are empty unless the widget carries a numeric value range
+// (Semantics.value_range — sliders/progress report in percent units).
 struct KxA11yNode {
     int depth = 0;
     int parent = -1;   // index of the parent node, -1 = under the app root
@@ -111,12 +118,18 @@ struct KxA11yNode {
     int checked = 0;   // 0 = null, 1 = false, 2 = true
     bool focusable = false;
     int x = 0, y = 0, w = 0, h = 0; // rect in window space (mapRectToRoot)
+    bool has_vrange = false;
+    double vmin = 0, vmax = 0, vnow = 0;
     std::string role;
     std::string label;
     std::string value;
 };
 
-static void* g_zig_root_node = nullptr;
+// The Zig tree root — set on the render thread at init (before the a11y
+// thread spawns), cleared at shutdown (after it joins). Atomic because the
+// a11y thread reads it when marshalling AT actions; the ordering itself is
+// already guaranteed by the thread create/join.
+static std::atomic<void*> g_zig_root_node{nullptr};
 
 // --- KxAtkObject: an AtkObject wrapping one semantic-tree node ---
 
@@ -137,6 +150,8 @@ struct _KxAtkObject {
     uint64_t parent_ptr;     // parent's Node ptr, 0 = application root
     GPtrArray* children;     // KxAtkObject* — not owned (registry-owned too)
     int index_in_parent;
+    bool has_vrange;         // the widget carries a numeric value range
+    double vmin, vmax, vnow; // AtkValue min/max/current (dump fields 12-14)
 };
 
 // A second type carries the AtkValue interface — interface presence is
@@ -301,6 +316,8 @@ static AtkAttributeSet* kx_atk_object_get_attributes(AtkObject* obj) {
 static void kx_atk_object_init(KxAtkObject* self) {
     self->children = g_ptr_array_new();
     self->index_in_parent = -1;
+    self->has_vrange = false;
+    self->vmin = self->vmax = self->vnow = 0;
 }
 
 static void kx_atk_object_finalize(GObject* object) {
@@ -381,13 +398,33 @@ static AtkObject* kx_atk_component_ref_accessible_at_point(AtkComponent* compone
     return nullptr;
 }
 
+// --- AT actions -> the render thread (marshalled via SDL user event) ---
+// The a11y thread must not walk the render-thread-owned Zig node tree, so
+// grab_focus/do_action push a registered user event instead of calling
+// kx_a11y_{focus,activate}_node directly. host.zig's event drain compares
+// event.type against kx_a11y_action_event_type() and dispatches on the
+// render thread. The codes are shared with a11y_bridge.zig's dispatch.
+static Uint32 g_action_event_type = 0; // SDL_RegisterEvents result; 0 = none
+enum : Sint32 { KX_A11Y_ACT_FOCUS = 1, KX_A11Y_ACT_ACTIVATE = 2 };
+
+static bool pushAtAction(Sint32 code, uint64_t node_ptr) {
+    void* root = g_zig_root_node.load();
+    if (!root || !node_ptr || !g_action_event_type) return false;
+    SDL_Event ev;
+    SDL_zero(ev);
+    ev.type = g_action_event_type;
+    ev.user.code = code;
+    ev.user.data1 = root;
+    ev.user.data2 = reinterpret_cast<void*>(static_cast<uintptr_t>(node_ptr));
+    return SDL_PushEvent(&ev);
+}
+
 static gboolean kx_atk_component_grab_focus(AtkComponent* component) {
     // AT-side focus request ("grabFocus" over AT-SPI) -> move Klaxon's focus
     // to the node, like VoiceOver's accessibilityElementDidBecomeFocused.
-    KxAtkObject* self = KX_ATK_OBJECT(component);
-    if (!self->node_ptr || !g_zig_root_node) return FALSE;
-    kx_a11y_focus_node(g_zig_root_node, self->node_ptr);
-    return TRUE;
+    return pushAtAction(KX_A11Y_ACT_FOCUS, KX_ATK_OBJECT(component)->node_ptr)
+               ? TRUE
+               : FALSE;
 }
 
 static gdouble kx_atk_component_get_alpha(AtkComponent*) {
@@ -418,10 +455,10 @@ static void kx_atk_component_iface_init(AtkComponentIface* iface) {
 // --- AtkAction ("click" -> synthesized pointer at the node center) ---
 
 static gboolean kx_atk_action_do_action(AtkAction* action, gint i) {
-    KxAtkObject* self = KX_ATK_OBJECT(action);
-    if (i != 0 || !self->node_ptr || !g_zig_root_node) return FALSE;
-    kx_a11y_activate_node(g_zig_root_node, self->node_ptr);
-    return TRUE;
+    if (i != 0) return FALSE;
+    return pushAtAction(KX_A11Y_ACT_ACTIVATE, KX_ATK_OBJECT(action)->node_ptr)
+               ? TRUE
+               : FALSE;
 }
 
 static gint kx_atk_action_get_n_actions(AtkAction* action) {
@@ -446,13 +483,21 @@ static void kx_atk_value_get_value_and_text(AtkValue* value, gdouble* out_value,
                                             gchar** out_text) {
     KxAtkObject* self = KX_ATK_OBJECT(value);
     const gchar* text = (self->value && self->value[0]) ? self->value : "";
-    if (out_value) *out_value = g_ascii_strtod(text, nullptr);
+    // The widget's numeric value when it carries a range (value_range in
+    // the dump); otherwise fall back to the leading number in the display
+    // string ("42%" -> 42 — every current emitter is a percent).
+    if (out_value)
+        *out_value = self->has_vrange ? self->vnow : g_ascii_strtod(text, nullptr);
     if (out_text) *out_text = g_strdup(text);
 }
 
-static AtkRange* kx_atk_value_get_range(AtkValue*) {
-    // The dump has no min/max — report the percent convention (0-100); the
-    // value text remains the authoritative payload.
+static AtkRange* kx_atk_value_get_range(AtkValue* value) {
+    KxAtkObject* self = KX_ATK_OBJECT(value);
+    if (self->has_vrange) return atk_range_new(self->vmin, self->vmax, nullptr);
+    // No numeric range on the node: report the percent convention (0-100).
+    // Correct today because every emitting widget normalizes to 0..1 and
+    // formats "{d}%" (slider, loading indicator) — a non-percent widget
+    // should fill Semantics.value_range instead of the string alone.
     return atk_range_new(0.0, 100.0, nullptr);
 }
 
@@ -509,17 +554,26 @@ static int parseCoord(const char* s, size_t len) {
     return (int)lroundf(strtof(buf, nullptr));
 }
 
+// The value-range fields carry f64s ("0", "42.5") — strtod, not parseCoord.
+static double parseF64(const char* s, size_t len) {
+    char buf[48];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    return strtod(buf, nullptr);
+}
+
 static void parseDump(const char* dump, std::vector<KxA11yNode>& nodes) {
     std::vector<int> stack; // stack[d] = node index at depth d on the current path
     const char* p = dump;
     while (p && *p) {
         const char* eol = p;
         while (*eol && *eol != '\n') eol++;
-        const char* fields[11];
-        size_t lens[11];
+        const char* fields[14];
+        size_t lens[14];
         int nfields = 0;
         const char* s = p;
-        while (s < eol && nfields < 11) {
+        while (s < eol && nfields < 14) {
             const char* bar = s;
             while (bar < eol && *bar != '|') bar++;
             fields[nfields] = s;
@@ -541,6 +595,14 @@ static void parseDump(const char* dump, std::vector<KxA11yNode>& nodes) {
                 node.y = parseCoord(fields[8], lens[8]);
                 node.w = parseCoord(fields[9], lens[9]);
                 node.h = parseCoord(fields[10], lens[10]);
+            }
+            // Fields 12-14 are always emitted (empty when the widget has no
+            // numeric range) — all three must be non-empty to count.
+            if (nfields >= 14 && lens[11] && lens[12] && lens[13]) {
+                node.has_vrange = true;
+                node.vmin = parseF64(fields[11], lens[11]);
+                node.vmax = parseF64(fields[12], lens[12]);
+                node.vnow = parseF64(fields[13], lens[13]);
             }
             while ((int)stack.size() > node.depth) stack.pop_back();
             node.parent = stack.empty() ? -1 : stack.back();
@@ -626,6 +688,8 @@ static void updateNode(KxAtkObject* o, const KxA11yNode& n, bool created) {
     const bool focusable_changed = !created && o->focusable != n.focusable;
     const bool bounds_changed = !created &&
         (o->x != n.x || o->y != n.y || o->w != n.w || o->h != n.h);
+    const bool vnow_changed = !created &&
+        (o->has_vrange != n.has_vrange || o->vnow != n.vnow);
 
     g_free(o->label);
     o->label = g_strdup(n.label.c_str());
@@ -637,10 +701,17 @@ static void updateNode(KxAtkObject* o, const KxA11yNode& n, bool created) {
     o->y = n.y;
     o->w = n.w;
     o->h = n.h;
+    o->has_vrange = n.has_vrange;
+    o->vmin = n.vmin;
+    o->vmax = n.vmax;
+    o->vnow = n.vnow;
 
     if (created) return; // fresh objects are read whole — no deltas to report
     if (label_changed) emitPropertyChange(o, "accessible-name");
     if (value_changed) emitPropertyChange(o, "accessible-description");
+    // AT-SPI Value.CurrentValue changes surface as accessible-value (the
+    // description emit above only covers the display string).
+    if (vnow_changed) emitPropertyChange(o, "accessible-value");
     if (checked_changed)
         atk_object_notify_state_change(ATK_OBJECT(o), ATK_STATE_CHECKED, o->checked == 2);
     if (focusable_changed)
@@ -809,8 +880,8 @@ static void a11yBridgeCallback(void* userdata, KxBridgeEventC ev) {
         case KX_A11Y_CONTROL_CHANGED:
             // Pull the dump HERE on the caller thread — the Zig semantic tree
             // is only safe to read from the thread semantics runs on.
-            if (g_zig_root_node) {
-                t->text = kx_a11y_dump_tree(g_zig_root_node);
+            if (void* root = g_zig_root_node.load()) {
+                t->text = kx_a11y_dump_tree(root);
                 t->zig_owned = true;
             }
             if (!t->text) { delete t; return; }
@@ -846,7 +917,12 @@ extern "C" {
 /// Initialize the ATK/AT-SPI bridge. `root_node` is the Klaxon root Node
 /// (used to dump the semantic tree on tree_dirty).
 void kx_a11y_init(void* root_node) {
-    g_zig_root_node = root_node;
+    g_zig_root_node.store(root_node);
+    // The user-event type AT actions marshal through (host.zig dispatches
+    // them on the render thread). Registration is fail-soft: when SDL's
+    // event range is exhausted, pushes stay gated off and actions no-op.
+    Uint32 ev_type = SDL_RegisterEvents(1);
+    g_action_event_type = (ev_type == (Uint32)-1) ? 0 : ev_type;
     // Register the C bridge callback with the Zig semantics module.
     kx_a11y_set_bridge(a11yBridgeCallback, nullptr);
     if (g_app_root) return; // already initialized
@@ -918,7 +994,16 @@ void kx_a11y_shutdown(void) {
         g_app_root = nullptr;
     }
     g_focused_ptr = 0;
-    g_zig_root_node = nullptr;
+    g_zig_root_node.store(nullptr);
+    g_action_event_type = 0;
+}
+
+/// The SDL user-event type AT actions are marshalled through (user.code:
+/// KX_A11Y_ACT_*; user.data1 = root Node*, data2 = target node ptr). 0 when
+/// the bridge is uninitialized or registration failed — host.zig compares
+/// incoming event types against this on the render thread.
+uint32_t kx_a11y_action_event_type(void) {
+    return g_action_event_type;
 }
 
 /// Opaque handle on the application root AtkObject (API parity with the

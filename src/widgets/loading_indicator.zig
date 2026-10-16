@@ -406,7 +406,11 @@ fn liSyncCb(userdata: ?*anyopaque) void {
     if (s.sig) |sig| {
         const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(sig.peek(), 0, 1) * 100}) catch return;
         s.value_len = str.len;
-        if (n.semantics) |sem| sem.value = s.value_buf[0..s.value_len];
+        if (n.semantics) |sem| {
+            sem.value = s.value_buf[0..s.value_len];
+            // Percent units, matching the "{d}%" display string.
+            sem.value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(sig.peek(), 0, 1) * 100 };
+        }
         ui.semantics.notifyControlChanged(n); // a11y: the value changed
     }
     n.markDirty();
@@ -454,7 +458,7 @@ pub fn loadingIndicator(allocator: std.mem.Allocator, progress: ?*ui.state.Signa
     if (progress) |sig| {
         const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(sig.peek(), 0, 1) * 100}) catch "";
         s.value_len = str.len;
-        ui.semantics.attach(node, .{ .role = .progress, .label = "Loading indicator", .value = s.value_buf[0..s.value_len] });
+        ui.semantics.attach(node, .{ .role = .progress, .label = "Loading indicator", .value = s.value_buf[0..s.value_len], .value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(sig.peek(), 0, 1) * 100 } });
         sig.subscribe(.{ .callback = .{ .fn_ptr = liSyncCb, .userdata = node } });
     } else {
         ui.semantics.attach(node, .{ .role = .progress, .label = "Loading indicator" });
