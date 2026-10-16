@@ -69,7 +69,7 @@ const circular_gap: f32 = 4; // Circular TrackActiveSpace
 const arc_segments: usize = 48; // per full circle
 const wave_seg_cap: usize = 2048; // emitted segment buffer (adaptive stride)
 const linear_indet_ms: u32 = 1750; // LinearAnimationDuration
-const circular_indet_ms: u32 = 6000; // CircularAnimationProgressDuration
+pub const circular_indet_ms: u32 = 6000; // CircularAnimationProgressDuration
 const wave_offset_ms: f32 = 1000; // waveSpeed = wavelength/s → 1 cycle/s
 
 pub const ProgressKind = enum { linear, circular };
@@ -86,10 +86,10 @@ pub const ProgressOptions = struct {
 fn easeEmphAccel(x: f32) f32 {
     return anim.cubicBezier(0.3, 0.0, 0.8, 0.15, x);
 }
-fn easeEmphDecel(x: f32) f32 {
+pub fn easeEmphDecel(x: f32) f32 {
     return anim.cubicBezier(0.05, 0.7, 0.1, 1.0, x);
 }
-fn easeStandard(x: f32) f32 {
+pub fn easeStandard(x: f32) f32 {
     return anim.cubicBezier(0.2, 0.0, 0.0, 1.0, x);
 }
 
@@ -170,7 +170,7 @@ fn arcPoint(cx: f32, cy: f32, r: f32, deg: f32) struct { x: f32, y: f32 } {
 
 /// Fill xs/ys with an arc from `start_deg` sweeping `sweep_deg` (clockwise).
 /// Returns the point count (<= max).
-fn arcPolyline(xs: []f32, ys: []f32, cx: f32, cy: f32, r: f32, start_deg: f32, sweep_deg: f32) usize {
+pub fn arcPolyline(xs: []f32, ys: []f32, cx: f32, cy: f32, r: f32, start_deg: f32, sweep_deg: f32) usize {
     if (!std.math.isFinite(sweep_deg)) return 0;
     const n: usize = @intFromFloat(@ceil(@abs(sweep_deg) / 360 * arc_segments));
     const count = @min(@max(n, 2), xs.len);
@@ -422,12 +422,12 @@ fn indetFractions(t_ms: f32, out: *[4]f32) void {
 /// progress: 0.1 -> 0.87 over the first half (Standard), back over the
 /// second (Linear). additionalRotation: +90deg steps at 300/1800/3300/4800ms
 /// with EmphasizedDecelerate, holding between.
-fn circIndetProgress(t_ms: f32) f32 {
+pub fn circIndetProgress(t_ms: f32) f32 {
     if (t_ms <= 3000) return 0.1 + (0.87 - 0.1) * easeStandard(t_ms / 3000);
     return 0.87 + (0.1 - 0.87) * ((t_ms - 3000) / 3000);
 }
 
-fn circAddRotation(t_ms: f32) f32 {
+pub fn circAddRotation(t_ms: f32) f32 {
     // keyframes: step k eases [k*1500, k*1500+300] from 90k to 90(k+1) with
     // EmphasizedDecelerate, then holds. Upstream: 90@300 hold->1500,
     // 180@1800 hold->3000, 270@3300 hold->4500, 360@4800 hold->6000.

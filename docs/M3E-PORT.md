@@ -42,7 +42,7 @@ Port contract per widget:
 | nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |
 | navigation_rail | NavigationRail.kt | NavigationRailTokens | **ported** |
 | progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-LinearWavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | ported |
-| pull_to_refresh | pulltorefresh/PullToRefresh.kt | — | pending |
+| pull_to_refresh | pulltorefresh/PullToRefresh.kt | PullToRefreshTokens | **ported** (nested-drag/capture semantics; arrow indicator + Level2 shadow) |
 | radio | RadioButton.kt | RadioButtonTokens | ported |
 | search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | **ported** (collapsed bar; expanded SearchView pending) |
 | segmented_button | SegmentedButton.kt | SegmentedButtonTokens | **ported** |

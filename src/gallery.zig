@@ -2667,14 +2667,14 @@ test "gallery: the M3E pull-to-refresh triggers on a pull past the threshold" {
     const sy = widgets.scroll_view.scrollOffset(sv);
     const b = ptr.bounds;
     try std.testing.expect(!g.ptr_refreshing.peek());
-    // pull down 100 at the top (past the 80dp threshold; the first move past
-    // the top anchors the pull origin, the next one pulls)
+    // pull down 200 at the top (adjusted 100 > the 80dp threshold; the first
+    // move past the top anchors the pull origin, the next one pulls)
     const x = b.x + b.w / 2;
     const y0 = b.y + 40;
     router.dispatchPointer(g.root, .{ .phase = .down, .x = x, .y = y0 - sy, .raw_x = x, .raw_y = y0 - sy });
     router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 60 - sy, .raw_x = x, .raw_y = y0 + 60 - sy }); // anchor
-    router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 160 - sy, .raw_x = x, .raw_y = y0 + 160 - sy }); // pull 100
-    router.dispatchPointer(g.root, .{ .phase = .up, .x = x, .y = y0 + 160 - sy, .raw_x = x, .raw_y = y0 + 160 - sy });
+    router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 260 - sy, .raw_x = x, .raw_y = y0 + 260 - sy }); // pull 200
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = x, .y = y0 + 260 - sy, .raw_x = x, .raw_y = y0 + 260 - sy });
     try std.testing.expectEqual(@as(u32, 1), g.ptr_refresh.peek()); // on_refresh fired
     try std.testing.expect(g.ptr_refreshing.peek()); // the signal round-trips
     try std.testing.expect(pull_to_refresh_w.adjusted(ptr) > 0); // the indicator holds at rest
@@ -2684,8 +2684,8 @@ test "gallery: the M3E pull-to-refresh triggers on a pull past the threshold" {
     try std.testing.expectEqual(@as(f32, 0), pull_to_refresh_w.adjusted(ptr));
     router.dispatchPointer(g.root, .{ .phase = .down, .x = x, .y = y0 - sy, .raw_x = x, .raw_y = y0 - sy });
     router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 60 - sy, .raw_x = x, .raw_y = y0 + 60 - sy }); // anchor
-    router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 200 - sy, .raw_x = x, .raw_y = y0 + 200 - sy }); // pull 140
-    router.dispatchPointer(g.root, .{ .phase = .up, .x = x, .y = y0 + 200 - sy, .raw_x = x, .raw_y = y0 + 200 - sy });
+    router.dispatchPointer(g.root, .{ .phase = .move, .x = x, .y = y0 + 300 - sy, .raw_x = x, .raw_y = y0 + 300 - sy }); // pull 240
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = x, .y = y0 + 300 - sy, .raw_x = x, .raw_y = y0 + 300 - sy });
     try std.testing.expectEqual(@as(u32, 2), g.ptr_refresh.peek()); // the second pull fired too
     try std.testing.expect(g.ptr_refreshing.peek());
     g.ptr_refreshing.set(false);

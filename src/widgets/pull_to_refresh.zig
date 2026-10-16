@@ -6,12 +6,14 @@
 // Compose pulltorefresh/PullToRefresh.kt (PullToRefreshDefaults):
 //   - PositionalThreshold 80dp: the raw pull distance that triggers a refresh
 //   - DragMultiplier 0.5: the adjusted (indicator + content offset) distance
-//   - the indicator: a 40dp circle (SurfaceContainerHigh), the 16dp spinner
-//     (arc radius 5.5, stroke 2.5, OnSurfaceVariant), max sweep 0.8 (288°),
-//     alpha 0.3..1 by progress
-//   - releasing past the threshold fires onRefresh; while refreshing the
-//     indicator holds at rest (the content offset 40 = the fully visible
-//     indicator at the top)
+//   - the indicator: a 40dp circle (SurfaceContainerHigh, Level2 shadow);
+//     while pulling it shows the CircularArrowProgressIndicator — a
+//     butt-capped arc (ArrowValues: first 40% discarded, 0.8 max arc,
+//     rotation + tension) with a stroked 10x5dp arrowhead — and while
+//     refreshing the indeterminate 16dp CircularProgressIndicator
+//   - releasing with adjusted > 80dp (raw pull > 160) fires onRefresh;
+//     while refreshing the content holds at the 80dp offset and the
+//     indicator rests at the 40..80dp band (indicator bottom = adjusted)
 //
 // Behavior: a drag DOWN while the content is at scroll top pulls — the
 // content translates down by `adjusted = pull × 0.5` (paint/hit-time, like
@@ -44,12 +46,12 @@
 // and translated in pre_children_paint.
 //
 // v1 deviations (documented, fixed later):
-//   - The arc has no arrowhead (no triangle-fill primitive — the arc is a
-//     sampled round-capped polyline only) and no spin while refreshing (a
-//     static arc at progress 1 — the spin lands with the animation phase).
 //   - The at-scroll-top check looks at the DIRECT content child only (no
 //     nested-scroll coordination).
-//   - The M3E LoadingIndicator variant (2d.4) is a follow-up.
+//   - The M3E LoadingIndicator variant (ContainedLoadingIndicator — the
+//     alternate upstream indicator) is a follow-up.
+//   - The refreshing spinner runs the circular-indeterminate schedule from
+//     progress.zig (shared helpers), not a separate keyframe port.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -58,6 +60,7 @@ const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
 const scroll_view = @import("scroll_view.zig");
+const progress_w = @import("progress.zig");
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -75,13 +78,17 @@ pub const PullToRefreshOptions = struct {
 /// M3E measurement tokens (PullToRefreshDefaults + the private vals).
 const threshold: f32 = 80; // PositionalThreshold (raw pull → trigger)
 const drag_multiplier: f32 = 0.5;
-const resting: f32 = 40; // the resting adjusted offset = threshold × 0.5 (= SpinnerContainerSize)
-const indicator_d: f32 = 40; // SpinnerContainerSize
-const arc_radius: f32 = 5.5;
-const arc_stroke: f32 = 2.5;
-const max_sweep: f32 = 0.8; // × 360°
-const min_alpha: f32 = 0.3;
+const resting: f32 = 80; // the refreshing offset = thresholdPx (upstream: verticalOffset = thresholdPx while refreshing)
+const indicator_d: f32 = 40; // SpinnerContainerSize / IndicatorBox
+const indicator_elev: f32 = 3; // PullToRefreshDefaults.Elevation = Level2
+const arc_radius: f32 = 6.75; // ArcRadius 5.5 + StrokeWidth/2 (the arc centerline)
+const arc_stroke: f32 = 2.5; // StrokeWidth
+const arrow_w: f32 = 10; // ArrowWidth
+const arrow_h: f32 = 5; // ArrowHeight
+const max_progress_arc: f32 = 0.8; // MaxProgressArc (× 360°)
+const min_alpha: f32 = 0.3; // MinAlpha
 const arc_segments: usize = 24;
+const spinner_size: f32 = 16; // SpinnerSize (the refreshing spinner box)
 
 const Track = struct {
     pointer: u64 = 0,
@@ -100,6 +107,12 @@ const PtrState = struct {
     pulling: bool = false,
     track: Track = .{},
     anim_channel: u8 = 0, // channel marker (stable address)
+    // --- refreshing spinner clock (the indeterminate CircularProgressIndicator
+    // shown while refreshing — same schedule as progress.zig circular) ---
+    elapsed_ms: f64 = 0,
+    last_phase: f32 = 0,
+    spin_channel: u8 = 0, // channel marker (stable address)
+    spin_running: bool = false,
 };
 
 const Callback = ui.state.Callback;
@@ -187,6 +200,7 @@ fn ptrLayout(n: *Node, bounds: Rect) void {
     } else if (target != s.anim_to and !s.pulling) {
         animateAdjusted(n, s, target);
     }
+    if (s.sig.peek() and !s.spin_running) startSpin(n, s); // lazy retry (no timeline at attach)
 }
 
 fn ptrPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -194,13 +208,41 @@ fn ptrPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = ctx; // transparent: the content child paints (translated)
 }
 
+/// Upstream calculateVerticalOffset: the content offset is the adjusted
+/// pull up to the threshold, then a non-linear tension (capped at 2×).
+fn verticalOffset(adj: f32) f32 {
+    if (adj <= threshold) return adj;
+    const overshoot = @abs(adj / threshold) - 1;
+    const lt = std.math.clamp(overshoot, 0, 2);
+    return threshold + threshold * (lt - lt * lt / 4);
+}
+
+/// Upstream ArrowValues: the pull progress drives the arc rotation/sweep
+/// and the arrowhead scale.
+const ArrowValues = struct { rotation: f32, start: f32, end: f32, scale: f32 };
+fn arrowValues(progress: f32) ArrowValues {
+    const adjusted_p = @max(@min(1, progress) - 0.4, 0) * 5.0 / 3.0;
+    const overshoot = @abs(progress) - 1;
+    const lt = std.math.clamp(overshoot, 0, 2);
+    const tension = lt - lt * lt / 4;
+    const end_trim = adjusted_p * max_progress_arc;
+    const rotation = (-0.25 + 0.4 * adjusted_p + tension) * 0.5;
+    return .{
+        .rotation = rotation,
+        .start = rotation * 360,
+        .end = (rotation + end_trim) * 360,
+        .scale = @min(1, adjusted_p),
+    };
+}
+
 fn ptrPreChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     // clipRect pushes its own save — clipReset pops it, restoring the
     // enclosing clip (scroll view, damage rect) intact. The content is
-    // clipped to the container and translated down by the adjusted offset.
+    // clipped to the container and translated down by the tension-capped
+    // vertical offset.
     ui.paint.clipRect(ctx, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
-    ui.paint.translate(ctx, 0, s.adjusted);
+    ui.paint.translate(ctx, 0, verticalOffset(s.adjusted));
 }
 
 fn ptrPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -208,35 +250,66 @@ fn ptrPostChildrenPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const b = n.bounds;
-    if (s.adjusted <= 0.001) return;
-    const progress = @min(1, s.adjusted / resting);
-    // the indicator rides the content's top edge (its bottom = the edge)
+    const refreshing = s.sig.peek();
+    if (s.adjusted <= 0.001 and !refreshing) return;
+    const progress = s.adjusted / threshold; // upstream distanceFraction
+    // the IndicatorBox rides the pull: its bottom edge = adjusted distance
     const cx = b.x + b.w / 2;
     const edge_y = b.y + s.adjusted;
+    const acy = edge_y - indicator_d / 2; // the container's center y
     ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h); // saves
-    // the container: a 40dp circle (SurfaceContainerHigh)
+    // the container: a 40dp circle at Level2 elevation (upstream IndicatorBox)
+    ui.paint.elevationShadow(ctx, cx - indicator_d / 2, edge_y - indicator_d, indicator_d, indicator_d, indicator_d / 2, indicator_elev, t.colors.shadow);
     ui.paint.fillRRect(ctx, cx - indicator_d / 2, edge_y - indicator_d, indicator_d, indicator_d, indicator_d / 2, t.colors.surface_container_high);
-    // the arc: a 16dp spinner, clockwise from the top, sweep = progress × 288°
-    if (progress > 0.01) {
-        const alpha = min_alpha + (1 - min_alpha) * progress;
-        const color = ui.paint.withAlphaScaled(t.colors.on_surface_variant, alpha);
-        const sweep = progress * max_sweep * 2 * std.math.pi;
-        const acy = edge_y - indicator_d / 2; // the container's center y
+    if (refreshing) {
+        // upstream: CircularProgressIndicator (indeterminate) at SpinnerSize
+        // 16dp — the same keyframe schedule as progress.zig's circular
+        // indeterminate, at the PTR's 5.5+stroke/2 radius / 2.5 stroke.
+        const t_ms = @mod(@as(f32, @floatCast(s.elapsed_ms)), @as(f32, @floatFromInt(progress_w.circular_indet_ms)));
+        const sweep = @max(progress_w.circIndetProgress(t_ms) * 360, 0.1);
+        const rot = (t_ms / @as(f32, @floatFromInt(progress_w.circular_indet_ms))) * 1080 + progress_w.circAddRotation(t_ms);
         var xs: [arc_segments + 1]f32 = undefined;
         var ys: [arc_segments + 1]f32 = undefined;
-        var i: usize = 0;
-        while (i <= arc_segments) : (i += 1) {
-            const a = -std.math.pi / 2.0 + sweep * (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(arc_segments)));
-            xs[i] = cx + @cos(a) * arc_radius;
-            ys[i] = acy + @sin(a) * arc_radius;
+        const na = progress_w.arcPolyline(&xs, &ys, cx, acy, arc_radius, rot, sweep);
+        ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], arc_stroke, true, t.colors.on_surface_variant);
+    } else if (progress > 0.01) {
+        // upstream CircularArrowProgressIndicator: butt-capped arc +
+        // a stroked arrowhead at the leading end.
+        const v = arrowValues(progress);
+        const alpha: f32 = if (progress >= 1) 1 else min_alpha;
+        const color = ui.paint.withAlphaScaled(t.colors.on_surface_variant, alpha);
+        var xs: [arc_segments + 1]f32 = undefined;
+        var ys: [arc_segments + 1]f32 = undefined;
+        const na = progress_w.arcPolyline(&xs, &ys, cx, acy, arc_radius, v.start, v.end - v.start);
+        ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], arc_stroke, false, color);
+        // the arrowhead: an open triangle stroked at 2.5dp, placed at the
+        // arc's end and rotated about the center by (end - strokeWidth) deg
+        const sc = v.scale;
+        const lx = [3]f32{ 0, arrow_w * sc / 2, arrow_w * sc };
+        const ly = [3]f32{ 0, arrow_h * sc, 0 };
+        // translate: (cx + radius - inset, cy - strokeWidth); radius = the
+        // spinner box's half-size (8dp), inset = ArrowWidth*scale/2
+        const inset = arrow_w * sc / 2;
+        const ox = cx + spinner_size / 2 - inset;
+        const oy = acy - arc_stroke;
+        const rot_deg = (v.end - arc_stroke) * std.math.pi / 180;
+        const cosr = @cos(rot_deg);
+        const sinr = @sin(rot_deg);
+        var ax: [3]f32 = undefined;
+        var ay: [3]f32 = undefined;
+        for (0..3) |i| {
+            const px = ox + lx[i] - cx;
+            const py = oy + ly[i] - acy;
+            ax[i] = cx + px * cosr - py * sinr;
+            ay[i] = acy + px * sinr + py * cosr;
         }
-        ui.paint.strokePolyline(ctx, &xs, &ys, arc_stroke, true, color);
+        ui.paint.strokePolyline(ctx, &ax, &ay, arc_stroke, false, color);
     }
     ui.paint.clipReset(ctx); // restores
 }
 
 fn ptrMapPaintRect(n: *Node, r: Rect) Rect {
-    const dy = stateOf(n).adjusted;
+    const dy = verticalOffset(stateOf(n).adjusted);
     return .{ .x = r.x, .y = r.y + dy, .w = r.w, .h = r.h };
 }
 
@@ -245,7 +318,7 @@ fn ptrChildClip(n: *Node) Rect {
 }
 
 fn ptrPreChildrenHit(n: *Node, px: f32, py: f32) node_mod.HitPoint {
-    const dy = stateOf(n).adjusted;
+    const dy = verticalOffset(stateOf(n).adjusted);
     return .{ .x = px, .y = py - dy };
 }
 
@@ -307,9 +380,51 @@ fn ptrOnPointer(n: *Node, ev: input.PointerEvent) bool {
     return true;
 }
 
+/// The refreshing spinner clock: a looping 0..1 linear tween (the driving
+/// loop period); the update callback accumulates real elapsed time so the
+/// indeterminate schedule never drifts. Without a timeline it stays static.
+fn startSpin(n: *Node, s: *PtrState) void {
+    const tl = anim.timeline() orelse return;
+    _ = tl.play(.{
+        .kind = anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, progress_w.circular_indet_ms, .{ .ease = .linear }),
+        .from = .{ 0, 0, 0, 0 },
+        .channel = @ptrCast(&s.spin_channel),
+        .on_update = .{ .fn_ptr = spinUpdateCb, .userdata = n },
+        .on_complete = .{ .fn_ptr = spinLoopCb, .userdata = n },
+    });
+    s.spin_running = true;
+}
+
+fn stopSpin(n: *Node, s: *PtrState) void {
+    if (!s.spin_running) return;
+    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.spin_channel));
+    s.spin_running = false;
+    n.markDirtyRect(n.bounds);
+}
+
+fn spinUpdateCb(userdata: ?*anyopaque, value: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    var d = value[0] - s.last_phase;
+    if (d < 0) d += 1;
+    s.elapsed_ms += @as(f64, d) * @as(f64, @floatFromInt(progress_w.circular_indet_ms));
+    s.last_phase = value[0];
+    n.markDirtyRect(n.bounds);
+}
+
+fn spinLoopCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.spin_running = false;
+    if (s.sig.peek()) startSpin(n, s); // loop while refreshing
+}
+
 fn ptrDeinit(n: *Node) void {
     const s = stateOf(n);
-    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel));
+    if (anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.anim_channel));
+        tl.cancelChannel(@ptrCast(&s.spin_channel));
+    }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = ptrSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -365,7 +480,8 @@ fn ptrAnimCompleteCb(userdata: ?*anyopaque) void {
 /// The release: past the threshold → on_refresh + the refreshing signal (the
 /// sync animates to the resting offset); below → snap back.
 fn finishPull(n: *Node, s: *PtrState, pull: f32) void {
-    if (pull >= threshold) {
+    // upstream onRelease: adjustedDistancePulled (= pull × 0.5) > thresholdPx
+    if (pull * drag_multiplier > threshold) {
         if (s.on_refresh) |cb| cb.fn_ptr(cb.userdata);
         s.sig.set(true);
     } else {
@@ -378,6 +494,11 @@ fn finishPull(n: *Node, s: *PtrState, pull: f32) void {
 fn ptrSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
+    if (s.sig.peek()) {
+        if (s.laid_out) startSpin(n, s);
+    } else {
+        stopSpin(n, s);
+    }
     if (!s.laid_out or s.pulling) return;
     const target: f32 = if (s.sig.peek()) resting else 0;
     if (target != s.adjusted) animateAdjusted(n, s, target);
@@ -430,7 +551,7 @@ test "pull_to_refresh: measures/layouts like its content (fills the parent)" {
     try std.testing.expectEqual(@as(f32, 0), adjusted(ptr)); // hidden
 }
 
-test "pull_to_refresh: a drag down at scroll top pulls; release past 80 triggers; below snaps back" {
+test "pull_to_refresh: a drag down at scroll top pulls; release past the adjusted threshold triggers; below snaps back" {
     var fired: u32 = 0;
     const cb = Callback{ .fn_ptr = refreshCounterCb, .userdata = &fired };
     var router = input.InputRouter{};
@@ -453,12 +574,20 @@ test "pull_to_refresh: a drag down at scroll top pulls; release past 80 triggers
     try std.testing.expectEqual(@as(f32, 0), adjusted(ptr)); // snapped back
     try std.testing.expectEqual(@as(u32, 0), fired);
     try std.testing.expect(!refreshing.peek());
-    // a long pull (100 ≥ 80): triggers
+    // a pull of 100 → adjusted 50 < 80: still no trigger (upstream compares
+    // the ADJUSTED distance to the 80dp threshold)
     router.dispatchPointer(ptr, .{ .phase = .down, .x = 50, .y = 100, .raw_x = 50, .raw_y = 100 });
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 130, .raw_x = 50, .raw_y = 130 }); // anchor
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 230, .raw_x = 50, .raw_y = 230 }); // pull 100
     try std.testing.expectEqual(@as(f32, 50), adjusted(ptr)); // 100 × 0.5
     router.dispatchPointer(ptr, .{ .phase = .up, .x = 50, .y = 230, .raw_x = 50, .raw_y = 230 });
+    try std.testing.expectEqual(@as(u32, 0), fired);
+    // a pull of 200 → adjusted 100 > 80: triggers
+    router.dispatchPointer(ptr, .{ .phase = .down, .x = 50, .y = 100, .raw_x = 50, .raw_y = 100 });
+    router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 130, .raw_x = 50, .raw_y = 130 }); // anchor
+    router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 330, .raw_x = 50, .raw_y = 330 }); // pull 200
+    try std.testing.expectEqual(@as(f32, 100), adjusted(ptr)); // 200 × 0.5
+    router.dispatchPointer(ptr, .{ .phase = .up, .x = 50, .y = 330, .raw_x = 50, .raw_y = 330 });
     try std.testing.expectEqual(@as(u32, 1), fired); // on_refresh fired
     try std.testing.expect(refreshing.peek()); // the signal round-trips
     try std.testing.expectEqual(resting, adjusted(ptr)); // held at rest
@@ -529,29 +658,30 @@ test "golden: the indicator paints the container circle + the arc; the content t
     defer input.setCurrent(null);
     const ptr = try ptrWithScroll(a, refreshing, null);
     defer ptr.deinit();
-    // pull 40 → adjusted 20: the indicator's bottom rides the content's top
-    // edge (y = 10 + 20 = 30), the container spans y = -10..30 (clipped to 10)
+    // pull 100 → adjusted 50: progress = 50/80 = 0.625 (above the arrow
+    // indicator's 0.4 floor). The indicator's bottom rides the pull edge
+    // (y = 10 + 50 = 60), the container spans y = 20..60, center (60, 40)
     ptr.layout(.{ .x = 10, .y = 10, .w = 100, .h = 200 });
     router.dispatchPointer(ptr, .{ .phase = .down, .x = 60, .y = 100, .raw_x = 60, .raw_y = 100 });
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 60, .y = 120, .raw_x = 60, .raw_y = 120 }); // anchor
-    router.dispatchPointer(ptr, .{ .phase = .move, .x = 60, .y = 160, .raw_x = 60, .raw_y = 160 }); // pull 40
+    router.dispatchPointer(ptr, .{ .phase = .move, .x = 60, .y = 220, .raw_x = 60, .raw_y = 220 }); // pull 100
     var r = try golden.Renderer.init(a, 120, 220);
     defer r.deinit();
     r.paint(ptr, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
     // the container circle (surface_container_high) at the top-center
-    // (cx = 60, the container's center y = 10 + 20 - 20 = 10): inside it
-    try std.testing.expectEqual(t.colors.surface_container_high, f.pixelAt(60, 10));
-    // the arc ink (on_surface_variant @ partial alpha — blended over the
-    // container, so not the exact role color) inside the container
-    try std.testing.expect(f.countNotIn(.{ .x = 52, .y = 2, .w = 16, .h = 16 }, t.colors.surface_container_high) > 0);
-    // the content translated down by 20: the red content starts at y = 30
-    try std.testing.expectEqual(@as(Color, 0xFF0000FF), f.pixelAt(60, 40));
+    try std.testing.expectEqual(t.colors.surface_container_high, f.pixelAt(60, 40));
+    // the arrow-indicator ink inside the container (blended over it, so not
+    // the exact role color)
+    try std.testing.expect(f.countNotIn(.{ .x = 52, .y = 32, .w = 16, .h = 16 }, t.colors.surface_container_high) > 0);
+    // the content translated down by the vertical offset (50 < 80 → 50):
+    // the red content starts at y = 60
+    try std.testing.expectEqual(@as(Color, 0xFF0000FF), f.pixelAt(60, 70));
     // left of the container (x = 20 is outside the 40dp circle), above the
     // content: untouched background
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(20, 25));
-    router.dispatchPointer(ptr, .{ .phase = .up, .x = 60, .y = 140, .raw_x = 60, .raw_y = 140 });
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(20, 45));
+    router.dispatchPointer(ptr, .{ .phase = .up, .x = 60, .y = 220, .raw_x = 60, .raw_y = 220 });
 }
 
 test "pull_to_refresh: a drag that scrolls to the top first does not count the scrolled distance as pull" {
@@ -634,9 +764,9 @@ test "pull_to_refresh: a pull starting over a button still triggers (the release
     router.dispatchPointer(ptr, .{ .phase = .down, .x = 25, .y = 20, .raw_x = 25, .raw_y = 20 });
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 25, .y = 120, .raw_x = 25, .raw_y = 120 }); // the button cancels; the PTR's track self-heals
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 25, .y = 220, .raw_x = 25, .raw_y = 220 }); // anchor: the capture is stolen
-    router.dispatchPointer(ptr, .{ .phase = .move, .x = 25, .y = 320, .raw_x = 25, .raw_y = 320 }); // pull 100
-    try std.testing.expectEqual(@as(f32, 50), adjusted(ptr));
-    router.dispatchPointer(ptr, .{ .phase = .up, .x = 25, .y = 320, .raw_x = 25, .raw_y = 320 });
+    router.dispatchPointer(ptr, .{ .phase = .move, .x = 25, .y = 420, .raw_x = 25, .raw_y = 420 }); // pull 200
+    try std.testing.expectEqual(@as(f32, 100), adjusted(ptr));
+    router.dispatchPointer(ptr, .{ .phase = .up, .x = 25, .y = 420, .raw_x = 25, .raw_y = 420 });
     try std.testing.expectEqual(@as(u32, 1), fired); // the refresh fired
     try std.testing.expectEqual(@as(u32, 0), btn_fired); // the button's click was canceled
     try std.testing.expect(refreshing.peek());
@@ -667,10 +797,10 @@ test "pull_to_refresh: a fresh gesture cancels the in-flight snap-back spring" {
     // a new pull before the spring settles: the down cancels the spring
     router.dispatchPointer(ptr, .{ .phase = .down, .x = 50, .y = 100, .raw_x = 50, .raw_y = 100 });
     router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 130, .raw_x = 50, .raw_y = 130 }); // anchor
-    router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 230, .raw_x = 50, .raw_y = 230 }); // pull 100
-    try std.testing.expectEqual(@as(f32, 50), adjusted(ptr));
+    router.dispatchPointer(ptr, .{ .phase = .move, .x = 50, .y = 330, .raw_x = 50, .raw_y = 330 }); // pull 200
+    try std.testing.expectEqual(@as(f32, 100), adjusted(ptr));
     tl.tick(50); // the canceled spring must not overwrite the new pull
-    try std.testing.expectEqual(@as(f32, 50), adjusted(ptr));
-    router.dispatchPointer(ptr, .{ .phase = .up, .x = 50, .y = 230, .raw_x = 50, .raw_y = 230 });
-    try std.testing.expect(refreshing.peek()); // 100 ≥ 80 → triggered
+    try std.testing.expectEqual(@as(f32, 100), adjusted(ptr));
+    router.dispatchPointer(ptr, .{ .phase = .up, .x = 50, .y = 330, .raw_x = 50, .raw_y = 330 });
+    try std.testing.expect(refreshing.peek()); // adjusted 100 > 80 → triggered
 }
