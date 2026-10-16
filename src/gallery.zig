@@ -3129,7 +3129,6 @@ test "zz2: slider value changes must not leave ghost thumbs" {
         if (is_thumb and !in_run) { runs += 1; in_run = true; }
         if (!is_thumb) in_run = false;
     }
-    std.debug.print("slider bounds=({d:.0},{d:.0} {d:.0}x{d:.0}) primary-runs={d}\n", .{ sb.x, sb.y, sb.w, sb.h, runs });
     try std.testing.expectEqual(@as(u32, 1), runs); // exactly one thumb bar
 }
 

@@ -38,7 +38,7 @@ Port contract per widget:
 | icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | **ported** |
 | list_item | ListItem.kt | ListTokens | pending |
 | loading_indicator | LoadingIndicator.kt | LoadingIndicatorTokens | **ported** |
-| menu | Menu.kt | MenuTokens, StandardMenuTokens | pending |
+| menu | Menu.kt | MenuTokens, StandardMenuTokens | **ported** |
 | nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |
 | navigation_rail | NavigationRail.kt | NavigationRailTokens | **ported** |
 | progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-LinearWavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | ported |

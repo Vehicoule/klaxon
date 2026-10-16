@@ -35,6 +35,7 @@
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const anim = ui.anim;
 const input = @import("../ui/input.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -65,10 +66,14 @@ pub const MenuOptions = struct {
 const item_h: f32 = 48; // MenuListItemContainerHeight
 const item_h_pad: f32 = 12; // DropdownMenuItemHorizontalPadding
 const icon_size: f32 = 24;
-const icon_gap: f32 = 16; // LeadingContentEndPadding
-const trail_gap: f32 = 8;
+const icon_gap: f32 = 12; // icon→label (DropdownMenuItemHorizontalPadding, icon present)
+const trail_gap: f32 = 12; // label→trailing (DropdownMenuItemHorizontalPadding, trailing present)
+const item_min_w: f32 = 112; // DropdownMenuItemDefaultMinWidth
+const item_max_w: f32 = 280; // DropdownMenuItemDefaultMaxWidth
+const menu_h_margin: f32 = 8; // MenuHorizontalMargin — min inset to the window edge
 const panel_v_pad: f32 = 8; // DropdownMenuVerticalPadding
 const panel_radius: f32 = 4; // CornerExtraSmall
+const open_ms: u32 = 150; // scale 0.8→1 + alpha 0→1 (Menu.kt open anim)
 
 const ItemDef = struct {
     label: [:0]const u8, // owned
@@ -89,6 +94,11 @@ const MenuState = struct {
     pressed_index: i32 = -1,
     /// The last selected index (pub accessor `selectedIndex`).
     selected: usize = 0,
+    /// Open/close animation progress: 0..1 lerps scale 0.8→1 and alpha
+    /// (upstream ExpandedScaleTarget/ClosedScaleTarget).
+    open_progress: f32 = 0,
+    open_target: f32 = 0,
+    open_channel: u8 = 0, // channel marker (stable address)
 };
 
 fn stateOf(n: *Node) *MenuState {
@@ -103,22 +113,25 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
     return buf[0..str.len :0];
 }
 
-/// The panel width: the widest item's content + paddings.
+/// The panel width: the widest item's content + paddings, clamped to the
+/// upstream item band [DropdownMenuItemDefaultMinWidth 112,
+/// DropdownMenuItemDefaultMaxWidth 280].
 fn panelWidth(s: *MenuState, t: Theme) f32 {
     var w: f32 = 0;
     for (s.items.items) |def| {
-        var cw = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.body_large.size, false).width;
+        var cw = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.label_large.size, false).width;
         if (def.leading_icon != null) cw += icon_size + icon_gap;
         if (def.trailing_text.len > 0) cw += trail_gap + ui.paint.measureText(def.trailing_text, t.type_scale.label_small.size, false).width;
         w = @max(w, cw);
     }
-    return w;
+    return @min(@max(w, item_min_w), item_max_w);
 }
 
-/// The panel width clamped to the window: a long label must not push the
-/// panel offscreen. The available width runs from the panel's start edge to
-/// the root's end (RTL: the window's start to the panel's end edge). A
-/// standalone menu (no parent — tests/goldens) is unclamped.
+/// The panel width clamped to the window (MenuHorizontalMargin 8 from the
+/// screen edge): a long label must not push the panel offscreen. The
+/// available width runs from the panel's start edge to the root's end
+/// (RTL: the window's start to the panel's end edge). A standalone menu
+/// (no parent — tests/goldens) is unclamped.
 fn panelWidthFit(n: *Node, s: *MenuState, t: Theme, bounds: Rect) f32 {
     const pw = panelWidth(s, t);
     const parent = n.parent orelse return pw;
@@ -126,8 +139,8 @@ fn panelWidthFit(n: *Node, s: *MenuState, t: Theme, bounds: Rect) f32 {
     while (root.parent) |p| root = p;
     const rtl = ui.i18n.direction() == .rtl;
     const px = if (rtl) bounds.x + bounds.w - pw else bounds.x;
-    const avail = if (rtl) px else root.bounds.w - px;
-    return @min(pw, @max(avail, 0));
+    const avail = if (rtl) px - root.bounds.x else root.bounds.x + root.bounds.w - px;
+    return @min(pw, @max(avail - menu_h_margin, 0));
 }
 
 /// Damage covers the anchor AND the item rows: the panel paints below the
@@ -139,12 +152,48 @@ fn markMenuDirty(n: *Node) void {
     n.markDirtyRect(region);
 }
 
+/// Drive the open animation (scale+alpha); snaps without a timeline.
+fn retargetOpen(n: *Node, s: *MenuState, target: f32) void {
+    if (target == s.open_target) return;
+    s.open_target = target;
+    if (anim.timeline()) |tl| {
+        _ = tl.play(.{
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, open_ms, .{ .ease = .standard }),
+            .from = .{ s.open_progress, 0, 0, 0 },
+            .channel = @ptrCast(&s.open_channel),
+            .on_update = .{ .fn_ptr = openAnimCb, .userdata = n },
+            .on_complete = .{ .fn_ptr = openDoneCb, .userdata = n },
+        });
+    } else {
+        s.open_progress = target;
+        if (target == 0) hideRows(n, s);
+        markMenuDirty(n);
+    }
+}
+
+fn openAnimCb(userdata: ?*anyopaque, v: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).open_progress = v[0];
+    markMenuDirty(n);
+}
+
+fn openDoneCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (s.open_target == 0) hideRows(n, s); // faded out: drop the rows
+}
+
+fn hideRows(n: *Node, s: *MenuState) void {
+    _ = s;
+    for (n.children.items[1..]) |child| child.setVisible(false);
+}
+
 /// Apply the open state (the single transition path — the signal and the
 /// programmatic setOpen both land here).
 fn applyOpen(n: *Node, s: *MenuState, open: bool) void {
     if (s.open == open) return;
     s.open = open;
-    for (n.children.items[1..]) |child| child.setVisible(open); // [0] = anchor
+    if (open) for (n.children.items[1..]) |child| child.setVisible(true); // fade in from 0
     s.highlight = -1;
     s.pressed_index = -1;
     markMenuDirty(n);
@@ -158,6 +207,7 @@ fn applyOpen(n: *Node, s: *MenuState, open: bool) void {
         // dangle across a tree rebuild (unlike a captured prev focus).
         input.requestFocus(s.anchor);
     }
+    retargetOpen(n, s, if (open) 1 else 0);
 }
 
 fn menuSyncCb(userdata: ?*anyopaque) void {
@@ -215,10 +265,10 @@ fn itemMeasure(n: *Node, c: Constraints) Size {
     const ms = stateOf(s.owner);
     const t = ms.opts.theme;
     const def = ms.items.items[s.def_index];
-    var w = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.body_large.size, false).width;
+    var w = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.label_large.size, false).width;
     if (def.leading_icon != null) w += icon_size + icon_gap;
     if (def.trailing_text.len > 0) w += trail_gap + ui.paint.measureText(def.trailing_text, t.type_scale.label_small.size, false).width;
-    return c.constrain(.{ .w = w, .h = item_h });
+    return c.constrain(.{ .w = @min(@max(w, item_min_w), item_max_w), .h = item_h });
 }
 
 fn itemLayout(n: *Node, bounds: Rect) void {
@@ -262,11 +312,11 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, theme_mod.stateLayer(cs.surface_container, cs.on_surface, alpha));
         }
     }
-    // the label (vertically centered)
-    const lm = ui.paint.measureText(def.label, t.type_scale.body_large.size, false);
+    // the label (vertically centered, upstream ProvideTextStyle labelLarge)
+    const lm = ui.paint.measureText(def.label, t.type_scale.label_large.size, false);
     const label_x = b.x + item_h_pad + (if (def.leading_icon != null) icon_size + icon_gap else 0);
     const label_y = b.y + (b.h - lm.height) / 2 + lm.ascent;
-    ui.paint.text(ctx, def.label, mx(b.x, b.w, label_x, lm.width, rtl), label_y, t.type_scale.body_large.size, false, label_col);
+    ui.paint.text(ctx, def.label, mx(b.x, b.w, label_x, lm.width, rtl), label_y, t.type_scale.label_large.size, false, label_col);
     // the leading icon (start side, vertically centered)
     if (def.leading_icon) |iname| {
         const ix = mx(b.x, b.w, b.x + item_h_pad, icon_size, rtl);
@@ -367,17 +417,39 @@ fn menuPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = ctx;
 }
 
+/// Upstream calculateTransformOrigin: the scale pivot = the horizontal
+/// center of the anchor∩panel intersection (0/1 when disjoint); a
+/// below-anchor menu pivots on its top edge.
+fn transformOriginX(b: Rect, px: f32, pw: f32) f32 {
+    if (px >= b.x + b.w) return px; // panel starts at the anchor's end
+    if (px + pw <= b.x) return px + pw;
+    const lo = @max(b.x, px);
+    const hi = @min(b.x + b.w, px + pw);
+    return (lo + hi) / 2;
+}
+
 /// The popup overlay pass (the host paints the open popup after the tree):
 /// the panel + the visible item rows, above any later sibling.
 fn menuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
-    if (!s.open) return;
+    if (!s.open and s.open_progress <= 0) return;
     const t = s.opts.theme;
     const b = n.bounds;
     const pw = panelWidthFit(n, s, t, b);
     const ph = panel_v_pad * 2 + @as(f32, @floatFromInt(s.items.items.len)) * item_h;
     const rtl = ui.i18n.direction() == .rtl;
     const px = if (rtl) b.x + b.w - pw else b.x;
+    // the open animation: scale 0.8→1 from the anchor's overlap center +
+    // fade 0→1 (upstream ExpandedScaleTarget/ExpandedAlphaTarget)
+    const p = std.math.clamp(s.open_progress, 0, 1);
+    const sc = 0.8 + 0.2 * p;
+    const ox = transformOriginX(b, px, pw);
+    const oy = b.y + b.h; // top edge of the panel
+    ui.paint.save(ctx);
+    ui.paint.translate(ctx, ox, oy);
+    ui.paint.scale(ctx, sc, sc);
+    ui.paint.translate(ctx, -ox, -oy);
+    ui.paint.layerAlpha(ctx, p);
     // M3 menu elevation = 2dp.
     ui.paint.elevationShadow(ctx, px, b.y + b.h, pw, ph, panel_radius, 2,
         t.colors.shadow);
@@ -385,6 +457,8 @@ fn menuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     for (n.children.items[1..]) |child| { // [0] = the anchor
         if (child.visible) itemPaint(child, ctx);
     }
+    ui.paint.restore(ctx); // layer alpha
+    ui.paint.restore(ctx); // own save
 }
 
 fn menuOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -432,6 +506,7 @@ fn menuOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 fn menuDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.open_channel));
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = menuSyncCb, .userdata = n } });
     // Node.deinit calls input.releaseNode(n) FIRST: it clears the router's
     // open_popup only when it still points to THIS node. No unconditional
@@ -586,14 +661,16 @@ test "menu: measures like the anchor; lays the panel out below it (start-aligned
     try std.testing.expectEqual(item_h, item0.bounds.h);
     const item1 = m.children.items[2];
     try std.testing.expectEqual(@as(f32, 200 + 40 + 8 + 48), item1.bounds.y);
-    // the panel width = the widest item (icon + label + trailing text)
+    // the panel width = the widest item (icon + label + trailing text),
+    // clamped to the upstream [112, 280] item band
     const t = theme_mod.light;
-    const w_copy = item_h_pad * 2 + ui.paint.measureText("Copy", 16, false).width;
-    const w_paste = item_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Paste", 16, false).width;
-    const w_delete = item_h_pad * 2 + ui.paint.measureText("Delete", 16, false).width + trail_gap + ui.paint.measureText("Del", 11, false).width;
-    const expect_w = @max(w_copy, @max(w_paste, w_delete));
+    const ls = t.type_scale.label_large.size;
+    const ts = t.type_scale.label_small.size;
+    const w_copy = item_h_pad * 2 + ui.paint.measureText("Copy", ls, false).width;
+    const w_paste = item_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Paste", ls, false).width;
+    const w_delete = item_h_pad * 2 + ui.paint.measureText("Delete", ls, false).width + trail_gap + ui.paint.measureText("Del", ts, false).width;
+    const expect_w = @min(@max(@max(w_copy, @max(w_paste, w_delete)), item_min_w), item_max_w);
     try std.testing.expectApproxEqAbs(expect_w, item0.bounds.w, 0.001);
-    _ = t;
 }
 
 test "menu: open/close via the signal; item click selects + closes; keyboard nav" {
@@ -677,10 +754,11 @@ test "menu: the panel width is clamped to the window (a long label stays onscree
     win.add(m);
     defer win.deinit();
     win.layout(.{ .x = 0, .y = 0, .w = 200, .h = 400 });
-    // the intrinsic width (~324) exceeds the window: the panel is clamped to
-    // the width available from its start edge to the window's end
+    // the intrinsic width (clamped to 280 max) exceeds the window: the panel
+    // is clamped to the width available from its start edge to the window's
+    // end minus the upstream 8dp MenuHorizontalMargin
     const intrinsic = panelWidth(stateOf(m), theme_mod.light);
-    const avail = 200 - m.bounds.x;
+    const avail = 200 - m.bounds.x - menu_h_margin;
     try std.testing.expect(intrinsic > avail); // the label is really too wide
     const item0 = m.children.items[1];
     try std.testing.expectEqual(@min(intrinsic, avail), item0.bounds.w);
