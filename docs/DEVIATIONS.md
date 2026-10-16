@@ -18,10 +18,15 @@ code; don't patch it").
 | WASM without generated font header linked a silently empty font manager | runtime diagnostic in `platform_font_mgr` (`66e2b1e`) |
 | Outlined text-field cutout = surface-colored patch over the stroke (wrong on non-surface backgrounds) | `kx_clip_rect_diff` (ABI 0.20.0, `SkClipOp::kDifference`) — the border gets a real hole (`cfc8828`) |
 | `gpu_begin_offscreen`/`gpu_end_offscreen` stubs on iOS → `kx_gpu_warmup` silently no-op'd | ported the macOS Graphite warmup implementation verbatim |
+| Signal/Memo/TextSignal `deinit` twice during `notify` → duplicate zombie → double-free; TextSignal freed its buffer before the deferred gate → subscriber UAF | `dying`-first guard + buffer freed inside the deferred destroy (`91a6817`, regression tests) |
+| `listView`/`gridView` inside `scrollView` measured `h=inf` → `@intFromFloat` panic on first paint | unbounded height now reports natural content height + `isFinite` guard at the cast (`91a6817`) |
+| Carousel `@intFromFloat` panics on crafted options (`spacing == -item_width`, non-finite viewport, ratio > u32); `snapOffset` could hang on a denormal stride | guards + ratio clamps; snap candidates bounded by the item count (`cd0c8b3`) |
+| `scroll.visibleRange` panicked on denormal strides; `mapPointToParentSpace` truncated ancestors past 64; `flex_total` u32 overflow; damage `present_rect` could land 1px outside the pixel surface (desynced upload pitch); `kx_fill/stroke_path` trusted verb/point agreement across the ABI; navigator hero back-pointer UAF on view deinit; `KLAXON_DPR=inf` → non-finite display scale | all hardened (`cd0c8b3`) |
+| Node-bound signal subscriptions were convention-only (a missed `unsubscribe` = `.node` markDirty UAF) | `Node.bound_signals` + `state.unbindAll` in `deinitBody`; `SignalBase.detachBoundNodes` for the signal-dies-first ordering (`978c909`) |
+| Theme `platform.hit_target_min` / `control_height` / `motion.durations` populated but unread — a custom theme silently did nothing | wired into 27 files (`8b6618d`); `Shadow`/`Elevation`/`Spacing` documented reference-only (widgets raster via SkShadowUtils) |
 
 ## Open — needs design work, not a one-liner
 
-- **`theme.state`/`spacing`/`elevation`/`motion.durations`/`platform.*` tables** — populated + tested but read by few widgets (wiring in progress; `platform.scrollbar_*`/`cursors`/`focus_ring_*` already live). `theme.elevation`'s `{dy,blur,alpha}` model is incompatible with the SkShadowUtils parametric path — reference-only by design.
 - **ATK action callbacks run on the a11y thread** (`kx_a11y_linux.cpp:384-390,420-424`) — `grab_focus`/`do_action` walk the Zig node tree while the render thread owns it. The header documents the window; the real fix is marshalling through an SDL user event — deferred to a dedicated a11y-threading task.
 - **`AtkValue` reports a fixed 0–100 range** (`kx_a11y_linux.cpp:453-456`) — currently *correct*: every numeric role emits a percent string (`slider` formats `{d:.0}%`). Latent trap only if a widget ever reports non-percent values; the fix is carrying min/max in the Semantics struct + dump.
 - **`optionsFromValue` ignores unknown option keys** (`src/ui/value.zig:321`) — a typo'd serialized field silently renders defaults. Deliberate forward-compat choice (new fields don't break old docs); could grow a strict/diagnostic mode later.
