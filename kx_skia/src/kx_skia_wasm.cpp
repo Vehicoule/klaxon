@@ -14,6 +14,7 @@
 #include "kx_skia_platform.h"
 
 #include <SDL3/SDL.h>
+#include <cstdio> // fprintf (missing-font diagnostic)
 
 #include <GLES3/gl32.h> // emscripten sysroot (WebGL2); glBindFramebuffer
 
@@ -415,6 +416,15 @@ sk_sp<SkFontMgr> platform_font_mgr() {
         if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Embedded(&header)) {
             return mgr;
         }
+    }
+    // No embedded font: every text entry point still succeeds but shapes
+    // zero glyphs — a silent blank-text artifact. Emit one runtime
+    // diagnostic so a prebuilt shim doesn't hide the missing codegen.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        fprintf(stderr,
+            "kx_skia: no embedded font (run scripts/fetch-deps.sh web-wasm) — text renders empty\n");
     }
     return SkFontMgr_New_Custom_Empty();
 }

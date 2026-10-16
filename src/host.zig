@@ -177,6 +177,10 @@ pub const Host = struct {
     /// path): only that region needs the readback + texture upload. null =
     /// full surface (full repaint, overlays, or GPU backend).
     present_rect: ?sdl.c.SDL_Rect,
+    /// Set when SDL_UpdateTexture fails mid-present: the texture keeps stale
+    /// pixels for the damaged region, so the NEXT frame takes the
+    /// full-repaint path (self-heals) instead of trusting partial damage.
+    present_failed: bool = false,
     /// Mobile: window size in pixels (SDL_GetWindowSizeInPixels). The kx
     /// canvas is pixel-sized; width/height stay in points (dp) — the
     /// layout space.
@@ -850,6 +854,10 @@ pub const Host = struct {
         const raster = kx.c.kx_backend_of(host.ctx) == kx.c.KX_BACKEND_RASTER;
         const focus = semantics_mod.currentFocus();
         host.present_rect = null; // full present unless the damage path narrows it
+        // A failed upload forces ONE full repaint; if it presents clean the
+        // damage path resumes (persistent failures re-arm every frame).
+        const recover_present = host.present_failed;
+        host.present_failed = false;
         // The repaint region (root space = points): the traversal culls any
         // subtree that can't reach it — off-surface content costs nothing.
         const surface = ui.node.Rect{
@@ -863,7 +871,7 @@ pub const Host = struct {
         // retained old overlay pixels (ghosting). Force a full repaint when
         // the overlay (or the inspector panel) is enabled so the panel area
         // is cleared first.
-        if (raster and root.damage_valid and !host.devtools.enabled and !host.inspector.enabled) {
+        if (raster and root.damage_valid and !host.devtools.enabled and !host.inspector.enabled and !recover_present) {
             // Repaint the tree clipped to the damaged region — and clear the
             // clip first (SkCanvas::clear is clip-aware): vacated pixels
             // (moving widgets) are erased, not trailed. The focus ring paints
@@ -1379,6 +1387,19 @@ pub const Host = struct {
         host.display_scale = displayScaleOf(host.window, host.width, host.pixel_width);
     }
 
+    /// One-shot diagnostic for a failed texture upload — a persistent
+    /// failure shouldn't spam per frame, and a transient one self-heals via
+    /// present_failed.
+    fn logPresentFailOnce() void {
+        const S = struct {
+            var logged: bool = false;
+        };
+        if (!S.logged) {
+            S.logged = true;
+            std.debug.print("klaxon: SDL_UpdateTexture failed: {s}\n", .{sdl.c.SDL_GetError()});
+        }
+    }
+
     fn present(host: *Host) void {
         // Frame timeline (Phase 4a.4): the raster present splits into submit
         // (readback + texture update + render-to-queue) and present (the
@@ -1399,7 +1420,12 @@ pub const Host = struct {
                     if (need <= host.pixels.len and
                         kx.c.kx_readback_rgba_rect(host.ctx, host.pixels.ptr, need, r.x, r.y, r.w, r.h))
                     {
-                        _ = sdl.c.SDL_UpdateTexture(t, &r, host.pixels.ptr, r.w * 4);
+                        if (!sdl.c.SDL_UpdateTexture(t, &r, host.pixels.ptr, r.w * 4)) {
+                            // Stale texels in the damage rect: force the next
+                            // frame onto the full-repaint path (once, logged).
+                            host.present_failed = true;
+                            logPresentFailOnce();
+                        }
                     }
                 }
                 if (host.renderer) |r2| {
@@ -1413,7 +1439,10 @@ pub const Host = struct {
                 return;
             }
             if (kx.c.kx_readback_rgba(host.ctx, host.pixels.ptr, host.pixels.len, &w, &h)) {
-                _ = sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.pixel_width * 4);
+                if (!sdl.c.SDL_UpdateTexture(t, null, host.pixels.ptr, host.pixel_width * 4)) {
+                    host.present_failed = true;
+                    logPresentFailOnce();
+                }
                 if (host.renderer) |r| {
                     _ = sdl.c.SDL_RenderTexture(r, t, null, null);
                     const t_submit = sdl.c.SDL_GetTicksNS();

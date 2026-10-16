@@ -152,6 +152,18 @@ fn sbHasPendingCb(userdata: ?*anyopaque) bool {
     return s.hide_deadline != null;
 }
 
+/// Register the offset-tracker ticker (once). Lazy: a scrollbar built before
+/// the host installs its timeline registers at the first paint instead of
+/// permanently losing thumb tracking (same retry pattern as the snackbar's
+/// registerTicker / the gesture detector's pointer-down retry).
+fn ensureTicker(s: *ScrollbarState) void {
+    if (s.ticker != null) return;
+    const tl = anim.timeline() orelse return;
+    const t = anim.Timeline.Ticker{ .fn_ptr = sbTickCb, .userdata = s, .has_pending = sbHasPendingCb };
+    tl.addTicker(t);
+    s.ticker = t;
+}
+
 fn thumbRect(s: *const ScrollbarState, b: Rect) Rect {
     const info = s.opts.scroll.vtable.scroll_info.?(s.opts.scroll);
     const track_h = b.h;
@@ -175,6 +187,7 @@ fn scrollbarLayout(n: *Node, bounds: Rect) void {
 }
 fn scrollbarPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(ScrollbarState, n);
+    ensureTicker(s); // thumb tracking starts when the bar is on screen
     const info = s.opts.scroll.vtable.scroll_info.?(s.opts.scroll);
     if (!info.canScroll()) return; // nothing to scroll: no thumb
     const style = styleOf(s);
@@ -340,11 +353,7 @@ pub fn scrollbar(allocator: std.mem.Allocator, opts: ScrollbarOptions) !*Node {
     // Track the scrollable's offset: the thumb repaints when it moves.
     // (The scrollbar must not outlive its scrollable — the ticker borrows it,
     // same convention as the dropdown's borrowed menu-item labels.)
-    if (anim.timeline()) |tl| {
-        const t = anim.Timeline.Ticker{ .fn_ptr = sbTickCb, .userdata = s, .has_pending = sbHasPendingCb };
-        tl.addTicker(t);
-        s.ticker = t;
-    }
+    ensureTicker(s);
     node.state = s;
     return node;
 }

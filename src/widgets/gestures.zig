@@ -43,6 +43,23 @@ fn arenaHasPendingCb(userdata: ?*anyopaque) bool {
     return arena.hasPendingTimeWork();
 }
 
+/// Register the arena as a timeline ticker (once — the ticker matters only
+/// while a pointer is held). Lazy: a detector built before the host installs
+/// its timeline registers on the first pointer down instead of silently
+/// losing deadline-driven long-press (same retry pattern as the snackbar's
+/// registerTicker / progress's layout retry).
+fn ensureTicker(s: *DetectorState) void {
+    if (s.ticker != null) return;
+    const tl = anim.timeline() orelse return;
+    const t = anim.Timeline.Ticker{
+        .fn_ptr = arenaTickCb,
+        .userdata = &s.arena,
+        .has_pending = arenaHasPendingCb,
+    };
+    tl.addTicker(t);
+    s.ticker = t;
+}
+
 fn detectorMeasure(n: *Node, c: Constraints) Size {
     var size = Size{};
     if (n.children.items.len > 0) size = n.children.items[0].measure(c);
@@ -58,6 +75,7 @@ fn detectorPaint(n: *Node, ctx: *kx.Ctx) void {
 }
 fn detectorOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(DetectorState, n);
+    if (ev.phase == .down) ensureTicker(s); // the deadline clock is needed now
     // Gestures are physical-finger semantics: feed the arena window-space
     // coordinates — a scrollable scrolling under a held finger must not
     // corrupt pan deltas, velocity or pinch distances.
@@ -92,15 +110,7 @@ pub fn gestureDetector(allocator: std.mem.Allocator, opts: GestureDetectorOption
     // Register the arena as a timeline ticker: long-press fires precisely at
     // the threshold (the host ticks the timeline every loop iteration), and
     // has_pending lets the host bound its idle wait while a pointer is held.
-    if (anim.timeline()) |tl| {
-        const t = anim.Timeline.Ticker{
-            .fn_ptr = arenaTickCb,
-            .userdata = &s.arena,
-            .has_pending = arenaHasPendingCb,
-        };
-        tl.addTicker(t);
-        s.ticker = t;
-    }
+    ensureTicker(s);
     node.state = s;
     return node;
 }

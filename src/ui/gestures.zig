@@ -32,7 +32,10 @@ const input = @import("input.zig");
 // --- Tuned constants (1d.6) ---
 
 pub const SLOP: f32 = 12; // movement tolerance before a gesture claims
-pub const TAP_TIMEOUT_MS: u64 = 200; // max duration of a tap
+/// Max duration of a tap. Upstream (Compose detectTapGestures) bounds the
+/// tap by the long-press timeout — a press released any time before it still
+/// taps; a separate shorter timeout would swallow 200–499 ms presses.
+pub const TAP_TIMEOUT_MS: u64 = 500;
 pub const DOUBLE_TAP_MS: u64 = 300; // max interval between two taps
 pub const LONG_PRESS_MS: u64 = 500; // hold duration for a long-press
 pub const SWIPE_VELOCITY: f32 = 500; // px/s fling threshold
@@ -678,10 +681,14 @@ test "tap fires on a quick up within slop, rejects on move or long hold" {
     _ = r2.feed(pev(.down, 0, 0, 0, 0));
     _ = r2.feed(pev(.move, 50, 0, 50, 0));
     try std.testing.expect(r2.feed(pev(.up, 50, 0, 100, 0)) == null);
-    // held too long → no tap
+    // held past the long-press bound → no tap (upstream bounds taps by it);
+    // a release ANY time before it still taps (no 200–500 ms dead zone)
     var r3 = Recognizer{ .kind = .tap };
     _ = r3.feed(pev(.down, 0, 0, 0, 0));
-    try std.testing.expect(r3.feed(pev(.up, 0, 0, 300, 0)) == null);
+    try std.testing.expectEqual(Fire.tap, r3.feed(pev(.up, 0, 0, 300, 0)).?);
+    var r4 = Recognizer{ .kind = .tap };
+    _ = r4.feed(pev(.down, 0, 0, 0, 0));
+    try std.testing.expect(r4.feed(pev(.up, 0, 0, 600, 0)) == null);
 }
 
 test "double tap fires on the second quick tap, not on the first" {

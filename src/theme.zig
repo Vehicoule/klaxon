@@ -199,18 +199,27 @@ pub const Easings = struct {
     standard_accelerate: Bezier, // (0.3, 0, 1, 1)
     standard_decelerate: Bezier, // (0, 0, 0, 1)
     emphasized: Bezier, // (0.2, 0, 0, 1)
-    emphasized_accelerate: Bezier, // (0.3, 0.1, 0.2, 1)
+    emphasized_accelerate: Bezier, // (0.3, 0, 0.8, 0.15)
     emphasized_decelerate: Bezier, // (0.05, 0.7, 0.1, 1)
 };
 
-/// M3E spring presets, per the M3E motion spec (stiffness + damping ratio,
-/// converted to the anim.Spring parameterization c = 2*zeta*sqrt(k*m)):
-/// default — general container transforms; spatial — large movements
-/// (sheets, drawers); effects — small effects (ripples, toggles).
+/// M3E spring presets — the ExpressiveMotionTokens scheme (stiffness +
+/// damping ratio, converted to the anim.Spring parameterization
+/// c = 2*zeta*sqrt(k*m)): default/spatial ride DefaultSpatial (380, 0.8);
+/// effects rides DefaultEffects (1600, 1.0) — effects springs are
+/// CRITICALLY damped so colors/fractions never overshoot. fast_*/slow_*
+/// expose the remaining four tokens (FastSpatial 800/0.6, FastEffects
+/// 3800/1.0, SlowSpatial 200/0.8, SlowEffects 800/1.0) for widgets whose
+/// upstream source names them (Switch thumb, TextField label = FastSpatial;
+/// NavigationDrawer close = FastEffects).
 pub const Springs = struct {
     default_spring: anim.Spring,
     spatial_spring: anim.Spring,
     effects_spring: anim.Spring,
+    fast_spatial: anim.Spring,
+    fast_effects: anim.Spring,
+    slow_spatial: anim.Spring,
+    slow_effects: anim.Spring,
 };
 
 pub const Motion = struct {
@@ -316,13 +325,20 @@ const motion: Motion = .{
         .standard_accelerate = .{ .x1 = 0.3, .y1 = 0.0, .x2 = 1.0, .y2 = 1.0 },
         .standard_decelerate = .{ .x1 = 0.0, .y1 = 0.0, .x2 = 0.0, .y2 = 1.0 },
         .emphasized = .{ .x1 = 0.2, .y1 = 0.0, .x2 = 0.0, .y2 = 1.0 },
-        .emphasized_accelerate = .{ .x1 = 0.3, .y1 = 0.1, .x2 = 0.2, .y2 = 1.0 },
+        .emphasized_accelerate = .{ .x1 = 0.3, .y1 = 0.0, .x2 = 0.8, .y2 = 0.15 },
         .emphasized_decelerate = .{ .x1 = 0.05, .y1 = 0.7, .x2 = 0.1, .y2 = 1.0 },
     },
     .springs = .{
-        .default_spring = anim.Spring.fromDampingRatio(1400, 0.8, 1),
-        .spatial_spring = anim.Spring.fromDampingRatio(700, 0.8, 1),
-        .effects_spring = anim.Spring.fromDampingRatio(3800, 0.9, 1),
+        // ExpressiveMotionTokens — was a Standard/Expressive hybrid
+        // ((1400,0.8)/(700,0.8)/(3800,0.9)) that matched no published scheme
+        // and left effects underdamped (ζ 0.9 → color/fraction overshoot).
+        .default_spring = anim.Spring.fromDampingRatio(380, 0.8, 1), // DefaultSpatial
+        .spatial_spring = anim.Spring.fromDampingRatio(380, 0.8, 1), // DefaultSpatial
+        .effects_spring = anim.Spring.fromDampingRatio(1600, 1.0, 1), // DefaultEffects
+        .fast_spatial = anim.Spring.fromDampingRatio(800, 0.6, 1), // FastSpatial
+        .fast_effects = anim.Spring.fromDampingRatio(3800, 1.0, 1), // FastEffects
+        .slow_spatial = anim.Spring.fromDampingRatio(200, 0.8, 1), // SlowSpatial
+        .slow_effects = anim.Spring.fromDampingRatio(800, 1.0, 1), // SlowEffects
     },
 };
 
@@ -634,10 +650,15 @@ test "theme: motion tokens are ordered and springs settle" {
         try std.testing.expectApproxEqAbs(@as(f32, 0), b.sample(0), 1e-4);
         try std.testing.expectApproxEqAbs(@as(f32, 1), b.sample(1), 1e-4);
     }
-    // Springs settle on target (closed form, tick-rate independent).
-    inline for (.{ m.springs.default_spring, m.springs.spatial_spring, m.springs.effects_spring }) |s| {
+    // Springs settle on target (closed form, tick-rate independent) — all
+    // seven presets of the Expressive scheme.
+    inline for (@typeInfo(Springs).@"struct".field_names) |name| {
+        const s: anim.Spring = @field(m.springs, name);
         try std.testing.expect(@abs(s.displacement(100, 0, 5.0)) < 0.5);
     }
+    // Effects springs are critically damped (ζ = 1) — a color or progress
+    // fraction must never overshoot (ExpressiveMotionTokens.kt:24-33).
+    try std.testing.expect(m.springs.effects_spring.displacement(1, 0, 0.3) <= 1.0);
 }
 
 test "theme: light and dark share the non-color tokens" {

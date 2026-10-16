@@ -33,7 +33,7 @@
 //   settles with DrawerPositionalThreshold 0.5 (fraction of the travel) and
 //   DrawerVelocityThreshold 400dp/s, then animates to the anchor with the
 //   release velocity — open rides DefaultSpatial (Klaxon spatial_spring),
-//   close FastEffects (effects_spring); a positive overshoot stretches the
+//   close FastEffects (fast_effects); a positive overshoot stretches the
 //   container horizontally into the screen-edge gap (upstream
 //   horizontalScaleUp — the flat bg widens toward the edge; the content
 //   counter-scale is deferred). While invisible (fraction 0) the sheet is
@@ -408,15 +408,18 @@ fn drawerAnimCompleteCb(userdata: ?*anyopaque) void {
     applyProgress(n, s, s.anim_to, s.anim_to * scrim_max_alpha);
 }
 
-/// Slide the panel + fade the scrim to `to` (0/1) with the spatial spring;
-/// without a timeline, snap.
+/// Slide the panel + fade the scrim to `to` (0/1); without a timeline, snap.
+/// Upstream splits the spec by direction — open rides DefaultSpatial, close
+/// FastEffects (NavigationDrawer.kt:353-355, 501-502).
 fn animateProgress(n: *Node, s: *DrawerState, to: f32) void {
     s.anim_to = to;
     const from: anim.Vec4 = .{ s.progress, scrimStateOf(s.scrim).alpha, 0, 0 };
     const target: anim.Vec4 = .{ to, to * scrim_max_alpha, 0, 0 };
+    const springs = s.opts.theme.motion.springs;
+    const spec = if (to == 0) springs.fast_effects else springs.spatial_spring;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.springAnim(from, target, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .kind = anim.Animation.springAnim(from, target, spec, .{ 0, 0, 0, 0 }),
             .from = from,
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = drawerAnimUpdateCb, .userdata = n },

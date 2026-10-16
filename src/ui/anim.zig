@@ -168,6 +168,7 @@ pub const Ease = enum {
     standard, // M3 standard: cubic-bezier(0.2, 0, 0, 1)
     emphasized, // M3 emphasized: cubic-bezier(0.2, 0, 0, 1) — same curve as standard per the M3 spec; the family differs via its accelerate/decelerate variants
     emphasized_decelerate, // M3 emphasized decelerate: cubic-bezier(0.05, 0.7, 0.1, 1)
+    emphasized_accelerate, // M3 emphasized accelerate: cubic-bezier(0.3, 0, 0.8, 0.15)
     standard_accelerate, // M3 standard accelerate: cubic-bezier(0.3, 0, 1, 1)
     standard_decelerate, // M3 standard decelerate: cubic-bezier(0, 0, 0, 1)
 };
@@ -195,6 +196,7 @@ pub fn sampleEase(e: Ease, t: f32) f32 {
         .standard => cubicBezier(0.2, 0.0, 0.0, 1.0, t),
         .emphasized => cubicBezier(0.2, 0.0, 0.0, 1.0, t),
         .emphasized_decelerate => cubicBezier(0.05, 0.7, 0.1, 1.0, t),
+        .emphasized_accelerate => cubicBezier(0.3, 0.0, 0.8, 0.15, t),
         .standard_accelerate => cubicBezier(0.3, 0.0, 1.0, 1.0, t),
         .standard_decelerate => cubicBezier(0.0, 0.0, 0.0, 1.0, t),
     };
