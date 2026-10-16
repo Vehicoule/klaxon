@@ -28,17 +28,18 @@
 //   - children paint clipped to the viewport (items never bleed past the
 //     strip); hit-testing uses each child's morphed bounds
 //
-// v1 deviations (documented, fixed later):
-//   - The end-arrangement morph is a single linear keyline lerp over the
-//     last leg of the scroll range (Compose shifts focal keylines one at a
-//     time through the focal run — the visual result matches at the two
-//     stops and midpoints are close).
-//   - Items are LAID OUT at their morphed width (content resizes) instead
-//     of Compose's mask-only clipping (an image crops the same; text
-//     reflows instead of clipping).
-//   - Snap is instant (no fling/spring animation — the anim pass is
-//     Phase 3); the hero/fullscreen-center strategies and parallax/haptics
-//     are not implemented.
+// Ported 1:1 from upstream (carousel/Carousel.kt, KeylineList.kt,
+// Strategy.kt, Keylines.kt, KeylineSnapPosition.kt — androidx-main):
+// createKeylinesWithPivot, multiBrowseKeylineList, uncontainedKeylineList,
+// getStartKeylineSteps, getEndKeylineSteps, moveKeylineStep,
+// getStepInterpolationPoints, get(Start|End)ShiftDistance,
+// getKeylineListForScrollOffset, getSnapPositionOffset, and the
+// Modifier.carouselItem mask+translation math (items keep their FULL
+// natural size inside per-item mask wrappers — no content reflow).
+//
+// Remaining deviations: no contentPadding support (we never expose it),
+// no hero/center-aligned strategy, no parallax; release settle uses our
+// spatial spring seeded with the fling velocity (≈ TargetedFlingBehavior).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -259,48 +260,479 @@ fn uncontainedArrangement(viewport: f32, item_width: f32, spacing: f32) ?Arrange
     return .{ .small_size = 0, .small_count = 0, .medium_size = medium_size, .medium_count = medium_count, .large_size = large_size, .large_count = large_count };
 }
 
-/// One keyline: a size class at two scroll-alignment positions — the
-/// start-aligned center and the end-aligned (zone-mirrored) center. During
-/// the end-of-scroll morph the item size interpolates between them.
+/// Compose `Keyline` (KeylineList.kt): the size an item takes when its
+/// center is co-located with this keyline. `offset` is the ADJUSTED
+/// position (post-shift); `unadjusted_offset` is the position items land
+/// on without shifting (stride-based) — items compare their unadjusted
+/// center against keyline unadjusted offsets, then morph toward the
+/// interpolated keyline's size + offset. `cutoff` = how far the keyline
+/// straddles the container edge (0 when fully inside or fully outside).
 const Keyline = struct {
-    start_center: f32,
-    end_center: f32,
     size: f32,
+    offset: f32,
+    unadjusted_offset: f32,
+    cutoff: f32 = 0,
+    is_focal: bool = false,
+    is_anchor: bool = false,
+    is_pivot: bool = false,
+
+    /// Compose `lerp(Keyline, Keyline, Float)` — flags follow the nearer
+    /// endpoint.
+    fn lerpTo(a: Keyline, b: Keyline, t: f32) Keyline {
+        return .{
+            .size = a.size + (b.size - a.size) * t,
+            .offset = a.offset + (b.offset - a.offset) * t,
+            .unadjusted_offset = a.unadjusted_offset + (b.unadjusted_offset - a.unadjusted_offset) * t,
+            .cutoff = a.cutoff + (b.cutoff - a.cutoff) * t,
+            .is_focal = if (t < 0.5) a.is_focal else b.is_focal,
+            .is_anchor = if (t < 0.5) a.is_anchor else b.is_anchor,
+            .is_pivot = if (t < 0.5) a.is_pivot else b.is_pivot,
+        };
+    }
 };
 
-/// The computed keyline set for the current layout (recomputed when the
-/// viewport, spacing, variant or item count changes).
-const Keylines = struct {
+/// A keyline as added by the strategy DSL (size + anchor flag; offsets are
+/// computed by the pivot pass).
+const TmpKeyline = struct { size: f32, is_anchor: bool = false };
+
+/// Compose `KeylineList` — a fixed-capacity list (bounded port: 2 anchors
+/// + up to a screenful of focal/non-focal keylines).
+const KeylineList = struct {
     lines: [max_keylines]Keyline = undefined,
     count: usize = 0,
-    stride: f32 = 0,
-    large_size: f32 = 0,
-    /// The scroll offset where the end-arrangement morph completes.
-    offset_max: f32 = 0,
-    /// The scroll range over which the arrangement morphs start→end (the
-    /// max distance any keyline travels).
-    shift_span: f32 = 0,
+    // Cached indices (the upstream lazy vals — recomputed on every build).
+    pivot_index: usize = 0,
+    first_non_anchor_index: usize = 0,
+    last_non_anchor_index: usize = 0,
+    first_focal_index: usize = 0,
+    last_focal_index: usize = 0,
 
-    fn blendedCenter(k: Keyline, t: f32) f32 {
-        return k.start_center + (k.end_center - k.start_center) * t;
+    fn focalCount(kl: *const KeylineList) usize {
+        return if (kl.count == 0) 0 else kl.last_focal_index - kl.first_focal_index + 1;
     }
 
-    /// The morph parameter: 0 = start-aligned, 1 = end-aligned (ramps over
-    /// the last shift_span of the scroll range).
-    fn tFor(ks: *const Keylines, offset: f32) f32 {
-        if (ks.shift_span <= 0 or ks.offset_max <= 0) return 0;
-        return std.math.clamp((offset - (ks.offset_max - ks.shift_span)) / ks.shift_span, 0, 1);
+    fn firstFocal(kl: *const KeylineList) Keyline {
+        return kl.lines[kl.first_focal_index];
+    }
+
+    fn lastFocal(kl: *const KeylineList) Keyline {
+        return kl.lines[kl.last_focal_index];
+    }
+
+    fn pivot(kl: *const KeylineList) Keyline {
+        return kl.lines[kl.pivot_index];
+    }
+
+    /// Recompute the cached indices after building `lines` (upstream does
+    /// this lazily via indexOfFirst/indexOfLast).
+    fn rebuildIndex(kl: *KeylineList) void {
+        kl.first_non_anchor_index = 0;
+        kl.last_non_anchor_index = 0;
+        kl.first_focal_index = 0;
+        kl.last_focal_index = 0;
+        kl.pivot_index = 0;
+        var i: usize = 0;
+        while (i < kl.count) : (i += 1) {
+            const k = kl.lines[i];
+            if (!k.is_anchor) kl.last_non_anchor_index = i;
+            if (k.is_focal) kl.last_focal_index = i;
+            if (k.is_pivot) kl.pivot_index = i;
+        }
+        i = kl.count;
+        while (i > 0) {
+            i -= 1;
+            const k = kl.lines[i];
+            if (!k.is_anchor) kl.first_non_anchor_index = i;
+            if (k.is_focal) kl.first_focal_index = i;
+        }
+    }
+
+    /// KeylineList.isFirstFocalItemAtStartOfContainer.
+    fn isFirstFocalItemAtStart(kl: *const KeylineList) bool {
+        const ff = kl.firstFocal();
+        return ff.offset - ff.size / 2 >= 0 and kl.first_focal_index == kl.first_non_anchor_index;
+    }
+
+    /// KeylineList.isLastFocalItemAtEndOfContainer.
+    fn isLastFocalItemAtEnd(kl: *const KeylineList, carousel_size: f32) bool {
+        const lf = kl.lastFocal();
+        return lf.offset + lf.size / 2 <= carousel_size and kl.last_focal_index == kl.last_non_anchor_index;
+    }
+
+    /// KeylineList.firstIndexAfterFocalRangeWithSize — the first index at
+    /// or after the last focal keyline whose size equals `size` (or the
+    /// last index when none matches).
+    fn firstIndexAfterFocalRangeWithSize(kl: *const KeylineList, size: f32) usize {
+        var i = kl.last_focal_index;
+        while (i < kl.count) : (i += 1) {
+            if (kl.lines[i].size == size) return i;
+        }
+        return kl.count - 1;
+    }
+
+    /// KeylineList.lastIndexBeforeFocalRangeWithSize.
+    fn lastIndexBeforeFocalRangeWithSize(kl: *const KeylineList, size: f32) usize {
+        var i = kl.first_focal_index;
+        while (i > 0) {
+            i -= 1;
+            if (kl.lines[i].size == size) return i;
+        }
+        return 0;
+    }
+
+    /// KeylineList.getKeylineBefore — the index of the last keyline whose
+    /// unadjustedOffset is < `unadjusted` (or 0 when none).
+    fn keylineBeforeIndex(kl: *const KeylineList, unadjusted: f32) usize {
+        var i = kl.count;
+        while (i > 0) {
+            i -= 1;
+            if (kl.lines[i].unadjusted_offset < unadjusted) return i;
+        }
+        return 0;
+    }
+
+    /// KeylineList.getKeylineAfter — the index of the first keyline whose
+    /// unadjustedOffset is >= `unadjusted` (or the last).
+    fn keylineAfterIndex(kl: *const KeylineList, unadjusted: f32) usize {
+        for (kl.lines[0..kl.count], 0..) |k, i| {
+            if (k.unadjusted_offset >= unadjusted) return i;
+        }
+        return kl.count - 1;
+    }
+
+    /// Compose `lerp(KeylineList, KeylineList, Float)` — elementwise (the
+    /// two lists always share the count — steps preserve it).
+    fn lerpTo(a: *const KeylineList, b: *const KeylineList, t: f32) KeylineList {
+        var out: KeylineList = .{ .count = a.count };
+        for (a.lines[0..a.count], b.lines[0..b.count], 0..) |ka, kb, i| {
+            out.lines[i] = ka.lerpTo(kb, t);
+        }
+        out.rebuildIndex();
+        return out;
     }
 };
+
+/// isCutoffLeft — the keyline straddles the start edge.
+fn isCutoffLeft(size: f32, offset: f32) bool {
+    return offset - size / 2 < 0 and offset + size / 2 > 0;
+}
+
+/// isCutoffRight — the keyline straddles the end edge.
+fn isCutoffRight(size: f32, offset: f32, carousel_size: f32) bool {
+    return offset - size / 2 < carousel_size and offset + size / 2 > carousel_size;
+}
+
+/// KeylineListScopeImpl.findLastFocalIndex — the contiguous run of
+/// focal-size items starting at the first focal.
+fn findLastFocalIndex(tmp: []const TmpKeyline, first_focal: usize, focal_size: f32) usize {
+    var last = first_focal;
+    while (last + 1 < tmp.len and tmp[last + 1].size == focal_size) last += 1;
+    return last;
+}
+
+/// The focal indices over a tmp keyline list: the first NON-ANCHOR item
+/// whose size strictly exceeds the running max (scope.add semantics), then
+/// the contiguous run of that size.
+fn focalIndices(tmp: []const TmpKeyline) struct { first: usize, last: usize, size: f32 } {
+    var first: usize = 0;
+    var focal_size: f32 = 0;
+    for (tmp, 0..) |k, i| {
+        if (!k.is_anchor and k.size > focal_size) {
+            first = i;
+            focal_size = k.size;
+        }
+    }
+    return .{ .first = first, .last = findLastFocalIndex(tmp, first, focal_size), .size = focal_size };
+}
+
+/// KeylineListScopeImpl.createKeylinesWithPivot — verbatim: place the
+/// pivot at `pivot_offset`, then walk keylines away from it accumulating
+/// size-based offsets (visual positions) and stride-based unadjusted
+/// offsets (where an unshifted item's center lands).
+fn createWithPivot(tmp: []const TmpKeyline, pivot_index: usize, pivot_offset: f32, first_focal_index: usize, last_focal_index: usize, item_main_size: f32, carousel_size: f32, spacing: f32) KeylineList {
+    var kl: KeylineList = .{};
+    if (tmp.len == 0 or pivot_index >= tmp.len or tmp.len > max_keylines) return kl;
+    const pv = tmp[pivot_index];
+    const pivot_cutoff: f32 = if (isCutoffLeft(pv.size, pivot_offset))
+        pivot_offset - pv.size / 2
+    else if (isCutoffRight(pv.size, pivot_offset, carousel_size))
+        pivot_offset + pv.size / 2 - carousel_size
+    else
+        0;
+    kl.lines[0] = .{
+        .size = pv.size,
+        .offset = pivot_offset,
+        .unadjusted_offset = pivot_offset,
+        .is_focal = pivot_index >= first_focal_index and pivot_index <= last_focal_index,
+        .is_anchor = pv.is_anchor,
+        .is_pivot = true,
+        .cutoff = pivot_cutoff,
+    };
+    kl.count = 1;
+    // Before the pivot: insert at the front, preserving tmp order.
+    var offset = pivot_offset - item_main_size / 2 - spacing;
+    var unadjusted = pivot_offset - item_main_size / 2 - spacing;
+    var written: [max_keylines]Keyline = undefined;
+    written[0] = kl.lines[0];
+    var wc: usize = 1;
+    var oi: usize = pivot_index;
+    while (oi > 0) {
+        oi -= 1;
+        const t = tmp[oi];
+        const t_off = offset - t.size / 2;
+        const t_unadj = unadjusted - item_main_size / 2;
+        const cutoff: f32 = if (isCutoffLeft(t.size, t_off)) @abs(t_off - t.size / 2) else 0;
+        // shift the tail right by one, prepend
+        std.mem.copyBackwards(Keyline, written[1 .. wc + 1], written[0..wc]);
+        written[0] = .{
+            .size = t.size,
+            .offset = t_off,
+            .unadjusted_offset = t_unadj,
+            .is_focal = oi >= first_focal_index and oi <= last_focal_index,
+            .is_anchor = t.is_anchor,
+            .cutoff = cutoff,
+        };
+        wc += 1;
+        offset -= t.size + spacing;
+        unadjusted -= item_main_size + spacing;
+    }
+    // After the pivot: append.
+    offset = pivot_offset + item_main_size / 2 + spacing;
+    unadjusted = pivot_offset + item_main_size / 2 + spacing;
+    for (tmp[pivot_index + 1 ..], pivot_index + 1..) |t, oi2| {
+        const t_off = offset + t.size / 2;
+        const t_unadj = unadjusted + item_main_size / 2;
+        const cutoff: f32 = if (isCutoffRight(t.size, t_off, carousel_size)) t_off + t.size / 2 - carousel_size else 0;
+        written[wc] = .{
+            .size = t.size,
+            .offset = t_off,
+            .unadjusted_offset = t_unadj,
+            .is_focal = oi2 >= first_focal_index and oi2 <= last_focal_index,
+            .is_anchor = t.is_anchor,
+            .cutoff = cutoff,
+        };
+        wc += 1;
+        offset += t.size + spacing;
+        unadjusted += item_main_size + spacing;
+    }
+    @memcpy(kl.lines[0..wc], written[0..wc]);
+    kl.count = wc;
+    kl.rebuildIndex();
+    return kl;
+}
+
+/// keylineListOf(carouselSize, spacing, alignment) — the focal-index/pivot
+/// derivation then the pivot pass. `alignment` is Start (-1) for our
+/// multi_browse/uncontained strategies (Center only for hero, later).
+fn keylineListOf(carousel_size: f32, spacing: f32, tmp: []const TmpKeyline) KeylineList {
+    const f = focalIndices(tmp);
+    // CarouselAlignment.Start: the pivot is the first focal, offset to the
+    // focal half-size (the first large sits flush at the start edge).
+    const pivot_offset = f.size / 2;
+    return createWithPivot(tmp, f.first, pivot_offset, f.first, f.last, f.size, carousel_size, spacing);
+}
+
+/// moveKeylineAndCreateShiftedKeylineList — one step: move `src` to `dst`,
+/// shift the pivot by the moved keyline's (size - cutoff + spacing) toward
+/// the move direction, rebuild from the pivot.
+fn moveKeylineStep(from: *const KeylineList, src: usize, dst: usize, carousel_size: f32, spacing: f32) KeylineList {
+    const pivot_dir: f32 = if (src > dst) 1 else -1;
+    const pivot_delta = (from.lines[src].size - from.lines[src].cutoff + spacing) * pivot_dir;
+    const new_pivot_index: usize = @intCast(@max(0, @as(i32, @intCast(from.pivot_index)) + @as(i32, @intFromFloat(pivot_dir))));
+    const new_pivot_offset = from.pivot().offset + pivot_delta;
+    var tmp: [max_keylines]TmpKeyline = undefined;
+    var tn: usize = 0;
+    for (from.lines[0..from.count]) |k| {
+        if (tn != src) {
+            tmp[tn] = .{ .size = k.size, .is_anchor = k.is_anchor };
+            tn += 1;
+        }
+    }
+    // re-insert the moved keyline at dst
+    std.mem.copyBackwards(TmpKeyline, tmp[dst + 1 .. tn + 1], tmp[dst..tn]);
+    tmp[dst] = .{ .size = from.lines[src].size, .is_anchor = from.lines[src].is_anchor };
+    tn += 1;
+    const f = focalIndices(tmp[0..tn]);
+    return createWithPivot(tmp[0..tn], new_pivot_index, new_pivot_offset, f.first, f.last, f.size, carousel_size, spacing);
+}
+
+/// getStartKeylineSteps — steps that move the focal range toward the
+/// container start, one non-anchor keyline at a time (each step re-inserts
+/// the first non-anchor keyline after the focal range, size-matched).
+fn startKeylineSteps(defaults: *const KeylineList, carousel_size: f32, spacing: f32, out: *[max_steps]KeylineList) usize {
+    var n: usize = 0;
+    if (defaults.count == 0) return 0;
+    out[n] = defaults.*;
+    n += 1;
+    if (defaults.isFirstFocalItemAtStart()) return n;
+    const start_index = defaults.first_non_anchor_index;
+    const num_steps = defaults.first_focal_index -| start_index;
+    if (num_steps == 0 and defaults.firstFocal().cutoff > 0) {
+        if (n < max_steps) {
+            out[n] = moveKeylineStep(defaults, 0, 0, carousel_size, spacing);
+            n += 1;
+        }
+        return n;
+    }
+    var i: usize = 0;
+    while (i < num_steps and n < max_steps) : (i += 1) {
+        const prev = &out[n - 1];
+        const orig = start_index + i;
+        var dst = defaults.count - 1;
+        if (orig > 0) {
+            const neighbor_size = defaults.lines[orig - 1].size;
+            dst = prev.firstIndexAfterFocalRangeWithSize(neighbor_size) - 1;
+        }
+        out[n] = moveKeylineStep(prev, defaults.first_non_anchor_index, dst, carousel_size, spacing);
+        n += 1;
+    }
+    return n;
+}
+
+/// getEndKeylineSteps — the mirror: move the last non-anchor keyline
+/// before the focal range, one at a time, until the last focal rests at
+/// the container end.
+fn endKeylineSteps(defaults: *const KeylineList, carousel_size: f32, spacing: f32, out: *[max_steps]KeylineList) usize {
+    var n: usize = 0;
+    if (defaults.count == 0) return 0;
+    out[n] = defaults.*;
+    n += 1;
+    if (defaults.isLastFocalItemAtEnd(carousel_size)) return n;
+    const end_index = defaults.last_non_anchor_index;
+    const num_steps = end_index -| defaults.last_focal_index;
+    if (num_steps == 0 and defaults.lastFocal().cutoff > 0) {
+        if (n < max_steps) {
+            out[n] = moveKeylineStep(defaults, 0, 0, carousel_size, spacing);
+            n += 1;
+        }
+        return n;
+    }
+    var i: usize = 0;
+    while (i < num_steps and n < max_steps) : (i += 1) {
+        const prev = &out[n - 1];
+        const orig = end_index - i;
+        var dst: usize = 0;
+        if (orig < defaults.count - 1) {
+            const neighbor_size = defaults.lines[orig + 1].size;
+            dst = prev.lastIndexBeforeFocalRangeWithSize(neighbor_size) + 1;
+        }
+        out[n] = moveKeylineStep(prev, defaults.last_non_anchor_index, dst, carousel_size, spacing);
+        n += 1;
+    }
+    return n;
+}
+
+/// getStepInterpolationPoints — unequally spaced [0..1] points per step,
+/// weighted by each step's shift distance fraction of the total.
+fn stepInterpolationPoints(total_shift: f32, steps: []const KeylineList, shifting_left: bool, out: *[max_steps]f32) void {
+    out[0] = 0;
+    if (total_shift == 0 or steps.len == 0) return;
+    var i: usize = 1;
+    while (i < steps.len) : (i += 1) {
+        const dist = if (shifting_left)
+            steps[i].lines[0].unadjusted_offset - steps[i - 1].lines[0].unadjusted_offset
+        else
+            steps[i - 1].lines[steps[i - 1].count - 1].unadjusted_offset - steps[i].lines[steps[i].count - 1].unadjusted_offset;
+        const pct = dist / total_shift;
+        out[i] = if (i == steps.len - 1) 1 else out[i - 1] + pct;
+    }
+}
+
+/// Compose `lerp(outputMin, outputMax, inputMin, inputMax, value)` —
+/// clamped remap.
+fn remapClamp(out_min: f32, out_max: f32, in_min: f32, in_max: f32, v: f32) f32 {
+    if (v <= in_min) return out_min;
+    if (v >= in_max) return out_max;
+    return out_min + (out_max - out_min) * ((v - in_min) / (in_max - in_min));
+}
+
+/// The carousel strategy (Compose Strategy): the default (start-aligned)
+/// keyline list + the start/end shift steps the scroll morphs through.
+const Strategy = struct {
+    default_keylines: KeylineList = .{},
+    start_steps: [max_steps]KeylineList = undefined,
+    start_count: usize = 0,
+    end_steps: [max_steps]KeylineList = undefined,
+    end_count: usize = 0,
+    start_shift_distance: f32 = 0,
+    end_shift_distance: f32 = 0,
+    start_shift_points: [max_steps]f32 = undefined,
+    end_shift_points: [max_steps]f32 = undefined,
+    /// itemMainAxisSize — the focal (fully unmasked) item main size.
+    item_main_size: f32 = 0,
+    /// Test-facing aliases (kept from v1): stride = L + spacing.
+    stride: f32 = 0,
+    large_size: f32 = 0,
+    offset_max: f32 = 0,
+    valid: bool = false,
+    item_spacing: f32 = 0,
+
+    /// getKeylineListForScrollOffset — the interpolated keyline list for
+    /// the current scroll position (steps at both ends, default between).
+    fn listForOffset(st: *const Strategy, offset: f32) KeylineList {
+        const positive = @max(0, offset);
+        const start_shift_offset = st.start_shift_distance;
+        const end_shift_offset = @max(0, st.offset_max - st.end_shift_distance);
+        if (positive >= start_shift_offset and positive <= end_shift_offset) {
+            return st.default_keylines;
+        }
+        var interpolation: f32 = 0;
+        var points: *const [max_steps]f32 = &st.start_shift_points;
+        var steps: []const KeylineList = st.start_steps[0..st.start_count];
+        if (positive > end_shift_offset) {
+            interpolation = remapClamp(0, 1, end_shift_offset, st.offset_max, positive);
+            points = &st.end_shift_points;
+            steps = st.end_steps[0..st.end_count];
+        } else {
+            interpolation = remapClamp(1, 0, 0, start_shift_offset, positive);
+        }
+        if (steps.len == 0) return st.default_keylines;
+        var from: usize = 0;
+        var to: usize = 0;
+        var stepped: f32 = 0;
+        var lower = points[0];
+        var i: usize = 1;
+        while (i < steps.len) : (i += 1) {
+            const upper = points[i];
+            if (interpolation <= upper) {
+                from = i - 1;
+                to = i;
+                stepped = remapClamp(0, 1, lower, upper, interpolation);
+                break;
+            }
+            lower = upper;
+        }
+        return steps[from].lerpTo(&steps[to], stepped);
+    }
+
+    /// getSnapPositionOffset — the scroll offset that snaps `item_index`
+    /// into the focal run (nearest aligned step).
+    fn snapPositionOffset(st: *const Strategy, item_index: usize, item_count: usize) f32 {
+        if (!st.valid) return 0;
+        var offset = st.default_keylines.firstFocal().unadjusted_offset - st.item_main_size / 2;
+        if (st.start_count > 0 and item_index <= st.start_count - 1) {
+            const si = st.start_count - 1 - @min(item_index, st.start_count - 1);
+            offset = st.start_steps[si].firstFocal().unadjusted_offset - st.item_main_size / 2;
+        }
+        const last_item = item_count -| 1;
+        if (st.end_count > 0 and item_index >= last_item -| (st.end_count - 1) and item_count > st.default_keylines.focalCount()) {
+            const si = st.end_count - 1 - @min(last_item -| item_index, st.end_count - 1);
+            offset = st.end_steps[si].lastFocal().unadjusted_offset - st.item_main_size / 2;
+        }
+        return std.math.clamp(offset, 0, st.offset_max);
+    }
+};
+
+const max_steps = 8;
 
 // --- the scrollable strip ---
 
 const CarouselState = struct {
     opts: CarouselOptions,
     scroll: scroll_mod.ScrollState = .{},
-    /// The keyline geometry of the last layout (kept for paint-free
-    /// scroll snaps + tests).
-    keylines: Keylines = .{},
+    /// The strategy (keyline geometry) of the last layout — kept for
+    /// paint-free scroll snaps + tests.
+    keylines: Strategy = .{},
     /// Per-pointer drag tracks (window-space x — see ScrollInput).
     tracks: [8]Track = @splat(.{ .pointer = 0, .x = 0, .active = false }),
     dragged: bool = false,
@@ -338,9 +770,11 @@ fn releaseTrack(s: *CarouselState, pointer: u64) void {
     }
 }
 
-/// Recompute the keyline set for the current viewport/options/item count:
-/// the arrangement → the start-aligned + end-aligned keyline positions.
-fn computeKeylines(n: *Node, s: *CarouselState) void {
+/// Build the strategy for the current viewport/options/item count:
+/// arrangement → tmp keylines → pivot-built default list → start/end
+/// shift steps + interpolation points (Carousel.kt CarouselPageSize /
+/// Strategy ctor).
+fn computeStrategy(n: *Node, s: *CarouselState) void {
     const viewport = n.bounds.w;
     const count = n.children.items.len;
     s.keylines = .{};
@@ -351,162 +785,69 @@ fn computeKeylines(n: *Node, s: *CarouselState) void {
     if (arr.large_count == 0 or arr.large_size <= 0) return;
 
     const spacing = s.opts.item_spacing;
-    const stride = arr.large_size + spacing;
-    const ks = &s.keylines;
-    ks.stride = stride;
-    ks.large_size = arr.large_size;
+    const st = &s.keylines;
+    st.stride = arr.large_size + spacing;
+    st.large_size = arr.large_size;
+    st.item_main_size = arr.large_size;
+    st.item_spacing = spacing;
     // the content: n item slots of stride minus the trailing spacing
-    const content = @as(f32, @floatFromInt(count)) * stride - spacing;
-    s.scroll.content = content;
+    s.scroll.content = @as(f32, @floatFromInt(count)) * st.stride - spacing;
     s.scroll.viewport = viewport;
     // Clamp against the new range: if the offset moved, every keyline
     // position shifts — damage the viewport.
     if (s.scroll.setOffset(s.scroll.offset)) n.markDirty();
-    ks.offset_max = s.scroll.maxOffset();
+    st.offset_max = s.scroll.maxOffset();
 
+    // createLeftAlignedKeylineList: [anchorL][large×F][medium×M][small×S][anchorR]
     const left_anchor = switch (s.opts.variant) {
         .multi_browse => anchor_size,
         .uncontained => @max(@min(anchor_size, s.opts.item_width), arr.medium_size * 0.5),
     };
-    const right_anchor = anchor_size;
-
-    // START-aligned centers (createLeftAlignedKeylineList):
-    //   [anchorL][large×F][medium×M][small×S][anchorR]
-    var i: usize = 0;
-    const first_focal = arr.large_size / 2;
-    var last_focal = first_focal;
-    ks.lines[i] = .{ .start_center = first_focal - (arr.large_size + left_anchor) / 2 - spacing, .end_center = 0, .size = left_anchor };
-    i += 1;
-    const focal_start = i;
-    for (0..arr.large_count) |f| {
-        const c = first_focal + @as(f32, @floatFromInt(f)) * stride;
-        ks.lines[i] = .{ .start_center = c, .end_center = 0, .size = arr.large_size };
-        last_focal = c;
-        i += 1;
+    var tmp: [max_keylines]TmpKeyline = undefined;
+    var tn: usize = 0;
+    tmp[tn] = .{ .size = left_anchor, .is_anchor = true };
+    tn += 1;
+    for (0..arr.large_count) |_| {
+        tmp[tn] = .{ .size = arr.large_size };
+        tn += 1;
     }
-    var prev_size = arr.large_size;
-    var prev_center = last_focal;
     for (0..arr.medium_count) |_| {
-        const c = prev_center + (prev_size + arr.medium_size) / 2 + spacing;
-        ks.lines[i] = .{ .start_center = c, .end_center = 0, .size = arr.medium_size };
-        prev_center = c;
-        prev_size = arr.medium_size;
-        i += 1;
+        tmp[tn] = .{ .size = arr.medium_size };
+        tn += 1;
     }
     for (0..arr.small_count) |_| {
-        const c = prev_center + (prev_size + arr.small_size) / 2 + spacing;
-        ks.lines[i] = .{ .start_center = c, .end_center = 0, .size = arr.small_size };
-        prev_center = c;
-        prev_size = arr.small_size;
-        i += 1;
+        tmp[tn] = .{ .size = arr.small_size };
+        tn += 1;
     }
-    ks.lines[i] = .{ .start_center = prev_center + (prev_size + right_anchor) / 2 + spacing, .end_center = 0, .size = right_anchor };
-    i += 1;
-    ks.count = i;
+    tmp[tn] = .{ .size = anchor_size, .is_anchor = true };
+    tn += 1;
 
-    // END-aligned centers (the zone-mirrored arrangement, focal run flush
-    // to the end edge): [anchorL][small][medium][large×F][anchorR].
-    const end_last_focal = viewport - arr.large_size / 2;
-    // focal keylines (in order): end centers step back from the last
-    for (0..arr.large_count) |f| {
-        ks.lines[focal_start + f].end_center = end_last_focal - @as(f32, @floatFromInt(arr.large_count - 1 - @as(u32, @intCast(f)))) * stride;
-    }
-    // medium zones sit left of the first end focal, small left of medium
-    var eprev_center = ks.lines[focal_start].end_center;
-    var eprev_size = arr.large_size;
-    // walk the non-focal keylines in REVERSE order (small nearest anchor)
-    // — medium sits adjacent to the focal run, small outside it
-    var nonfocal: [4]usize = .{ 0, 0, 0, 0 };
-    var nn: usize = 0;
-    if (arr.small_count > 0) {
-        // small keyline is the one BEFORE the right anchor in start order
-        nonfocal[nn] = focal_start + arr.large_count + arr.medium_count; // small index
-        nn += 1;
-    }
-    if (arr.medium_count > 0) {
-        nonfocal[nn] = focal_start + arr.large_count; // medium index
-        nn += 1;
-    }
-    // nonfocal now lists [small?, medium?] in the end-order (nearest to
-    // anchorL first); fill their end centers walking left from the focal
-    var k: usize = nn;
-    while (k > 0) {
-        k -= 1;
-        const idx = nonfocal[k];
-        const c = eprev_center - (eprev_size + ks.lines[idx].size) / 2 - spacing;
-        ks.lines[idx].end_center = c;
-        eprev_center = c;
-        eprev_size = ks.lines[idx].size;
-    }
-    // anchors: left anchor leftmost, right anchor past the last end focal
-    ks.lines[0].end_center = eprev_center - (eprev_size + left_anchor) / 2 - spacing;
-    ks.lines[ks.count - 1].end_center = end_last_focal + (arr.large_size + right_anchor) / 2 + spacing;
-
-    // the morph span: the max distance any keyline travels start→end
-    var span: f32 = 0;
-    for (ks.lines[0..ks.count]) |kl| {
-        span = @max(span, @abs(kl.end_center - kl.start_center));
-    }
-    ks.shift_span = @min(span, ks.offset_max);
+    st.default_keylines = keylineListOf(viewport, spacing, tmp[0..tn]);
+    st.start_count = startKeylineSteps(&st.default_keylines, viewport, spacing, &st.start_steps);
+    st.end_count = endKeylineSteps(&st.default_keylines, viewport, spacing, &st.end_steps);
+    // getStartShiftDistance / getEndShiftDistance
+    st.start_shift_distance = if (st.start_count == 0) 0 else @max(0, st.start_steps[st.start_count - 1].lines[0].unadjusted_offset - st.start_steps[0].lines[0].unadjusted_offset);
+    st.end_shift_distance = if (st.end_count == 0) 0 else @max(0, st.end_steps[0].lines[st.end_steps[0].count - 1].unadjusted_offset - st.end_steps[st.end_count - 1].lines[st.end_steps[st.end_count - 1].count - 1].unadjusted_offset);
+    stepInterpolationPoints(st.start_shift_distance, st.start_steps[0..st.start_count], true, &st.start_shift_points);
+    stepInterpolationPoints(st.end_shift_distance, st.end_steps[0..st.end_count], false, &st.end_shift_points);
+    st.valid = st.default_keylines.count > 0 and viewport > 0 and st.item_main_size > 0;
 }
 
-/// The item width at a viewport-space center x under the blended keylines.
-fn keylineSizeAt(ks: *const Keylines, t: f32, x: f32) f32 {
-    if (ks.count == 0) return 0;
-    // find the two blended keyline centers bracketing x (centers may cross
-    // mid-morph — scan for the immediate neighbors)
-    var lo: usize = 0;
-    var hi: usize = 0;
-    var lo_c: f32 = -std.math.inf(f32);
-    var hi_c: f32 = std.math.inf(f32);
-    for (0..ks.count) |j| {
-        const c = Keylines.blendedCenter(ks.lines[j], t);
-        if (c <= x and c > lo_c) {
-            lo = j;
-            lo_c = c;
-        }
-        if (c >= x and c < hi_c) {
-            hi = j;
-            hi_c = c;
-        }
-    }
-    if (lo_c == -std.math.inf(f32)) return ks.lines[hi].size; // left of all
-    if (hi_c == std.math.inf(f32)) return ks.lines[lo].size; // right of all
-    if (hi == lo or hi_c == lo_c) return ks.lines[lo].size;
-    const frac = (x - lo_c) / (hi_c - lo_c);
-    return ks.lines[lo].size + (ks.lines[hi].size - ks.lines[lo].size) * frac;
-}
-
-/// The scroll offset of the nearest item-focal snap: candidates are the
-/// stride-multiples under both alignments (start: k*stride; end:
-/// k*stride + endShift where endShift = offset_max - (n-F)*stride).
+/// The scroll offset of the nearest item-focal snap — getSnapPositionOffset
+/// evaluated per item, nearest wins (singleAdvanceFlingBehavior's target).
 fn snapOffset(s: *CarouselState, offset: f32) f32 {
-    const ks = &s.keylines;
+    const st = &s.keylines;
     const count = s.scroll.content + s.opts.item_spacing; // n*stride
-    const stride = ks.stride;
-    if (stride <= 0 or ks.offset_max <= 0) return 0;
-    const n_f: f32 = count / stride;
-    const large_count: f32 = blk: {
-        var f: f32 = 0;
-        for (ks.lines[0..ks.count]) |kl| {
-            if (kl.size == ks.large_size) f += 1;
-        }
-        break :blk f;
-    };
-    const end_shift = ks.offset_max - @max(0, n_f - large_count) * stride;
-    const k_max = @max(0, n_f - large_count);
+    if (st.stride <= 0 or st.offset_max <= 0) return 0;
+    const n: usize = @intFromFloat(@max(1, @round(count / st.stride)));
     var best: f32 = 0;
     var best_d: f32 = std.math.inf(f32);
-    var k: f32 = 0;
-    while (k <= k_max) : (k += 1) {
-        const cand_a = std.math.clamp(k * stride, 0, ks.offset_max);
-        const cand_b = std.math.clamp(k * stride + end_shift, 0, ks.offset_max);
-        for ([2]f32{ cand_a, cand_b }) |cand| {
-            const d = @abs(cand - offset);
-            if (d < best_d) {
-                best_d = d;
-                best = cand;
-            }
+    for (0..n) |i| {
+        const cand = st.snapPositionOffset(i, n);
+        const d = @abs(cand - offset);
+        if (d < best_d) {
+            best_d = d;
+            best = cand;
         }
     }
     return best;
@@ -562,33 +903,104 @@ fn carouselMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = w, .h = max_h });
 }
 
+/// Per-item mask (Compose Modifier.carouselItem): the item keeps its FULL
+/// unmasked size as content; only the interpolated keyline's rect shows —
+/// the wrapper's bounds ARE the visible band (so hit-testing lands on the
+/// visible part) and the child inside is laid out at the item's natural
+/// size, clipped by the wrapper's child_clip.
+const mask_vtable = ui.node.VTable{
+    .measure = struct {
+        fn m(n: *Node, c: Constraints) Size {
+            if (n.children.items.len == 0) return c.constrain(.{});
+            return n.children.items[0].measure(c);
+        }
+    }.m,
+    .layout = struct {
+        fn l(n: *Node, b: Rect) void {
+            _ = n;
+            _ = b; // the carousel positions the item inside itself
+        }
+    }.l,
+    .paint = struct {
+        fn p(n: *Node, ctx: *kx.Ctx) void {
+            _ = n;
+            _ = ctx;
+        }
+    }.p,
+    .child_clip = struct {
+        fn c(n: *Node) Rect {
+            return n.bounds; // clip the item's full-size content to the band
+        }
+    }.c,
+    .deinit = struct {
+        fn d(n: *Node) void {
+            _ = n;
+        }
+    }.d,
+};
+
+/// Wrap any not-yet-masked child in a mask node (lazy — callers add plain
+/// item children; the mask is internal chrome owned by the carousel).
+fn ensureWrapped(n: *Node) void {
+    var i: usize = 0;
+    while (i < n.children.items.len) : (i += 1) {
+        const c = n.children.items[i];
+        if (c.vtable == &mask_vtable) continue;
+        const m = Node.create(n.allocator, &mask_vtable) catch return;
+        _ = n.remove(c);
+        m.add(c);
+        n.insert(i, m);
+    }
+}
+
 fn carouselLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
-    const count = n.children.items.len;
-    computeKeylines(n, s);
-    // a11y: attach .list_item to plain-container children (interactive
-    // children keep their own semantics — a button in an item stays a button)
-    for (n.children.items) |child| {
-        if (child.semantics == null) {
-            ui.semantics.attach(child, .{ .role = .list_item, .focusable = true });
+    ensureWrapped(n);
+    computeStrategy(n, s);
+    // a11y: attach .list_item to the mask wrappers (the item content keeps
+    // its own semantics — a button in an item stays a button)
+    for (n.children.items) |mask| {
+        if (mask.semantics == null) {
+            ui.semantics.attach(mask, .{ .role = .list_item, .focusable = true });
         }
     }
-    if (count == 0) return;
-    const ks = &s.keylines;
-    const t = Keylines.tFor(ks, s.scroll.offset);
+    const st = &s.keylines;
+    if (!st.valid or n.children.items.len == 0) return;
+    const ks = st.listForOffset(s.scroll.offset);
+    const large = st.item_main_size;
+    const stride = st.stride;
     const rtl = ui.i18n.direction() == .rtl;
-    for (n.children.items, 0..) |child, i| {
-        // the item center in local (viewport) space: large/2 + i*stride -
-        // offset; its width morphs between the blended keylines
-        const center = ks.large_size / 2 + @as(f32, @floatFromInt(i)) * ks.stride - s.scroll.offset;
-        const w = @max(0, keylineSizeAt(ks, t, center));
-        var x = bounds.x + center - w / 2;
-        if (rtl) {
-            // mirror the item around the viewport — item 0 sits at the
-            // end edge, scrolling "forward" moves content toward start
-            x = bounds.x + bounds.w - center - w / 2;
+    for (n.children.items, 0..) |mask, i| {
+        // Modifier.carouselItem: the item center in unadjusted (stride)
+        // space → bracketing keylines → the interpolated keyline drives the
+        // mask size + the translation pinning masked edges together.
+        const unadjusted_center = large / 2 + @as(f32, @floatFromInt(i)) * stride - s.scroll.offset;
+        const bi = ks.keylineBeforeIndex(unadjusted_center);
+        const ai = ks.keylineAfterIndex(unadjusted_center);
+        const before = ks.lines[bi];
+        const after = ks.lines[ai];
+        const progress = if (bi == ai)
+            1
+        else
+            std.math.clamp((unadjusted_center - before.unadjusted_offset) / (after.unadjusted_offset - before.unadjusted_offset), 0, 1);
+        const ik = before.lerpTo(after, progress);
+        const out_of_bounds = bi == ai; // beyond the first/last keyline
+        var translation = ik.offset - unadjusted_center;
+        if (out_of_bounds) {
+            // beyond the first/last keyline: keep translating by the
+            // masked-size ratio (Compose's outOfBoundsOffset)
+            translation += (unadjusted_center - ik.unadjusted_offset) / ik.size;
         }
-        child.layout(.{ .x = x, .y = bounds.y, .w = w, .h = bounds.h });
+        const mask_center = unadjusted_center + translation;
+        const mask_w = @max(0, ik.size);
+        // the visible band is centered on the item center (the mask rect is
+        // item-space symmetric around the middle)
+        const screen_cx = if (rtl) bounds.x + bounds.w - mask_center else bounds.x + mask_center;
+        mask.layout(.{ .x = screen_cx - mask_w / 2, .y = bounds.y, .w = mask_w, .h = bounds.h });
+        // the item inside the mask: full natural size, centered on the same
+        // point — the wrapper clip reveals only the band
+        const item = mask.children.items[0];
+        item.layout(.{ .x = screen_cx - large / 2, .y = bounds.y, .w = large, .h = bounds.h });
     }
 }
 
@@ -819,12 +1231,17 @@ test "carousel layout: items land at keyline positions with morphing widths" {
     const first = c.children.items[0];
     try std.testing.expectApproxEqAbs(ks.large_size, first.bounds.w, 0.01);
     try std.testing.expectApproxEqAbs(ks.large_size / 2, first.bounds.x + first.bounds.w / 2, 0.01);
-    // the second item morphs into the medium zone (narrower than focal)
+    // For 390dp / 186dp / 8dp the lowest-cost arrangement is [L][M][S]:
+    // item i lands on keyline i+1 in unadjusted space, so item1 takes the
+    // medium keyline's size and item2 the small's (verbatim upstream cost).
     const item1 = c.children.items[1];
-    try std.testing.expect(item1.bounds.w < ks.large_size);
-    // an item past the last keyline is the 10dp anchor sliver (offscreen)
+    try std.testing.expectApproxEqAbs(ks.default_keylines.lines[2].size, item1.bounds.w, 0.01);
     const item2 = c.children.items[2];
-    try std.testing.expect(item2.bounds.w <= anchor_size + 1);
+    try std.testing.expectApproxEqAbs(ks.default_keylines.lines[3].size, item2.bounds.w, 0.01);
+    try std.testing.expect(item2.bounds.w < item1.bounds.w);
+    // an item past the last keyline is the 10dp anchor sliver (offscreen)
+    const item5 = c.children.items[5];
+    try std.testing.expect(item5.bounds.w <= anchor_size + 1);
 }
 
 test "carousel drag: moves the content, snaps to an item on release" {
