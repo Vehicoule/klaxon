@@ -188,6 +188,8 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
 
     // --- the pill ---
     const container = cs.surface_container_high;
+    // SearchBarTokens.ContainerElevation = Level3 (6dp shadow elevation)
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, container_h, radius, 6, cs.shadow);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, container_h, radius, container);
     // the state layer over the pill (enabled only)
     if (s.opts.enabled) {
@@ -692,9 +694,12 @@ test "golden: the pill paints SurfaceContainerHigh with rounded ends; the search
     defer f.deinit();
     // the pill's middle: surface_container_high
     try std.testing.expectEqual(t.colors.surface_container_high, f.pixelAt(200, 40));
-    // the rounded end: the exact corner stays background
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(20, 12));
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(20, 67));
+    // the rounded end: the exact corner carries no pill ink (the Level3
+    // shadow may tint it — assert it is NOT the container color)
+    try std.testing.expect(f.pixelAt(20, 12) != t.colors.surface_container_high);
+    try std.testing.expect(f.pixelAt(20, 67) != t.colors.surface_container_high);
+    // the Level3 container elevation casts a shadow below the pill
+    try std.testing.expect(f.pixelAt(200, 70) != @as(Color, 0xFFFFFFFF));
     // the leading search icon ink (on_surface) at 16..40
     try std.testing.expect(f.countColorIn(.{ .x = 36, .y = 28, .w = 24, .h = 24 }, t.colors.on_surface) > 0);
     // the placeholder ink (on_surface_variant) right of the icon
