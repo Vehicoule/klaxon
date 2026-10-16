@@ -30,6 +30,14 @@
 //   - state layers: the state's icon color @ hover 0.08 / focus 0.10 /
 //     pressed 0.12 over the container (at alpha over a transparent container)
 //
+// Ported from Compose IconButton.kt + *IconButtonTokens: dimsFor carries
+// the per-size ContainerHeight/IconSize/LeadingSpace (per width family) /
+// ContainerShapeSquare/PressedContainerShape tokens; the checked morph is
+// upstream's SelectedContainerShapeRound/Square swap; the pressed state
+// outranks checked (shapeByInteraction's pressed ? pressedShape : checked
+// ? checkedShape : shape); the outlined toggle drops its border while
+// checked (outlinedIconToggleButtonBorder → null).
+//
 // v1 deviations (documented, fixed later):
 //   - Flat colors (no elevation shadows — Phase 3); instant shape morphs.
 //   - Checked + disabled (outlined toggle): container OnSurface@0.10, icon
@@ -243,8 +251,13 @@ fn iconButtonPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
         }
     }
-    // outline (outlined variant) — painted over the state layer
-    if (s.opts.variant == .outlined) {
+    // outline (outlined variant) — painted over the state layer. Upstream
+    // outlinedIconToggleButtonBorder returns null while CHECKED (the
+    // InverseSurface pill is the selected marker, no border); the plain
+    // outlined button always strokes.
+    const border_shown = s.opts.variant == .outlined and
+        !(s.sig != null and isChecked(s));
+    if (border_shown) {
         const oc = if (s.opts.enabled) vc.outline else vc.disabled_outline;
         ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, radius, d.outline_width, oc);
     }

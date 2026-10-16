@@ -6,9 +6,10 @@
 // FloatingActionButtonMenu.kt / ToggleFloatingActionButton.kt +
 // FabMenuBaselineTokens / FabBaselineTokens / MenuTokens:
 //   - the toggle FAB is the baseline FAB look (fab.zig): 56x56, CornerLarge
-//     (16), PrimaryContainer fill + OnPrimaryContainer 24dp icon, elevation
-//     level3 (6dp rest, 8dp hovered); the 48dp a11y floor applies to the
-//     HIT target, never the painted container
+//     (16), PrimaryContainer fill + OnPrimaryContainer 24dp icon; the
+//     ToggleFloatingActionButton pins a FIXED level3 (6dp) shadow via
+//     graphicsLayer — no interaction lift; the 48dp a11y floor applies to
+//     the HIT target, never the painted container
 //   - open morph (FabMenuBaselineTokens.CloseButton* + the toggle FAB's
 //     checked state): the FAB becomes the 56dp CornerFull close button in
 //     the family's solid pair (Primary / OnPrimary) with the close icon at
@@ -16,14 +17,15 @@
 //     when the caller gives one, else the fab_icon at the close size
 //   - items: a vertical column END-aligned to the FAB (Compose's
 //     horizontalAlignment = Alignment.End; RTL mirrors it to the start
-//     edge). Each row is the spec's two-part item: a label chip
-//     (SurfaceContainer fill, 12dp corner, 8dp horizontal padding, text
-//     label_large on OnSurface) sitting at the button's START side +
-//     a 48dp item button (12dp corner, TertiaryContainer fill,
-//     OnTertiaryContainer icon at 24dp — ListItemIconSize). The rows stack
-//     upward: item[0] at the top, the last row closest to the FAB.
-//     8dp between rows, 8dp between the column and the FAB
-//     (CloseButtonBetweenSpace), 8dp chip↔button (ListItemIconLabelSpace)
+//     edge). Each item is the upstream single pill
+//     (FloatingActionButtonMenuItem): a 56dp-tall CornerFull Surface in
+//     PrimaryContainer holding [icon 24, gap 8, label] centered — the icon
+//     at ListItemIconSize 24, the label in titleMedium on
+//     OnPrimaryContainer, leading/trailing space 24, min width 56
+//     (ListItemContainerHeight/MinWidth; Surface's default shadowElevation
+//     casts no item shadow). The rows stack upward: item[0] at the top,
+//     the last row 8dp (CloseButtonBetweenSpace) above the FAB;
+//     4dp between rows (ListItemBetweenSpace)
 //   - state layers: the item content color over the container at hover
 //     0.08 / focus 0.10 / pressed 0.12; disabled items = OnSurface@0.38
 //     content over OnSurface@0.12 container (chip included)
@@ -41,10 +43,8 @@
 // v1 deviations (documented, fixed later):
 //   - No staggered expand/collapse animation (Compose runs a per-item
 //     spring + fade — the column pops in; the morph is instant) — Phase 3.
-//   - The item is the spec-page chip + 48dp button pair; the newest Compose
-//     tokens instead fold icon + label into ONE 56dp CornerFull pill
-//     (ListItemContainerShape, leading/trailing space 24). The split
-//     version implemented here matches the documented v1 brief.
+//   - `enabled` on items is a Klaxon extension (upstream items take no
+//     enabled flag): OnSurface@0.12 container + OnSurface@0.38 content.
 //   - No scroll for menus taller than the screen (Compose lazies + clips
 //     the column); the column can overflow the window's TOP edge — the
 //     caller positions the FAB with room above it.
@@ -104,18 +104,18 @@ pub const FabMenuOptions = struct {
     theme: Theme = theme_mod.light,
 };
 
-/// M3E tokens (FabMenuBaselineTokens + FabBaselineTokens + MenuTokens; the
-/// corner radii resolve through the theme's shape scale).
+/// M3E tokens (FabMenuBaselineTokens + FabBaselineTokens; the corner radii
+/// resolve through the theme's shape scale).
 const fab_size: f32 = 56; // FabBaselineTokens.ContainerHeight (= CloseButton)
 const fab_icon_size: f32 = 24; // FabBaselineTokens.IconSize
 const close_icon_size: f32 = 20; // FabMenuBaselineTokens.CloseButtonIconSize
-const item_size: f32 = 48; // item button (the spec page's mini target)
+const item_height: f32 = 56; // FabMenuBaselineTokens.ListItemContainerHeight
+const item_min_w: f32 = 56; // FabMenuItemMinWidth (= ListItemContainerHeight)
 const item_icon_size: f32 = 24; // FabMenuBaselineTokens.ListItemIconSize
-const item_gap: f32 = 8; // rows spacing (spec range 4–8; token = 4)
+const item_h_pad: f32 = 24; // ListItemLeadingSpace / ListItemTrailingSpace
+const item_label_gap: f32 = 8; // ListItemIconLabelSpace
+const item_gap: f32 = 4; // FabMenuBaselineTokens.ListItemBetweenSpace
 const fab_gap: f32 = 8; // FabMenuBaselineTokens.CloseButtonBetweenSpace
-const label_gap: f32 = 8; // FabMenuBaselineTokens.ListItemIconLabelSpace
-const label_h_pad: f32 = 8; // chip content padding (start/end)
-const label_v_pad: f32 = 6; // chip content padding (top/bottom) — v1 pick
 const scrim_alpha: f32 = 0.32; // the M3 scrim opacity
 const min_target: f32 = 48; // a11y touch-target floor
 
@@ -173,56 +173,40 @@ fn fabRect(b: Rect) Rect {
 /// The item column's total height (items + the inter-row gaps).
 fn columnHeight(count: usize) f32 {
     if (count == 0) return 0;
-    return @as(f32, @floatFromInt(count)) * item_size +
+    return @as(f32, @floatFromInt(count)) * item_height +
         @as(f32, @floatFromInt(count - 1)) * item_gap;
 }
 
-/// The label chip's size for `def` (label_large text + the chip padding).
-fn chipSize(t: Theme, def: ItemDef) Size {
-    const ls = t.type_scale.label_large;
-    const lm = ui.paint.measureText(def.label, ls.size, ls.weight >= 500);
-    return .{
-        .w = label_h_pad * 2 + lm.width,
-        .h = @min(item_size, lm.height + label_v_pad * 2), // never taller than the row
-    };
+/// An item's pill width: max(ListItemContainerHeight, 24 + icon + 8 +
+/// label + 24) — upstream Row.sizeIn(minWidth=56, minHeight=56).padding(
+/// start=24, end=24) holding spacedBy(8) [icon, label], label in
+/// titleMedium.
+fn itemWidth(t: Theme, def: ItemDef) f32 {
+    const ts = t.type_scale.title_medium;
+    const lm = ui.paint.measureText(def.label, ts.size, ts.weight >= 500);
+    return @max(item_min_w, item_h_pad * 2 + item_icon_size + item_label_gap + lm.width);
 }
 
-/// The 48x48 item-button rect for `i`, END-aligned to the FAB rect (LTR:
-/// the right edges share; RTL: the left edges). `i = 0` is the top row.
-fn itemButtonRect(s: *FabMenuState, b: Rect, i: usize) Rect {
+/// Item `i`'s pill rect, END-aligned to the FAB rect (upstream
+/// horizontalAlignment = Alignment.End — RTL mirrors it to the start
+/// edge). `i = 0` is the top row; the last row sits fab_gap above the FAB.
+fn itemRect(s: *FabMenuState, t: Theme, b: Rect, i: usize) Rect {
     const fr = fabRect(b);
     const col_h = columnHeight(s.items.items.len);
-    const y = fr.y - fab_gap - col_h + @as(f32, @floatFromInt(i)) * (item_size + item_gap);
+    const y = fr.y - fab_gap - col_h + @as(f32, @floatFromInt(i)) * (item_height + item_gap);
+    const w = itemWidth(t, s.items.items[i]);
     const rtl = ui.i18n.direction() == .rtl;
-    const x = if (rtl) fr.x else fr.x + fr.w - item_size;
-    return .{ .x = x, .y = y, .w = item_size, .h = item_size };
+    const x = if (rtl) fr.x else fr.x + fr.w - w;
+    return .{ .x = x, .y = y, .w = w, .h = item_height };
 }
 
-/// The label chip's rect: start-side of the button, vertically centered
-/// on the row (LTR: left of the button; RTL: right).
-fn itemChipRect(s: *FabMenuState, t: Theme, b: Rect, i: usize) Rect {
-    const br = itemButtonRect(s, b, i);
-    const cs = chipSize(t, s.items.items[i]);
-    const y = br.y + (br.h - cs.h) / 2;
-    const rtl = ui.i18n.direction() == .rtl;
-    const x = if (rtl) br.x + br.w + label_gap else br.x - label_gap - cs.w;
-    return .{ .x = x, .y = y, .w = cs.w, .h = cs.h };
-}
-
-/// The item's full row rect (chip + gap + button) — the hit target and the
-/// a11y child bounds.
-fn itemRowRect(s: *FabMenuState, t: Theme, b: Rect, i: usize) Rect {
-    const br = itemButtonRect(s, b, i);
-    const cr = itemChipRect(s, t, b, i);
-    return ui.node.rectUnion(br, cr);
-}
-
-/// The column's bounds-box (parent space) — rows + gaps. Empty when there
-/// are no items. Valid open or closed (damage covers both transitions).
+/// The column's bounds-box (parent space) — the union of the item pills.
+/// Empty when there are no items. Valid open or closed (damage covers both
+/// transitions).
 fn itemsRect(s: *FabMenuState, t: Theme, b: Rect) Rect {
     if (s.items.items.len == 0) return .{ .x = b.x, .y = b.y };
-    var r = itemRowRect(s, t, b, 0);
-    for (1..s.items.items.len) |i| r = ui.node.rectUnion(r, itemRowRect(s, t, b, i));
+    var r = itemRect(s, t, b, 0);
+    for (1..s.items.items.len) |i| r = ui.node.rectUnion(r, itemRect(s, t, b, i));
     return r;
 }
 
@@ -240,7 +224,7 @@ fn fabHitRect(b: Rect) Rect {
 fn itemAt(s: *FabMenuState, t: Theme, b: Rect, x: f32, y: f32) i32 {
     if (!s.open) return -1;
     for (0..s.items.items.len) |i| {
-        if (itemRowRect(s, t, b, i).contains(x, y)) return @intCast(i);
+        if (itemRect(s, t, b, i).contains(x, y)) return @intCast(i);
     }
     return -1;
 }
@@ -389,10 +373,11 @@ fn fabMenuPaint(n: *Node, ctx: *kx.Ctx) void {
         cs.on_primary
     else
         cs.on_primary_container;
-    // M3 elevation level 3 (level 4 hovered) — the FAB's signature lift.
+    // M3 elevation level 3 — upstream's ToggleFloatingActionButton pins
+    // FabShadowElevation = Level3 via graphicsLayer (NO interaction
+    // animation: the hover state layer still shows, the shadow stays).
     if (s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, fr.x, fr.y, fr.w, fr.h, radius,
-            if (s.fab_hovered) 8 else 6, cs.shadow);
+        ui.paint.elevationShadow(ctx, fr.x, fr.y, fr.w, fr.h, radius, 6, cs.shadow);
     }
     if (container & 0xFF != 0) ui.paint.fillRRect(ctx, fr.x, fr.y, fr.w, fr.h, radius, container);
     // the state layer (enabled only): the content color over the container
@@ -414,35 +399,26 @@ fn fabMenuPaint(n: *Node, ctx: *kx.Ctx) void {
 }
 
 /// The popup overlay pass (the host paints the open popup after the tree):
-/// the item column, above any later sibling. Leaf — no children.
+/// the item column, above any later sibling. Leaf — no children. Each item
+/// is the upstream single pill: CornerFull, PrimaryContainer,
+/// title_medium label — Surface's default (no shadowElevation param in
+/// FloatingActionButtonMenuItem) casts no shadow.
 fn fabMenuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     if (!s.open) return;
     const t = s.opts.theme;
     const cs = t.colors;
     const b = n.bounds;
-    const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
+    const ts = t.type_scale.title_medium;
+    const bold = ts.weight >= 500;
     const focused = input.isFocused(n);
     for (s.items.items, 0..) |def, i| {
         const idx: i32 = @intCast(i);
-        const br = itemButtonRect(s, b, i);
-        const cr = itemChipRect(s, t, b, i);
-        const btn_container: Color = if (def.enabled) cs.tertiary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.12);
-        const btn_content: Color = if (def.enabled) cs.on_tertiary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-        // the label chip (start side): Level2 shadow like the menu panel
-        ui.paint.elevationShadow(ctx, cr.x, cr.y, cr.w, cr.h, t.shape.medium, 2, cs.shadow);
-        ui.paint.fillRRect(ctx, cr.x, cr.y, cr.w, cr.h, t.shape.medium,
-            if (def.enabled) cs.surface_container else ui.paint.withAlphaScaled(cs.on_surface, 0.12));
-        const lm = ui.paint.measureText(def.label, ls.size, bold);
-        const tx = cr.x + label_h_pad; // the label text itself stays LTR
-        const baseline = cr.y + (cr.h - lm.height) / 2 + lm.ascent;
-        ui.paint.text(ctx, def.label, tx, baseline, ls.size, bold, if (def.enabled) cs.on_surface else ui.paint.withAlphaScaled(cs.on_surface, 0.38));
-        // the item button: Level3 shadow (ListItemContainerElevation)
-        if (def.enabled) {
-            ui.paint.elevationShadow(ctx, br.x, br.y, br.w, br.h, t.shape.medium, 6, cs.shadow);
-        }
-        ui.paint.fillRRect(ctx, br.x, br.y, br.w, br.h, t.shape.medium, btn_container);
+        const pr = itemRect(s, t, b, i);
+        const radius = pr.h / 2; // ListItemContainerShape = CornerFull
+        const container: Color = if (def.enabled) cs.primary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.12);
+        const content: Color = if (def.enabled) cs.on_primary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+        ui.paint.fillRRect(ctx, pr.x, pr.y, pr.w, pr.h, radius, container);
         // state layer (enabled only): pressed > highlight — focus when the
         // menu holds the keyboard focus, hover otherwise (menu.zig's rule)
         if (def.enabled) {
@@ -452,9 +428,16 @@ fn fabMenuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
                 if (focused) t.state.focus else t.state.hover
             else
                 0;
-            if (alpha > 0) ui.paint.fillRRect(ctx, br.x, br.y, br.w, br.h, t.shape.medium, theme_mod.stateLayer(btn_container, btn_content, alpha));
+            if (alpha > 0) ui.paint.fillRRect(ctx, pr.x, pr.y, pr.w, pr.h, radius, theme_mod.stateLayer(container, content, alpha));
         }
-        paintIcon(ctx, def.icon, br.x + (br.w - item_icon_size) / 2, br.y + (br.h - item_icon_size) / 2, item_icon_size, btn_content);
+        // the pill content: [icon 24, gap 8, label] centered (upstream
+        // Arrangement.spacedBy(ListItemIconLabelSpace, CenterHorizontally))
+        const lm = ui.paint.measureText(def.label, ts.size, bold);
+        const content_w = item_icon_size + item_label_gap + lm.width;
+        const cx = pr.x + (pr.w - content_w) / 2;
+        paintIcon(ctx, def.icon, cx, pr.y + (pr.h - item_icon_size) / 2, item_icon_size, content);
+        const baseline = pr.y + (pr.h - lm.height) / 2 + lm.ascent;
+        ui.paint.text(ctx, def.label, cx + item_icon_size + item_label_gap, baseline, ts.size, bold, content);
     }
 }
 
@@ -594,13 +577,13 @@ fn fabMenuOnKey(n: *Node, ev: input.KeyEvent) bool {
     return false;
 }
 
-/// Item `index`'s row rect in NODE-LOCAL space (Semantics.child_bounds —
+/// Item `index`'s pill rect in NODE-LOCAL space (Semantics.child_bounds —
 /// the a11y bridge maps it to window space for highlights and targeted
 /// activation taps).
 fn fabMenuChildBounds(n: *Node, index: usize) Rect {
     const s = stateOf(n);
     const local = Rect{ .x = 0, .y = 0, .w = n.bounds.w, .h = n.bounds.h };
-    const r = itemRowRect(s, s.opts.theme, local, index);
+    const r = itemRect(s, s.opts.theme, local, index);
     return r;
 }
 
@@ -713,17 +696,20 @@ test "fab_menu: measures the baseline FAB square (56x56); items are overlay chro
     const fr = fabRect(n.bounds);
     try std.testing.expectEqual(@as(f32, 82), fr.x); // 10 + (200-56)/2
     try std.testing.expectEqual(@as(f32, 222), fr.y); // 200 + (100-56)/2
-    // the column stacks ABOVE the FAB, end-aligned, 8dp between everything
+    // the column stacks ABOVE the FAB, end-aligned pills: 4dp between rows,
+    // 8dp between the last pill and the FAB
     const s = stateOf(n);
     const t = theme_mod.light;
-    const br0 = itemButtonRect(s, n.bounds, 0);
-    const br1 = itemButtonRect(s, n.bounds, 1);
-    try std.testing.expectEqual(fr.x + fr.w - item_size, br0.x); // right edges share (LTR)
-    try std.testing.expectEqual(br0.y + item_size + item_gap, br1.y);
-    try std.testing.expectEqual(fr.y - fab_gap, br1.y + item_size); // last row 8dp above the FAB
-    // the chip sits on the button's START side
-    const cr0 = itemChipRect(s, t, n.bounds, 0);
-    try std.testing.expectEqual(br0.x - label_gap, cr0.x + cr0.w);
+    const pr0 = itemRect(s, t, n.bounds, 0);
+    const pr1 = itemRect(s, t, n.bounds, 1);
+    try std.testing.expectEqual(fr.x + fr.w - pr0.w, pr0.x); // right edges share (LTR)
+    try std.testing.expectEqual(pr0.y + item_height + item_gap, pr1.y);
+    try std.testing.expectEqual(fr.y - fab_gap, pr1.y + item_height); // last pill 8dp above the FAB
+    // the pill: max(56, 24 + icon24 + gap8 + title_medium label + 24)
+    const ts = t.type_scale.title_medium;
+    const lm = ui.paint.measureText("Star", ts.size, ts.weight >= 500);
+    try std.testing.expectApproxEqAbs(@max(item_min_w, item_h_pad * 2 + item_icon_size + item_label_gap + lm.width), pr0.w, 0.001);
+    try std.testing.expectEqual(item_height, pr0.h);
 }
 
 test "fab_menu: click toggles open (signal + on_toggle); signal drives it back" {
@@ -780,8 +766,8 @@ test "fab_menu: item click fires its callback and closes; disabled items don't f
     setOpen(n, true);
     try std.testing.expect(isOpen(n));
     const s = stateOf(n);
-    // item 0's row (top of the column): a click on the chip's label area fires it
-    const r0 = itemRowRect(s, theme_mod.light, n.bounds, 0);
+    // item 0's pill (top of the column): a click on its label area fires it
+    const r0 = itemRect(s, theme_mod.light, n.bounds, 0);
     const x0 = r0.x + 4;
     const y0 = r0.y + r0.h / 2;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x0, .y = y0, .raw_x = x0, .raw_y = y0 });
@@ -793,16 +779,16 @@ test "fab_menu: item click fires its callback and closes; disabled items don't f
     try std.testing.expectEqualStrings("Star", n.semantics.?.value);
     // the disabled item swallows its click (no fire, and the menu stays open)
     setOpen(n, true);
-    const r1 = itemRowRect(s, theme_mod.light, n.bounds, 1);
+    const r1 = itemRect(s, theme_mod.light, n.bounds, 1);
     const x1 = r1.x + r1.w - 4;
     const y1 = r1.y + r1.h / 2;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x1, .y = y1, .raw_x = x1, .raw_y = y1 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x1, .y = y1, .raw_x = x1, .raw_y = y1 });
     try std.testing.expectEqual(@as(u32, 0), count1);
     try std.testing.expect(isOpen(n));
-    // the full router path: the popup-aware hit-test resolves the item row
+    // the full router path: the popup-aware hit-test resolves the item pill
     // outside the FAB's bounds and delivers the click to this leaf
-    const rr0 = itemRowRect(s, theme_mod.light, n.bounds, 0);
+    const rr0 = itemRect(s, theme_mod.light, n.bounds, 0);
     router.dispatchPointer(n, .{ .phase = .down, .x = rr0.x + rr0.w - 4, .y = rr0.y + rr0.h / 2 });
     router.dispatchPointer(n, .{ .phase = .up, .x = rr0.x + rr0.w - 4, .y = rr0.y + rr0.h / 2 });
     try std.testing.expectEqual(@as(u32, 2), count0);
@@ -880,16 +866,13 @@ test "fab_menu: RTL mirrors the column (button to the left, chip to its right)" 
     n.layout(.{ .x = 0, .y = 200, .w = 56, .h = 56 });
     const s = stateOf(n);
     const fr = fabRect(n.bounds);
-    const br = itemButtonRect(s, n.bounds, 0);
-    const cr = itemChipRect(s, theme_mod.light, n.bounds, 0);
-    // RTL: the button's LEFT edge is the FAB's left edge; the chip is to its right
-    try std.testing.expectEqual(fr.x, br.x);
-    try std.testing.expectEqual(br.x + br.w + label_gap, cr.x);
-    // a click on the row still fires (the row union covers chip..button)
+    const pr = itemRect(s, theme_mod.light, n.bounds, 0);
+    // RTL: the pill's LEFT edge is the FAB's left edge (end-aligned flipped)
+    try std.testing.expectEqual(fr.x, pr.x);
+    // a click inside the pill fires the item
     setOpen(n, true);
-    const row = itemRowRect(s, theme_mod.light, n.bounds, 0);
-    const x = cr.x + 4;
-    const y = row.y + row.h / 2;
+    const x = pr.x + pr.w - 4;
+    const y = pr.y + pr.h / 2;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x, .y = y, .raw_x = x, .raw_y = y });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x, .y = y, .raw_x = x, .raw_y = y });
     try std.testing.expectEqual(@as(u32, 1), count);
@@ -910,11 +893,11 @@ test "fab_menu: semantics — toggle role, checked follows open, menu_item child
     try std.testing.expectEqual(ui.semantics.Role.menu_item, kids[0].role);
     try std.testing.expectEqualStrings("Star", kids[0].label);
     try std.testing.expect(kids[0].actions.contains(.activate));
-    // the child bounds are node-local row rects (item 0 sits above the FAB)
+    // the child bounds are node-local pill rects (item 0 sits above the FAB)
     n.layout(.{ .x = 100, .y = 300, .w = 56, .h = 56 });
     const cb0 = fabMenuChildBounds(n, 0);
     const s = stateOf(n);
-    const row0 = itemRowRect(s, theme_mod.light, n.bounds, 0);
+    const row0 = itemRect(s, theme_mod.light, n.bounds, 0);
     try std.testing.expectEqual(row0.y - 300, cb0.y);
     try std.testing.expectEqual(row0.x - 100, cb0.x);
     sig.set(false);
@@ -940,7 +923,7 @@ test "golden: closed paints only the primary_container FAB (no items)" {
     try std.testing.expectEqual(@as(u64, 0), f.countNotIn(.{ .x = 0, .y = 0, .w = 160, .h = 120 }, 0xFFFFFFFF));
 }
 
-test "golden: open paints the item chips + tertiary buttons above the FAB" {
+test "golden: open paints the primary_container item pills above the FAB" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try fabMenu(a, &two_items, .{ .theme = t });
@@ -953,13 +936,14 @@ test "golden: open paints the item chips + tertiary buttons above the FAB" {
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     const s = stateOf(n);
-    // item 1's button (closest to the FAB): tertiary_container
-    const br1 = itemButtonRect(s, n.bounds, 1);
-    try std.testing.expectEqual(t.colors.tertiary_container, f.pixelAt(@intFromFloat(br1.x + 4), @intFromFloat(br1.y + 24)));
-    // item 0's chip: surface_container; its label ink is on_surface
-    const cr0 = itemChipRect(s, t, n.bounds, 0);
-    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(@intFromFloat(cr0.x + 2), @intFromFloat(cr0.y + cr0.h / 2)));
-    try std.testing.expect(f.countColorIn(cr0, t.colors.on_surface) > 0);
+    // item 1's pill (closest to the FAB): primary_container (the fill at
+    // the pill's left edge, clear of the centered icon/label ink)
+    const pr1 = itemRect(s, t, n.bounds, 1);
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(@intFromFloat(pr1.x + 4), @intFromFloat(pr1.y + pr1.h / 2)));
+    // item 0's pill: primary_container fill + on_primary_container label ink
+    const pr0 = itemRect(s, t, n.bounds, 0);
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(@intFromFloat(pr0.x + 4), @intFromFloat(pr0.y + pr0.h / 2)));
+    try std.testing.expect(f.countColorIn(pr0, t.colors.on_primary_container) > 0);
     // the open FAB is the solid-primary full circle: a point inside the
     // circle above the 20dp icon's ink; the corner misses the fill
     const fr = fabRect(n.bounds);
@@ -967,7 +951,7 @@ test "golden: open paints the item chips + tertiary buttons above the FAB" {
     try std.testing.expect(f.pixelAt(@intFromFloat(fr.x + 2), @intFromFloat(fr.y + 2)) != t.colors.primary);
     // items paint in the overlay pass above a later sibling's territory —
     // here simply: nothing else overwrote them (exact color inside)
-    try std.testing.expect(f.countColor(t.colors.tertiary_container) > 0);
+    try std.testing.expect(f.countColor(t.colors.primary_container) > 0);
 }
 
 test "golden: open menu items paint ABOVE a later sibling (the overlay pass)" {
@@ -992,15 +976,15 @@ test "golden: open menu items paint ABOVE a later sibling (the overlay pass)" {
     // the FAB sits bottom-right (144,244); the items overflow upward into
     // the magenta box's region (y = 100..300) and must paint over it
     const s = stateOf(n);
-    const br1 = itemButtonRect(s, n.bounds, 1);
-    try std.testing.expect(br1.y < 244);
-    // off the icon glyph (24dp centered): the container ink at the edge
-    try std.testing.expectEqual(t.colors.tertiary_container, f.pixelAt(@intFromFloat(br1.x + 4), @intFromFloat(br1.y + 24)));
+    const pr1 = itemRect(s, theme_mod.light, n.bounds, 1);
+    try std.testing.expect(pr1.y < 244);
+    // off the icon glyph (24dp + label centered): the pill ink at the edge
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(@intFromFloat(pr1.x + 4), @intFromFloat(pr1.y + pr1.h / 2)));
     // the magenta sibling shows through where nothing overlays it
     try std.testing.expectEqual(@as(Color, 0xFF00FFFF), f.pixelAt(20, 290));
 }
 
-test "golden: a pressed item paints the on_tertiary_container state layer" {
+test "golden: a pressed item paints the on_primary_container state layer" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try fabMenu(a, &two_items, .{ .theme = t });
@@ -1010,17 +994,17 @@ test "golden: a pressed item paints the on_tertiary_container state layer" {
     n.layout(.{ .x = 80, .y = 190, .w = 56, .h = 56 });
     setOpen(n, true);
     const s = stateOf(n);
-    const br0 = itemButtonRect(s, n.bounds, 0);
-    const x = br0.x + 4; // off the icon glyph
-    const y = br0.y + 24;
+    const pr0 = itemRect(s, t, n.bounds, 0);
+    const x = pr0.x + 4; // off the icon/label ink at the pill's left edge
+    const y = pr0.y + pr0.h / 2;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x, .y = y, .raw_x = x, .raw_y = y });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    try golden.expectPixelApprox(f, @intFromFloat(x), @intFromFloat(y), golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_tertiary_container, t.state.pressed), t.colors.tertiary_container));
+    try golden.expectPixelApprox(f, @intFromFloat(x), @intFromFloat(y), golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_primary_container, t.state.pressed), t.colors.primary_container));
 }
 
-test "golden: a disabled item paints the OnSurface@0.12 button + @0.38 icon" {
+test "golden: a disabled item paints the OnSurface@0.12 pill + @0.38 content" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const items = [_]FabMenuItem{
@@ -1036,12 +1020,13 @@ test "golden: a disabled item paints the OnSurface@0.12 button + @0.38 icon" {
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     const s = stateOf(n);
-    const br = itemButtonRect(s, n.bounds, 0);
-    // the button container: on_surface @ 0.12 over the background
+    const pr = itemRect(s, t, n.bounds, 0);
+    // the pill container: on_surface @ 0.12 over the background (the fill
+    // at the pill's left edge, clear of the dimmed icon/label ink)
     const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF);
-    try golden.expectPixelApprox(f, @intFromFloat(br.x + 4), @intFromFloat(br.y + 24), dis);
-    // the icon ink: on_surface @ 0.38 over the dimmed container
-    try std.testing.expect(f.countColorApproxIn(br, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), dis)) > 0);
+    try golden.expectPixelApprox(f, @intFromFloat(pr.x + 4), @intFromFloat(pr.y + pr.h / 2), dis);
+    // the icon/label ink: on_surface @ 0.38 over the dimmed container
+    try std.testing.expect(f.countColorApproxIn(pr, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), dis)) > 0);
 }
 
 test "golden: scrim paints the M3 scrim over the widget's extent while open" {

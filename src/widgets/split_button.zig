@@ -1,7 +1,8 @@
 // An M3E split button (filled style): a leading action button + a trailing
 // toggle button (the dropdown arrow), joined with a 2dp gap; both are
-// Primary/OnPrimary pills whose INNER corners (where they meet) are
-// ExtraSmall (4dp).
+// Primary/OnPrimary pills whose INNER corners (where they meet) use the
+// size's InnerCornerCornerSize (ExtraSmall→Medium by size) and morph to
+// InnerPressedCornerCornerSize while that half is pressed.
 //
 // Spec: m3.material.io/components/split-buttons + Compose SplitButton.kt
 // (SplitButtonLayout / SplitButtonDefaults.LeadingButton / TrailingButton)
@@ -10,12 +11,15 @@
 //     XS 32 / 12+10 / 22 / 13; S 40 / 16+12 / 22 / 13; M 56 / 24+24 / 26 / 15;
 //     L 96 / 48+48 / 38 / 29; XL 136 / 64+64 / 50 / 43
 //   - BetweenSpace = 2dp; LeadingButtonMinWidth = TrailingButtonMinWidth = 48
-//   - leading button: label label_large + optional 20dp leading icon (8dp
-//     gap), centered; trailing button: the trailing icon centered
+//   - leading button: label label_large + optional leading icon at the
+//     size's iconSizeFor (20/20/24/32/40) with the size's iconSpacingFor
+//     gap (4/8/8/12/16), centered; trailing button: the trailing icon
+//     centered
 //   - shapes: both CornerFull (pill = h/2) on the OUTER corners; the inner
-//     corners (leading's end / trailing's start) = ExtraSmall 4dp. On
-//     hover/pressed the inner corners morph to Medium 12dp (the M3E quirk —
-//     v1 keeps them static, Phase 3)
+//     corners (leading's end / trailing's start) = InnerCornerCornerSize —
+//     4/4/4/8/12 (XS/S/M/L/XL). The PRESSED half morphs its inner corners
+//     to InnerPressedCornerCornerSize — 8/12/12/20/20 (upstream's
+//     per-half pressedShape; instant until the animation system lands).
 //   - colors: filled = Primary container + OnPrimary content; disabled =
 //     container OnSurface @ 0.10, content OnSurfaceVariant @ 0.38 (same as
 //     the M3E filled button)
@@ -29,7 +33,13 @@
 // v1 deviations (documented, fixed later):
 //   - Filled style only (tonal / elevated / outlined variants are
 //     follow-ups — same structure, different colors).
-//   - Static inner corners (no hover/press morph to Medium — Phase 3).
+//   - No checked trailing state (upstream's CircleShape morph for the
+//     open-menu toggle has no signal in this API yet).
+//   - The trailing icon sits at the geometric center — upstream nudges it
+//     toward the gap via an optical-centering modifier we can't reproduce
+//     without its private source.
+//   - The pressed corner morph is instant (upstream animates the radius —
+//     Phase 3).
 //   - No embedded menu: the trailing button fires `on_trailing` and the app
 //     opens a menu (the M3E menu widget, PR D2).
 const std = @import("std");
@@ -62,31 +72,34 @@ pub const SplitButtonOptions = struct {
     theme: Theme = theme_mod.light,
 };
 
-/// Per-size tokens (SplitButton*Tokens).
+/// Per-size tokens (SplitButton*Tokens + leadingButtonIconSizeFor =
+/// ButtonDefaults.iconSizeFor + the leading icon's iconSpacingFor gap +
+/// the size's InnerCornerCornerSize / InnerPressedCornerCornerSize).
 const Dims = struct {
     height: f32,
     lead_pad_l: f32,
     lead_pad_r: f32,
     trail_icon: f32,
     trail_pad: f32,
+    inner_rest: f32, // InnerCornerCornerSize
+    inner_pressed: f32, // InnerPressedCornerCornerSize (the pressed half morphs)
+    lead_icon: f32, // leadingButtonIconSizeFor (= Button's iconSizeFor)
+    lead_icon_gap: f32, // icon-label gap (= iconSpacingFor)
 };
 
 fn dimsFor(size: SplitButtonSize) Dims {
     return switch (size) {
-        .xsmall => .{ .height = 32, .lead_pad_l = 12, .lead_pad_r = 10, .trail_icon = 22, .trail_pad = 13 },
-        .small => .{ .height = 40, .lead_pad_l = 16, .lead_pad_r = 12, .trail_icon = 22, .trail_pad = 13 },
-        .medium => .{ .height = 56, .lead_pad_l = 24, .lead_pad_r = 24, .trail_icon = 26, .trail_pad = 15 },
-        .large => .{ .height = 96, .lead_pad_l = 48, .lead_pad_r = 48, .trail_icon = 38, .trail_pad = 29 },
-        .xlarge => .{ .height = 136, .lead_pad_l = 64, .lead_pad_r = 64, .trail_icon = 50, .trail_pad = 43 },
+        .xsmall => .{ .height = 32, .lead_pad_l = 12, .lead_pad_r = 10, .trail_icon = 22, .trail_pad = 13, .inner_rest = 4, .inner_pressed = 8, .lead_icon = 20, .lead_icon_gap = 4 },
+        .small => .{ .height = 40, .lead_pad_l = 16, .lead_pad_r = 12, .trail_icon = 22, .trail_pad = 13, .inner_rest = 4, .inner_pressed = 12, .lead_icon = 20, .lead_icon_gap = 8 },
+        .medium => .{ .height = 56, .lead_pad_l = 24, .lead_pad_r = 24, .trail_icon = 26, .trail_pad = 15, .inner_rest = 4, .inner_pressed = 12, .lead_icon = 24, .lead_icon_gap = 8 },
+        .large => .{ .height = 96, .lead_pad_l = 48, .lead_pad_r = 48, .trail_icon = 38, .trail_pad = 29, .inner_rest = 8, .inner_pressed = 20, .lead_icon = 32, .lead_icon_gap = 12 },
+        .xlarge => .{ .height = 136, .lead_pad_l = 64, .lead_pad_r = 64, .trail_icon = 50, .trail_pad = 43, .inner_rest = 12, .inner_pressed = 20, .lead_icon = 40, .lead_icon_gap = 16 },
     };
 }
 
 const min_w: f32 = 48; // LeadingButtonMinWidth = TrailingButtonMinWidth
 const min_target: f32 = 48; // a11y touch-target floor
 const between: f32 = 2; // BetweenSpace
-const inner_corner: f32 = 4; // ExtraSmall (static in v1)
-const lead_icon_size: f32 = 20; // ButtonSmallTokens.IconSize
-const lead_icon_gap: f32 = 8;
 
 const SplitState = struct {
     label: [:0]const u8, // owned
@@ -141,7 +154,7 @@ fn splitMeasure(n: *Node, c: Constraints) Size {
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
     var lead_w = d.lead_pad_l + d.lead_pad_r + ui.paint.measureText(s.label, ls.size, bold).width;
-    if (s.opts.leading_icon != null) lead_w += lead_icon_size + lead_icon_gap;
+    if (s.opts.leading_icon != null) lead_w += d.lead_icon + d.lead_icon_gap;
     lead_w = @max(lead_w, min_w);
     const tw = trailWidth(s);
     return c.constrain(.{ .w = lead_w + between + tw, .h = d.height });
@@ -184,13 +197,16 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
     const fg: Color = if (s.opts.enabled) cs.on_primary else ui.paint.withAlphaScaled(cs.on_surface_variant, 0.38);
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
-    // --- the leading half: pill on the start side, ExtraSmall on the end.
-    // Its content is clipped to the half (a constrained width never bleeds
-    // into the trailing half or outside the node).
+    // --- the leading half: pill on the start side, the size's inner corner
+    // on the end (inner_rest, morphing to inner_pressed while THIS half is
+    // pressed — upstream's per-half pressedShape). Its content is clipped
+    // to the half (a constrained width never bleeds into the trailing half
+    // or outside the node).
+    const lead_inner: f32 = if (s.pressed == 1) d.inner_pressed else d.inner_rest;
     if (lead_w > 0) {
         var tl: f32 = half;
-        var tr: f32 = inner_corner;
-        var br: f32 = inner_corner;
+        var tr: f32 = lead_inner;
+        var br: f32 = lead_inner;
         var bl: f32 = half;
         if (rtl) {
             const t2 = tl;
@@ -219,30 +235,32 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         // icon moves to the end side)
         const lm = ui.paint.measureText(s.label, ls.size, bold);
         var content_w = lm.width;
-        if (s.opts.leading_icon != null) content_w += lead_icon_size + lead_icon_gap;
+        if (s.opts.leading_icon != null) content_w += d.lead_icon + d.lead_icon_gap;
         var icon_x = lx + (lead_w - content_w) / 2;
         var label_x = icon_x;
-        if (s.opts.leading_icon != null) label_x += lead_icon_size + lead_icon_gap;
+        if (s.opts.leading_icon != null) label_x += d.lead_icon + d.lead_icon_gap;
         if (rtl) {
-            icon_x = mirror(lx, lead_w, icon_x, lead_icon_size, true);
+            icon_x = mirror(lx, lead_w, icon_x, d.lead_icon, true);
             label_x = mirror(lx, lead_w, label_x, lm.width, true);
         }
         const baseline = b.y + (b.h - lm.height) / 2 + lm.ascent;
         if (s.opts.leading_icon) |iname| {
-            paintIcon(ctx, iname, icon_x, b.y + (b.h - lead_icon_size) / 2, lead_icon_size, fg);
+            paintIcon(ctx, iname, icon_x, b.y + (b.h - d.lead_icon) / 2, d.lead_icon, fg);
         }
         ui.paint.text(ctx, s.label, label_x, baseline, ls.size, bold, fg);
         ui.paint.clipReset(ctx); // restores
     }
-    // --- the trailing half: ExtraSmall on the start side, pill on the end,
-    // clipped to the node's right edge (a width below the halves' minimum
-    // never paints outside the node)
+    // --- the trailing half: the size's inner corner on the start side
+    // (morphing to inner_pressed while THIS half is pressed), pill on the
+    // end, clipped to the node's right edge (a width below the halves'
+    // minimum never paints outside the node)
+    const trail_inner: f32 = if (s.pressed == 2) d.inner_pressed else d.inner_rest;
     const tclip_w = @max(@min(tw, b.x + b.w - tx), 0);
     if (tclip_w > 0) {
-        var tl: f32 = inner_corner;
+        var tl: f32 = trail_inner;
         var tr: f32 = half;
         var br: f32 = half;
-        var bl: f32 = inner_corner;
+        var bl: f32 = trail_inner;
         if (rtl) {
             const t2 = tl;
             tl = tr;
@@ -623,13 +641,14 @@ test "split_button: RTL mirrors the content row (the leading icon moves to the e
     const lm = ui.paint.measureText("Save", ls.size, true);
     const tw = trailWidth(stateOf(n));
     const lead_w = bw - between - tw;
-    const content_w = lead_icon_size + lead_icon_gap + lm.width;
+    const dd = dimsFor(.small); // the default size
+    const content_w = dd.lead_icon + dd.lead_icon_gap + lm.width;
     const cx = 20 + (lead_w - content_w) / 2; // the icon's LTR x
     // the icon lands at the mirrored position (the end side of the content row)
-    const icon_x = 2 * 20 + bw - cx - lead_icon_size;
-    try std.testing.expect(f.countColorIn(.{ .x = icon_x, .y = 20 + (sz.h - lead_icon_size) / 2, .w = lead_icon_size, .h = lead_icon_size }, t.colors.on_primary) > 0);
+    const icon_x = 2 * 20 + bw - cx - dd.lead_icon;
+    try std.testing.expect(f.countColorIn(.{ .x = icon_x, .y = 20 + (sz.h - dd.lead_icon) / 2, .w = dd.lead_icon, .h = dd.lead_icon }, t.colors.on_primary) > 0);
     // the label lands at its mirrored position (before the icon)
-    const label_x = 2 * 20 + bw - (cx + lead_icon_size + lead_icon_gap) - lm.width;
+    const label_x = 2 * 20 + bw - (cx + dd.lead_icon + dd.lead_icon_gap) - lm.width;
     try std.testing.expect(label_x < icon_x); // the icon is at the end side
     try std.testing.expect(f.countColorIn(.{ .x = label_x, .y = 30, .w = lm.width, .h = 14 }, t.colors.on_primary) > 0);
 }

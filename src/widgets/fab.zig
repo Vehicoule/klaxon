@@ -25,7 +25,8 @@
 //   - state layers: the content color @ hover 0.08 / focus 0.10 /
 //     pressed 0.12 over the container
 //   - elevation level3 (hover level4): the real ambient+spot shadow —
-//     6dp rest, 8dp hovered/focused
+//     6dp rest/pressed/focused, 8dp hovered (a press while hovered holds
+//     level 3 — upstream's last-interaction rule)
 //   - toggle (ToggleFloatingActionButton): unchecked = the plain FAB;
 //     checked morphs to 56dp CornerFull, the family's solid/on-solid pair,
 //     icon 20 (FabMenuBaselineTokens.CloseButton*)
@@ -248,10 +249,12 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     const cc = currentColors(s);
     const r = fabContainerRect(n, s);
     const radius = currentDims(s).radius;
-    // M3 elevation level 3 (level 4 hovered) — the FAB's signature lift.
+    // M3 elevation: level 3 rest/focus/press, level 4 hovered — upstream's
+    // last-interaction rule means a press while hovered holds level 3 (the
+    // press interaction is newer than the hover).
     if (s.opts.enabled) {
         ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius,
-            if (s.hovered) 8 else 6, t.colors.shadow);
+            if (s.hovered and !s.pressed) 8 else 6, t.colors.shadow);
     }
     // container
     if (cc.container & 0xFF != 0) {

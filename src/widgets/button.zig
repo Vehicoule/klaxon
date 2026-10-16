@@ -2,23 +2,35 @@
 // filled tonal, elevated, outlined, text) in the five M3E sizes (XS 32,
 // S 40, M 56, L 96, XL 136).
 //
-// Spec: m3.material.io/components/buttons (+ /specs) + Compose M3E tokens
-// (BaselineButtonTokens / Button{XSmall,Small,Medium,Large,XLarge}Tokens /
-// {Filled,FilledTonal,Elevated,Outlined,Text}ButtonTokens + Button.kt):
+// Ported verbatim from Compose .ref/material3/Button.kt + tokens —
+//   Button()'s defaultMinSize/Row/Arrangement.Center layout,
+//   ButtonDefaults.contentPaddingFor / iconSizeFor / iconSpacingFor /
+//   textStyleFor / buttonShapesFor, ButtonElevation state tables
+//   (buttonElevation / elevatedButtonElevation / filledTonalButtonElevation),
+//   the *ButtonColors defaults, and outlinedButtonBorder:
 //   - sizes: heights 32/40/56/96/136, icon 20/20/24/32/40, icon-label gap
-//     8/8/8/12/16, content padding (h/v) 12/6, 16/8, 24/16, 48/32, 64/48
+//     4/8/8/12/16 (iconSpacingFor — ExtraSmallIconSpacing is hardcoded 4dp,
+//     not the broader token's 8), content padding (h/v) 12/6, 16/8, 24/16,
+//     48/32, 64/48 — every variant including text
 //   - shapes: round (default) = CornerFull (pill = height/2); square =
 //     CornerMedium 12 (XS/S), CornerLarge 16 (M), CornerExtraLarge 28 (L/XL)
 //   - shape morph: pressed = CornerSmall 8 (XS/S), CornerMedium 12 (M),
 //     CornerLarge 16 (L/XL) — both round and square buttons
 //   - label styles: label_large (XS/S), title_medium (M), headline_small (L),
-//     headline_large (XL); text variant horizontal padding 12 (end 16 with
-//     a trailing icon slot)
-//   - min width 58dp (small, Compose ButtonDefaults.MinWidth); min height =
-//     the container height (all sizes)
+//     headline_large (XL)
+//   - min width 58dp and min height = the container height, all sizes
+//     (ButtonDefaults.MinWidth in the shared Button() composable)
 //   - colors per variant (see variantColors); disabled: container OnSurface
 //     @0.10 (0.12 tonal), label/icon OnSurfaceVariant @0.38 (OnSurface @0.38
-//     tonal), outlined border OutlineVariant @0.10; tonal small icon = 18dp
+//     tonal), outlined border OutlineVariant @0.10, text container
+//     transparent; tonal small icon = 18dp; text label = Primary (upstream
+//     hardcodes Primary — the TextButtonTokens label token is wrong)
+//   - outline width 1dp for every size (outlinedButtonBorder always uses
+//     ButtonSmallTokens.OutlinedOutlineWidth — the L/XL tokens' 2/3 are not
+//     wired to the composable default)
+//   - elevation: elevated = Level1 rest/press/focus, Level2 hovered;
+//     filled + tonal cast a Level1 shadow on hover only; a press overrides
+//     the hover (upstream's last-interaction rule)
 //   - state layers: the on-color blended over the container at hover 0.08 /
 //     focus 0.10 / pressed 0.12 (theme.state); over a transparent container
 //     (outlined/text) the layer is the on-color AT that alpha (lerping from
@@ -30,11 +42,11 @@
 //     end side); the children paint clipped to the button's bounds (a
 //     constrained button never lets label ink cross the container edge)
 //
-//   - Elevated casts the real M3 level-1 shadow (level-3 on hover).
 //   - Shape morph on press is instant (the animated morph lands with the
 //     animation system, Phase 3).
-//   - Text button label = Primary per the m3.material.io spec (the Compose
-//     token says OnSurfaceVariant — the spec wins, ADR-0010).
+//   - Upstream's asymmetric per-icon content padding
+//     (contentPaddingFor(hasStartIcon/hasEndIcon)) is opt-in upstream and
+//     never used by the composable defaults — not exposed in this API.
 //   - Label weight: the Text widget has a bold flag, not a weight axis —
 //     weight >= 500 renders bold (label_large / title_medium), 400 renders
 //     regular (headline_small / headline_large).
@@ -93,15 +105,22 @@ pub const Dims = struct {
 
 pub fn dimsFor(size: ButtonSize) Dims {
     return switch (size) {
-        .xsmall => .{ .height = 32, .icon = 20, .icon_gap = 8, .h_padding = 12, .v_padding = 6, .square_corner = 12, .pressed_corner = 8, .outline_width = 1 },
+        // icon_gap = ButtonDefaults.iconSpacingFor (ExtraSmallIconSpacing is
+        // hardcoded 4dp in Button.kt — the broader token's 8 is not used).
+        // outline_width = ButtonDefaults.outlinedButtonBorder, which always
+        // uses ButtonSmallTokens.OutlinedOutlineWidth (1dp) for every size
+        // (the L/XL OutlinedOutlineWidth tokens are not wired to the
+        // composable's default border).
+        .xsmall => .{ .height = 32, .icon = 20, .icon_gap = 4, .h_padding = 12, .v_padding = 6, .square_corner = 12, .pressed_corner = 8, .outline_width = 1 },
         .small => .{ .height = 40, .icon = 20, .icon_gap = 8, .h_padding = 16, .v_padding = 8, .square_corner = 12, .pressed_corner = 8, .outline_width = 1 },
         .medium => .{ .height = 56, .icon = 24, .icon_gap = 8, .h_padding = 24, .v_padding = 16, .square_corner = 16, .pressed_corner = 12, .outline_width = 1 },
-        .large => .{ .height = 96, .icon = 32, .icon_gap = 12, .h_padding = 48, .v_padding = 32, .square_corner = 28, .pressed_corner = 16, .outline_width = 2 },
-        .xlarge => .{ .height = 136, .icon = 40, .icon_gap = 16, .h_padding = 64, .v_padding = 48, .square_corner = 28, .pressed_corner = 16, .outline_width = 3 },
+        .large => .{ .height = 96, .icon = 32, .icon_gap = 12, .h_padding = 48, .v_padding = 32, .square_corner = 28, .pressed_corner = 16, .outline_width = 1 },
+        .xlarge => .{ .height = 136, .icon = 40, .icon_gap = 16, .h_padding = 64, .v_padding = 48, .square_corner = 28, .pressed_corner = 16, .outline_width = 1 },
     };
 }
 
-/// Compose ButtonDefaults.MinWidth (small buttons).
+/// Compose ButtonDefaults.MinWidth — applies to every size (the shared
+/// Button() composable's defaultMinSize).
 const min_width: f32 = 58;
 const min_target: f32 = 48; // a11y touch-target floor
 /// FilledTonalButtonTokens.IconSize (the small tonal icon is 18dp).
@@ -154,8 +173,10 @@ pub fn variantColors(t: Theme, variant: ButtonVariant) VariantColors {
         },
         .text => .{
             .container = transparent,
-            .on = cs.primary, // m3.material.io spec (Compose token: OnSurfaceVariant)
-            .disabled_container = ui.paint.withAlphaScaled(cs.on_surface, 0.10),
+            // upstream textButtonColors hardcodes Primary (the token's
+            // OnSurfaceVariant is marked incorrect in Button.kt)
+            .on = cs.primary,
+            .disabled_container = transparent, // upstream: Color.Transparent
             .disabled_on = ui.paint.withAlphaScaled(cs.on_surface_variant, 0.38),
             .outline = transparent,
             .disabled_outline = transparent,
@@ -173,18 +194,12 @@ pub fn labelStyle(t: Theme, size: ButtonSize) theme_mod.TypeStyle {
     };
 }
 
-/// Content padding (Compose ButtonDefaults.<Size>ContentPadding; the text
-/// variant uses TextButtonContentPadding: 12 horizontal, end 16 with icon).
+/// Content padding (Compose ButtonDefaults.contentPaddingFor — every M3E
+/// variant including TextButton delegates to the same per-size padding;
+/// the asymmetric icon paddings upstream offers are opt-in params the
+/// composable defaults never pass).
 pub fn contentPadding(opts: ButtonOptions) EdgeInsets {
     const d = dimsFor(opts.size);
-    if (opts.variant == .text) {
-        return .{
-            .left = 12,
-            .top = d.v_padding,
-            .right = if (opts.icon != null) 16 else 12,
-            .bottom = d.v_padding,
-        };
-    }
     return .{ .left = d.h_padding, .top = d.v_padding, .right = d.h_padding, .bottom = d.v_padding };
 }
 
@@ -220,7 +235,9 @@ fn buttonMeasure(n: *Node, c: Constraints) Size {
     }
     var size = Size{ .w = content_w + pad.hSum(), .h = content_h + pad.vSum() };
     size.h = @max(size.h, d.height); // the container height is the minimum
-    if (s.opts.size == .small) size.w = @max(size.w, min_width);
+    // upstream: defaultMinSize(minWidth = MinWidth) in the shared Button()
+    // composable — the 58dp floor applies to every size, not just small
+    size.w = @max(size.w, min_width);
     return c.constrain(size);
 }
 
@@ -296,12 +313,19 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
         b.h / 2 // CornerFull = pill
     else
         d.square_corner;
-    // Elevated variant: real M3 elevation shadow (rest level 1, hover
-    // level 2 — the spec's resting→hover lift). Painted under the
-    // container so the state layer composites on top of it.
-    if (s.opts.variant == .elevated and s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, radius,
-            if (s.hovered) 3 else 1, t.colors.shadow);
+    // Elevation (upstream ButtonElevation state tables): filled/tonal are
+    // flat except a Level-1 hover shadow (Hovered/HoverContainerElevation);
+    // elevated rests at Level 1, lifts to Level 2 hovered, Level 1
+    // pressed/focused, 0 disabled. A press overrides the hover (upstream's
+    // last-interaction rule). Painted under the container so the state
+    // layer composites on top of it.
+    if (s.opts.enabled) {
+        const elev: f32 = switch (s.opts.variant) {
+            .filled, .filled_tonal => if (s.hovered and !s.pressed) 1 else 0,
+            .elevated => if (s.hovered and !s.pressed) 3 else 1,
+            else => 0,
+        };
+        if (elev > 0) ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, radius, elev, t.colors.shadow);
     }
     // container
     const container = if (s.opts.enabled) vc.container else vc.disabled_container;

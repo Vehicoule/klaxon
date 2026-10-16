@@ -1,16 +1,21 @@
 // An M3E button group: a row of connected buttons separated by 2dp whose
 // adjacent (inner) corners collapse to a small radius while the outer
-// corners keep the button shape — and the pressed button's corners morph
-// out to full roundness (the M3E "squeeze" signature).
+// corners keep the button shape; the pressed button's INNER corners morph
+// tighter (the M3E squeeze signature — instant, not animated).
 //
 // Spec: m3.material.io/components/button-groups + Compose ButtonGroup.kt
-// (ButtonGroupDefaults.ConnectedButtonSpaceBetween / connectedButtonShapes):
-//   - spacing between connected buttons: 2dp (ConnectedButtonSpaceBetween)
+// (ButtonGroupDefaults.ConnectedButtonSpaceBetween /
+// connectedLeading/Trailing/MiddleButtonShapes +
+// ConnectedButtonGroupSmallTokens):
+//   - spacing between connected buttons: 2dp (ConnectedButtonSpaceBetween =
+//     BetweenSpace)
 //   - shapes: the FIRST/LAST outer corners keep the button shape (round =
 //     CornerFull = h/2; square = the size's square_corner); every INNER
-//     corner uses the connected radius (8dp); a pressed button morphs ALL
-//     its corners to CornerFull — the button visually detaches from its
-//     neighbours (Compose pressedShape on the connected row)
+//     corner uses InnerCornerCornerSize = CornerValueSmall (8dp); the
+//     PRESSED item morphs its inner corners to
+//     PressedInnerCornerCornerSize = CornerValueExtraSmall (4dp) — outer
+//     corners stay (upstream connectedLeading/TrailingButtonPressShape; a
+//     pressed middle item morphs all four corners)
 //   - states: same as button — hover 0.08 / focus 0.10 / pressed 0.12 state
 //     layer of the on-color over the container; disabled = OnSurface @ 0.38
 //     content over OnSurface @ 0.10 container
@@ -25,11 +30,13 @@
 //     start-side shape follows the reading direction)
 //
 // v1 deviations (documented, fixed later):
-//   - No animated corner morph — the press transition is instant (the
-//     spring on the corner radius lands with the animation pass).
+//   - No animated corner morph or pressed-width expansion — upstream
+//     animates the pressed item to grow ~15% while compressing its
+//     neighbours; v1 keeps static proportional widths + instant corners.
 //   - No overflow menu (ButtonGroup overflow → the trailing "more" slot).
-//   - Action-only: no toggle/selected state (single-choice groups are the
-//     segmented button's job).
+//   - Action-only: no toggle/selected state (upstream's checked = CornerFull
+//     has no signal in this API; single-choice groups are the segmented
+//     button's job).
 
 const std = @import("std");
 const kx = @import("../kx.zig");
@@ -66,9 +73,13 @@ pub const ButtonGroupOptions = struct {
 
 /// ButtonGroupDefaults.ConnectedButtonSpaceBetween.
 const space_between: f32 = 2;
-/// The inner (connected) corner radius — Compose's connected rest shape is
-/// a small round on the adjacent sides.
+/// ConnectedButtonGroupSmallTokens.InnerCornerCornerSize (CornerValueSmall).
 const inner_corner: f32 = 8;
+/// ConnectedButtonGroupSmallTokens.PressedInnerCornerCornerSize
+/// (CornerValueExtraSmall) — the pressed item's INNER corners morph to it
+/// (upstream connectedLeading/TrailingButtonPressShape; a pressed middle
+/// item's connectedMiddleButtonPressShape morphs all four).
+const inner_corner_pressed: f32 = 4;
 const min_target: f32 = 48; // a11y touch-target floor
 
 const ItemDef = struct {
@@ -152,21 +163,21 @@ fn groupChildBounds(n: *Node, index: usize) Rect {
 
 const Corners = struct { tl: f32, tr: f32, br: f32, bl: f32 };
 
-/// The item's corner radii: outer corners on the row's ends keep the
-// button shape, inner corners collapse to inner_corner; a pressed item
-// morphs all corners to CornerFull (the M3E squeeze).
+/// The item's corner radii (upstream connectedLeading/Trailing/Middle
+/// ButtonShapes): the row's outer corners keep the button shape, the inner
+/// corners take inner_corner; the PRESSED item morphs only its inner
+/// corners to inner_corner_pressed — outer corners stay (a pressed middle
+/// item morphs all four; a single item has no inner sides, so press shows
+/// the state layer only). Instant morph (upstream animates it).
 fn itemCorners(s: *GroupState, h: f32, i: usize) Corners {
     const count = s.items.items.len;
     const outer: f32 = if (s.opts.shape == .round) h / 2 else button_w.dimsFor(s.opts.size).square_corner;
-    if (s.pressed == @as(i32, @intCast(i))) {
-        const r: f32 = if (s.opts.shape == .round) h / 2 else button_w.dimsFor(s.opts.size).pressed_corner;
-        return .{ .tl = r, .tr = r, .br = r, .bl = r };
-    }
+    const inner: f32 = if (s.pressed == @as(i32, @intCast(i))) inner_corner_pressed else inner_corner;
     return .{
-        .tl = if (i == 0) outer else inner_corner,
-        .bl = if (i == 0) outer else inner_corner,
-        .tr = if (i == count - 1) outer else inner_corner,
-        .br = if (i == count - 1) outer else inner_corner,
+        .tl = if (i == 0) outer else inner,
+        .bl = if (i == 0) outer else inner,
+        .tr = if (i == count - 1) outer else inner,
+        .br = if (i == count - 1) outer else inner,
     };
 }
 
@@ -521,7 +532,7 @@ test "button_group: click fires the item under the pointer" {
     try std.testing.expectEqual(@as(u32, 1), c2);
 }
 
-test "button_group: pressed item morphs to full round (M3E squeeze)" {
+test "button_group: pressed item morphs its inner corners to extra-small (M3E squeeze)" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try buttonGroup(a, &.{ .{ .label = "Copy" }, .{ .label = "Paste" }, .{ .label = "Cut" } }, .{ .theme = t });
@@ -530,14 +541,27 @@ test "button_group: pressed item morphs to full round (M3E squeeze)" {
     var router = input.InputRouter{};
     input.setCurrent(&router);
     defer input.setCurrent(null);
-    // press the middle item — its inner corners should now be full-round
+    // press the middle item — all four of its corners are inner, so all
+    // four take PressedInnerCornerCornerSize (4dp)
     const r2 = itemRectLtr(stateOf(n), n.bounds, 1);
     const mid_x = r2.x + r2.w / 2;
     router.dispatchPointer(n, .{ .phase = .down, .x = mid_x, .y = 38 });
     try std.testing.expectEqual(@as(i32, 1), stateOf(n).pressed);
     const cor = itemCorners(stateOf(n), r2.h, 1);
-    try std.testing.expectEqual(r2.h / 2, cor.tl); // morph: full round
+    try std.testing.expectEqual(inner_corner_pressed, cor.tl);
+    try std.testing.expectEqual(inner_corner_pressed, cor.tr);
+    // an END item's outer corners keep the button shape while its inner
+    // corners morph
+    const cor0 = itemCorners(stateOf(n), r2.h, 0);
+    try std.testing.expectEqual(r2.h / 2, cor0.tl); // untouched while unpressed
     router.dispatchPointer(n, .{ .phase = .up, .x = mid_x, .y = 38 });
+    // press item 0: its inner (right) corners morph; outer (left) stay round
+    const r1 = itemRectLtr(stateOf(n), n.bounds, 0);
+    router.dispatchPointer(n, .{ .phase = .down, .x = r1.x + r1.w / 2, .y = 38 });
+    const cor0p = itemCorners(stateOf(n), r2.h, 0);
+    try std.testing.expectEqual(r2.h / 2, cor0p.tl); // outer stays
+    try std.testing.expectEqual(inner_corner_pressed, cor0p.tr); // inner morphs
+    router.dispatchPointer(n, .{ .phase = .up, .x = r1.x + r1.w / 2, .y = 38 });
 }
 
 test "button_group: disabled item claims but does not fire" {

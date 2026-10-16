@@ -13,9 +13,17 @@
 //   - shapes (itemShape on CornerFull): count == 1 -> full; first -> the
 //     start side full (tl/bl = h/2); last -> the end side full (tr/br = h/2);
 //     middle -> square. RTL mirrors the row and the shapes
-//   - segment: 1dp Outline border (disabled: OnSurface @ 0.12), label
-//     label_large, optional 18dp icon + 8dp gap, content padding 12dp
-//     start/end
+//   - segment: 1dp Outline border (disabled: Outline @ 0.12 — upstream's
+//     disabled*BorderColor = OutlineColor.copy(0.12)), label label_large,
+//     18dp icon slot + 8dp gap RESERVED for every segment (Compose's
+//     SegmentedButtonContentMeasurePolicy always includes max(IconSize,
+//     iconWidth) + IconSpacing; an empty slot re-centers the label),
+//     content padding 12dp start/end
+//   - paint order: Compose zIndex = interactionCount + checked*5 — a
+//     pressed unchecked segment paints over quiet neighbours, the checked
+//     segment over everyone (the higher-z claims the shared 1dp border);
+//     the focused segment carries the 0.10 focus layer (the Klaxon row's
+//     virtual focus is the selected segment)
 //   - colors: selected = SecondaryContainer fill + OnSecondaryContainer
 //     content; unselected = transparent fill + OnSurface content; disabled =
 //     OnSurface @ 0.38 content (the fill stays: a disabled+selected segment
@@ -112,14 +120,17 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
 }
 
 /// The segment width: all segments are equal, sized to the widest content
-/// (icon + gap + label + paddings) with the 58dp min width.
+/// (icon slot + gap + label + paddings) with the 58dp min width. Upstream's
+/// SegmentedButtonContentMeasurePolicy reserves `max(IconSize, iconWidth) +
+/// IconSpacing` for EVERY segment — the check-icon slot exists even when the
+/// icon content is empty (the -13dp offset then re-centers the label, which
+/// is what an icon-less label's centered paint below reproduces).
 fn segWidth(s: *SegState, t: Theme) f32 {
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
     var w: f32 = seg_min_w;
     for (s.items.items) |def| {
-        var cw = seg_h_pad * 2 + ui.paint.measureText(def.label, ls.size, bold).width;
-        if (def.icon != null) cw += icon_size + icon_gap;
+        const cw = seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText(def.label, ls.size, bold).width;
         w = @max(w, cw);
     }
     return w;
@@ -268,75 +279,95 @@ fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, size: f32, col
     icon_w.drawIcon(ctx, name, x, y, size / 24.0, color);
 }
 
+/// One segment's fill + state layer + content + border. The fill, state
+/// layer and content are clipped to the segment (a shrunken segment never
+/// bleeds into its neighbours); the border paints after the reset
+/// (unclipped per segment — like the M3E button's outline, a stroke is
+/// centered on the edge).
+fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: bool) void {
+    const t = s.opts.theme;
+    const b = n.bounds;
+    const cs = t.colors;
+    const count = s.items.items.len;
+    const def = s.items.items[i];
+    const idx: i32 = @intCast(i);
+    const sh = segShape(b, i, count, w);
+    const sr = sh.sr;
+    const selected = i == s.selected;
+    const ls = t.type_scale.label_large;
+    const bold = ls.weight >= 500;
+    ui.paint.clipRect(ctx, sr.x, sr.y, sr.w, sr.h); // saves
+    // container (a disabled+selected segment keeps the fill)
+    if (selected) {
+        ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, cs.secondary_container);
+    }
+    // state layer (enabled only): the content color over the container.
+    // Upstream the focused segment carries the layer — the Klaxon row is
+    // one focused control whose virtual focus is the selected segment.
+    if (def.enabled) {
+        const alpha: f32 = if (s.pressed == idx)
+            t.state.pressed
+        else if (focused and selected)
+            t.state.focus
+        else if (s.hovered == idx)
+            t.state.hover
+        else
+            0;
+        if (alpha > 0) {
+            const on = if (selected) cs.on_secondary_container else cs.on_surface;
+            const layer = if (selected)
+                theme_mod.stateLayer(cs.secondary_container, on, alpha)
+            else
+                ui.paint.withAlphaScaled(on, alpha); // transparent container
+            ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, layer);
+        }
+    }
+    // content: [icon, gap, label] centered (the always-reserved icon slot
+    // means an icon-less label centers in the segment — see segWidth)
+    const fg: Color = if (!def.enabled)
+        ui.paint.withAlphaScaled(cs.on_surface, 0.38)
+    else if (selected)
+        cs.on_secondary_container
+    else
+        cs.on_surface;
+    const lm = ui.paint.measureText(def.label, ls.size, bold);
+    var content_w = lm.width;
+    if (def.icon != null) content_w += icon_size + icon_gap;
+    const cx = sr.x + (sr.w - content_w) / 2;
+    const baseline = sr.y + (sr.h - lm.height) / 2 + lm.ascent;
+    var tx = cx;
+    if (def.icon) |iname| {
+        paintIcon(ctx, iname, tx, sr.y + (sr.h - icon_size) / 2, icon_size, fg);
+        tx += icon_size + icon_gap;
+    }
+    ui.paint.text(ctx, def.label, tx, baseline, ls.size, bold, fg);
+    ui.paint.clipReset(ctx); // restores
+    // border — upstream disabled*BorderColor = OutlineColor @ 0.12 (the
+    // DisabledOutlineColor OnSurface token is not the one the colors use)
+    const oc: Color = if (def.enabled) cs.outline else ui.paint.withAlphaScaled(cs.outline, 0.12);
+    ui.paint.strokeRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, border_w, oc);
+}
+
 fn segPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const b = n.bounds;
-    const cs = t.colors;
     const count: usize = s.items.items.len;
     if (count == 0) return;
     const w = segWidthFit(s, t, b);
-    const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
     const focused = input.isFocused(n);
-    // One pass per segment, in order (Compose z-order: a later segment's
-    // fill covers the previous segment's border in the 1dp overlap). The
-    // fill + state layer + content are clipped to the segment (a shrunken
-    // segment never bleeds into its neighbours); the border is painted
-    // after the reset (unclipped per segment — like the M3E button's
-    // outline, a stroke is centered on the edge).
+    // Upstream z-order (zIndex = interactionCount + checked*5): a checked
+    // segment paints ABOVE its neighbours in the 1dp overlap, and an
+    // interacting (pressed) unchecked segment above quiet ones — the
+    // higher-z segment claims the shared border.
     for (0..count) |i| {
-        const def = s.items.items[i];
-        const idx: i32 = @intCast(i);
-        const sh = segShape(b, i, count, w);
-        const sr = sh.sr;
-        const selected = i == s.selected;
-        ui.paint.clipRect(ctx, sr.x, sr.y, sr.w, sr.h); // saves
-        // container (a disabled+selected segment keeps the fill)
-        if (selected) {
-            ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, cs.secondary_container);
-        }
-        // state layer (enabled only): the content color over the container
-        if (def.enabled) {
-            const alpha: f32 = if (s.pressed == idx)
-                t.state.pressed
-            else if (focused)
-                t.state.focus
-            else if (s.hovered == idx)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                const on = if (selected) cs.on_secondary_container else cs.on_surface;
-                const layer = if (selected)
-                    theme_mod.stateLayer(cs.secondary_container, on, alpha)
-                else
-                    ui.paint.withAlphaScaled(on, alpha); // transparent container
-                ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, layer);
-            }
-        }
-        // content: [icon, gap, label] centered
-        const fg: Color = if (!def.enabled)
-            ui.paint.withAlphaScaled(cs.on_surface, 0.38)
-        else if (selected)
-            cs.on_secondary_container
-        else
-            cs.on_surface;
-        const lm = ui.paint.measureText(def.label, ls.size, bold);
-        var content_w = lm.width;
-        if (def.icon != null) content_w += icon_size + icon_gap;
-        const cx = sr.x + (sr.w - content_w) / 2;
-        const baseline = sr.y + (sr.h - lm.height) / 2 + lm.ascent;
-        var tx = cx;
-        if (def.icon) |iname| {
-            paintIcon(ctx, iname, tx, sr.y + (sr.h - icon_size) / 2, icon_size, fg);
-            tx += icon_size + icon_gap;
-        }
-        ui.paint.text(ctx, def.label, tx, baseline, ls.size, bold, fg);
-        ui.paint.clipReset(ctx); // restores
-        // border
-        const oc: Color = if (def.enabled) cs.outline else ui.paint.withAlphaScaled(cs.on_surface, 0.12);
-        ui.paint.strokeRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, border_w, oc);
+        if (i != s.selected and s.pressed != @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
+    }
+    for (0..count) |i| {
+        if (i != s.selected and s.pressed == @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
+    }
+    for (0..count) |i| {
+        if (i == s.selected) segPaintOne(n, s, ctx, i, w, focused);
     }
 }
 
@@ -538,7 +569,8 @@ test "segmented_button: measures equal-width segments overlapping by the border;
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     const t = theme_mod.light;
     const ls = t.type_scale.label_large;
-    const w_month = seg_h_pad * 2 + ui.paint.measureText("Month", ls.size, true).width;
+    // every segment reserves the 26dp icon slot (upstream measure policy)
+    const w_month = seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Month", ls.size, true).width;
     const w = @max(seg_min_w, w_month); // all segments = the widest content
     try std.testing.expectApproxEqAbs(@as(f32, 3) * w - 2 * border_w, sz.w, 0.001);
     try std.testing.expectEqual(seg_height, sz.h);
@@ -546,7 +578,7 @@ test "segmented_button: measures equal-width segments overlapping by the border;
     const one = try segmentedButton(a, &.{.{ .label = "Only" }}, null, null, .{});
     defer one.deinit();
     const sz1 = one.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@max(seg_min_w, seg_h_pad * 2 + ui.paint.measureText("Only", ls.size, true).width), sz1.w, 0.001);
+    try std.testing.expectApproxEqAbs(@max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Only", ls.size, true).width), sz1.w, 0.001);
 }
 
 test "segmented_button: click selects (signal + on_change); arrows move AND select; a11y follows" {
@@ -566,7 +598,7 @@ test "segmented_button: click selects (signal + on_change); arrows move AND sele
     // click the 3rd segment (the widest item sets the segment width; the
     // segments overlap by 1dp)
     const t = theme_mod.light;
-    const w = @max(seg_min_w, seg_h_pad * 2 + ui.paint.measureText("Month", t.type_scale.label_large.size, true).width);
+    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Month", t.type_scale.label_large.size, true).width);
     const x3 = @as(f32, @floatFromInt(2)) * (w - border_w) + 10;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
@@ -636,8 +668,10 @@ test "golden: a hovered unselected segment paints the on_surface state layer" {
     var r = try golden.Renderer.init(std.testing.allocator, 200, 80);
     defer r.deinit();
     n.layout(.{ .x = 20, .y = 20, .w = 160, .h = 40 });
-    // hover the 2nd (unselected) segment
-    const w = segWidth(stateOf(n), t);
+    // hover the 2nd (unselected) segment — the FIT width: the always-
+    // reserved icon slot pushes the intrinsic row past 160, so the
+    // segments shrink to fill the assigned bounds
+    const w = segWidthFit(stateOf(n), t, n.bounds);
     const x2 = 20 + (w - border_w) + w - 5; // near its end edge, no label ink
     _ = n.vtable.on_pointer.?(n, .{ .phase = .enter, .x = x2, .y = 40 });
     r.paint(n, 0xFFFFFFFF);
@@ -665,9 +699,9 @@ test "golden: a disabled segment paints the OnSurface@0.38 label + the @0.12 bor
     // the label ink: on_surface @ 0.38 over the background
     const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), 0xFFFFFFFF);
     try std.testing.expect(f.countColorIn(.{ .x = 30, .y = 30, .w = 60, .h = 20 }, dis) > 0);
-    // the border ink: on_surface @ 0.12 over the background (row 20 is the
-    // first segment's straight top edge)
-    const boc = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF);
+    // the border ink: Outline @ 0.12 over the background (row 20 is the
+    // first segment's straight top edge) — upstream disabled*BorderColor
+    const boc = golden.blendOver(ui.paint.withAlphaScaled(t.colors.outline, 0.12), 0xFFFFFFFF);
     try golden.expectPixelApprox(f, 50, 20, boc);
 }
 
