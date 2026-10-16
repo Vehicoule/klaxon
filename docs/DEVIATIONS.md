@@ -24,13 +24,17 @@ code; don't patch it").
 | `scroll.visibleRange` panicked on denormal strides; `mapPointToParentSpace` truncated ancestors past 64; `flex_total` u32 overflow; damage `present_rect` could land 1px outside the pixel surface (desynced upload pitch); `kx_fill/stroke_path` trusted verb/point agreement across the ABI; navigator hero back-pointer UAF on view deinit; `KLAXON_DPR=inf` → non-finite display scale | all hardened (`cd0c8b3`) |
 | Node-bound signal subscriptions were convention-only (a missed `unsubscribe` = `.node` markDirty UAF) | `Node.bound_signals` + `state.unbindAll` in `deinitBody`; `SignalBase.detachBoundNodes` for the signal-dies-first ordering (`978c909`) |
 | Theme `platform.hit_target_min` / `control_height` / `motion.durations` populated but unread — a custom theme silently did nothing | wired into 27 files (`8b6618d`); `Shadow`/`Elevation`/`Spacing` documented reference-only (widgets raster via SkShadowUtils) |
+|| `gestures.SLOP = 12` fixed for every pointer kind — mouse/stylus drags had a finger-sized dead zone | `panSlop(pointer)`: precision pointers engage pan at 2dp (Flutter `kPrecisePointerPanSlop`), touch keeps 12dp; tap/press dead zones unchanged (`b035a19`) |
+|| Determinate progress snapped on value changes | `ProgressOptions.progress_sig` binds a `Signal(f32)`; changes animate with upstream `ProgressAnimationSpec` (ζ=1.0 / stiffness 50) and snap when no timeline exists (`b035a19`) |
+|| ATK action callbacks walked the node tree from the a11y thread | marshalled through an SDL user event onto the UI thread; `AtkValue` carries real min/max/now from `Semantics.value_range` (`d0e9124`) |
+|| The IME stack was dormant: `SDL_StartTextInput` never ran outside desktop (no soft keyboard on Android/iOS), composition/preedit events were dropped | focus-gated `SDL_StartTextInput`/`StopTextInput` + `SDL_SetTextInputArea` anchoring on `VTable.wants_text_input`; `SDL_EVENT_TEXT_EDITING` routed through `KeyEvent.text_editing` into TextField/SearchBar/SearchView composition buffers (below) |
+|| Char-level font fallback resolved on macOS only — every `SkFontMgr_Custom` family (Android/Linux/Windows/WASM, iOS directory path) returned nullptr from `onMatchFamilyStyleCharacter` → non-Latin codepoints shaped to `.notdef` | `KxCachingFontMgr::scanForCoverage`: bounded covering-scan over the manager's family list (emoji-locale pre-pass for `und-Zsye`), memoized per (family, style, locale, codepoint) (below) |
+|| SkParagraph always built paragraphs on an LTR base — trailing neutrals and weak-direction runs landed on the wrong side under an RTL locale | ABI 0.21.0 `kx_set_text_direction` process-global, mirrored from `i18n.direction()`; the text cache keys on it for bidi-relevant strings only (below) |
 
 ## Open — needs design work, not a one-liner
 
-- **ATK action callbacks run on the a11y thread** (`kx_a11y_linux.cpp:384-390,420-424`) — `grab_focus`/`do_action` walk the Zig node tree while the render thread owns it. The header documents the window; the real fix is marshalling through an SDL user event — deferred to a dedicated a11y-threading task.
-- **`AtkValue` reports a fixed 0–100 range** (`kx_a11y_linux.cpp:453-456`) — currently *correct*: every numeric role emits a percent string (`slider` formats `{d:.0}%`). Latent trap only if a widget ever reports non-percent values; the fix is carrying min/max in the Semantics struct + dump.
 - **`optionsFromValue` ignores unknown option keys** (`src/ui/value.zig:321`) — a typo'd serialized field silently renders defaults. Deliberate forward-compat choice (new fields don't break old docs); could grow a strict/diagnostic mode later.
-- **`input_ime` on macOS is a win (7.8× vs Qt) but Android/iOS could not be measured** — SkParagraph re-shapes the growing buffer O(n) per commit; an incremental path would need paragraph-level caching that doesn't exist in SkParagraph.
+- **`input_ime` measures synthetic commit injection, not a real IME round-trip** — like-for-like with all three runners (each injects commit strings too), and the real path is now wired (focus-gated text input + composition routing, above), but the bench can't drive an OS-level IME. Separately: SkParagraph re-shapes the growing buffer O(n) per commit; an incremental path would need paragraph-level caching that doesn't exist in SkParagraph.
 
 ## Register — documented incompleteness in widget code
 
@@ -52,15 +56,16 @@ Each widget's header carries the same list; these are the tracked ones
 - `tree.zig` — no keyboard nav/lazy loading/drag-drop/icons.
 - `carousel.zig` — no contentPadding, no hero/center-aligned strategy, no
   parallax.
-- `progress.zig` — progress changes snap (no spring); wave attach
-  micro-animations skipped.
+- `progress.zig` — static `progress` snaps on rebuild (the spring runs on
+  `progress_sig` writes); wave attach micro-animations skipped.
 - `drawer.zig` — no predictive back, window-inset padding, content
   scale-down during overshoot, or `confirmStateChange`.
-- `gestures.zig` — `SLOP = 12` fixed px (px == dp; ~4dp effective at 3×);
-  first tap fires immediately (no double-tap hold); long-press without a
-  timeline fires on the first event after the deadline.
-- `i18n.zig` — number/date tables cover en/fr/ja/ar only; no native digits
-  (ar renders Latin digits); ICU/CLDR is the upgrade path.
+- `gestures.zig` — first tap fires immediately (no double-tap hold);
+  long-press without a timeline fires on the first event after the
+  deadline. (Slop is now pointer-type aware — fixed audit row above.)
+- `i18n.zig` — number/date tables cover en/fr/ja/ar/es; no native digits
+  (ar renders Latin digits); ICU/CLDR is the upgrade path. (The paragraph
+  bidi base direction follows the locale — fixed audit row above.)
 - `color_picker.zig` — no alpha slider (forced 0xFF), no RGB/HSL inputs,
   no eyedropper.
 - `kx_skia_android.cpp` — font family/fallback hardcode Roboto/Droid Sans;
