@@ -1,57 +1,33 @@
-// Floating toolbar (M3E) — a pill-shaped container floating above content,
-// packing 24dp icon actions (plus optional vertical-divider group
-// separators) and an optional FAB docked inside the end padding. Standard
-// and vibrant variants; each item owns its own on_press callback — a
-// toolbar of actions, not a selection control (no selection signal).
+// Floating toolbar (M3E) — 1:1 port of Compose material3 FloatingToolbar.kt
+// (HorizontalFloatingToolbar / HorizontalFloatingToolbarWithFabLayout).
 //
-// Spec: m3.material.io/components/toolbars + Compose FloatingToolbar.kt
-// (HorizontalFloatingToolbar / FloatingToolbarDefaults):
-//   - container: a 56dp CornerFull pill (radius = h/2), SurfaceContainer —
-//     the M3E "vibrant" variant swaps in TertiaryContainer — lifted 3dp
-//     (the elevationShadow level is dp) above the content
-//   - children: standard icon buttons = 48dp cells (the a11y touch-target
-//     floor) with the 24dp icon centered, 8dp between cells, 16dp end
-//     padding
-//   - colors: icons OnSurfaceVariant; vibrant = OnTertiaryContainer;
-//     disabled = OnSurface @ 0.38; state layers = the on-color blended
-//     over the (opaque) container at hover 0.08 / focus 0.10 / pressed
-//     0.12 (theme.state)
-//   - divider (`.divider = true` on an item): a group separator — 1dp
-//     OutlineVariant line, 24dp long, cell = the thickness (the 8dp gaps
-//     space it from its neighbours)
-//   - docked FAB (the vibrant look): a 48dp CornerLarge (16dp) squircle,
-//     PrimaryContainer + OnPrimaryContainer icon, small elevation — v1
-//     docks it INSIDE the end padding (the spec look overlaps the pill's
-//     end edge by ~8dp)
-//   - input: per-item down/up press (a drag past the touch slop —
-//     gestures.SLOP, raw coords — is a scroll, not a press); hover
-//     tracking; left/right arrows move the ACTIVE item (RTL flips),
-//     Enter/Space activates it; a pressed slot takes the keyboard focus
-//     so the arrows continue from it
-//   - semantics: a focusable group exposing virtual children — a button
-//     per action, a separator per divider, a trailing button for the FAB;
-//     a targeted activation dispatches a tap at the child's rect, hit-
-//     tested like a real pointer
-//   - RTL: the row mirrors — the first item sits at the end side and the
-//     FAB docks at the start edge
+// Upstream sources (.ref/material3, androidx-main):
+//   - FloatingToolbar.kt: HorizontalFloatingToolbarWithFabLayout (the FAB
+//     sits BESIDE the pill with a ToolbarToFabGap 8dp gap; the bar shrinks
+//     to width*expandedProgress toward the FAB edge while the FAB lerps
+//     FabSizeRange FabBaseline..FabMedium = 56..80)
+//   - tokens/FloatingToolbarTokens.kt: ContainerHeight 64, Leading/Trailing
+//     Space 8, CornerFull, Standard SurfaceContainer, Vibrant
+//     PrimaryContainer
+//   - colors (defaultFloatingToolbar{Standard,Vibrant}Colors): content =
+//     contentColorFor(container); FAB = PrimaryContainer (standard) /
+//     TertiaryContainer (vibrant); elevation = Level0 no-FAB / Level1
+//     expanded-with-FAB, FAB Level2 (hover Level3)
 //
-// v1 deviations (documented, fixed later):
-//   - Fixed 56dp height: the vibrant/FAB-docked 64dp container token and
-//     the FAB's ~8dp pill-edge overlap are not implemented (the FAB docks
-//     inside the 16dp end padding).
-//   - Ripple-less: the state layer paints instantly (the M3E ripple lands
-//     with the animation system, Phase 3).
-//   - No overflow scrolling — a narrower-than-intrinsic assignment clips
-//     the end items inside the pill (the content row centers when wider).
-//   - The slots are chrome painted by the widget (a leaf — no document
-//     children); Compose's FloatingToolbar takes arbitrary composable
-//     children, v1 is icon actions + dividers only.
-//   - up/down arrows are NOT claimed (they bubble to scrollables) — only
-//     left/right move the active item in the horizontal pill.
+// Ported: the 64dp pill with adjacent 48dp icon cells (the upstream Row
+// has no spacedBy — cells touch), the beside-FAB expand/collapse morph
+// (bar width lerp + FAB 56↔80 + elevation lerp, FastSpatial-ish tween),
+// vibrant color pair fix, RTL mirroring.
+//
+// Deviations: the slots are chrome painted by the widget (a leaf — Compose
+// takes arbitrary composable children); up/down arrows are not claimed;
+// no scrollBehavior wiring (the expanded flag is a Signal the app or the
+// scroll host drives); FAB position = End only (Start mirrors in RTL).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const anim = ui.anim;
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -79,33 +55,42 @@ pub const ToolbarItem = struct {
 };
 
 pub const ToolbarOptions = struct {
-    /// M3E vibrant variant: TertiaryContainer pill + OnTertiaryContainer
-    /// content (the standard variant is SurfaceContainer/OnSurfaceVariant).
+    /// M3E vibrant variant: PrimaryContainer pill + OnPrimaryContainer
+    /// content, TertiaryContainer FAB (the standard variant is
+    /// SurfaceContainer/OnSurfaceVariant + PrimaryContainer FAB).
     vibrant: bool = false,
-    /// A 48dp PrimaryContainer FAB docked inside the END padding (null =
-    /// no FAB slot).
+    /// A FAB beside the pill's END edge, 8dp away (null = no FAB slot).
+    /// With `expanded` set, collapsing shrinks the bar to nothing and grows
+    /// the FAB 56→80 (HorizontalFloatingToolbarWithFabLayout).
     fab_icon: ?icon_w.IconName = null,
     on_fab_press: ?Callback = null,
     /// The docked FAB's accessible name (an icon-only control).
     fab_a11y_label: []const u8 = "Action",
+    /// Live expanded state (null = always expanded). Collapsed = just the
+    /// FAB (or an empty pill without one).
+    expanded: ?*ui.state.Signal(bool) = null,
     /// The group's accessible name.
     a11y_label: []const u8 = "Toolbar",
     theme: Theme = theme_mod.light,
 };
 
 /// M3E tokens (FloatingToolbarTokens + FloatingToolbarDefaults).
-const bar_height: f32 = 56; // standard ContainerHeight (vibrant+fab = 64: v1 keeps 56)
-const h_pad: f32 = 16; // horizontal end padding
+const bar_height: f32 = 64; // ContainerHeight
+const bar_outer_height: f32 = 80; // with-FAB min height = FabSizeRange.end (FabMedium)
+const h_pad: f32 = 8; // ContainerLeadingSpace / ContainerTrailingSpace
 const item_cell: f32 = 48; // a standard icon-button cell (the a11y floor)
 const icon_size: f32 = 24; // IconSize
-const item_gap: f32 = 8; // spacing between the cells
 const divider_w: f32 = 1; // the separator's thickness
 const divider_h: f32 = 24; // the separator's length
-const fab_size: f32 = 48; // docked FAB container
+const fab_min: f32 = 56; // FabBaselineTokens.ContainerWidth (expanded)
+const fab_max: f32 = 80; // FabMediumTokens.ContainerWidth (collapsed)
+const toolbar_fab_gap: f32 = 8; // ToolbarToFabGap
 const fab_corner: f32 = 16; // CornerLarge squircle
 const fab_icon_size: f32 = 24;
-const bar_elevation: f32 = 3; // the floating pill's lift (dp)
-const fab_elevation: f32 = 2; // the docked FAB's lift (dp)
+const bar_elevation_expanded: f32 = 1; // ContainerExpandedElevationWithFab = Level1
+const fab_elevation: f32 = 3; // Level2 (default toolbar FAB)
+const fab_elevation_hover: f32 = 6; // Level3
+const expand_ms: u32 = 300; // MotionScheme FastSpatial ~300ms
 const min_target: f32 = 48; // a11y touch-target floor
 const shadow_spill: f32 = 16; // paint/damage overflow covering the shadows
 
@@ -135,6 +120,12 @@ const ToolbarState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// Expand/collapse (FloatingToolbarWithFabLayout): 1 = the bar is fully
+    /// expanded (FAB at FabBaseline 56), 0 = collapsed (bar width 0, FAB at
+    /// FabMedium 80). Animated with the FastSpatial-ish tween.
+    expand_progress: f32 = 1,
+    expand_target: f32 = 1,
+    expand_channel: u8 = 0, // channel marker (stable address)
 };
 
 fn stateOf(n: *Node) *ToolbarState {
@@ -170,37 +161,63 @@ fn pressable(s: *const ToolbarState, idx: i32) bool {
     return i < s.items.items.len and s.items.items[i].enabled and !s.items.items[i].divider;
 }
 
-/// The row's intrinsic width (the end paddings, the FAB slot included).
-fn contentWidth(s: *const ToolbarState) f32 {
-    const count = s.items.items.len;
+/// The bar content's intrinsic width (upstream maxToolbarPlaceableWidth):
+/// the 8dp leading/trailing spaces around the adjacent cells.
+fn barContentWidth(s: *const ToolbarState) f32 {
     var w: f32 = h_pad * 2;
     for (s.items.items) |def| w += cellW(def);
-    if (count > 0) w += @as(f32, @floatFromInt(count - 1)) * item_gap;
-    if (hasFab(s)) w += (if (count > 0) item_gap else 0) + fab_size;
     return w;
 }
 
-/// The content block's left edge: centered in any slack (the pill hugs its
-/// content at intrinsic size), start-pinned — then clipped — when narrower.
-fn contentX(s: *const ToolbarState, b: Rect) f32 {
-    return b.x + @max(0, (b.w - contentWidth(s)) / 2);
+/// The whole widget's width (upstream `width` = maxBarW + gap + fabMin).
+fn totalWidth(s: *const ToolbarState) f32 {
+    var w = barContentWidth(s);
+    if (hasFab(s)) w += toolbar_fab_gap + fab_min;
+    return w;
 }
 
-/// Slot `index`'s rect in LTR space: 0..items.len = the item cells (a
-/// divider's is its 1dp x 24dp line), items.len = the FAB docked inside
-/// the end padding. The caller mirrors for RTL.
+/// The FAB's current size: 80 collapsed → 56 expanded (upstream lerps
+/// FabSizeRange by 1 - expandedProgress).
+fn fabSize(s: *const ToolbarState) f32 {
+    return fab_max + (fab_min - fab_max) * s.expand_progress;
+}
+
+/// The bar pill rect in LTR space: its END edge is pinned at
+/// b.x + barContentWidth; collapsing slides the start edge toward it
+/// (upstream toolbarX = maxBarW - barW).
+fn barRectLtr(s: *const ToolbarState, b: Rect) Rect {
+    const cw = barContentWidth(s);
+    const bw = cw * s.expand_progress;
+    return .{
+        .x = b.x + (cw - bw),
+        .y = b.y + (b.h - bar_height) / 2,
+        .w = bw,
+        .h = bar_height,
+    };
+}
+
+/// The FAB rect in LTR space: its END edge is pinned at the widget's end
+/// edge (upstream fabX = width - fabW), vertically centered.
+fn fabRectLtr(s: *const ToolbarState, b: Rect) Rect {
+    const fs = fabSize(s);
+    return .{
+        .x = b.x + b.w - fs,
+        .y = b.y + (b.h - fs) / 2,
+        .w = fs,
+        .h = fs,
+    };
+}
+
+/// Slot `index`'s rect in LTR space: 0..items.len = the item cells inside
+/// the bar (they ride the shrinking pill — x follows barRectLtr), a
+/// divider's is its 1dp x 24dp line; items.len = the FAB beside the pill.
+/// The caller mirrors for RTL.
 fn slotRectLtr(s: *const ToolbarState, b: Rect, index: usize) Rect {
     const count = s.items.items.len;
-    if (index == count) {
-        return .{
-            .x = contentX(s, b) + contentWidth(s) - h_pad - fab_size,
-            .y = b.y + (b.h - fab_size) / 2,
-            .w = fab_size,
-            .h = fab_size,
-        };
-    }
-    var x = contentX(s, b) + h_pad;
-    for (0..index) |i| x += cellW(s.items.items[i]) + item_gap;
+    if (index == count) return fabRectLtr(s, b);
+    const bar = barRectLtr(s, b);
+    var x = bar.x + h_pad;
+    for (0..index) |i| x += cellW(s.items.items[i]);
     const def = s.items.items[index];
     if (def.divider) {
         return .{ .x = x, .y = b.y + (b.h - divider_h) / 2, .w = divider_w, .h = divider_h };
@@ -220,13 +237,18 @@ fn slotRect(s: *const ToolbarState, b: Rect, index: usize) Rect {
 }
 
 /// The slot under the point (-1 = none), in the widget's parent space. The
-/// whole pill column is the target — the cells' tight 48dp height is only
-/// the painted affordance.
+/// item cells are hit only inside the (possibly shrunken) bar rect — a
+/// collapsing bar's clipped items don't press. The whole column is the hit
+/// zone (the cells' tight height is only the painted affordance).
 fn slotAt(s: *const ToolbarState, b: Rect, x: f32, y: f32) i32 {
-    if (y < b.y or y >= b.y + b.h) return -1;
+    const bar_l = barRectLtr(s, b);
+    const bar = if (ui.i18n.direction() == .rtl) mirrorX(b, bar_l) else bar_l;
+    const in_bar = x >= bar.x and x < bar.x + bar.w;
     for (0..slotCount(s)) |i| {
         const r = slotRect(s, b, i);
-        if (x >= r.x and x < r.x + r.w) return @intCast(i);
+        const is_fab = i == s.items.items.len;
+        if (!is_fab and !in_bar) continue;
+        if (x >= r.x and x < r.x + r.w and y >= b.y and y < b.y + b.h) return @intCast(i);
     }
     return -1;
 }
@@ -271,7 +293,10 @@ fn slotActivate(n: *Node, idx: usize) void {
 
 fn toolbarMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
-    return c.constrain(.{ .w = contentWidth(s), .h = bar_height });
+    // upstream: defaultMinSize(minHeight = FabSizeRange.endInclusive) — the
+    // with-FAB toolbar is 80 tall (the collapsed FAB fills it)
+    const h = if (hasFab(s)) bar_outer_height else bar_height;
+    return c.constrain(.{ .w = totalWidth(s), .h = h });
 }
 
 fn toolbarLayout(n: *Node, bounds: Rect) void {
@@ -291,55 +316,69 @@ fn toolbarPaint(n: *Node, ctx: *kx.Ctx) void {
     const t = s.opts.theme;
     const cs = t.colors;
     const b = n.bounds;
-    const container: Color = if (s.opts.vibrant) cs.tertiary_container else cs.surface_container;
-    const on: Color = if (s.opts.vibrant) cs.on_tertiary_container else cs.on_surface_variant;
+    // upstream vibrant = PrimaryContainer/OnPrimaryContainer pill,
+    // TertiaryContainer FAB; standard = SurfaceContainer/OnSurfaceVariant,
+    // PrimaryContainer FAB
+    const container: Color = if (s.opts.vibrant) cs.primary_container else cs.surface_container;
+    const on: Color = if (s.opts.vibrant) cs.on_primary_container else cs.on_surface_variant;
+    const fab_bg: Color = if (s.opts.vibrant) cs.tertiary_container else cs.primary_container;
+    const fab_fg: Color = if (s.opts.vibrant) cs.on_tertiary_container else cs.on_primary_container;
     const focused = input.isFocused(n);
-    // the floating pill: a level-3 ambient+spot shadow under the CornerFull
-    // container (the spill is declared via damage_overflow at init)
-    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, b.h / 2, bar_elevation, cs.shadow);
-    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, b.h / 2, container);
-    // the slots clip to the pill: a narrower-than-intrinsic assignment
-    // truncates the end items instead of painting outside the node
-    ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
-    for (0..slotCount(s)) |i| {
-        const idx: i32 = @intCast(i);
-        const r = slotRect(s, b, i);
-        const is_fab = i == s.items.items.len;
-        if (!is_fab and s.items.items[i].divider) {
-            ui.paint.fillRect(ctx, r.x, r.y, r.w, r.h, cs.outline_variant);
-            continue;
-        }
-        const base: Color = if (is_fab) cs.primary_container else container;
-        const on_c: Color = if (is_fab) cs.on_primary_container else on;
-        const enabled = pressable(s, idx);
-        if (is_fab) {
-            // the docked FAB: a small lift under the CornerLarge squircle
-            ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, fab_corner, fab_elevation, cs.shadow);
-            ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, cs.primary_container);
-        }
-        // the state layer (enabled slots only): the on-color blended over
-        // the container — an opaque lerp, the container is always opaque
-        if (enabled) {
-            const alpha: f32 = if (s.pressed == idx)
-                t.state.pressed
-            else if (focused and s.active == idx)
-                t.state.focus
-            else if (s.hovered == idx)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                const layer = theme_mod.stateLayer(base, on_c, alpha);
-                ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, if (is_fab) fab_corner else r.h / 2, layer);
+    const bar_l = barRectLtr(s, b);
+    const bar = if (ui.i18n.direction() == .rtl) mirrorX(b, bar_l) else bar_l;
+    const count = s.items.items.len;
+    if (bar.w > 0.5) {
+        // the pill: with-FAB elevation lerps Level0→Level1 by progress,
+        // no-FAB is flat (upstream ContainerExpandedElevation = Level0)
+        const elev = if (hasFab(s)) bar_elevation_expanded * s.expand_progress else 0;
+        if (elev > 0.01) ui.paint.elevationShadow(ctx, bar.x, bar.y, bar.w, bar.h, bar.h / 2, elev, cs.shadow);
+        ui.paint.fillRRect(ctx, bar.x, bar.y, bar.w, bar.h, bar.h / 2, container);
+        // the items clip to the shrinking pill (upstream clip=true)
+        ui.paint.clipRect(ctx, bar.x, bar.y, bar.w, bar.h);
+        for (0..count) |i| {
+            const idx: i32 = @intCast(i);
+            const r = slotRect(s, b, i);
+            if (s.items.items[i].divider) {
+                ui.paint.fillRect(ctx, r.x, r.y, r.w, r.h, cs.outline_variant);
+                continue;
             }
+            const enabled = pressable(s, idx);
+            // the state layer (enabled slots only): the on-color blended
+            // over the container — an opaque lerp, the container is always opaque
+            if (enabled) {
+                const alpha: f32 = if (s.pressed == idx)
+                    t.state.pressed
+                else if (focused and s.active == idx)
+                    t.state.focus
+                else if (s.hovered == idx)
+                    t.state.hover
+                else
+                    0;
+                if (alpha > 0) {
+                    const layer = theme_mod.stateLayer(container, on, alpha);
+                    ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, r.h / 2, layer);
+                }
+            }
+            // the icon (centered in the cell; disabled = OnSurface @ 0.38)
+            const fg: Color = if (enabled) on else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+            paintIcon(ctx, s.items.items[i].icon, r.x + (r.w - icon_size) / 2, r.y + (r.h - icon_size) / 2, icon_size, fg);
         }
-        // the icon (centered in the cell; disabled = OnSurface @ 0.38)
-        const fg: Color = if (enabled) on_c else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-        const isz: f32 = if (is_fab) fab_icon_size else icon_size;
-        const icon_name = if (is_fab) s.opts.fab_icon.? else s.items.items[i].icon;
-        paintIcon(ctx, icon_name, r.x + (r.w - isz) / 2, r.y + (r.h - isz) / 2, isz, fg);
+        ui.paint.clipReset(ctx);
     }
-    ui.paint.clipReset(ctx); // the pill-bounds clip
+    // the beside-FAB paints OUTSIDE the pill clip (Level2 squircle, Level3
+    // hovered — upstream FloatingActionButtonDefaults elevation)
+    if (hasFab(s)) {
+        const idx: i32 = @intCast(count);
+        const r = slotRect(s, b, count);
+        const elev = if (s.hovered == idx) fab_elevation_hover else fab_elevation;
+        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, fab_corner, elev, cs.shadow);
+        ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, fab_bg);
+        if (s.pressed == idx or s.hovered == idx or (focused and s.active == idx)) {
+            const alpha: f32 = if (s.pressed == idx) t.state.pressed else if (focused and s.active == idx) t.state.focus else t.state.hover;
+            ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, theme_mod.stateLayer(fab_bg, fab_fg, alpha));
+        }
+        paintIcon(ctx, s.opts.fab_icon.?, r.x + (r.w - fab_icon_size) / 2, r.y + (r.h - fab_icon_size) / 2, fab_icon_size, fab_fg);
+    }
 }
 
 fn toolbarOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -433,8 +472,42 @@ fn toolbarOnKey(n: *Node, ev: input.KeyEvent) bool {
     return false;
 }
 
+/// Expand/collapse (upstream expandedProgress): a tween toward the target
+/// — snaps without a timeline.
+fn retargetExpand(n: *Node, s: *ToolbarState, target: f32) void {
+    if (target == s.expand_target) return;
+    s.expand_target = target;
+    if (anim.timeline()) |tl| {
+        _ = tl.play(.{
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, expand_ms, .{ .ease = .standard }),
+            .from = .{ s.expand_progress, 0, 0, 0 },
+            .channel = @ptrCast(&s.expand_channel),
+            .on_update = .{ .fn_ptr = expandCb, .userdata = n },
+        });
+    } else {
+        s.expand_progress = target;
+        n.markDirty();
+    }
+}
+
+fn expandCb(userdata: ?*anyopaque, value: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.expand_progress = value[0];
+    n.markDirty();
+}
+
+fn expandSyncCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    const target: f32 = if (s.opts.expanded.?.peek()) 1 else 0;
+    retargetExpand(n, s, target);
+}
+
 fn toolbarDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.expand_channel));
+    if (s.opts.expanded) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = expandSyncCb, .userdata = n } });
     input.releaseNode(n);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
@@ -463,9 +536,11 @@ const toolbar_vtable = ui.node.VTable{
 
 /// An M3E floating toolbar. The items are internal chrome painted by the
 /// widget (a leaf — no document children). `items` are copied (the labels
-/// are owned). `opts.fab_icon` docks a 48dp FAB inside the end padding;
-/// `opts.vibrant` swaps the SurfaceContainer/OnSurfaceVariant pair for
-/// TertiaryContainer/OnTertiaryContainer.
+/// are owned). `opts.fab_icon` adds a FAB beside the pill's end edge;
+/// `opts.expanded` (a live signal) collapses the bar into the FAB
+/// (upstream HorizontalFloatingToolbarWithFabLayout); `opts.vibrant` swaps
+/// the SurfaceContainer/OnSurfaceVariant + PrimaryContainer-FAB palette
+/// for PrimaryContainer/OnPrimaryContainer + TertiaryContainer-FAB.
 pub fn toolbar(allocator: std.mem.Allocator, items: []const ToolbarItem, opts: ToolbarOptions) !*Node {
     const node = try Node.create(allocator, &toolbar_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
@@ -492,6 +567,11 @@ pub fn toolbar(allocator: std.mem.Allocator, items: []const ToolbarItem, opts: T
     s.fab_label = try dupeZ(allocator, opts.fab_a11y_label);
     errdefer allocator.free(s.fab_label);
     s.active = nextPressable(s, -1, 1); // the keyboard focus starts on the first action
+    if (opts.expanded) |sig| {
+        s.expand_progress = if (sig.peek()) 1 else 0;
+        s.expand_target = s.expand_progress;
+        sig.subscribe(.{ .callback = .{ .fn_ptr = expandSyncCb, .userdata = node } });
+    }
     node.state = s;
     // the pill/fab shadows paint past the bounds — declare the spill so the
     // paint/damage rect contract covers them
@@ -532,19 +612,20 @@ fn pressCounterCb(userdata: ?*anyopaque) void {
     c.* += 1;
 }
 
-test "toolbar: measures the pill (16dp end padding, 48dp cells, 8dp gaps); 56dp tall" {
+test "toolbar: measures the pill (8dp padding, adjacent 48dp cells); 64dp tall" {
     const a = std.testing.allocator;
     const n = try toolbar(a, &.{ .{ .icon = .search }, .{ .icon = .plus }, .{ .divider = true }, .{ .icon = .star } }, .{});
     defer n.deinit();
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
-    // 16 + 48 + 8 + 48 + 8 + 1 + 8 + 48 + 16 = 201
-    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + 3 * item_cell + divider_w + 3 * item_gap), sz.w, 0.001);
+    // 8 + 48 + 48 + 1 + 48 + 8 = 161 (cells touch — the upstream Row has no spacing)
+    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + 3 * item_cell + divider_w), sz.w, 0.001);
     try std.testing.expectEqual(bar_height, sz.h);
-    // the FAB docks inside the end padding (+8 gap + 48)
+    // the FAB sits BESIDE the pill: +8 gap + 56 (FabBaseline), outer height 80
     const f = try toolbar(a, &.{.{ .icon = .plus }}, .{ .fab_icon = .check });
     defer f.deinit();
     const szf = f.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + item_cell + item_gap + fab_size), szf.w, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + item_cell + toolbar_fab_gap + fab_min), szf.w, 0.001);
+    try std.testing.expectEqual(bar_outer_height, szf.h);
     // an empty toolbar is just the padding
     const e = try toolbar(a, &.{}, .{});
     defer e.deinit();
@@ -568,32 +649,32 @@ test "toolbar: a click fires the item's on_press; disabled slots and dividers do
         .{ .icon = .star, .on_press = .{ .fn_ptr = pressCounterCb, .userdata = &hit_b } },
     }, .{ .fab_icon = .check, .on_fab_press = .{ .fn_ptr = pressCounterCb, .userdata = &fab_hits } });
     defer n.deinit();
-    // 16 + [48 +8+ 48 +8+ 1 +8+ 48] +8+ 48 +16 = 257
-    n.layout(.{ .x = 0, .y = 0, .w = 257, .h = 56 });
+    // bar content = 8 + 48+48+1+48 + 8 = 161; + 8 gap + 56 FAB = 225 x 80
+    n.layout(.{ .x = 0, .y = 0, .w = 225, .h = 80 });
     const down_up = struct {
         fn f(nn: *Node, x: f32) void {
-            _ = nn.vtable.on_pointer.?(nn, .{ .phase = .down, .x = x, .y = 28, .raw_x = x, .raw_y = 28 });
-            _ = nn.vtable.on_pointer.?(nn, .{ .phase = .up, .x = x, .y = 28, .raw_x = x, .raw_y = 28 });
+            _ = nn.vtable.on_pointer.?(nn, .{ .phase = .down, .x = x, .y = 40, .raw_x = x, .raw_y = 40 });
+            _ = nn.vtable.on_pointer.?(nn, .{ .phase = .up, .x = x, .y = 40, .raw_x = x, .raw_y = 40 });
         }
     }.f;
-    down_up(n, 16 + 24); // item 0
+    down_up(n, 8 + 24); // item 0 (cell at bar.x+8 = 8..56)
     try std.testing.expectEqual(@as(u32, 1), hit_a);
     try std.testing.expectEqual(@as(i32, 0), stateOf(n).active); // the press moves the active slot
-    // the disabled item (cell at x = 72) doesn't press — its down is unclaimed
-    try std.testing.expect(!n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 72 + 24, .y = 28, .raw_x = 72 + 24, .raw_y = 28 }));
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 72 + 24, .y = 28, .raw_x = 72 + 24, .raw_y = 28 });
+    // the disabled item (cell at x = 56..104) doesn't press — its down is unclaimed
+    try std.testing.expect(!n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 56 + 24, .y = 40, .raw_x = 56 + 24, .raw_y = 40 }));
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 56 + 24, .y = 40, .raw_x = 56 + 24, .raw_y = 40 });
     try std.testing.expectEqual(@as(u32, 0), hit_b);
-    // the divider column (x = 128) is inert too
-    try std.testing.expect(!n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 128, .y = 28, .raw_x = 128, .raw_y = 28 }));
+    // the divider column (x = 104) is inert too
+    try std.testing.expect(!n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 104, .y = 40, .raw_x = 104, .raw_y = 40 }));
     try std.testing.expectEqual(@as(u32, 0), hit_b);
-    down_up(n, 136 + 24); // item 3
+    down_up(n, 105 + 24); // item 3 (cell 105..153)
     try std.testing.expectEqual(@as(u32, 1), hit_b);
-    // the docked FAB (x = 193..241) fires on_fab_press
-    down_up(n, 193 + 24);
+    // the beside-FAB (x = 225-56 = 169..225) fires on_fab_press
+    down_up(n, 169 + 28);
     try std.testing.expectEqual(@as(u32, 1), fab_hits);
     try std.testing.expectEqual(@as(i32, 4), stateOf(n).active);
-    // a gap between the cells hits nothing
-    try std.testing.expectEqual(@as(i32, -1), slotAt(stateOf(n), n.bounds, 68, 28));
+    // the 8dp gap between the pill end (161) and the FAB (169) hits nothing
+    try std.testing.expectEqual(@as(i32, -1), slotAt(stateOf(n), n.bounds, 165, 40));
 }
 
 test "toolbar: left/right move the active slot (skipping disabled + dividers, wrapping); Enter activates" {
@@ -609,7 +690,7 @@ test "toolbar: left/right move the active slot (skipping disabled + dividers, wr
         .{ .icon = .star, .on_press = .{ .fn_ptr = pressCounterCb, .userdata = &hits } },
     }, .{});
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 201, .h = 56 });
+    n.layout(.{ .x = 0, .y = 0, .w = 161, .h = 64 });
     input.requestFocus(n);
     try std.testing.expectEqual(@as(i32, 0), stateOf(n).active); // the first action is active
     // right skips the disabled item AND the divider to the last action
@@ -634,7 +715,8 @@ test "toolbar: semantics — a focusable group with virtual button children, a s
         .{ .icon = .star, .enabled = false },
     }, .{ .fab_icon = .check, .fab_a11y_label = "Done" });
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 250, .h = 56 });
+    // intrinsic: bar content 8+48+1+48+8 = 113; +8 gap +56 FAB = 177 x 80
+    n.layout(.{ .x = 0, .y = 0, .w = 177, .h = 80 });
     const sem = n.semantics.?;
     try std.testing.expectEqual(ui.semantics.Role.group, sem.role);
     try std.testing.expect(sem.focusable);
@@ -650,13 +732,13 @@ test "toolbar: semantics — a focusable group with virtual button children, a s
     try std.testing.expectEqualStrings("star", sem.children[2].label); // @tagName fallback
     try std.testing.expectEqual(ui.semantics.Role.button, sem.children[3].role);
     try std.testing.expectEqualStrings("Done", sem.children[3].label);
-    // child_bounds in node-local space: item 0's cell, then the FAB slot.
-    // The 201dp content centers in the 250dp assignment: x0 = 24.5 + 16.
+    // child_bounds in node-local space: item 0's cell at bar.x+8 = 8;
+    // the FAB slot pinned at the end edge (177-56 = 121), 56 wide expanded.
     const r0 = sem.child_bounds.?(n, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 40.5), r0.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), r0.x, 0.001);
     const rf = sem.child_bounds.?(n, 3);
-    try std.testing.expectEqual(fab_size, rf.w);
-    try std.testing.expectApproxEqAbs(@as(f32, 24.5 + 201 - h_pad - fab_size), rf.x, 0.001);
+    try std.testing.expectEqual(fab_min, rf.w);
+    try std.testing.expectApproxEqAbs(@as(f32, 177 - fab_min), rf.x, 0.001);
 }
 
 test "toolbar: the 48dp a11y floor is the hit target when the pill is constrained short" {
@@ -676,21 +758,21 @@ test "golden: the pill paints SurfaceContainer + on_surface_variant icons; the d
     defer n.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 200, 96);
     defer r.deinit();
-    // intrinsic: 32 + 48+1+48 + 2*8 = 145
-    n.layout(.{ .x = 20, .y = 20, .w = 145, .h = 56 });
+    // intrinsic: 8 + 48+1+48 + 8 = 113 x 64
+    n.layout(.{ .x = 20, .y = 20, .w = 113, .h = 64 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the pill fill at the gap between cell 0 and the divider (x = 20+16+48+4)
-    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(88, 48));
-    // the first cell's icon ink (the 24dp box inside the 48dp cell)
-    try std.testing.expect(f.countColorIn(.{ .x = 48, .y = 36, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0);
-    // the divider column: 1dp of outline_variant at x = 92, y = 36..60
-    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(92, 48));
-    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(92, 36));
-    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(92, 59));
-    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(92, 34)); // above the line
-    // the pill's full-rounded corner (r = 28): the corner box has no container
+    // the pill fill inside cell 1's padding (star icon sits at x = 88..112)
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(118, 52));
+    // the first cell's icon ink (the 24dp box at x = 20+8+12 = 40..64)
+    try std.testing.expect(f.countColorIn(.{ .x = 40, .y = 40, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0);
+    // the divider column: 1dp of outline_variant at x = 20+8+48 = 76, y = 40..64
+    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(76, 52));
+    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(76, 41));
+    try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(76, 63));
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(76, 38)); // above the line
+    // the pill's full-rounded corner (r = 32): the corner box has no container
     try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 20, .y = 20, .w = 8, .h = 8 }, t.colors.surface_container));
 }
 
@@ -701,56 +783,90 @@ test "golden: a pressed item paints the on-color state layer circle over the con
     defer n.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 200, 96);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 136, .h = 56 }); // 32 + 96 + 8
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 60, .y = 48, .raw_x = 60, .raw_y = 48 });
+    n.layout(.{ .x = 20, .y = 20, .w = 112, .h = 64 }); // 8 + 96 + 8
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 52, .y = 52, .raw_x = 52, .raw_y = 52 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     // inside the state-layer circle, clear of the icon ink (cell 0 at
-    // x = 36..84, center 60): the left interior edge shows the blend
+    // x = 28..76, center 52): the left interior edge shows the blend
     const layer = theme_mod.stateLayer(t.colors.surface_container, t.colors.on_surface_variant, t.state.pressed);
-    try golden.expectPixelApprox(f, 40, 48, layer);
-    // the unpressed second cell still shows the bare container
-    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(108, 32));
+    try golden.expectPixelApprox(f, 32, 52, layer);
+    // the unpressed second cell still shows the bare container (past the
+    // icon's ink box at x = 88..112)
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(118, 52));
 }
 
-test "golden: the vibrant variant paints TertiaryContainer + on_tertiary_container content" {
+test "golden: the vibrant variant paints PrimaryContainer + on_primary_container content" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try toolbar(a, &.{ .{ .icon = .search }, .{ .icon = .star, .enabled = false } }, .{ .theme = t, .vibrant = true });
     defer n.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 200, 96);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 136, .h = 56 });
+    n.layout(.{ .x = 20, .y = 20, .w = 112, .h = 64 }); // 8 + 96 + 8
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    try std.testing.expectEqual(t.colors.tertiary_container, f.pixelAt(80, 48)); // the gap between the cells
-    try std.testing.expect(f.countColorIn(.{ .x = 48, .y = 36, .w = 24, .h = 24 }, t.colors.on_tertiary_container) > 0);
-    // the disabled icon: on_surface @ 0.38 over the tertiary_container pill
-    const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), t.colors.tertiary_container);
-    try std.testing.expect(f.countColorApproxIn(.{ .x = 104, .y = 36, .w = 24, .h = 24 }, dis) > 0);
+    // upstream vibrant = PrimaryContainer / OnPrimaryContainer (cell 1's
+    // padding — the icon's ink box is x = 88..112)
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(118, 52));
+    try std.testing.expect(f.countColorIn(.{ .x = 40, .y = 40, .w = 24, .h = 24 }, t.colors.on_primary_container) > 0);
+    // the disabled icon: on_surface @ 0.38 over the primary_container pill
+    const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), t.colors.primary_container);
+    try std.testing.expect(f.countColorApproxIn(.{ .x = 88, .y = 40, .w = 24, .h = 24 }, dis) > 0);
 }
 
-test "golden: the docked FAB paints a PrimaryContainer squircle + on_primary_container icon at the end" {
+test "golden: the beside-FAB paints a PrimaryContainer squircle + on_primary_container icon at the end" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try toolbar(a, &.{.{ .icon = .search }}, .{ .theme = t, .fab_icon = .check });
     defer n.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 200, 96);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 136, .h = 56 });
+    // bar content = 8+48+8 = 64; +8 gap +56 FAB = 128 x 80
+    n.layout(.{ .x = 20, .y = 8, .w = 128, .h = 80 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the FAB slot: end edge inside the end padding → x = 20+136-16-48 = 92
+    // the FAB: end edge at 20+128 = 148 → x = 92..148, y = 8+12 = 20..76
     // (probe beside the icon — the glyph's AA edges bleed faint ink nearby)
-    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(96, 48)); // mid-height start edge
-    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(138, 48)); // near the end edge
-    try std.testing.expect(f.countColorIn(.{ .x = 104, .y = 36, .w = 24, .h = 24 }, t.colors.on_primary_container) > 0);
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(96, 60)); // mid-height start edge
+    try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(144, 60)); // near the end edge
+    try std.testing.expect(f.countColorIn(.{ .x = 108, .y = 48, .w = 24, .h = 24 }, t.colors.on_primary_container) > 0);
     // the FAB's squircle corner (16dp radius): the deep corner pixels stay
-    // container-colored (the r-16 arc doesn't reach the corner 4px)
-    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 92, .y = 24, .w = 4, .h = 4 }, t.colors.primary_container));
+    // background (the r-16 arc doesn't reach the corner 4px)
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 92, .y = 20, .w = 4, .h = 4 }, t.colors.primary_container));
+    // the pill is a separate surface, 8dp away (gap at x = 84..92)
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 85, .y = 40, .w = 6, .h = 20 }, t.colors.surface_container));
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(82, 48));
+}
+
+test "toolbar: collapsing shrinks the bar toward the FAB and grows it 56→80" {
+    const a = std.testing.allocator;
+    const expanded = try ui.state.Signal(bool).init(a, true);
+    defer expanded.deinit();
+    const n = try toolbar(a, &.{ .{ .icon = .search }, .{ .icon = .star } }, .{ .fab_icon = .check, .expanded = expanded });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 176, .h = 80 }); // bar 112 + 8 + 56
+    const s = stateOf(n);
+    // expanded: bar at full 112, FAB at 56
+    try std.testing.expectApproxEqAbs(@as(f32, 112), barRectLtr(s, n.bounds).w, 0.001);
+    try std.testing.expectEqual(fab_min, fabRectLtr(s, n.bounds).w);
+    // collapse (no timeline → snap): the bar vanishes, the FAB is 80 and
+    // its end edge stays pinned (x = 176-80 = 96)
+    expanded.set(false);
+    try std.testing.expectEqual(@as(f32, 0), s.expand_progress);
+    try std.testing.expectEqual(@as(f32, 0), barRectLtr(s, n.bounds).w);
+    const fr = fabRectLtr(s, n.bounds);
+    try std.testing.expectEqual(fab_max, fr.w);
+    try std.testing.expectApproxEqAbs(@as(f32, 176 - fab_max), fr.x, 0.001);
+    // a collapsed bar's item slot does not hit (outside the 0-width bar)
+    try std.testing.expectEqual(@as(i32, -1), slotAt(s, n.bounds, 32, 40));
+    try std.testing.expect(slotAt(s, n.bounds, 120, 40) >= 0); // the FAB still hits
+    // re-expand snaps back
+    expanded.set(true);
+    try std.testing.expectEqual(@as(f32, 1), s.expand_progress);
 }
 
 test "toolbar: RTL mirrors the row (the first item sits at the end side, the FAB at the start)" {
@@ -770,10 +886,10 @@ test "toolbar: RTL mirrors the row (the first item sits at the end side, the FAB
         .{ .icon = .star },
     }, .{});
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 136, .h = 56 }); // 32 + 96 + 8
-    // LTR item 0 cell [16, 64) mirrors to [136-64, 136-16) = [72, 120)
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 96, .y = 28, .raw_x = 96, .raw_y = 28 });
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 96, .y = 28, .raw_x = 96, .raw_y = 28 });
+    n.layout(.{ .x = 0, .y = 0, .w = 112, .h = 64 }); // 8 + 96 + 8
+    // LTR item 0 cell [8, 56) mirrors to [112-56, 112-8) = [56, 104)
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 80, .y = 32, .raw_x = 80, .raw_y = 32 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 80, .y = 32, .raw_x = 80, .raw_y = 32 });
     try std.testing.expectEqual(@as(u32, 1), hits); // the right-side cell is item 0
     // left moves forward (toward the visual left = increasing index in RTL)
     input.requestFocus(n);
