@@ -1,0 +1,21 @@
+{
+  "scenes": [
+    {
+      "name": "anim_100",
+      "frame_time_avg_ms": 0.6,
+      "frame_time_p50_ms": 0.6,
+      "frame_time_p99_ms": 0.7,
+      "frame_time_p999_ms": 0.8,
+      "jank_frames": 0,
+      "jank_pct": 0.0,
+      "fps": 1704.5,
+      "draw_calls_per_frame": 412,
+      "rss_mb": 117.5,
+      "ttff_ms": 5.1,
+      "frames_rendered": 130,
+      "extra": {}
+    }
+  ],
+  "binary_size_bytes": 132816,
+  "timestamp": "2026-10-16T13:09:15Z"
+}
