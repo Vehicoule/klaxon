@@ -10,8 +10,12 @@
 //   - icon (optional): 24dp, secondary, 16dp bottom padding
 //   - headline (optional): headline_small, on_surface, 16dp bottom padding
 //   - supporting text: body_medium, on_surface_variant
-//   - actions: text buttons (primary, label_large), end-aligned, 8dp spacing,
-//     24dp above (16 gap + 8)
+//   - actions: text buttons (primary, label_large), end-aligned, 8dp spacing —
+//     AlertDialogFlowRow: they wrap to stacked lines when they overflow, the
+//     confirm (LAST child in visual order) staying on top; each line's gap
+//     is the previous slot's bottom padding (16 icon/title, 24 touch /
+//     16 precision-pointer for the text — shouldUsePrecisionPointer-
+//     ComponentSizing via input.precisionPointer)
 //   - scrim: the scrim token at 32% opacity; a click outside closes the
 //     dialog (and Escape / hardware back via the modal back stack)
 //   - motion: v1 fades the panel (layer alpha); M3E scales+fades with the
@@ -61,13 +65,23 @@ const Theme = theme_mod.Theme;
 /// M3E measurement tokens (Compose DialogTokens / AlertDialog.kt).
 const min_width: f32 = 280;
 const max_width: f32 = 560;
-const container_padding: f32 = 24;
 const corner: f32 = 28;
 const icon_size: f32 = 24;
-const gap: f32 = 16;
-const actions_top_extra: f32 = 8; // 16 gap + 8 = 24dp above the actions
 const scrim_max_alpha: f32 = 0.32;
 const fade_ms: u32 = 200;
+
+/// AlertDialog.kt — shouldUsePrecisionPointerComponentSizing drives the
+/// density: a mouse window pads 20dp with a 16dp text spacing; touch pads
+/// 24dp with a 24dp text spacing.
+fn containerPadding() f32 {
+    return if (input.precisionPointer()) 20 else 24;
+}
+fn textPadding() f32 {
+    return if (input.precisionPointer()) 16 else 24;
+}
+const icon_bottom_pad: f32 = 16; // IconPadding (bottom = 16)
+const title_bottom_pad: f32 = 16; // TitlePadding (bottom = 16)
+const actions_gap: f32 = 8; // ButtonsMainAxisSpacing / ButtonsCrossAxisSpacing
 
 /// Full-screen dialog tokens (Compose FullScreenDialog.kt — the top bar is
 /// a single-row TopAppBar: AppBarTokens.ContainerHeight 64, 4dp edge
@@ -265,6 +279,68 @@ const panel_vtable = ui.node.VTable{
     .pre_children_paint = panelPreChildrenPaint,
     .post_children_paint = panelPostChildrenPaint,
     .deinit = panelDeinit,
+};
+
+// --- actions flow (AlertDialogFlowRow) ---
+// Upstream runs the buttons through a direction-flipped FlowRow holding
+// [confirm, dismiss]: visually [dismiss][confirm] end-aligned while they
+// fit; on overflow the row wraps and the confirm stays on the first line.
+// Klaxon callers pass buttons in VISUAL order (confirm last), so the
+// wrapped stack iterates children in reverse — the last lands on top,
+// each kept at natural width, end-aligned, 8dp between lines.
+fn actionsFit(n: *Node, avail_w: f32) ?Size {
+    // null = overflow -> stack
+    if (n.children.items.len == 0) return .{};
+    const actions = n.children.items[0];
+    const rm = actions.measure(.{ .max_w = std.math.inf(f32), .max_h = std.math.inf(f32) });
+    if (rm.w <= avail_w) return rm;
+    return null;
+}
+
+fn actionsFlowMeasure(n: *Node, c: Constraints) Size {
+    if (actionsFit(n, c.max_w)) |rm| return c.constrain(rm);
+    const actions = n.children.items[0];
+    var h: f32 = 0;
+    var w: f32 = 0;
+    for (actions.children.items, 0..) |b, i| {
+        const bm = b.measure(.{ .max_w = c.max_w, .max_h = c.max_h });
+        if (i > 0) h += actions_gap;
+        h += bm.h;
+        w = @max(w, bm.w);
+    }
+    return c.constrain(.{ .w = w, .h = h });
+}
+
+fn actionsFlowLayout(n: *Node, b: Rect) void {
+    if (n.children.items.len == 0) return;
+    const actions = n.children.items[0];
+    if (actionsFit(n, b.w)) |rm| {
+        actions.layout(.{ .x = b.x + b.w - rm.w, .y = b.y, .w = rm.w, .h = rm.h });
+        return;
+    }
+    actions.layout(b); // row bounds cover the stacked area (hit test)
+    // last child (the confirm) on the first line, stacking downward —
+    // upstream's flipped FlowRow keeps the confirm on top when wrapping.
+    var y = b.y;
+    var i = actions.children.items.len;
+    while (i > 0) {
+        i -= 1;
+        const ch = actions.children.items[i];
+        const cm = ch.measure(.{ .max_w = b.w, .max_h = b.h });
+        ch.layout(.{ .x = b.x + b.w - cm.w, .y = y, .w = cm.w, .h = cm.h });
+        y += cm.h + actions_gap;
+    }
+}
+
+const actions_flow_vtable = ui.node.VTable{
+    .measure = actionsFlowMeasure,
+    .layout = actionsFlowLayout,
+    .paint = struct {
+        fn p(n: *Node, ctx: *kx.Ctx) void {
+            _ = n;
+            _ = ctx;
+        }
+    }.p,
 };
 
 // --- dialog ---
@@ -506,29 +582,40 @@ pub fn dialog(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_clo
         panel.add(top_bar);
         if (opts.content) |content| panel.add(content);
     } else {
-        // Content column: padding 24, gap 16, centered with an icon /
-        // start-aligned without. Actions get 8dp extra top padding (24dp
-        // total above them).
+        // AlertDialogContent: Column(padding = dialogPadding) of slots,
+        // each carrying its own bottom padding — icon 16, title 16, text
+        // 24 (touch) / 16 (precision pointer). The icon centers, the title
+        // centers only when an icon is present, the text stays start-
+        // aligned, and the actions box aligns end (upstream align calls).
         const col = try layout_w.column(allocator, .{
-            .gap = gap,
-            .padding = container_padding,
-            .cross_align = if (opts.icon != null) .center else .start,
+            .gap = 0,
+            .padding = containerPadding(),
         });
         if (opts.icon) |ic| {
             const icon_box = try layout_w.constrainedBox(allocator, .{ .min_w = icon_size, .max_w = icon_size, .min_h = icon_size, .max_h = icon_size });
             icon_box.add(ic);
-            col.add(icon_box);
+            const icon_pad = try layout_w.padding(allocator, ui.layout.EdgeInsets{ .bottom = icon_bottom_pad });
+            icon_pad.add(icon_box);
+            const icon_center = try layout_w.alignTo(allocator, .{ .alignment = .center });
+            icon_center.add(icon_pad);
+            col.add(icon_center);
         }
-        if (opts.title) |title| col.add(title);
-        if (opts.content) |content| col.add(content);
+        if (opts.title) |title| {
+            const title_pad = try layout_w.padding(allocator, ui.layout.EdgeInsets{ .bottom = title_bottom_pad });
+            title_pad.add(title);
+            const title_align = try layout_w.alignTo(allocator, .{ .alignment = if (opts.icon != null) .center else .top_left });
+            title_align.add(title_pad);
+            col.add(title_align);
+        }
+        if (opts.content) |content| {
+            const text_pad = try layout_w.padding(allocator, ui.layout.EdgeInsets{ .bottom = textPadding() });
+            text_pad.add(content);
+            col.add(text_pad);
+        }
         if (opts.actions) |actions| {
-            // actions are end-aligned (M3); 24dp above them (16 gap + 8 padding).
-            // v1: center_right (LTR) — RTL cross-axis mirroring is a follow-up.
-            const actions_end = try layout_w.alignTo(allocator, .{ .alignment = .center_right });
-            const actions_pad = try layout_w.padding(allocator, ui.layout.EdgeInsets{ .top = actions_top_extra });
-            actions_pad.add(actions);
-            actions_end.add(actions_pad);
-            col.add(actions_end);
+            const flow = try Node.create(allocator, &actions_flow_vtable);
+            flow.add(actions);
+            col.add(flow);
         }
         panel.add(col);
     }
@@ -614,6 +701,48 @@ test "dialog: a scrim click closes it; the global back path too" {
     try std.testing.expect(!open.peek());
     try std.testing.expectEqual(@as(u32, 2), closed);
     try std.testing.expectEqual(@as(usize, 0), router.back_stack_len);
+}
+
+test "dialog: actions wrap into a stacked flow when the row overflows" {
+    const layout_w = @import("layout.zig");
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    // visual order [dismiss, confirm] — confirm is the LAST child
+    const actions = try layout_w.row(std.testing.allocator, .{ .gap = actions_gap });
+    const b1 = try golden.solidBox(std.testing.allocator, 200, 40, 0xFF0000FF);
+    const b2 = try golden.solidBox(std.testing.allocator, 200, 40, 0x00FF00FF);
+    actions.add(b1);
+    actions.add(b2);
+    const d = try dialog(std.testing.allocator, open, null, .{
+        .title = try text_w.text(std.testing.allocator, "Title", .{}),
+        .actions = actions,
+    });
+    defer d.deinit();
+    // 300dp window: the 408dp row overflows the [280,560]-clamped panel —
+    // AlertDialogFlowRow stacks, confirm (last) on the first line.
+    d.layout(.{ .x = 0, .y = 0, .w = 300, .h = 320 });
+    const s = stateOf(d);
+    try std.testing.expect(b2.bounds.y < b1.bounds.y); // confirm on top
+    try std.testing.expectApproxEqAbs(b1.bounds.y, b2.bounds.y + b2.bounds.h + actions_gap, 0.01);
+    // both end-aligned inside the panel's padded content width
+    try std.testing.expectApproxEqAbs(b1.bounds.x + b1.bounds.w, b2.bounds.x + b2.bounds.w, 0.01);
+    try std.testing.expectApproxEqAbs(b2.bounds.x + b2.bounds.w, s.panel.bounds.x + s.panel.bounds.w - containerPadding(), 0.01);
+    // a fitting row stays horizontal, end-aligned
+    const open2 = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open2.deinit();
+    const actions2 = try layout_w.row(std.testing.allocator, .{ .gap = actions_gap });
+    const c1 = try golden.solidBox(std.testing.allocator, 60, 40, 0xFF0000FF);
+    const c2 = try golden.solidBox(std.testing.allocator, 60, 40, 0x00FF00FF);
+    actions2.add(c1);
+    actions2.add(c2);
+    const d2 = try dialog(std.testing.allocator, open2, null, .{
+        .title = try text_w.text(std.testing.allocator, "T", .{}),
+        .actions = actions2,
+    });
+    defer d2.deinit();
+    d2.layout(.{ .x = 0, .y = 0, .w = 480, .h = 320 });
+    try std.testing.expectApproxEqAbs(c1.bounds.y, c2.bounds.y, 0.01); // same line
+    try std.testing.expect(c1.bounds.x < c2.bounds.x); // visual order kept
 }
 
 test "golden: dialog paints the scrim and the centered panel (open)" {

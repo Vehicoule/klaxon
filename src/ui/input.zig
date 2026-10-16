@@ -42,6 +42,16 @@ pub const PointerEvent = struct {
     time_ms: u64 = 0, // event timestamp (SDL event ns / 1e6) — gesture timing
 };
 
+/// Tracks whether the window is driven by a precision pointer (mouse) —
+/// Compose's shouldUsePrecisionPointerComponentSizing. Mouse events set
+/// it, touch clears it; used by density-adaptive widgets (dialog paddings
+/// shrink 24→20/16dp). Defaults to true (a desktop window starts precise).
+var precision_pointer: bool = true;
+
+pub fn precisionPointer() bool {
+    return precision_pointer;
+}
+
 /// Platform-independent keys (the host maps SDL_Keycode → Key).
 pub const Key = enum(u32) {
     unknown = 0,
@@ -175,6 +185,9 @@ pub const InputRouter = struct {
         var ev = ev_in;
         ev.raw_x = ev_in.x;
         ev.raw_y = ev_in.y;
+        // pointer 0 = mouse (precision), >0 = a touch finger — the last
+        // input type wins, like upstream's LocalWindowInfo flag.
+        precision_pointer = ev.pointer == 0;
         if (ev.pointer == 0) {
             self.last_x = ev.x;
             self.last_y = ev.y;

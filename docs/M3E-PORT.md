@@ -19,36 +19,36 @@ Port contract per widget:
 | Klaxon widget | Upstream source | Tokens | Status |
 |---|---|---|---|
 | slider | Slider.kt | SliderTokens | ported (gap/corners/stop dot/handle morph/RTL) |
-| dialog | AlertDialog.kt | DialogTokens | audited — layout conforme |
-| app_bar | AppBar.kt | AppBarTokens + Small/Medium/Large(Flexible) | pending |
-| bottom_app_bar | AppBar.kt | BottomAppBarTokens | pending |
-| badge | Badge.kt | BadgeTokens | pending |
+| dialog | AlertDialog.kt | DialogTokens | **ported** |
+| app_bar | AppBar.kt | AppBarTokens + Small/Medium/Large(Flexible) | **ported** |
+| bottom_app_bar | AppBar.kt | BottomAppBarTokens | **ported** |
+| badge | Badge.kt | BadgeTokens | **ported** |
 | bottom_sheet | ModalBottomSheet.kt + SheetDefaults.kt + DragHandle.kt | SheetBottomTokens, DragHandleTokens | pending |
-| button | Button.kt | Button(S-XL)Tokens, Filled/Tonal/Outlined/TextButtonTokens | pending |
-| button_group | ButtonGroup.kt | ButtonGroupSmallTokens, ConnectedButtonGroupSmallTokens | pending |
+| button | Button.kt | Button(S-XL)Tokens, Filled/Tonal/Outlined/TextButtonTokens | **ported** |
+| button_group | ButtonGroup.kt | ButtonGroupSmallTokens, ConnectedButtonGroupSmallTokens | **ported** |
 | card | Card.kt | FilledCardTokens, ElevatedCardTokens | pending |
-| carousel | carousel/Carousel.kt + Keylines.kt + KeylineList.kt | — | pending |
+| carousel | carousel/Carousel.kt + Keylines.kt + KeylineList.kt + Strategy.kt + KeylineSnapPosition.kt | — | **ported** |
 | checkbox | Checkbox.kt | CheckboxTokens | pending |
 | chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | pending |
 | date_picker | DatePicker.kt | DatePickerModalTokens | pending |
-| divider | Divider.kt | DividerTokens | pending |
+| divider | Divider.kt | DividerTokens | **ported** |
 | drawer | NavigationDrawer.kt | — | pending |
-| fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | pending |
-| fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | pending |
-| icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | pending |
+| fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | **ported** |
+| fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | **ported** |
+| icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | **ported** |
 | list_item | ListItem.kt | ListTokens | pending |
-| loading_indicator | LoadingIndicator.kt | LoadingIndicatorTokens | pending |
+| loading_indicator | LoadingIndicator.kt | LoadingIndicatorTokens | **ported** |
 | menu | Menu.kt | MenuTokens, StandardMenuTokens | pending |
-| nav_bar | NavigationBar.kt | NavigationBarTokens | pending |
-| navigation_rail | NavigationRail.kt | NavigationRailTokens | pending |
+| nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |
+| navigation_rail | NavigationRail.kt | NavigationRailTokens | **ported** |
 | progress | ProgressIndicator.kt + WavyProgressIndicator.kt | (Linear|Circular)ProgressIndicatorTokens | pending |
 | pull_to_refresh | pulltorefresh/PullToRefresh.kt | — | pending |
 | radio | RadioButton.kt | RadioButtonTokens | pending |
 | search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | pending |
-| segmented_button | SegmentedButton.kt | SegmentedButtonTokens | pending |
+| segmented_button | SegmentedButton.kt | SegmentedButtonTokens | **ported** |
 | side_sheet | NavigationDrawer.kt (side-sheet variant) | SheetBottomTokens | pending |
 | snackbar | Snackbar.kt | SnackbarTokens | pending |
-| split_button | SplitButton.kt | SplitButtonTokens | pending |
+| split_button | SplitButton.kt | SplitButtonTokens | **ported** |
 | switch | Switch.kt | SwitchTokens | pending |
 | tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | pending |
 | text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | pending |
