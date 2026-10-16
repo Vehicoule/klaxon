@@ -39,6 +39,8 @@ namespace kx {
 struct GpuState {
     std::unique_ptr<skgpu::graphite::Context> context;
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
+    std::unique_ptr<skgpu::graphite::Recorder> warmup_recorder;
+    sk_sp<SkSurface> warmup_surface;
     CAMetalLayer* layer = nil;
     SDL_MetalView metal_view = nullptr;
     id<CAMetalDrawable> drawable = nil;
@@ -218,17 +220,37 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_CoreText(nullptr);
 }
 
-// Warmup: offscreen graphite surface — Phase 4e.1b; warmup is best-effort,
-// kx_gpu_warmup returns false on iOS until then (host logs and moves on).
+// Warmup: offscreen graphite surface on its own recorder — same draw ops,
+// so the same pipelines onscreen frames use (Metal compiles lazily on
+// first use). Identical to the macOS implementation.
 SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
-    (void)state;
-    (void)width;
-    (void)height;
-    return nullptr;
+    if (!state || !state->context || width <= 0 || height <= 0) return nullptr;
+    state->warmup_recorder = state->context->makeRecorder();
+    if (!state->warmup_recorder) return nullptr;
+    // BGRA like the wrapped CAMetalLayer drawable — pipelines are
+    // per-target-format, an RGBA warmup would not prime onscreen draws.
+    state->warmup_surface = SkSurfaces::RenderTarget(
+        state->warmup_recorder.get(),
+        SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+    return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }
 bool gpu_end_offscreen(GpuState* state) {
-    (void)state;
-    return false;
+    if (!state || !state->context) return false;
+    if (state->warmup_recorder) {
+        std::unique_ptr<skgpu::graphite::Recording> recording = state->warmup_recorder->snap();
+        if (recording) {
+            skgpu::graphite::InsertRecordingInfo info;
+            info.fRecording = recording.get();
+            info.fTargetSurface = state->warmup_surface.get();
+            state->context->insertRecording(info);
+        }
+        state->warmup_recorder.reset();
+    }
+    // Synchronous: the pipeline compile must complete inside the warmup
+    // call, not leak into the next real frame.
+    state->context->submit(skgpu::graphite::SyncToCpu::kYes);
+    state->warmup_surface = nullptr;
+    return true;
 }
 
 sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height) {
