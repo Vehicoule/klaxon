@@ -135,6 +135,10 @@ pub const VTable = struct {
     on_pointer: ?*const fn (node: *Node, ev: input_mod.PointerEvent) bool = null,
     /// Keyboard input (Phase 1c) — delivered to the focused node's chain.
     on_key: ?*const fn (node: *Node, ev: input_mod.KeyEvent) bool = null,
+    /// The node edits text (TextField/SearchBar/SearchView): the host
+    /// raises the platform IME while it's focused (SDL_StartTextInput +
+    /// SetTextInputArea) — desktop always-on paths ignore this.
+    wants_text_input: bool = false,
     /// Scroll (wheel) input (Phase 1f) — bubbles up until a scrollable
     /// reports it handled.
     on_scroll: ?*const fn (node: *Node, ev: input_mod.ScrollEvent) bool = null,

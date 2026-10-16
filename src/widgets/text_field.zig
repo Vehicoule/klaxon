@@ -157,6 +157,11 @@ const TextFieldState = struct {
     /// that prefix — appended mid-frame or unsafe to split — measures
     /// whole and merges into the last segment.
     segs: std.array_list.Managed(Seg) = undefined,
+    /// IME composition (preedit) — SDL_EVENT_TEXT_EDITING replaces it
+    /// wholesale; the next text_input commits into `buf` and clears it.
+    /// Never committed to `buf`, the signal, or semantics — platforms that
+    /// collapse composition to commits (Android) simply leave it empty.
+    comp: std.array_list.Managed(u8) = undefined,
 
     const Seg = struct {
         text: [:0]u8, // owned
@@ -167,6 +172,10 @@ const TextFieldState = struct {
     fn text(s: *TextFieldState) [:0]const u8 {
         // Sentinel slice via the many-item pointer (see input.zig).
         return s.buf.items.ptr[0..s.buf.items.len :0];
+    }
+
+    fn composition(s: *TextFieldState) [:0]const u8 {
+        return s.comp.items.ptr[0..s.comp.items.len :0];
     }
 };
 
@@ -626,7 +635,8 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_x = c.x + @min(leftOffset(s), rightOffset(s));
     const clip_w = c.w - leftOffset(s) - rightOffset(s);
     ui.paint.clipRect(ctx, clip_x, c.y, clip_w, c.h);
-    if (s.buf.items.len > 0) {
+    const has_comp = s.comp.items.len > 0;
+    if (s.buf.items.len > 0 or has_comp) {
         const style = bodyLarge(t);
         const m = fieldMetrics(s);
         const tx = mx(c.x, c.w, tr.x, m.width, rtl);
@@ -639,9 +649,19 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
             sx += seg.m.width;
         }
+        var caret_x = sx;
+        if (has_comp) {
+            // Preedit: appended visually after the committed text with the
+            // platform-conventional underline (Compose marks the composing
+            // range; a 1px underline is the standard visual).
+            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
+            ui.paint.text(ctx, s.composition(), sx, baseline, style.size, false, fc.input);
+            ui.paint.fillRect(ctx, sx, baseline + 1, comp_m.width, 1, fc.input);
+            caret_x = sx + comp_m.width;
+        }
         if (focused) {
-            // the caret at the end of the text
-            ui.paint.fillRect(ctx, tx + m.width, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
+            // the caret at the end of the text (+ composition)
+            ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         }
     } else {
         // The placeholder shows only when the expanded label isn't covering
@@ -713,6 +733,11 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.kind) {
         .text_input => {
+            // A commit discharges the composition: SDL's sequence is
+            // text_input (commit) then text_editing("") (clear) on the
+            // platforms that report preedit at all.
+            s.comp.clearRetainingCapacity();
+            setSentinel(&s.comp);
             // Reject (never truncate) input that would grow the text past
             // the documented cap — a paste/IME burst is applied whole or
             // not at all.
@@ -723,16 +748,30 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
             applyEdit(n, s);
             return true;
         },
+        .text_editing => {
+            // SDL delivers the full composing string — replace, don't
+            // append. Bounded by the same documented cap; an over-cap
+            // preedit is dropped whole (never truncated mid-codepoint).
+            s.comp.clearRetainingCapacity();
+            if (ev.text.len <= ui.state.TextSignal.max_len) {
+                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+            }
+            setSentinel(&s.comp);
+            n.markDirty(); // repaint only — comp is not a committed edit
+            return true;
+        },
         .key_down => switch (ev.key) {
             .backspace => {
+                // An open composition eats the backspace (codepoint first).
+                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
                 // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (s.buf.items.len > 0) {
-                    const last = s.buf.items[s.buf.items.len - 1];
-                    s.buf.items.len -= 1;
+                while (target.items.len > 0) {
+                    const last = target.items[target.items.len - 1];
+                    target.items.len -= 1;
                     if ((last & 0xC0) != 0x80) break;
                 }
-                setSentinel(&s.buf);
-                applyEdit(n, s);
+                setSentinel(target);
+                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
                 return true;
             },
             .enter => {
@@ -740,6 +779,8 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
                 return true;
             },
             .escape => {
+                s.comp.clearRetainingCapacity();
+                setSentinel(&s.comp);
                 input.requestFocus(null);
                 n.markDirty();
                 return true;
@@ -777,6 +818,7 @@ fn textFieldDeinit(n: *Node) void {
     n.allocator.free(s.placeholder);
     n.allocator.free(s.supporting);
     s.buf.deinit();
+    s.comp.deinit();
     segsReset(s);
     s.segs.deinit();
     n.allocator.destroy(s);
@@ -789,6 +831,7 @@ const text_field_vtable = ui.node.VTable{
     .deinit = textFieldDeinit,
     .on_pointer = textFieldOnPointer,
     .on_key = textFieldOnKey,
+    .wants_text_input = true,
 };
 
 /// An M3E text field. `sig` = null → the text starts at `opts.initial`;
@@ -814,6 +857,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     errdefer allocator.free(supporting);
     s.* = .{
         .buf = std.array_list.Managed(u8).init(allocator),
+        .comp = std.array_list.Managed(u8).init(allocator),
         .segs = std.array_list.Managed(TextFieldState.Seg).init(allocator),
         .label = label,
         .placeholder = placeholder,

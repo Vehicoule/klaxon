@@ -180,10 +180,17 @@ const SearchViewState = struct {
     /// Stable channel addresses for the timeline (the switch idiom).
     progress_channel: u8 = 0,
     field_channel: u8 = 0,
+    /// IME composition (preedit) — same contract as text_field's: replaced
+    /// wholesale by text_editing, committed+cleared by text_input.
+    comp: std.array_list.Managed(u8) = undefined,
 
     fn text(s: *SearchViewState) [:0]const u8 {
         // Sentinel slice via the many-item pointer (see search_bar.zig).
         return s.buf.items.ptr[0..s.buf.items.len :0];
+    }
+
+    fn composition(s: *SearchViewState) [:0]const u8 {
+        return s.comp.items.ptr[0..s.comp.items.len :0];
     }
 };
 
@@ -192,7 +199,10 @@ fn stateOf(n: *Node) *SearchViewState {
 }
 
 /// Write the null sentinel at items[len] (the P0 TextField helper).
+/// Grows if the buffer is exactly full — writing the sentinel past
+/// capacity was a heap OOB (an empty/zero-cap buffer is the first case).
 fn setSentinel(buf: *std.array_list.Managed(u8)) void {
+    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
     buf.items.len += 1;
     buf.items[buf.items.len - 1] = 0;
     buf.items.len -= 1;
@@ -351,10 +361,11 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.fillRRect(ctx, bx, b.y + (header_h - iconBox(t)) / 2, iconBox(t), iconBox(t), iconBox(t) / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha * field_a));
     }
     // the arrow visual at iconEdge..iconEdge+24 — a back arrow (pointing at
-    // the start edge in RTL too: the arrow direction mirrors with the layout)
+    // the start edge in RTL too: the glyph itself auto-mirrors, so the
+    // literal name is always arrow_left — Compose AutoMirrored.ArrowBack)
     const icon_y = b.y + (header_h - icon_size) / 2;
     const back_x = mirrorX(b.x, b.w, b.x + iconEdge(t), icon_size, rtl);
-    paintIcon(ctx, if (rtl) .arrow_right else .arrow_left, back_x, icon_y, header_ink);
+    paintIcon(ctx, .arrow_left, back_x, icon_y, header_ink);
 
     // the clear button (the trailing min-interactive box; shown iff the
     // query is non-empty)
@@ -382,13 +393,21 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_w = b.w - textStart(t) - right;
     const clip_x = mirrorX(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, header_h);
-    if (hasText(s)) {
+    if (hasText(s) or s.comp.items.len > 0) {
         const m = ui.paint.measureText(s.text(), style.size, false);
         const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
         ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, header_ink);
+        var caret_x = tx + m.width;
+        if (s.comp.items.len > 0) {
+            // Preedit after the committed text, underlined (IME convention).
+            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
+            ui.paint.text(ctx, s.composition(), caret_x, ty + m.ascent, style.size, false, header_ink);
+            ui.paint.fillRect(ctx, caret_x, ty + m.ascent + 1, comp_m.width, 1, header_ink);
+            caret_x += comp_m.width;
+        }
         if (focused) {
-            // the caret at the end of the text
-            ui.paint.fillRect(ctx, tx + m.width, ty, caret_w, m.height, header_primary);
+            // the caret at the end of the text (+ composition)
+            ui.paint.fillRect(ctx, caret_x, ty, caret_w, m.height, header_primary);
         }
     } else {
         if (s.placeholder.len > 0) {
@@ -654,6 +673,9 @@ fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.open) return false;
     switch (ev.kind) {
         .text_input => {
+            // A commit discharges the composition (see text_field).
+            s.comp.clearRetainingCapacity();
+            setSentinel(&s.comp);
             // Reject (never truncate) input that would grow the text past
             // the documented cap — a paste/IME burst is applied whole or
             // not at all.
@@ -664,16 +686,27 @@ fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
             applyEdit(n, s);
             return true;
         },
+        .text_editing => {
+            s.comp.clearRetainingCapacity();
+            if (ev.text.len <= ui.state.TextSignal.max_len) {
+                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+            }
+            setSentinel(&s.comp);
+            n.markDirty(); // repaint only — comp is not a committed edit
+            return true;
+        },
         .key_down => switch (ev.key) {
             .backspace => {
+                // An open composition eats the backspace (codepoint first).
+                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
                 // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (s.buf.items.len > 0) {
-                    const last = s.buf.items[s.buf.items.len - 1];
-                    s.buf.items.len -= 1;
+                while (target.items.len > 0) {
+                    const last = target.items[target.items.len - 1];
+                    target.items.len -= 1;
                     if ((last & 0xC0) != 0x80) break;
                 }
-                setSentinel(&s.buf);
-                applyEdit(n, s);
+                setSentinel(target);
+                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
                 return true;
             },
             .up => {
@@ -858,6 +891,7 @@ fn searchViewDeinit(n: *Node) void {
     n.allocator.free(s.placeholder);
     n.allocator.free(s.label_z);
     s.buf.deinit();
+    s.comp.deinit();
     n.allocator.destroy(s);
 }
 
@@ -884,6 +918,7 @@ const search_view_vtable = ui.node.VTable{
     .deinit = searchViewDeinit,
     .on_pointer = searchViewOnPointer,
     .on_key = searchViewOnKey,
+    .wants_text_input = true,
     .paint_bounds = searchViewPaintBounds,
 };
 
@@ -939,6 +974,7 @@ pub fn searchView(
     errdefer allocator.destroy(s);
     s.* = .{
         .buf = std.array_list.Managed(u8).init(allocator),
+        .comp = std.array_list.Managed(u8).init(allocator),
         .placeholder = placeholder,
         .label_z = label_z,
         .items = std.array_list.Managed(ItemDef).init(allocator),
@@ -956,6 +992,7 @@ pub fn searchView(
         s.items.deinit();
         s.sem_children.deinit();
         s.buf.deinit();
+        s.comp.deinit();
     }
     try s.items.ensureTotalCapacity(items.len);
     try s.sem_children.ensureTotalCapacity(items.len);

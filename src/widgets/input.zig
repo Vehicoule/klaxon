@@ -576,6 +576,11 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
 fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(TextFieldState, n);
     switch (ev.kind) {
+        .text_editing => {
+            // Legacy widget: IME preedit is consumed but not rendered —
+            // the M3E fields render the composing span underlined.
+            return true;
+        },
         .text_input => {
             // Reject (never truncate) input that would grow the text past
             // the documented cap — a paste/IME burst is applied whole or
@@ -631,6 +636,7 @@ const text_field_vtable = ui.node.VTable{
     .deinit = textFieldDeinit,
     .on_pointer = textFieldOnPointer,
     .on_key = textFieldOnKey,
+    .wants_text_input = true,
 };
 
 pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_changed: ?Callback, on_submitted: ?Callback) !*Node {

@@ -206,6 +206,15 @@ pub const Host = struct {
     /// GPU warmup (Phase 4e.1): kx_gpu_warmup ran once (after the first
     /// present). False until then; raster backends skip the call entirely.
     gpu_warmed: bool = false,
+    /// IME lifecycle: the platform text input is active while a
+    /// wants_text_input node holds focus (SDL_StartTextInput/StopTextInput
+    /// — the soft keyboard on mobile, the IME session on desktop).
+    ime_active: bool = false,
+    /// The node the IME is anchored to — its bounds feed
+    /// SDL_SetTextInputArea each frame so the candidate window tracks
+    /// layout moves. Distinct from input.focused: a non-editable focus
+    /// means the IME is simply down.
+    ime_node: ?*Node = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -444,11 +453,10 @@ pub const Host = struct {
         }
         const t_gl = sdl.c.SDL_GetTicksNS();
 
-        // Text input events flow from window creation (TextField focus is
-        // managed by the input router; refine per-platform later). Mobile:
-        // the soft keyboard is driven by the platform text-input path —
-        // SDL_StartTextInput is a no-op there.
-        if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+        // Text input is focus-gated (syncIme): SDL_StartTextInput runs
+        // only while a wants_text_input node holds focus — the mobile soft
+        // keyboard appears on field focus, the desktop IME session anchors
+        // its candidate window at the field.
 
         // Mobile: the real window size comes from SDL after creation (the
         // caller may pass 0x0 — iOS ignores the requested size and goes
@@ -507,7 +515,7 @@ pub const Host = struct {
                     };
                     sdl.c.SDL_DestroyWindow(window);
                     window = plain;
-                    if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+                    // syncIme re-arms text input on the new window
                 } else {
                     _ = sdl.c.SDL_GL_MakeCurrent(gl_window, new_gl);
                     _ = sdl.c.SDL_GL_SetSwapInterval(0); // the platform paces the loop
@@ -525,7 +533,7 @@ pub const Host = struct {
                     window = gl_window;
                     gl_ctx = new_gl;
                     resolved_backend = kx.c.kx_backend_of(ctx);
-                    if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+                    // syncIme re-arms text input on the new window
                 }
             } else {
                 const plain = sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse {
@@ -534,7 +542,7 @@ pub const Host = struct {
                 };
                 sdl.c.SDL_DestroyWindow(window);
                 window = plain;
-                if (!is_mobile) _ = sdl.c.SDL_StartTextInput(window);
+                // syncIme re-arms text input on the new window
             }
         }
         const t_kx = sdl.c.SDL_GetTicksNS();
@@ -631,6 +639,37 @@ pub const Host = struct {
         const cur = host.cursorFor(want) orelse return;
         if (!sdl.c.SDL_SetCursor(cur)) return;
         host.current_cursor = want;
+    }
+
+    /// IME lifecycle: platform text input (the mobile soft keyboard, the
+    /// desktop IME session) is active exactly while a wants_text_input
+    /// node holds focus. Called every iteration — the area is re-anchored
+    /// so the candidate window tracks layout moves, and SDL no-ops a
+    /// redundant start.
+    fn syncIme(host: *Host) void {
+        const focused = host.input.focused;
+        const editing = focused != null and focused.?.vtable.wants_text_input;
+        if (editing) {
+            const node = focused.?;
+            host.ime_node = node;
+            const r = node.mapRectToRoot(node.bounds);
+            var area = sdl.c.SDL_Rect{
+                .x = @intFromFloat(@round(r.x)),
+                .y = @intFromFloat(@round(r.y)),
+                .w = @intFromFloat(@round(@max(0, r.w))),
+                .h = @intFromFloat(@round(@max(0, r.h))),
+            };
+            // cursor offset: at the field's end edge (caret-side anchor).
+            _ = sdl.c.SDL_SetTextInputArea(host.window, &area, area.w);
+            if (!host.ime_active) {
+                _ = sdl.c.SDL_StartTextInput(host.window);
+                host.ime_active = true;
+            }
+        } else if (host.ime_active) {
+            _ = sdl.c.SDL_StopTextInput(host.window);
+            host.ime_active = false;
+            host.ime_node = null;
+        }
     }
 
     /// The SDL cursor for a shape (created lazily, cached).
@@ -790,6 +829,9 @@ pub const Host = struct {
         // Render when the tree is dirty (or the app ticks: continuous) and
         // the app is active (mobile: skip while backgrounded).
         if (!quit and host.active and (root.dirty or on_frame != null)) host.renderFrame(root);
+        // The IME follows the focused text node (soft keyboard up/down,
+        // candidate-window anchor).
+        host.syncIme();
         // Pointer cursor follows the hovered node (desktop, Phase 2d-0.5).
         host.updateCursor();
         // Pace the whole iteration to the frame budget (~120 fps active).
@@ -1305,6 +1347,16 @@ pub const Host = struct {
                 _ = host.input.dispatchKey(.{
                     .kind = .text_input,
                     .text = std.mem.span(event.text.text),
+                });
+            },
+            sdl.c.SDL_EVENT_TEXT_EDITING => {
+                // IME preedit: replaces the focused field's composition
+                // range; the next TEXT_INPUT commits it.
+                _ = host.input.dispatchKey(.{
+                    .kind = .text_editing,
+                    .text = if (event.edit.text) |t| std.mem.span(t) else "",
+                    .comp_start = event.edit.start,
+                    .comp_len = event.edit.length,
                 });
             },
             sdl.c.SDL_EVENT_KEY_DOWN => {

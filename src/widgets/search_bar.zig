@@ -103,10 +103,17 @@ const SearchBarState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// IME composition (preedit) — same contract as text_field's: replaced
+    /// wholesale by text_editing, committed+cleared by text_input.
+    comp: std.array_list.Managed(u8) = undefined,
 
     fn text(s: *SearchBarState) [:0]const u8 {
         // Sentinel slice via the many-item pointer (see input.zig).
         return s.buf.items.ptr[0..s.buf.items.len :0];
+    }
+
+    fn composition(s: *SearchBarState) [:0]const u8 {
+        return s.comp.items.ptr[0..s.comp.items.len :0];
     }
 };
 
@@ -115,7 +122,10 @@ fn stateOf(n: *Node) *SearchBarState {
 }
 
 /// Write the null sentinel at items[len] (the P0 TextField helper).
+/// Grows if the buffer is exactly full — writing the sentinel past
+/// capacity was a heap OOB (an empty/zero-cap buffer is the first case).
 fn setSentinel(buf: *std.array_list.Managed(u8)) void {
+    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
     buf.items.len += 1;
     buf.items[buf.items.len - 1] = 0;
     buf.items.len -= 1;
@@ -256,13 +266,21 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_x = mx(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, container_h);
     const style = t.type_scale.body_large;
-    if (hasText(s)) {
+    if (hasText(s) or s.comp.items.len > 0) {
         const m = ui.paint.measureText(s.text(), style.size, false);
         const tx = mx(b.x, b.w, tr.x, m.width, rtl);
         ui.paint.text(ctx, s.text(), tx, tr.y + m.ascent, style.size, false, content);
+        var caret_x = tx + m.width;
+        if (s.comp.items.len > 0) {
+            // Preedit after the committed text, underlined (IME convention).
+            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
+            ui.paint.text(ctx, s.composition(), caret_x, tr.y + m.ascent, style.size, false, content);
+            ui.paint.fillRect(ctx, caret_x, tr.y + m.ascent + 1, comp_m.width, 1, content);
+            caret_x += comp_m.width;
+        }
         if (focused) {
-            // the caret at the end of the text
-            ui.paint.fillRect(ctx, tx + m.width, tr.y, caret_w, m.height, caret);
+            // the caret at the end of the text (+ composition)
+            ui.paint.fillRect(ctx, caret_x, tr.y, caret_w, m.height, caret);
         }
     } else {
         if (s.placeholder.len > 0) {
@@ -380,6 +398,9 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.kind) {
         .text_input => {
+            // A commit discharges the composition (see text_field).
+            s.comp.clearRetainingCapacity();
+            setSentinel(&s.comp);
             // Reject (never truncate) input that would grow the text past
             // the documented cap — a paste/IME burst is applied whole or
             // not at all.
@@ -390,16 +411,27 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
             applyEdit(n, s);
             return true;
         },
+        .text_editing => {
+            s.comp.clearRetainingCapacity();
+            if (ev.text.len <= ui.state.TextSignal.max_len) {
+                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+            }
+            setSentinel(&s.comp);
+            n.markDirty(); // repaint only — comp is not a committed edit
+            return true;
+        },
         .key_down => switch (ev.key) {
             .backspace => {
+                // An open composition eats the backspace (codepoint first).
+                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
                 // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (s.buf.items.len > 0) {
-                    const last = s.buf.items[s.buf.items.len - 1];
-                    s.buf.items.len -= 1;
+                while (target.items.len > 0) {
+                    const last = target.items[target.items.len - 1];
+                    target.items.len -= 1;
                     if ((last & 0xC0) != 0x80) break;
                 }
-                setSentinel(&s.buf);
-                applyEdit(n, s);
+                setSentinel(target);
+                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
                 return true;
             },
             .enter => {
@@ -407,6 +439,8 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
                 return true;
             },
             .escape => {
+                s.comp.clearRetainingCapacity();
+                setSentinel(&s.comp);
                 input.requestFocus(null);
                 n.markDirty();
                 return true;
@@ -441,6 +475,7 @@ fn searchBarDeinit(n: *Node) void {
     input.releaseNode(n);
     n.allocator.free(s.placeholder);
     s.buf.deinit();
+    s.comp.deinit();
     n.allocator.destroy(s);
 }
 
@@ -451,6 +486,7 @@ const search_bar_vtable = ui.node.VTable{
     .deinit = searchBarDeinit,
     .on_pointer = searchBarOnPointer,
     .on_key = searchBarOnKey,
+    .wants_text_input = true,
 };
 
 /// An M3E collapsed search bar. `sig` = null → the text starts at
@@ -478,6 +514,7 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     errdefer allocator.destroy(s);
     s.* = .{
         .buf = std.array_list.Managed(u8).init(allocator),
+        .comp = std.array_list.Managed(u8).init(allocator),
         .placeholder = placeholder,
         .opts = opts,
         .sig = sig,
@@ -487,6 +524,7 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     errdefer {
         allocator.free(s.placeholder);
         s.buf.deinit();
+        s.comp.deinit();
     }
     s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {

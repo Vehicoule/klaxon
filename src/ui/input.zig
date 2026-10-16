@@ -70,11 +70,17 @@ pub const Key = enum(u32) {
 };
 
 pub const KeyEvent = struct {
-    pub const Kind = enum { key_down, text_input };
+    pub const Kind = enum { key_down, text_input, text_editing };
     kind: Kind,
     key: Key = .unknown, // key_down
-    text: []const u8 = "", // text_input (UTF-8, borrowed from the event source)
+    text: []const u8 = "", // text_input / text_editing (UTF-8, borrowed)
     shift: bool = false, // modifier (Phase 2c: Shift+Tab = focus previous)
+    // text_editing (SDL_EVENT_TEXT_EDITING): IME composition/preedit. `text`
+    // is the full composing string; comp_start/comp_len are SDL's cursor /
+    // selection offsets within it (bytes on the SDL3 side we consume).
+    // Replaces the field's current composition; the next text_input commits.
+    comp_start: i32 = 0,
+    comp_len: i32 = 0,
 };
 
 /// Scroll (mouse wheel / touchpad) event — Phase 1f.
