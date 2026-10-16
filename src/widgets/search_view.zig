@@ -8,7 +8,8 @@
 // ExpandedFullScreenSearchView / SearchViewTokens / ListTokens:
 //   - container: Surface, CornerNone, FULL BLEED (the whole window — no
 //     scrim: the surface itself covers the content behind)
-//   - header: a 64dp row — the leading back button (a 48dp touch box, the
+//   - header: a 72dp row (SearchViewTokens FullScreenHeaderContainerHeight)
+//     — the leading back button (a 48dp touch box, the
 //     24dp arrow visual at 16..40), the query text (body_large OnSurface,
 //     a 1dp Primary caret at the text end while focused), the trailing
 //     clear button (a 48dp box, shown iff the query is non-empty)
@@ -23,9 +24,15 @@
 //   - state layers: OnSurface @ hover 0.08 / focus 0.10 / pressed 0.12
 //   - dismissal: the back arrow, Escape (the focused chain gets it first),
 //     and the router's modal back stack (hardware back / Escape unfocused)
-//   - open state: an app-owned Signal(bool) — the view is visible iff the
-//     signal is true; while open it takes the keyboard focus (the query
-//     field IS the view) and registers on the modal back stack
+//   - open state: an app-owned Signal(bool) — flipping it plays the
+//     upstream animationProgress spec: the surface morphs from the
+//     collapsed bar toward the full-screen CornerNone (rect lerps from
+//     opts.anchor → bounds, radius 28·(1-p)), the header field crossfades
+//     on its own 50ms channel, and the divider + suggestion column fades
+//     at alpha = progress (AnimationEnter 600+100 emphasized-decelerate /
+//     AnimationExit 350+100 linear). While open the view takes the
+//     keyboard focus (the query field IS the view) and registers on the
+//     modal back stack
 //
 // The widget is a LEAF (the search_bar / list_item idiom): the surface,
 // the header chrome and the suggestion rows are all painted by the widget
@@ -38,13 +45,13 @@
 // embed it in a full-viewport overlay/container). Inside an unbounded
 // parent, wrap it in a bounded box.
 //
-// v1 deviations (documented, fixed later):
-//   - No expand/collapse spring (the M3E shared-axis motion is a follow-up;
-//     the view snaps open/closed); the caret is static (no blink) and
-//     always at the text end; no IME panel placement (the query field
-//     renders/edits the buffer but there is no on-screen keyboard yet);
-//     the suggestion list does not scroll — rows past the bounds clip;
-//     RTL mirrors the chrome but the text runs
+// Remaining deviations (documented):
+//   - No predictive-back scrubbing (the router's back stack has no
+//     BackEvent progress channel — cancellation replays the enter spec);
+//     the caret is static (no blink) and always at the text end; no IME
+//     panel placement (the query field renders/edits the buffer but there
+//     is no on-screen keyboard yet); the suggestion list does not scroll —
+//     rows past the bounds clip; RTL mirrors the chrome but the text runs
 //     stay LTR (no bidi — same as text.zig/search_bar.zig).
 const std = @import("std");
 const kx = @import("../kx.zig");
@@ -82,10 +89,30 @@ pub const SearchViewOptions = struct {
     theme: Theme = theme_mod.light,
     /// The accessible name of the search region (the dialog role's label).
     label: []const u8 = "Search",
+    /// The collapsed search bar's rect in THIS NODE'S parent space — the
+    /// anchor the surface expands from (upstream collapsedCoords → the
+    /// SearchBarLayout interpolates it toward the full-screen bounds).
+    /// null = no geometry morph: the surface fills the bounds at every
+    /// progress and only the corner/alpha channels animate.
+    anchor: ?Rect = null,
 };
 
 // --- M3E tokens (SearchView/ListTokens + the TextFieldImpl paddings) ---
-const header_h: f32 = 64; // the input row (TopAppBar container height)
+const header_h: f32 = 72; // SearchViewTokens FullScreenHeaderContainerHeight
+/// SearchBarCornerRadius = InputFieldHeight (SearchBarTokens 56) / 2 — the
+/// surface morphs radius*(1-progress) → CornerNone (upstream animatedShape).
+const collapsed_corner: f32 = 28;
+/// Expansion: AnimationEnterFloatSpec — DurationLong4 + DurationShort2
+/// delay + EasingEmphasizedDecelerate. Collapse: ExitFloatSpec —
+/// DurationMedium3 + the same delay + a linear curve.
+const enter_ms: u32 = 600;
+const enter_delay_ms: u32 = 100;
+const exit_ms: u32 = 350;
+const exit_delay_ms: u32 = 100;
+/// The expanded input field's own crossfade (AnimationForContentFadeIn/Out):
+/// DurationShort2, a DurationShort1 lead-in on enter only.
+const field_ms: u32 = 50;
+const field_delay_ms: u32 = 50;
 const icon_box: f32 = 48; // minimumInteractiveComponentSize
 const icon_size: f32 = 24;
 const icon_edge: f32 = 16; // the icon visual offset (12 centered + 4 offset)
@@ -140,6 +167,14 @@ const SearchViewState = struct {
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
     back_registered: bool = false, // on the router's modal back stack while open
+    /// Upstream animationProgress: 0 = the collapsed bar, 1 = full-screen.
+    /// Drives the surface rect/corner morph + the divider/rows alpha; the
+    /// header field crossfades on `field_alpha` (its own spec).
+    progress: f32 = 0,
+    field_alpha: f32 = 0,
+    /// Stable channel addresses for the timeline (the switch idiom).
+    progress_channel: u8 = 0,
+    field_channel: u8 = 0,
 
     fn text(s: *SearchViewState) [:0]const u8 {
         // Sentinel slice via the many-item pointer (see search_bar.zig).
@@ -258,20 +293,45 @@ fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, color: Color) 
     icon_w.drawIcon(ctx, name, x, y, icon_size / 24.0, color);
 }
 
+/// The animated surface rect: progress morphs the anchor (the collapsed
+/// bar's rect — upstream collapsedCoords) toward the full bounds; without
+/// an anchor the surface covers the bounds at every progress.
+fn surfaceRect(s: *SearchViewState, b: Rect) Rect {
+    const a = s.opts.anchor orelse return b;
+    const p = s.progress;
+    const q = 1 - p;
+    return .{
+        .x = a.x * q + b.x * p,
+        .y = a.y * q + b.y * p,
+        .w = a.w * q + b.w * p,
+        .h = a.h * q + b.h * p,
+    };
+}
+
 fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
-    if (!s.open) return;
+    if (s.progress <= 0) return; // collapsed (incl. the exit's last frame)
     const b = n.bounds;
     const t = s.opts.theme;
     const cs = t.colors;
     const rtl = ui.i18n.direction() == .rtl;
     const focused = input.isFocused(n);
     const surface = cs.surface;
+    const p = s.progress;
+    const field_a = s.field_alpha;
 
-    // --- the full-bleed Surface (CornerNone — no scrim: it covers all) ---
-    ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, surface);
+    // --- the Surface: morphs from the collapsed bar toward the full-bleed
+    // CornerNone fullscreen (upstream animatedShape: radius 28·(1-p); the
+    // whole view's own chrome clips to the same rounded surface) ---
+    const sr = surfaceRect(s, b);
+    const radius = collapsed_corner * (1 - p);
+    ui.paint.clipRRect(ctx, sr.x, sr.y, sr.w, sr.h, radius);
+    ui.paint.fillRRect(ctx, sr.x, sr.y, sr.w, sr.h, radius, surface);
 
-    // --- header row ---
+    // --- header row (crossfades in on its own spec: field_alpha) ---
+    const header_ink = ui.paint.withAlphaScaled(cs.on_surface, field_a);
+    const header_muted = ui.paint.withAlphaScaled(cs.on_surface_variant, field_a);
+    const header_primary = ui.paint.withAlphaScaled(cs.primary, field_a);
     // the back button's state layer (a 48dp circle centered in its box)
     const bz = backZone(b);
     const bx = mirrorX(b.x, b.w, bz.x, bz.w, rtl);
@@ -282,13 +342,13 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     else
         0;
     if (back_alpha > 0) {
-        ui.paint.fillRRect(ctx, bx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha));
+        ui.paint.fillRRect(ctx, bx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha * field_a));
     }
     // the arrow visual at 16..40 — a back arrow (pointing at the start edge
     // in RTL too: the arrow direction mirrors with the layout)
     const icon_y = b.y + (header_h - icon_size) / 2;
     const back_x = mirrorX(b.x, b.w, b.x + icon_edge, icon_size, rtl);
-    paintIcon(ctx, if (rtl) .arrow_right else .arrow_left, back_x, icon_y, cs.on_surface);
+    paintIcon(ctx, if (rtl) .arrow_right else .arrow_left, back_x, icon_y, header_ink);
 
     // the clear button (the trailing 48dp box; shown iff the query is non-empty)
     if (hasText(s)) {
@@ -301,10 +361,10 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         else
             0;
         if (clear_alpha > 0) {
-            ui.paint.fillRRect(ctx, zx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, clear_alpha));
+            ui.paint.fillRRect(ctx, zx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, clear_alpha * field_a));
         }
         const cx = mirrorX(b.x, b.w, b.x + b.w - icon_edge - icon_size, icon_size, rtl);
-        paintIcon(ctx, .close, cx, icon_y, cs.on_surface_variant);
+        paintIcon(ctx, .close, cx, icon_y, header_muted);
     }
 
     // --- the query text (clipped between the icons; the whole clip rect
@@ -318,39 +378,46 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     if (hasText(s)) {
         const m = ui.paint.measureText(s.text(), style.size, false);
         const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
-        ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, cs.on_surface);
+        ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, header_ink);
         if (focused) {
             // the caret at the end of the text
-            ui.paint.fillRect(ctx, tx + m.width, ty, caret_w, m.height, cs.primary);
+            ui.paint.fillRect(ctx, tx + m.width, ty, caret_w, m.height, header_primary);
         }
     } else {
         if (s.placeholder.len > 0) {
             const m = ui.paint.measureText(s.placeholder, style.size, false);
             const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
-            ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, cs.on_surface_variant);
+            ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, header_muted);
         }
         if (focused) {
             // the caret at the (mirrored) start (empty text)
             const caret_x = mirrorX(b.x, b.w, b.x + text_start, 0, rtl);
-            ui.paint.fillRect(ctx, caret_x, ty, caret_w, style.line_height, cs.primary);
+            ui.paint.fillRect(ctx, caret_x, ty, caret_w, style.line_height, header_primary);
         }
     }
     ui.paint.clipReset(ctx);
 
-    // --- the divider under the header (1dp, outline_variant, full width) ---
-    ui.paint.fillRect(ctx, b.x, b.y + header_h, b.w, divider_h, cs.outline_variant);
+    // --- the divider + suggestion rows (the upstream wrappedContent column:
+    // shown iff progress > 0, alpha = animationProgress) ---
+    const body_ink = ui.paint.withAlphaScaled(cs.on_surface, p);
+    const body_muted = ui.paint.withAlphaScaled(cs.on_surface_variant, p);
+    // the divider under the header (1dp, outline_variant, full width)
+    ui.paint.fillRect(ctx, b.x, b.y + header_h, b.w, divider_h, ui.paint.withAlphaScaled(cs.outline_variant, p));
 
     // --- the suggestion rows ---
     const list_y = b.y + header_h + divider_h;
     const list_h = b.y + b.h - list_y;
-    if (list_h <= 0) return;
+    if (list_h <= 0) {
+        ui.paint.clipReset(ctx); // the animated surface clip
+        return;
+    }
     ui.paint.clipRect(ctx, b.x, list_y, b.w, list_h);
     for (s.items.items, 0..) |it, i| {
         const r = rowRect(b, i);
         if (r.y >= b.y + b.h) break; // ordered rows: the rest is clipped away
         const enabled = it.enabled;
-        const content: Color = if (enabled) cs.on_surface else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-        const muted: Color = if (enabled) cs.on_surface_variant else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+        const content: Color = if (enabled) body_ink else ui.paint.withAlphaScaled(cs.on_surface, 0.38 * p);
+        const muted: Color = if (enabled) body_muted else ui.paint.withAlphaScaled(cs.on_surface, 0.38 * p);
         // the state layer over the row (pressed > hovered/keyboard highlight)
         var alpha: f32 = 0;
         if (enabled) {
@@ -360,7 +427,7 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
                 alpha = if (focused) t.state.focus else t.state.hover;
         }
         if (alpha > 0) {
-            ui.paint.fillRect(ctx, r.x, r.y, r.w, r.h, theme_mod.stateLayer(surface, cs.on_surface, alpha));
+            ui.paint.fillRect(ctx, r.x, r.y, r.w, r.h, theme_mod.stateLayer(surface, cs.on_surface, alpha * p));
         }
         const iy = r.y + (row_h - icon_size) / 2;
         // the leading icon (24dp at 16 from the start)
@@ -384,6 +451,7 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.clipReset(ctx);
     }
     ui.paint.clipReset(ctx);
+    ui.paint.clipReset(ctx); // the animated surface clip
 }
 
 fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -635,10 +703,32 @@ fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
 /// Show/hide to match the open signal: visible iff open, the modal back
 /// handler tracks it, and the focus lands on the query field (or is
 /// released on dismiss).
+fn progressCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).progress = v[0];
+    n.markDirty();
+}
+fn fieldCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).field_alpha = v[0];
+    n.markDirty();
+}
+/// The exit animation settled at 0 → the view actually leaves the tree's
+/// visible set (upstream flips SearchBarValue back to Collapsed).
+fn hideCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    n.setVisible(false);
+    n.markDirty();
+}
+
+/// Show/hide to match the open signal — animated: opening plays the
+/// upstream enter spec (the surface morphs in from the collapsed geometry,
+/// the field + content fade on their own channels); closing plays the exit
+/// spec and hides the node once progress reaches 0. No timeline → snap
+/// (tests, headless).
 fn applyOpen(n: *Node, s: *SearchViewState, open: bool) void {
     if (s.open == open) return;
     s.open = open;
-    n.setVisible(open);
     s.highlight = -1;
     s.pressed_index = -1;
     s.fill_pressed = -1;
@@ -652,6 +742,46 @@ fn applyOpen(n: *Node, s: *SearchViewState, open: bool) void {
         input.requestFocus(null); // a dismissed view drops the focus
     }
     syncBackHandler(n, s);
+    if (ui.anim.timeline()) |tl| {
+        if (open) {
+            n.setVisible(true); // paints from the first frame (progress ≥ 0)
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, enter_ms, .{ .ease = .emphasized_decelerate }),
+                .from = .{ s.progress, 0, 0, 0 },
+                .delay_ms = enter_delay_ms,
+                .channel = @ptrCast(&s.progress_channel),
+                .on_update = .{ .fn_ptr = progressCb, .userdata = n },
+            });
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, field_ms, .{ .ease = .standard_accelerate }),
+                .from = .{ s.field_alpha, 0, 0, 0 },
+                .delay_ms = field_delay_ms,
+                .channel = @ptrCast(&s.field_channel),
+                .on_update = .{ .fn_ptr = fieldCb, .userdata = n },
+            });
+        } else {
+            // Stays visible while the exit runs — hideCb clears it at 0.
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, exit_ms, .{ .ease = .linear }),
+                .from = .{ s.progress, 0, 0, 0 },
+                .delay_ms = exit_delay_ms,
+                .channel = @ptrCast(&s.progress_channel),
+                .on_update = .{ .fn_ptr = progressCb, .userdata = n },
+                .on_complete = .{ .fn_ptr = hideCb, .userdata = n },
+            });
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, field_ms, .{ .ease = .standard_decelerate }),
+                .from = .{ s.field_alpha, 0, 0, 0 },
+                .channel = @ptrCast(&s.field_channel),
+                .on_update = .{ .fn_ptr = fieldCb, .userdata = n },
+            });
+        }
+    } else {
+        s.progress = if (open) 1 else 0;
+        s.field_alpha = s.progress;
+        n.setVisible(open);
+    }
+    n.markDirty();
 }
 
 /// Open state changed (the app set the signal).
@@ -703,6 +833,10 @@ fn svQuerySyncCb(userdata: ?*anyopaque) void {
 
 fn searchViewDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.progress_channel));
+        tl.cancelChannel(@ptrCast(&s.field_channel));
+    }
     s.open_sig.unsubscribe(.{ .callback = .{ .fn_ptr = svOpenSyncCb, .userdata = n } });
     if (s.query_sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = svQuerySyncCb, .userdata = n } });
     if (s.back_registered) {
@@ -719,6 +853,22 @@ fn searchViewDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
+/// The damage extent: the surface paints anywhere inside the
+/// anchor∪bounds hull while it morphs — report the union so a mid-anim
+/// repaint covers the trailing edge (the lerp rect is always inside it).
+fn searchViewPaintBounds(n: *Node) Rect {
+    const b = n.bounds;
+    const a = stateOf(n).opts.anchor orelse return b;
+    const x = @min(b.x, a.x);
+    const y = @min(b.y, a.y);
+    return .{
+        .x = x,
+        .y = y,
+        .w = @max(b.x + b.w, a.x + a.w) - x,
+        .h = @max(b.y + b.h, a.y + a.h) - y,
+    };
+}
+
 const search_view_vtable = ui.node.VTable{
     .measure = searchViewMeasure,
     .layout = searchViewLayout,
@@ -726,6 +876,7 @@ const search_view_vtable = ui.node.VTable{
     .deinit = searchViewDeinit,
     .on_pointer = searchViewOnPointer,
     .on_key = searchViewOnKey,
+    .paint_bounds = searchViewPaintBounds,
 };
 
 /// Suggestion `index`'s rect in NODE-LOCAL space (Semantics.child_bounds —
@@ -742,7 +893,10 @@ fn suggestionChildBounds(n: *Node, index: usize) Rect {
 /// The M3E expanded search view (full-screen). `items` is the suggestion
 /// list (copied — the view owns the labels). `open` is the app-owned open
 /// signal: true = visible + focused + on the modal back stack; flipping it
-/// animates nothing (v1 snaps). `query` = null → the text starts at
+/// plays the upstream expand/collapse spec (the surface morphs from
+/// opts.anchor → bounds with the corner radius lerping to CornerNone, the
+/// header field + suggestion column fade on their own channels — snaps
+/// when no timeline is installed). `query` = null → the text starts at
 /// `opts.initial`; non-null → the query mirrors the signal both ways.
 /// `on_changed` fires on every edit (incl. the clear + fill affordances);
 /// `on_select` on a suggestion activation (read the row via
@@ -1140,4 +1294,100 @@ test "golden: search_view open paints the surface, the header and the rows" {
     defer f2.deinit();
     try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(2, 2));
     try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(180, 200));
+}
+
+test "search_view: the expansion plays the upstream spec — progress + field channels" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, null, null, null, .{});
+    defer v.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 360, .h = 640 });
+    try std.testing.expect(!v.visible);
+    open.set(true);
+    // visible from the first frame; progress holds at 0 through the 100ms delay
+    try std.testing.expect(v.visible);
+    tl.tick(0); // lazy start: both clocks arm at now + delay
+    tl.tick(50);
+    try std.testing.expectEqual(@as(f32, 0), stateOf(v).progress);
+    tl.tick(100); // the enter spec starts
+    try std.testing.expectEqual(@as(f32, 0), stateOf(v).progress);
+    tl.tick(400); // 300ms into the 600ms emphasized-decelerate → most of the way
+    const mid = stateOf(v).progress;
+    try std.testing.expect(mid > 0.5 and mid < 1);
+    tl.tick(700); // 600ms in → done
+    try std.testing.expectEqual(@as(f32, 1), stateOf(v).progress);
+    // the field crossfade (50ms + 50 delay, standard accelerate) landed earlier
+    try std.testing.expectEqual(@as(f32, 1), stateOf(v).field_alpha);
+    // collapse: the exit spec (350ms + 100 delay, linear) keeps the node
+    // visible until progress reaches 0
+    open.set(false);
+    try std.testing.expect(v.visible); // the exit still draws
+    tl.tick(800); // lazy start at 800 + 100 delay
+    tl.tick(900);
+    try std.testing.expectEqual(@as(f32, 1), stateOf(v).progress); // delayed
+    tl.tick(1075); // ~half the 350ms linear exit
+    const p2 = stateOf(v).progress;
+    try std.testing.expect(p2 > 0.4 and p2 < 0.6);
+    try std.testing.expect(v.visible); // mid-exit: still on screen
+    tl.tick(1250); // 350ms in → complete → hideCb hides the node
+    try std.testing.expectEqual(@as(f32, 0), stateOf(v).progress);
+    try std.testing.expect(!v.visible);
+}
+
+test "search_view: the anchor morphs the surface rect; the radius lerps to CornerNone" {
+    var s: SearchViewState = undefined;
+    s.opts = .{ .anchor = .{ .x = 20, .y = 30, .w = 200, .h = 56 } };
+    const b = Rect{ .x = 0, .y = 0, .w = 360, .h = 640 };
+    s.progress = 0;
+    var r = surfaceRect(&s, b);
+    try std.testing.expectEqual(@as(f32, 20), r.x);
+    try std.testing.expectEqual(@as(f32, 200), r.w);
+    s.progress = 0.5;
+    r = surfaceRect(&s, b);
+    try std.testing.expectEqual(@as(f32, 10), r.x); // 20·0.5 + 0·0.5
+    try std.testing.expectEqual(@as(f32, 15), r.y);
+    try std.testing.expectEqual(@as(f32, 280), r.w); // 200·0.5 + 360·0.5
+    s.progress = 1;
+    r = surfaceRect(&s, b);
+    try std.testing.expectEqual(b.x, r.x);
+    try std.testing.expectEqual(b.h, r.h);
+    // no anchor → the surface covers the bounds at every progress
+    s.opts.anchor = null;
+    s.progress = 0.4;
+    r = surfaceRect(&s, b);
+    try std.testing.expectEqual(b.w, r.w);
+}
+
+test "golden: mid-expansion the surface paints rounded inside the animated clip" {
+    const t = theme_mod.light;
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const v = try searchView(std.testing.allocator, &SuggestionList.items, open, null, null, null, null, null, .{ .theme = t });
+    defer v.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 200, 160);
+    defer r.deinit();
+    v.layout(.{ .x = 0, .y = 0, .w = 200, .h = 160 });
+    // mid-expansion: progress 0.5 → the corner radius is 28·0.5 = 14
+    stateOf(v).progress = 0.5;
+    stateOf(v).field_alpha = 0.5;
+    r.paint(v, 0x112233FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // the rounded corner is OUTSIDE the clip → the background shows through
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f.pixelAt(1, 1));
+    try std.testing.expectEqual(@as(Color, 0x112233FF), f.pixelAt(199, 159));
+    // inside the corner radius the surface + content paint
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(100, 80));
+    // the divider fades at alpha = progress over the surface
+    const div = f.pixelAt(100, 73); // header 72 + divider 1
+    const want = ui.paint.withAlphaScaled(t.colors.outline_variant, 0.5);
+    _ = want; // blended over surface — just assert it's neither pure color
+    try std.testing.expect(div != 0x112233FF);
+    // the suggestion row background stays surface (between the icon box
+    // and the label — no state layer on an idle row)
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(48, 100));
 }

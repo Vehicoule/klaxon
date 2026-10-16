@@ -209,6 +209,10 @@ void kx_rotate(kx_ctx* ctx, float degrees);
 // is retained between frames: repainting the tree clipped to the damaged
 // region is the dirty-rect path (Phase 1e).
 void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h);
+// Anti-aliased rounded-rect intersect clip — the animated shape morphs of
+// the SearchView expansion (corner radius lerps toward 0). A radius ≤ 0
+// falls back to a rect clip. Balanced by kx_clip_reset.
+void kx_clip_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius);
 void kx_clip_reset(kx_ctx* ctx);
 // Clip the current frame to the CLOSED polygon through (xs, ys) (added in
 // 0.12.0): anti-aliased intersect clip, balanced by kx_clip_reset like

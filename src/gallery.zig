@@ -1042,7 +1042,7 @@ fn buildSearchBarSection(g: *Gallery, theme: Theme) !*Node {
         .{ .label = "material 3 expressive", .icon = .history, .trailing_icon = .north_west },
         .{ .label = "zig ui framework", .icon = .search, .trailing_icon = .north_west },
         .{ .label = "disabled suggestion", .enabled = false },
-    }, g.sv_open, null, null, .{ .fn_ptr = svSelectCb, .userdata = g }, .{ .fn_ptr = sbSubmitCb, .userdata = g }, null, .{ .placeholder = "Search…", .theme = theme });
+    }, g.sv_open, null, null, .{ .fn_ptr = svSelectCb, .userdata = g }, .{ .fn_ptr = sbSubmitCb, .userdata = g }, null, .{ .placeholder = "Search…", .theme = theme, .anchor = .{ .x = 8, .y = 8, .w = 344, .h = 56 } });
     const sv_frame = try layout.constrainedBox(a, .{ .min_w = 360, .max_w = 360, .min_h = 420, .max_h = 420 });
     const sv_clip = try container_w.container(a, .{ .color = theme.colors.surface, .radius = 16, .border_color = theme.colors.outline_variant, .border_width = 1 });
     sv_clip.add(sv);

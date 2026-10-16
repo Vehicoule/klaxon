@@ -44,7 +44,8 @@ Port contract per widget:
 | progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-LinearWavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | ported |
 | pull_to_refresh | pulltorefresh/PullToRefresh.kt | PullToRefreshTokens | **ported** (nested-drag/capture semantics; arrow indicator + Level2 shadow) |
 | radio | RadioButton.kt | RadioButtonTokens | ported |
-| search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | **ported** (collapsed bar; expanded SearchView pending) |
+| search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | **ported** (collapsed bar; the expanded view is `search_view` below) |
+| search_view | SearchBar.kt (ExpandedFullScreenSearchView + SearchBarImpl animation) | SearchViewTokens, ListTokens | **ported** (72dp header, full expansion spec: surface morph from the anchor + radius→CornerNone, field/content fades; no predictive-back scrubbing) |
 | segmented_button | SegmentedButton.kt | SegmentedButtonTokens | **ported** |
 | side_sheet | NavigationDrawer.kt (side-sheet variant) + MDA SideSheetBehavior | SheetBottomTokens | **ported** |
 | snackbar | Snackbar.kt | SnackbarTokens | ported |

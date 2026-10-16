@@ -55,6 +55,13 @@ pub fn clipRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32) void {
     kx.c.kx_clip_rect(ctx, x, y, w, h);
 }
 
+/// Clip the current frame to a rounded rect (save + anti-aliased intersect
+/// clip) — animated shape morphs (SearchView's radius → CornerNone).
+/// radius ≤ 0 falls back to a rect clip. Balanced with clipReset.
+pub fn clipRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32) void {
+    kx.c.kx_clip_rrect(ctx, x, y, w, h, radius);
+}
+
 pub fn clipReset(ctx: *kx.Ctx) void {
     kx.c.kx_clip_reset(ctx);
 }

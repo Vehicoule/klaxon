@@ -79,7 +79,7 @@ static void kx_prof(const char* name, uint64_t t0);
 // text for string draws, child for nested layers).
 struct KxRecOp {
     enum class K : uint8_t {
-        Save, Restore, Translate, Scale, Rotate, ClipRect, ClipPath,
+        Save, Restore, Translate, Scale, Rotate, ClipRect, ClipPath, ClipRRect,
         Clear, FillRect, FillRRect, FillRRectCorners, StrokeRRect,
         StrokeRRectCorners, StrokePolyline, FillPolygon, FillRRectGradient,
         FillPath, StrokePath, ShadowRRect, BackdropBlur,
@@ -1174,6 +1174,9 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 break;
             case KxRecOp::K::ClipPath:
                 kx_clip_path(ctx, op.xs.data(), op.ys.data(), op.count, op.f[0] != 0.0f ? 1 : 0);
+                break;
+            case KxRecOp::K::ClipRRect:
+                kx_clip_rrect(ctx, op.f[0], op.f[1], op.f[2], op.f[3], op.f[4]);
                 break;
             case KxRecOp::K::Clear: kx_clear(ctx, op.color); break;
             case KxRecOp::K::FillRect:
@@ -3014,6 +3017,28 @@ void kx_clip_path(kx_ctx* ctx, const float* xs, const float* ys, int count, int 
     kx_sprite_flush(ctx);
     ctx->canvas->save();
     ctx->canvas->clipPath(path, SkClipOp::kIntersect, aa != 0);
+}
+
+void kx_clip_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius) {
+    if (!ctx || !ctx->canvas) return;
+    if (kx_recording(ctx)) {
+        KxRecLayer* L = ctx->layers.back().get();
+        L->depth++;
+        KxRecOp op{KxRecOp::K::ClipRRect};
+        op.f[0] = x; op.f[1] = y; op.f[2] = w; op.f[3] = h; op.f[4] = radius;
+        op.local_bounds = kx_xywh(x, y, w, h, 1.0f);
+        L->ops.push_back(std::move(op));
+        return;
+    }
+    kx_sprite_flush(ctx); // pending sprites drew under the OLD clip
+    ctx->canvas->save();
+    if (radius <= 0.0f) {
+        ctx->canvas->clipRect(SkRect::MakeXYWH(x, y, w, h), SkClipOp::kIntersect, true);
+    } else {
+        ctx->canvas->clipRRect(
+            SkRRect::MakeRectXY(SkRect::MakeXYWH(x, y, w, h), radius, radius),
+            SkClipOp::kIntersect, true);
+    }
 }
 
 void kx_clip_reset(kx_ctx* ctx) {
