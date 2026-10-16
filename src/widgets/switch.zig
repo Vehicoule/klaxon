@@ -1,28 +1,54 @@
-// Switch (Phase 2d.2 PR B2, M3E) — the M3E switch (icon-less variant).
+// Switch (Phase 2d.2 PR B2, M3E) — the M3E switch (icon-less and icon
+// variants).
 //
-// Spec: m3.material.io/components/switch + Compose SwitchTokens / Switch.kt:
-//   - track 52x32 (TrackWidth/Height), CornerFull (pill), outline 2dp when
-//     unchecked (TrackOutlineWidth)
-//   - handle (CornerFull circle): unchecked 16x16 at x=8 (minBound =
-//     (32-16)/2), checked 24x24 at x=24 (maxBound = (52-24)-4), pressed 28x28
-//     (checked → maxBound-2, unchecked → TrackOutlineWidth); vertically
-//     centered (y = (32-w)/2)
-//   - colors: unchecked — track SurfaceContainerHighest + outline Outline,
-//     handle Outline (hover/pressed: OnSurfaceVariant); checked — track
-//     Primary, handle OnPrimary (hover/pressed: PrimaryContainer); disabled
-//     checked — track OnSurface@0.12, handle Surface; disabled unchecked —
-//     track SurfaceContainerHighest, outline OnSurface@0.38, handle
-//     OnSurface@0.38
-//   - state layer: a 40dp circle (StateLayerSize) centered on the handle,
-//     the handle color @ hover 0.08 / focus 0.10 / pressed 0.12
-//   - hit target: max(52,48) x max(32,48) centered on the track (the a11y
-//     floor is the hit area)
-//   - RTL: the track mirrors (the checked handle moves to the start side)
+// Ported from .ref/material3/Switch.kt (verbatim behavior):
+//   - SwitchImpl: the track Box is requiredSize(52x32) + border(2dp,
+//     borderColor, CornerFull) + background(trackColor) — the border draws
+//     inside the track edge → a 2dp ring flush with the pill edge, painted
+//     over the fill. The thumb Box is CenterStart-aligned; its LayoutNode
+//     (ThumbElement/ThumbNode.measure) sizes + offsets the content
+//   - ThumbNode.measure: size = pressed → PressedHandleWidth (28); else
+//     (thumbContent || checked) → ThumbDiameter (24) — so the icon variant's
+//     UNCHECKED thumb is 24 too (hasContent); else UncheckedThumbDiameter
+//     (16). offset = pressed&&checked → maxBound - TrackOutlineWidth (22);
+//     pressed&&!checked → TrackOutlineWidth (2); checked → maxBound (24 =
+//     TrackWidth - ThumbDiameter - ThumbPadding); else minBound
+//     ((32 - size)/2 → 8, or 4 with an icon)
+//   - the thumb's size/offset animate with MotionSchemeKeyTokens.FastSpatial
+//     (the theme spatial spring) EXCEPT pressed-state changes, which snap
+//     (SnapSpec) — pressing instantly grows to 28 and shifts to the ±2dp
+//     offsets; releasing springs back. The first layout uses the raw values
+//     (the Animatables are created lazily — no intro animation). Colors are
+//     plain params upstream → they snap on state change (no
+//     animateColorAsState in SwitchImpl)
+//   - colors (defaultSwitchColors): unchecked track SurfaceContainerHighest
+//     + border UnselectedFocusTrackOutlineColor (Outline) + thumb
+//     UnselectedHandleColor (Outline); checked track Primary + thumb
+//     SelectedHandleColor (OnPrimary) + border Transparent. The
+//     Selected/Unselected{Hover,Focus,Pressed}HandleColor variants
+//     (PrimaryContainer / OnSurfaceVariant — the style system resolves them;
+//     the defaults are interaction-static) apply like the spec states table
+//   - disabled colors compositeOver(surface) upstream — literal per the
+//     token math: checked track OnSurface@0.12 over surface + thumb Surface;
+//     unchecked track SurfaceContainerHighest@0.12 over surface + border
+//     OnSurface@0.12 over surface + thumb OnSurface@0.38 over surface
+//   - the thumb icon (thumbContent): a 16dp glyph centered in the thumb at
+//     iconColor — SelectedIconColor OnPrimaryContainer / UnselectedIconColor
+//     SurfaceContainerHighest (+ the disabled composites). show_icons draws
+//     check/close like the M3E spec asset
+//   - state layer: the unbounded ripple on the thumb (radius 20dp → a 40dp
+//     circle centered on the thumb) @ hover 0.08 / focus 0.10 / pressed
+//     0.12 — the spec's state layer color is the effective thumb color
+//   - hit target: max(52,48) x max(32,48) centered on the track
+//     (minimumInteractiveComponentSize — the a11y floor is the hit area)
+//   - RTL: the CenterStart thumb + placeRelative(offset) mirror the track —
+//     the offset counts from the end side (the checked thumb sits at the
+//     start edge like upstream RTL)
 //
-// v1 deviations (documented, fixed later):
-//   - No icon variant (the M3E switch with a check/cross icon in the handle
-//     lands with the icon system); the handle grow/shrink animation lands
-//     with Phase 3 (v1 switches sizes instantly).
+// Remaining deviations: a mid-flight re-press restarts the spring from 0
+// velocity (velocity continuity isn't carried); the InsetRing focus-ring
+// configuration isn't modeled (the thumb layer carries focus like the
+// default configuration).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -41,12 +67,16 @@ const Callback = ui.state.Callback;
 const Theme = theme_mod.Theme;
 
 /// M3E measurement tokens (SwitchTokens + Switch.kt).
-const track_w: f32 = 52;
-const track_h: f32 = 32;
-const outline_width: f32 = 2;
-const handle_off: f32 = 16; // UnselectedHandleWidth/Height
-const handle_on: f32 = 24; // SelectedHandleWidth/Height
-const handle_pressed: f32 = 28; // PressedHandleWidth/Height
+const track_w: f32 = 52; // SwitchWidth = TrackWidth
+const track_h: f32 = 32; // SwitchHeight = TrackHeight
+const outline_width: f32 = 2; // TrackOutlineWidth
+const handle_off: f32 = 16; // UncheckedThumbDiameter = UnselectedHandleWidth
+const handle_on: f32 = 24; // ThumbDiameter = SelectedHandleWidth
+const handle_pressed: f32 = 28; // PressedHandleWidth
+const thumb_padding: f32 = (track_h - handle_on) / 2; // ThumbPadding = 4
+/// thumbPathLength = SwitchWidth - ThumbDiameter - ThumbPadding → maxBound.
+const max_bound: f32 = track_w - handle_on - thumb_padding;
+const icon_size: f32 = 16; // Selected/UnselectedIconSize
 const state_layer_size: f32 = 40;
 /// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
 const min_target: f32 = 48;
@@ -74,6 +104,13 @@ const SwitchState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// ThumbNode's sizeAnim/offsetAnim: the animated thumb diameter and its
+    /// start-edge offset in track space (pre-RTL-mirror).
+    thumb_size: f32 = 0,
+    thumb_off: f32 = 0,
+    /// Animation channel markers (stable addresses).
+    size_channel: u8 = 0,
+    off_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *SwitchState {
@@ -84,46 +121,100 @@ fn isChecked(s: *SwitchState) bool {
     return s.sig.peek();
 }
 
-/// The track color, outline color, handle color and the state layer's
-/// on-color for the current state.
-const SWColors = struct { track: Color, outline: Color, handle: Color, on: Color };
+/// The track color, border color, thumb color, icon color and the state
+/// layer's on-color for the current state.
+const SWColors = struct { track: Color, outline: Color, handle: Color, icon: Color, on: Color };
 
+/// c.copy(alpha = k).compositeOver(surface) — an opaque composite like
+/// upstream's disabled color math.
+fn overSurface(c: Color, k: f32, surface: Color) Color {
+    const src = ui.paint.withAlphaScaled(c, k);
+    const sa: f32 = @floatFromInt(src & 0xFF);
+    const ch = struct {
+        fn f(sv: u32, dv: u32, a: f32) u32 {
+            const r = @round((@as(f32, @floatFromInt(sv)) * a + @as(f32, @floatFromInt(dv)) * (255 - a)) / 255);
+            return @intFromFloat(r);
+        }
+    }.f;
+    return (ch((src >> 24) & 0xFF, (surface >> 24) & 0xFF, sa) << 24) |
+        (ch((src >> 16) & 0xFF, (surface >> 16) & 0xFF, sa) << 16) |
+        (ch((src >> 8) & 0xFF, (surface >> 8) & 0xFF, sa) << 8) | 0xFF;
+}
+
+/// defaultSwitchColors + the per-state token variants (Switch.kt
+/// thumbColor/trackColor/borderColor/iconColor). The interaction variants
+/// come from the *Hover/*Focus/*Pressed tokens (the style system resolves
+/// them — the defaults are interaction-static); disabled colors are the
+/// upstream .copy(alpha).compositeOver(surface) results.
 fn currentColors(n: *Node, s: *SwitchState) SWColors {
     const cs = s.opts.theme.colors;
     if (!s.opts.enabled) {
         if (isChecked(s)) {
-            return .{ .track = ui.paint.withAlphaScaled(cs.on_surface, 0.12), .outline = 0x00000000, .handle = cs.surface, .on = cs.surface };
+            return .{
+                .track = overSurface(cs.on_surface, 0.12, cs.surface), // DisabledSelectedTrackColor @ DisabledTrackOpacity
+                .outline = 0x00000000, // disabledCheckedBorderColor = Transparent
+                .handle = cs.surface, // DisabledSelectedHandleColor @ 1.0 → Surface
+                .icon = overSurface(cs.on_surface, 0.38, cs.surface), // DisabledSelectedIconColor @ 0.38
+                .on = cs.surface,
+            };
         }
         return .{
-            .track = cs.surface_container_highest,
-            .outline = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
-            .handle = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
-            .on = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
+            .track = overSurface(cs.surface_container_highest, 0.12, cs.surface), // SCH @ 0.12 over surface — NOT the opaque SCH
+            .outline = overSurface(cs.on_surface, 0.12, cs.surface), // DisabledUnselectedTrackOutlineColor @ DisabledTrackOpacity
+            .handle = overSurface(cs.on_surface, 0.38, cs.surface), // DisabledUnselectedHandleColor @ 0.38
+            .icon = overSurface(cs.surface_container_highest, 0.38, cs.surface), // DisabledUnselectedIconColor @ 0.38
+            .on = overSurface(cs.on_surface, 0.38, cs.surface),
         };
     }
+    // the {Selected,Unselected}{Hover,Focus,Pressed}HandleColor tokens —
+    // PrimaryContainer / OnSurfaceVariant, all equal per state (the style
+    // system resolves them; the default colors are interaction-static)
     const interacting = s.hovered or s.pressed or input.isFocused(n);
     if (isChecked(s)) {
         const h = if (interacting) cs.primary_container else cs.on_primary;
-        return .{ .track = cs.primary, .outline = 0x00000000, .handle = h, .on = h };
+        return .{
+            .track = cs.primary, // SelectedTrackColor
+            .outline = 0x00000000, // checkedBorderColor = Transparent
+            .handle = h, // SelectedHandleColor / *HandleColor
+            .icon = cs.on_primary_container, // SelectedIconColor
+            .on = h,
+        };
     }
     const h = if (interacting) cs.on_surface_variant else cs.outline;
-    return .{ .track = cs.surface_container_highest, .outline = cs.outline, .handle = h, .on = h };
+    return .{
+        .track = cs.surface_container_highest, // UnselectedTrackColor
+        .outline = cs.outline, // Unselected{Focus}TrackOutlineColor
+        .handle = h, // UnselectedHandleColor / *HandleColor
+        .icon = cs.surface_container_highest, // UnselectedIconColor
+        .on = h,
+    };
 }
 
-/// The handle's rect (the Switch.kt thumb layout: minBound/maxBound, pressed
-/// offsets, vertically centered; mirrored in RTL).
-fn handleRect(n: *Node, s: *SwitchState) Rect {
+/// ThumbNode.measure's TARGET size/offset for the current state — the
+/// values the anims glide toward (pressed snaps). `hasContent` is the icon
+/// variant (thumbContent present → the unchecked thumb is 24).
+fn thumbTargets(n: *Node, s: *SwitchState) struct { size: f32, off: f32 } {
     _ = n;
     const on = isChecked(s);
-    const w: f32 = if (s.pressed) handle_pressed else if (on) handle_on else handle_off;
-    const x: f32 = if (s.pressed)
-        (if (on) track_w - handle_on - 4 - outline_width else outline_width) // maxBound-2 / TrackOutlineWidth
+    const has_content = s.opts.show_icons;
+    const size: f32 = if (s.pressed) handle_pressed else if (has_content or on) handle_on else handle_off;
+    const off: f32 = if (s.pressed)
+        (if (on) max_bound - outline_width else outline_width) // maxBound - TrackOutlineWidth / TrackOutlineWidth
     else if (on)
-        track_w - handle_on - 4 // maxBound
+        max_bound // thumbPathLength
     else
-        (track_h - handle_off) / 2; // minBound
-    const xr = if (ui.i18n.direction() == .rtl) track_w - x - w else x;
-    return .{ .x = xr, .y = (track_h - w) / 2, .w = w, .h = w };
+        (track_h - size) / 2; // minBound = thumbPaddingStart
+    return .{ .size = size, .off = off };
+}
+
+/// The thumb's rect: the animated size/offset in track space, vertically
+/// centered, mirrored in RTL (placeRelative counts the offset from the
+/// start edge).
+fn handleRect(n: *Node, s: *SwitchState) Rect {
+    _ = n;
+    const w = s.thumb_size;
+    const x = if (ui.i18n.direction() == .rtl) track_w - s.thumb_off - w else s.thumb_off;
+    return .{ .x = x, .y = (track_h - w) / 2, .w = w, .h = w };
 }
 
 fn switchMeasure(n: *Node, c: Constraints) Size {
@@ -143,23 +234,26 @@ fn switchPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
     const cc = currentColors(n, s);
-    // track (pill)
+    // track (pill): background then the border ring — the border draws
+    // INSIDE the track edge (Compose border() insets the ring), so its
+    // outer edge is flush with the pill
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, track_h / 2, cc.track);
     if (cc.outline & 0xFF != 0) {
-        ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, track_h / 2, outline_width, cc.outline);
+        ui.paint.strokeRRect(ctx, b.x + outline_width / 2, b.y + outline_width / 2, b.w - outline_width, b.h - outline_width, track_h / 2 - outline_width / 2, outline_width, cc.outline);
     }
-    // handle (absolute within the track; mirrored by handleRect for RTL)
+    // thumb (absolute within the track; mirrored by handleRect for RTL)
     const hr = handleRect(n, s);
     const h = Rect{ .x = b.x + hr.x, .y = b.y + hr.y, .w = hr.w, .h = hr.h };
     ui.paint.fillRRect(ctx, h.x, h.y, h.w, h.h, h.w / 2, cc.handle);
-    // M3E icon variant: a 16dp glyph centered in the handle, drawn in the
-    // track color — the token contrast pair in both states.
-    if (s.opts.show_icons and s.opts.enabled) {
-        const icon_size: f32 = 16;
+    // the thumb icon (thumbContent): a 16dp glyph centered in the thumb at
+    // iconColor — check when checked, close when not (the M3E spec asset)
+    if (s.opts.show_icons) {
         const icon_name: icon_w.IconName = if (isChecked(s)) .check else .close;
-        icon_w.drawIcon(ctx, icon_name, h.x + (h.w - icon_size) / 2, h.y + (h.h - icon_size) / 2, icon_size / 24.0, cc.track);
+        icon_w.drawIcon(ctx, icon_name, h.x + (h.w - icon_size) / 2, h.y + (h.h - icon_size) / 2, icon_size / 24.0, cc.icon);
     }
-    // state layer (enabled only): a 40dp circle centered on the handle
+    // state layer (the thumb's unbounded ripple, radius 20dp → a 40dp
+    // circle centered on the thumb): enabled only, the thumb color @ the
+    // state alpha
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)
             s.opts.theme.state.pressed
@@ -177,6 +271,50 @@ fn switchPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+fn thumbSizeCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).thumb_size = v[0];
+    n.markDirty();
+}
+fn thumbOffCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).thumb_off = v[0];
+    n.markDirty();
+}
+
+/// ThumbNode's animateTo calls: the thumb's size/offset retarget toward the
+/// current state — pressed-state changes snap (SnapSpec), everything else
+/// springs with FastSpatial (the theme spatial spring). No timeline → snap.
+fn retargetThumb(n: *Node, s: *SwitchState) void {
+    const t = thumbTargets(n, s);
+    if (ui.anim.timeline()) |tl| {
+        if (s.pressed) {
+            s.thumb_size = t.size;
+            s.thumb_off = t.off;
+            tl.cancelChannel(@ptrCast(&s.size_channel));
+            tl.cancelChannel(@ptrCast(&s.off_channel));
+            n.markDirty();
+            return;
+        }
+        const from: ui.anim.Vec4 = .{ s.thumb_size, s.thumb_off, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(.{ from[0], 0, 0, 0 }, .{ t.size, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .from = .{ from[0], 0, 0, 0 },
+            .channel = @ptrCast(&s.size_channel),
+            .on_update = .{ .fn_ptr = thumbSizeCb, .userdata = n },
+        });
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(.{ from[1], 0, 0, 0 }, .{ t.off, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .from = .{ from[1], 0, 0, 0 },
+            .channel = @ptrCast(&s.off_channel),
+            .on_update = .{ .fn_ptr = thumbOffCb, .userdata = n },
+        });
+    } else {
+        s.thumb_size = t.size;
+        s.thumb_off = t.off;
+    }
+}
+
 fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
@@ -185,12 +323,14 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed = true;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
+            retargetThumb(n, s); // pressed → snap to the pressed size/offset
             n.markDirty();
             return true;
         },
         .up => {
             const was_pressed = s.pressed;
             s.pressed = false;
+            retargetThumb(n, s); // release → spring back
             n.markDirty();
             // the click lands in the hit target, not necessarily in the track
             if (was_pressed and switchHitBounds(n).contains(ev.x, ev.y)) {
@@ -207,6 +347,7 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
                     s.pressed = false;
+                    retargetThumb(n, s); // cancel → spring back
                     n.markDirty();
                 }
             }
@@ -214,6 +355,7 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .outside_down => {
             s.pressed = false;
+            retargetThumb(n, s); // cancel → spring back
             n.markDirty();
             return true;
         },
@@ -248,16 +390,24 @@ fn switchOnKey(n: *Node, ev: input.KeyEvent) bool {
     return false;
 }
 
-/// Signal-driven repaint + semantic checked sync.
+/// Signal-driven repaint + semantic checked sync + the ThumbNode retarget
+/// (the check change springs the thumb's size/offset — or snaps mid-press,
+/// matching upstream's `if (isPressed) SnapSpec else animationSpec`).
 fn switchSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
-    if (n.semantics) |sem| sem.checked = stateOf(n).sig.peek();
+    const s = stateOf(n);
+    if (n.semantics) |sem| sem.checked = s.sig.peek();
+    retargetThumb(n, s);
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
 
 fn switchDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.size_channel));
+        tl.cancelChannel(@ptrCast(&s.off_channel));
+    }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = switchSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -304,6 +454,11 @@ pub fn @"switch"(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_c
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_changed = on_changed };
     node.state = s;
+    // seed the thumb at the raw targets (upstream's sizeAnim/offsetAnim are
+    // lazy — the first measure uses the values, no intro animation)
+    const t = thumbTargets(node, s);
+    s.thumb_size = t.size;
+    s.thumb_off = t.off;
     ui.semantics.attach(node, .{
         .role = .toggle,
         .label = opts.a11y_label,
@@ -356,8 +511,10 @@ test "switch: the handle follows the state (off/on/pressed positions)" {
     try std.testing.expectEqual(@as(f32, 24), hr.x);
     try std.testing.expectEqual(@as(f32, 4), hr.y);
     try std.testing.expectEqual(handle_on, hr.w);
-    // pressed on: 28x28 at (22, 2)
+    // pressed on: 28x28 at (22, 2) — the press path (down → retargetThumb)
+    // snaps to the pressed size/offset like upstream's SnapSpec
     s.pressed = true;
+    retargetThumb(b, s);
     hr = handleRect(b, s);
     try std.testing.expectEqual(@as(f32, 22), hr.x);
     try std.testing.expectEqual(@as(f32, 2), hr.y);
@@ -456,7 +613,9 @@ test "golden: disabled checked switch paints the OnSurface@0.12 track" {
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    try golden.expectPixelApprox(f, 10, 32, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF));
+    // upstream composites the disabled track over `surface` (opaque), not
+    // white — OnSurface@0.12 x surface
+    try golden.expectPixelApprox(f, 10, 32, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), t.colors.surface));
 }
 
 test "switch: paintRect covers the handle state layer extremes (culling/damage contract)" {

@@ -2,22 +2,34 @@
 // is a shared Signal(usize): each radio carries its `index`; checked =
 // (signal == index); a click selects it.
 //
-// Spec: m3.material.io/components/radio-button + Compose RadioButtonTokens /
-// RadioButton.kt:
-//   - circle 20dp (IconSize), outline 2dp (RadioStrokeWidth), the stroke is
-//     centered on a 9dp radius → the outer diameter is 20
-//   - checked: the dot fills (RadioButtonDotSize 12 minus the stroke half →
-//     a 10dp filled circle)
-//   - colors: selected → Primary; unselected → outline OnSurfaceVariant
-//     (hover/focus/pressed: OnSurface); disabled → OnSurface@0.38
-//   - state layer: a 40dp circle (StateLayerSize) centered on the circle,
-//     the circle's current color @ hover 0.08 / focus 0.10 / pressed 0.12
-//   - hit target: 48x48 centered on the circle (the a11y floor is the hit
-//     area, never the painted circle)
+// Ported from .ref/material3/RadioButton.kt (verbatim behavior):
+//   - RadioButtonImpl: the Canvas is padding(RadioButtonPadding=2dp) +
+//     requiredSize(IconSize=20dp) → the node measures 24x24 with the 20dp
+//     drawing centered; the draw scope is the 20dp icon
+//   - the ring: drawCircle(radius = IconSize/2 - strokeWidth/2 = 9,
+//     Stroke(2)) → a 2dp stroke centered on the 9dp radius (outer Ø 20)
+//   - the dot: animateDpAsState(RadioButtonDotSize/2 = 6dp when selected,
+//     MotionSchemeKeyTokens.FastSpatial — the theme spatial spring); drawn
+//     filled at radius dotRadius - strokeWidth/2 (= 5dp → Ø 10), skipped
+//     while the animated radius is 0
+//   - colors: radioColor(enabled, selected) — defaultRadioButtonColors:
+//     SelectedIconColor = Primary, UnselectedIconColor = OnSurfaceVariant,
+//     disabled both OnSurface@0.38 (Disabled*IconOpacity). Animated with
+//     MotionSchemeKeyTokens.DefaultEffects (the theme effects spring);
+//     disabled snaps (rememberUpdatedState). The Unselected{Hover,Focus,
+//     Pressed}IconColor tokens (all OnSurface — the style system resolves
+//     them; the default colors are interaction-static) apply like the spec
+//     states table.
+//   - state layer: the unbounded ripple (radius 20dp → a 40dp circle
+//     centered on the ring) @ hover 0.08 / focus 0.10 / pressed 0.12 —
+//     the spec's state layer color is the effective icon color
+//   - hit target: 48x48 centered on the ring
+//     (minimumInteractiveComponentSize — the a11y floor is the hit area,
+//     never the painted circle)
 //
-// v1 deviations (documented, fixed later):
-//   - Keyboard: Enter/Space select; arrow-key group navigation (selection
-//     follows focus) lands with the focus/navigation polish pass.
+// Remaining deviations (upstream-quirk / API-bound): none beyond the
+//   interaction-variant note above — a re-tap mid-animation restarts the
+//   spring from 0 velocity (velocity continuity isn't carried).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -34,10 +46,12 @@ const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
 /// M3E measurement tokens (RadioButtonTokens + RadioButton.kt).
-const circle_size: f32 = 20;
+const icon_size: f32 = 20; // RadioButtonTokens.IconSize (the draw scope)
+const padding: f32 = 2; // RadioButtonPadding — the node measures icon+2*pad
+const circle_size: f32 = 24;
 const circle_radius: f32 = 9; // IconSize/2 - strokeWidth/2 (the stroke is centered)
 const stroke_width: f32 = 2;
-const dot_size: f32 = 10; // RadioButtonDotSize (12) minus the stroke half
+const dot_radius: f32 = 6; // RadioButtonDotSize/2 (the animation target)
 const state_layer_size: f32 = 40;
 /// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
 const min_target: f32 = 48;
@@ -60,6 +74,13 @@ const RadioState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// animateDpAsState(RadioButtonDotSize/2, FastSpatial): 0 … 6.
+    dot_r: f32 = 0,
+    /// animateColorAsState(DefaultEffects): the ring/dot color.
+    circle_color: Color = 0,
+    /// Animation channel markers (stable addresses).
+    dot_channel: u8 = 0,
+    color_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *RadioState {
@@ -70,14 +91,17 @@ fn isChecked(s: *RadioState) bool {
     return s.sig.peek() == s.index;
 }
 
-/// The circle color + the state layer's on-color for the current state.
+/// The rest-state circle color (radioColor(enabled, selected) at the
+/// resting interaction state) + the state layer's on-color.
 const RColors = struct { circle: Color, on: Color };
 
 fn currentColors(n: *Node, s: *RadioState) RColors {
     const cs = s.opts.theme.colors;
     if (!s.opts.enabled) return .{ .circle = ui.paint.withAlphaScaled(cs.on_surface, 0.38), .on = ui.paint.withAlphaScaled(cs.on_surface, 0.38) };
     if (isChecked(s)) return .{ .circle = cs.primary, .on = cs.primary };
-    // hover/focus/pressed darkens the unselected outline (Unselected*IconColor)
+    // the Unselected{Hover,Focus,Pressed}IconColor tokens — all OnSurface
+    // (the style system resolves them; defaultRadioButtonColors itself is
+    // interaction-static)
     const interacting = s.hovered or s.pressed or input.isFocused(n);
     const c = if (interacting) cs.on_surface else cs.on_surface_variant;
     return .{ .circle = c, .on = c };
@@ -85,6 +109,7 @@ fn currentColors(n: *Node, s: *RadioState) RColors {
 
 fn radioMeasure(n: *Node, c: Constraints) Size {
     _ = n;
+    // padding(2dp) + requiredSize(IconSize) → 24x24, the icon centered
     return c.constrain(.{ .w = circle_size, .h = circle_size });
 }
 
@@ -103,9 +128,12 @@ fn radioPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
     const cc = currentColors(n, s);
+    // the 20dp icon centers in the (24dp) node — wrapContentSize centers the
+    // canvas in whatever space remains after the padding
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    // state layer (enabled only): a 40dp circle, the circle color @ the state alpha
+    // state layer (the unbounded ripple, radius 20dp → a 40dp circle
+    // centered on the ring): enabled only, the circle color @ the state alpha
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)
             s.opts.theme.state.pressed
@@ -119,11 +147,22 @@ fn radioPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.on, alpha));
         }
     }
-    // the circle outline (inset by half the stroke → the outer diameter is 20)
-    ui.paint.strokeRRect(ctx, b.x + stroke_width / 2, b.y + stroke_width / 2, b.w - stroke_width, b.h - stroke_width, circle_radius, stroke_width, cc.circle);
-    // the dot (checked)
-    if (isChecked(s)) {
-        ui.paint.fillRRect(ctx, cx - dot_size / 2, cy - dot_size / 2, dot_size, dot_size, dot_size / 2, cc.circle);
+    // The signal-animated color carries the check-state transition; the
+    // unselected icon's interaction variants (the *Hover/*Focus/*Pressed
+    // tokens) resolve instantly like the other interaction-state painting
+    // (defaultRadioButtonColors is interaction-static).
+    const circle = if (s.opts.enabled and !isChecked(s)) cc.circle else s.circle_color;
+    // the ring: drawCircle(radius=9, Stroke(2)) — the 2dp stroke centers on
+    // the r=9 circle (the rrect path), so the ring's outer edge is the 20dp
+    // icon edge
+    ui.paint.strokeRRect(ctx, cx - circle_radius, cy - circle_radius, circle_radius * 2, circle_radius * 2, circle_radius, stroke_width, circle);
+    // the dot: filled circle radius dotRadius - strokeWidth/2, only while the
+    // animated radius is > 0
+    if (s.dot_r > 0) {
+        const dr = s.dot_r - stroke_width / 2;
+        if (dr > 0) {
+            ui.paint.fillRRect(ctx, cx - dr, cy - dr, dr * 2, dr * 2, dr, circle);
+        }
     }
 }
 
@@ -197,16 +236,67 @@ fn radioOnKey(n: *Node, ev: input.KeyEvent) bool {
     return false;
 }
 
-/// Signal-driven repaint + semantic checked sync.
+fn dotRadiusCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).dot_r = v[0];
+    n.markDirty();
+}
+fn circleColorCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).circle_color = ui.anim.vec4ToColor(v);
+    n.markDirty();
+}
+
+/// Signal-driven repaint + semantic checked sync + the upstream
+/// transitions: animateDpAsState(dotRadius, FastSpatial → the theme spatial
+/// spring) for the dot; animateColorAsState(DefaultEffects → the theme
+/// effects spring) for the ring/dot color (snapped when disabled —
+/// rememberUpdatedState).
 fn radioSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
-    if (n.semantics) |sem| sem.checked = isChecked(stateOf(n));
+    const s = stateOf(n);
+    const checked = isChecked(s);
+    if (n.semantics) |sem| sem.checked = checked;
+    const cc = currentColors(n, s);
+    const dot_target: f32 = if (checked) dot_radius else 0;
+    if (s.opts.enabled) {
+        if (ui.anim.timeline()) |tl| {
+            const dfrom: ui.anim.Vec4 = .{ s.dot_r, 0, 0, 0 };
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(dfrom, .{ dot_target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+                .from = dfrom,
+                .channel = @ptrCast(&s.dot_channel),
+                .on_update = .{ .fn_ptr = dotRadiusCb, .userdata = n },
+            });
+            const cfrom = ui.anim.colorToVec4(s.circle_color);
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(cfrom, ui.anim.colorToVec4(cc.circle), s.opts.theme.motion.springs.effects_spring, .{ 0, 0, 0, 0 }),
+                .from = cfrom,
+                .channel = @ptrCast(&s.color_channel),
+                .on_update = .{ .fn_ptr = circleColorCb, .userdata = n },
+            });
+        } else {
+            s.dot_r = dot_target;
+            s.circle_color = cc.circle;
+        }
+    } else {
+        s.dot_r = dot_target;
+        s.circle_color = cc.circle;
+        if (ui.anim.timeline()) |tl| {
+            tl.cancelChannel(@ptrCast(&s.dot_channel));
+            tl.cancelChannel(@ptrCast(&s.color_channel));
+        }
+    }
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
 
 fn radioDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.dot_channel));
+        tl.cancelChannel(@ptrCast(&s.color_channel));
+    }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = radioSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -237,9 +327,14 @@ pub fn radio(allocator: std.mem.Allocator, sig: *ui.state.Signal(usize), index: 
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .index = index };
     node.state = s;
-    // the 40dp state layer is centered on the 20dp circle — paint (and
-    // damage) reaches (state_layer_size - circle_size)/2 past each edge
-    const layer_overflow = (state_layer_size - circle_size) / 2;
+    // seed the animated state at the current values (upstream's
+    // animate*AsState starts at the target — no intro animation)
+    s.circle_color = currentColors(node, s).circle;
+    s.dot_r = if (sig.peek() == index) dot_radius else 0;
+    // the 40dp state layer is centered on the circle's center (the bounds
+    // center) — paint (and damage) reaches 20dp from center; against a
+    // minimal 20dp bounds that's 10dp past each edge
+    const layer_overflow = state_layer_size / 2 - icon_size / 2;
     node.damage_overflow = .{ .left = layer_overflow, .right = layer_overflow, .top = layer_overflow, .bottom = layer_overflow };
     ui.semantics.attach(node, .{
         .role = .radio,
@@ -255,12 +350,13 @@ pub fn radio(allocator: std.mem.Allocator, sig: *ui.state.Signal(usize), index: 
 
 // --- tests ---
 
-test "radio: measures the 20dp circle; the 48dp floor is the hit target" {
+test "radio: measures the 24dp node (2dp pad + 20dp icon); the 48dp floor is the hit target" {
     const sig = try ui.state.Signal(usize).init(std.testing.allocator, 0);
     defer sig.deinit();
     const b = try radio(std.testing.allocator, sig, 0, .{ .a11y_label = "x" });
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
+    // padding(2dp) + requiredSize(IconSize=20dp) → a 24dp node
     try std.testing.expectEqual(circle_size, m.w);
     try std.testing.expectEqual(circle_size, m.h);
     b.layout(.{ .x = 100, .y = 100, .w = 20, .h = 20 });

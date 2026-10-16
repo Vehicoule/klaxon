@@ -1,27 +1,45 @@
 // Checkbox (Phase 2d.2 PR B2, M3E) — the M3E checkbox (with the error
 // variant).
 //
-// Spec: m3.material.io/components/checkbox + Compose CheckboxTokens /
-// Checkbox.kt:
-//   - box 18x18 (ContainerSize), corner radius 2, outline 2dp
-//     (UnselectedOutlineWidth)
-//   - unselected: transparent box, outline OnSurfaceVariant (hover/focus/
-//     pressed: OnSurface); selected: box Primary, checkmark OnPrimary
-//   - error variant: selected box Error / checkmark OnError; unselected
-//     outline Error
-//   - disabled: selected box OnSurface@0.38 + checkmark Surface; unselected
-//     outline OnSurface@0.38
-//   - state layer: a 40dp circle (StateLayerSize, CornerFull) centered on the
-//     box, indicator color @ hover 0.08 / focus 0.10 / pressed 0.12 —
-//     indicator = Primary (checked) / OnSurfaceVariant (unchecked), Error in
-//     the error variant
-//   - the checkmark is a 2dp round-capped polyline (kx_stroke_polyline)
+// Ported from .ref/material3/Checkbox.kt (verbatim behavior):
+//   - CheckboxImpl (the isCheckboxStylingFixEnabled / M3E path — 18dp
+//     CheckboxTokens.ContainerSize box, no legacy 2dp CheckboxDefaultPadding):
+//     drawBox + drawCheck + the checkDrawFraction /
+//     checkCenterGravitationShiftFraction transition specs +
+//     colorAnimationSpecForState + defaultCheckboxColors
+//   - drawBox: box == border → fill the 18x18 r2 box; else a 14x14 inner fill
+//     (inset by the 2dp stroke) + a centered 2dp rrect ring inset 1dp (the
+//     ring's outer edge is flush with the box bounds, inner corner square)
+//   - drawCheck + CheckDrawingCache: the check is a 3-point polyline at
+//     (0.25,0.5) → (0.4,0.65) → (0.75,0.3) of the box, drawn to
+//     pathMeasure.length * checkFraction (the draw-on animation); the stroke
+//     is floor(2dp) = 2px, StrokeCap.Square (kx polyline butt — square extends
+//     the caps by half the stroke, a 1px cosmetic delta)
+//   - checkDrawFraction: Off→On springs with MotionSchemeKeyTokens.
+//     DefaultSpatial (the theme spatial spring); →Off is a snap() with a
+//     100ms SnapAnimationDelay — modeled as a 0ms tween on a 100ms delay
+//     (headless: snaps). The checkCenterGravitationShiftFraction only moves
+//     for the Indeterminate state — this widget is binary (the public API is
+//     Signal(bool)); the gravitation term stays 0.
+//   - box/border/checkmark colors animate with colorAnimationSpecForState
+//     (DefaultEffects entering, FastEffects leaving — both map to the theme
+//     effects spring); disabled colors snap (rememberUpdatedState).
+//   - state layer (the ripple, bounded=false radius 20dp): a 40dp circle
+//     centered on the box @ hover 0.08 / focus 0.10 / pressed 0.12. Checked:
+//     indicatorColor = the box color (Primary / Error). Unchecked: upstream's
+//     flag-on path passes uncheckedBoxColor (Transparent) — an upstream quirk
+//     that would drop the layer entirely; the spec table's unselected layer
+//     is On Surface, which is also what the flag-off Unspecified ripple
+//     resolves to (contentColor) — used here.
+//   - the unselected border uses the Unselected*{Hover,Focus,Pressed}
+//     OutlineColor tokens (all OnSurface — the style system resolves them;
+//     defaultCheckboxColors itself is interaction-static)
 //   - hit target: 48x48 centered on the box (minimumInteractiveComponentSize —
 //     the a11y floor is the hit area, never the painted box)
 //
-// v1 deviations (documented, fixed later):
-//   - The indeterminate state (a dash instead of a checkmark) is not modeled —
-//     v1 is binary (on/off). The animated check draw lands with Phase 3.
+// Remaining deviations (public-API-bound or upstream-quirk):
+//   - no indeterminate state (the API is binary)
+//   - disabled colors are straight-alpha (upstream composites over surface)
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -57,6 +75,16 @@ pub const CheckboxOptions = struct {
     theme: Theme = theme_mod.light,
 };
 
+/// CheckDrawingCache's path geometry (Checkbox.kt). Fractions of the box.
+/// `gravit` is checkCenterGravitationShiftFraction — only nonzero for the
+/// Indeterminate state (out of scope for the binary API); kept in the math
+/// so the port matches the upstream function shape.
+const CheckPoint = struct { x: f32, y: f32 };
+// flag-on (M3E) point fractions: (0.25,0.5) → (0.4,0.65) → (0.75,0.3)
+const check_left: CheckPoint = .{ .x = 0.25, .y = 0.5 };
+const check_cross: CheckPoint = .{ .x = 0.4, .y = 0.65 };
+const check_right: CheckPoint = .{ .x = 0.75, .y = 0.3 };
+
 const CheckboxState = struct {
     opts: CheckboxOptions,
     sig: *ui.state.Signal(bool),
@@ -67,6 +95,17 @@ const CheckboxState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// checkDrawFraction: 0 unchecked … 1 fully drawn (drawn-on animation).
+    check_frac: f32 = 0,
+    /// The animated box / border / checkmark colors.
+    box_color: Color = 0,
+    border_color: Color = 0,
+    check_color: Color = 0,
+    /// Animation channel markers (stable addresses).
+    frac_channel: u8 = 0,
+    box_channel: u8 = 0,
+    border_channel: u8 = 0,
+    check_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *CheckboxState {
@@ -77,8 +116,13 @@ fn isChecked(s: *CheckboxState) bool {
     return s.sig.peek();
 }
 
-/// The box color (selected), outline color (unselected), checkmark color and
-/// the state layer's indicator color for the current state.
+/// The target colors for the current state — defaultCheckboxColors
+/// (Checkbox.kt: CheckedContainerColor Selected → Primary/Error, Transparent
+/// unselected; CheckedBorderColor == container; UnselectedBorderColor →
+/// Unselected*OutlineColor tokens — OnSurfaceVariant at rest, OnSurface
+/// interacting, Error in the error variant; SelectedIconColor OnPrimary/
+/// OnError; disabled → OnSurface@0.38 box, OnSurface@0.38 border, Surface
+/// checkmark).
 const CBColors = struct { box: Color, outline: Color, check: Color, indicator: Color };
 
 fn currentColors(n: *Node, s: *CheckboxState) CBColors {
@@ -88,26 +132,32 @@ fn currentColors(n: *Node, s: *CheckboxState) CBColors {
         if (isChecked(s)) {
             return .{
                 .box = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
-                .outline = 0x00000000,
+                .outline = ui.paint.withAlphaScaled(cs.on_surface, 0.38), // CheckedBorderColor == container
                 .check = cs.surface,
-                .indicator = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
+                .indicator = 0x00000000,
             };
         }
         return .{
             .box = 0x00000000,
-            .outline = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
+            .outline = ui.paint.withAlphaScaled(cs.on_surface, 0.38), // UnselectedDisabledOutlineColor
             .check = 0x00000000,
-            .indicator = ui.paint.withAlphaScaled(cs.on_surface, 0.38),
+            .indicator = 0x00000000,
         };
     }
-    // hover/focus/pressed darkens the unselected outline (Unselected*OutlineColor)
+    // the Unselected{Hover,Focus,Pressed}OutlineColor tokens — all OnSurface
+    // (defaultCheckboxColors itself is interaction-static; the style system
+    // resolves these)
     const interacting = s.hovered or s.pressed or input.isFocused(n);
     if (isChecked(s)) {
         const c = if (err) cs.@"error" else cs.primary;
-        return .{ .box = c, .outline = 0x00000000, .check = if (err) cs.on_error else cs.on_primary, .indicator = c };
+        return .{ .box = c, .outline = c, .check = if (err) cs.on_error else cs.on_primary, .indicator = c };
     }
     const outline = if (interacting or err) (if (err) cs.@"error" else cs.on_surface) else cs.on_surface_variant;
-    const indicator = if (err) cs.@"error" else cs.on_surface_variant;
+    // the spec's unselected state layer is On Surface (upstream's flag-on
+    // ripple would pass the Transparent uncheckedBoxColor — the flag-off
+    // Unspecified ripple resolves to ≈OnSurface via contentColor, so
+    // OnSurface is the spec color either way)
+    const indicator = if (err) cs.@"error" else cs.on_surface;
     return .{ .box = 0x00000000, .outline = outline, .check = 0x00000000, .indicator = indicator };
 }
 
@@ -127,13 +177,74 @@ fn checkboxHitBounds(n: *Node) Rect {
     };
 }
 
+fn lerpF(a: f32, b: f32, t: f32) f32 {
+    return a + (b - a) * t;
+}
+
+/// DrawScope.drawBox (Checkbox.kt): box == border → fill the whole r2 box;
+/// otherwise a 14x14 inner fill inset by the stroke (square corners —
+/// max(0, radius - stroke)) under a 2dp ring inset by half the stroke
+/// (corner radius 1). `stroke.width` = floor(StrokeWidth) = 2.
+fn drawBox(ctx: *kx.Ctx, x: f32, y: f32, size: f32, box_color: Color, border_color: Color) void {
+    if (box_color == border_color) {
+        ui.paint.fillRRect(ctx, x, y, size, size, box_radius, box_color);
+    } else {
+        ui.paint.fillRRect(ctx, x + outline_width, y + outline_width, size - outline_width * 2, size - outline_width * 2, 0, box_color);
+        const half = outline_width / 2;
+        ui.paint.strokeRRect(ctx, x + half, y + half, size - outline_width, size - outline_width, box_radius - half, outline_width, border_color);
+    }
+}
+
+/// DrawScope.drawCheck (Checkbox.kt): the check is a 3-point polyline drawn
+/// to `pathMeasure.length * checkFraction`. Gravitated fractions —
+/// crossX/crossY/end-Y lerp toward 0.5 as crossCenterGravitation → 1 (the
+/// indeterminate morph; 0 for this binary widget). The stroke is
+/// floor(2dp) = 2px, StrokeCap.Square upstream — the kx polyline's flat cap
+/// is the closest available primitive (the square cap extends endpoints by
+/// half the stroke: a sub-pixel cosmetic delta).
+fn drawCheck(ctx: *kx.Ctx, x: f32, y: f32, size: f32, check_color: Color, check_frac: f32, gravit: f32) void {
+    if (check_frac <= 0) return;
+    const p0 = CheckPoint{ .x = check_left.x * size, .y = lerpF(check_left.y, 0.5, gravit) * size };
+    const p1 = CheckPoint{ .x = lerpF(check_cross.x, 0.5, gravit) * size, .y = lerpF(check_cross.y, 0.5, gravit) * size };
+    const p2 = CheckPoint{ .x = check_right.x * size, .y = lerpF(check_right.y, 0.5, gravit) * size };
+    const l1 = @sqrt((p1.x - p0.x) * (p1.x - p0.x) + (p1.y - p0.y) * (p1.y - p0.y));
+    const l2 = @sqrt((p2.x - p1.x) * (p2.x - p1.x) + (p2.y - p1.y) * (p2.y - p1.y));
+    const d = (l1 + l2) * check_frac; // getSegment(0, length * fraction)
+    var xs: [3]f32 = undefined;
+    var ys: [3]f32 = undefined;
+    var count: usize = 2;
+    xs[0] = x + p0.x;
+    ys[0] = y + p0.y;
+    if (d <= l1) {
+        // a partial first segment: lerp from p0 toward p1
+        const t = if (l1 > 0) d / l1 else 0;
+        xs[1] = x + p0.x + (p1.x - p0.x) * t;
+        ys[1] = y + p0.y + (p1.y - p0.y) * t;
+    } else {
+        xs[1] = x + p1.x;
+        ys[1] = y + p1.y;
+        if (d < l1 + l2) {
+            const t = (d - l1) / l2;
+            xs[2] = x + p1.x + (p2.x - p1.x) * t;
+            ys[2] = y + p1.y + (p2.y - p1.y) * t;
+            count = 3;
+        } else {
+            xs[2] = x + p2.x;
+            ys[2] = y + p2.y;
+            count = 3;
+        }
+    }
+    ui.paint.strokePolyline(ctx, xs[0..count], ys[0..count], check_stroke, false, check_color);
+}
+
 fn checkboxPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
     const cc = currentColors(n, s);
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    // state layer (enabled only): a 40dp circle, indicator @ the state alpha
+    // state layer (the unbounded ripple, radius 20dp → a 40dp circle
+    // centered on the box): enabled only, indicator @ the state alpha
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)
             s.opts.theme.state.pressed
@@ -147,16 +258,16 @@ fn checkboxPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.indicator, alpha));
         }
     }
-    // the box
-    if (isChecked(s)) {
-        ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, box_radius, cc.box);
-        // the checkmark: a round-capped polyline inside the 18dp box
-        const xs = [_]f32{ b.x + 4, b.x + 7.5, b.x + 14 };
-        const ys = [_]f32{ b.y + 9.5, b.y + 13, b.y + 6.5 };
-        ui.paint.strokePolyline(ctx, &xs, &ys, check_stroke, true, cc.check);
-    } else {
-        ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, box_radius, outline_width, cc.outline);
-    }
+    // The signal-animated colors apply to the check-state transition; the
+    // unselected outline's interaction variants (the *Hover/*Focus/*Pressed
+    // tokens) resolve instantly like the rest of the interaction-state
+    // painting (upstream's default colors are interaction-static — the
+    // variants come from the style system and apply per-state).
+    const border = if (s.opts.enabled and !isChecked(s)) cc.outline else s.border_color;
+    // the box — the animated colors decide which drawBox branch runs
+    drawBox(ctx, b.x, b.y, b.w, s.box_color, border);
+    // the checkmark draws through checkDrawFraction (drawn on/off)
+    drawCheck(ctx, b.x, b.y, b.w, s.check_color, s.check_frac, 0);
 }
 
 fn checkboxOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -231,16 +342,111 @@ fn checkboxOnKey(n: *Node, ev: input.KeyEvent) bool {
     return false;
 }
 
-/// Signal-driven repaint + semantic checked sync.
+/// animateColorAsState(colorAnimationSpecForState): Off → FastEffects, else
+/// DefaultEffects. Both motion tokens map to the theme effects spring; the
+/// lanes are the color's RGBA (lerpColor semantics). Disabled → snap
+/// (rememberUpdatedState — no animation across enabled/disabled).
+fn animateColor(s: *CheckboxState, current: Color, target: Color, channel: *anyopaque, cb: ui.anim.Animation.UpdateCallback) Color {
+    if (ui.anim.timeline()) |tl| {
+        const from = ui.anim.colorToVec4(current);
+        const to = ui.anim.colorToVec4(target);
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, to, s.opts.theme.motion.springs.effects_spring, .{ 0, 0, 0, 0 }),
+            .from = from,
+            .channel = channel,
+            .on_update = cb,
+        });
+        return current;
+    }
+    return target;
+}
+
+fn boxColorCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).box_color = ui.anim.vec4ToColor(v);
+    n.markDirty();
+}
+fn borderColorCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).border_color = ui.anim.vec4ToColor(v);
+    n.markDirty();
+}
+fn checkColorCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).check_color = ui.anim.vec4ToColor(v);
+    n.markDirty();
+}
+fn checkFracCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).check_frac = v[0];
+    n.markDirty();
+}
+
+/// The checkbox transition specs (Checkbox.kt): Off→On springs the check on
+/// with DefaultSpatial (the theme spatial spring); →Off is snap(100ms) — the
+/// check lingers while the box fades, then vanishes. No timeline → snap.
+fn animateCheckFrac(n: *Node, s: *CheckboxState, checked: bool) void {
+    const target: f32 = if (checked) 1 else 0;
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ s.check_frac, 0, 0, 0 };
+        if (checked) {
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(from, .{ 1, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+                .from = from,
+                .channel = @ptrCast(&s.frac_channel),
+                .on_update = .{ .fn_ptr = checkFracCb, .userdata = n },
+            });
+        } else {
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, 0, .{ .ease = .linear }),
+                .from = from,
+                .delay_ms = 100, // SnapAnimationDelay
+                .channel = @ptrCast(&s.frac_channel),
+                .on_update = .{ .fn_ptr = checkFracCb, .userdata = n },
+            });
+        }
+    } else {
+        s.check_frac = target;
+    }
+}
+
+/// Signal-driven repaint + semantic checked sync + the upstream transitions
+/// (checkDrawFraction + the three animated colors).
 fn checkboxSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
-    if (n.semantics) |sem| sem.checked = stateOf(n).sig.peek();
+    const s = stateOf(n);
+    const checked = s.sig.peek();
+    if (n.semantics) |sem| sem.checked = checked;
+    const cc = currentColors(n, s);
+    if (s.opts.enabled) {
+        s.box_color = animateColor(s, s.box_color, cc.box, @ptrCast(&s.box_channel), .{ .fn_ptr = boxColorCb, .userdata = n });
+        s.border_color = animateColor(s, s.border_color, cc.outline, @ptrCast(&s.border_channel), .{ .fn_ptr = borderColorCb, .userdata = n });
+        s.check_color = animateColor(s, s.check_color, cc.check, @ptrCast(&s.check_channel), .{ .fn_ptr = checkColorCb, .userdata = n });
+        animateCheckFrac(n, s, checked);
+    } else {
+        s.box_color = cc.box;
+        s.border_color = cc.outline;
+        s.check_color = cc.check;
+        s.check_frac = if (checked) 1 else 0;
+        if (ui.anim.timeline()) |tl| {
+            tl.cancelChannel(@ptrCast(&s.frac_channel));
+            tl.cancelChannel(@ptrCast(&s.box_channel));
+            tl.cancelChannel(@ptrCast(&s.border_channel));
+            tl.cancelChannel(@ptrCast(&s.check_channel));
+        }
+    }
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
 
 fn checkboxDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.frac_channel));
+        tl.cancelChannel(@ptrCast(&s.box_channel));
+        tl.cancelChannel(@ptrCast(&s.border_channel));
+        tl.cancelChannel(@ptrCast(&s.check_channel));
+    }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = checkboxSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -270,6 +476,13 @@ pub fn checkbox(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_ch
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_changed = on_changed };
     node.state = s;
+    // seed the animated state at the current values (upstream's
+    // remember/animateColorAsState starts at the target — no intro animation)
+    const cc = currentColors(node, s);
+    s.box_color = cc.box;
+    s.border_color = cc.outline;
+    s.check_color = cc.check;
+    s.check_frac = if (sig.peek()) 1 else 0;
     // the 40dp state layer is centered on the 18dp box — paint (and damage)
     // reaches (state_layer_size - box_size)/2 past each edge
     const layer_overflow = (state_layer_size - box_size) / 2;
@@ -395,8 +608,10 @@ test "golden: unchecked checkbox strokes the OnSurfaceVariant outline, transpare
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the top outline, mid-edge: on_surface_variant
-    try std.testing.expectEqual(t.colors.on_surface_variant, f.pixelAt(24, 15));
+    // the top outline, mid-edge: on_surface_variant — the ported drawBox
+    // insets the ring by half the stroke so its outer edge is flush with the
+    // box edge; the solid stroke band is y∈[15.5,17.5] → sample row 16
+    try std.testing.expectEqual(t.colors.on_surface_variant, f.pixelAt(24, 16));
     // inside: transparent → bg
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(24, 24));
 }

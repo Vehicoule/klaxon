@@ -1,20 +1,32 @@
 // Tabs widget (Phase 2d.1, M3E batch 1) — primary top tab row.
 //
-// Spec: m3.material.io/components/tabs (M3E) + Compose
-// PrimaryNavigationTabTokens:
-//   - container height 48 (label only) / 64 (icon + label), color surface,
-//   - tabs split the width into equal sections, content vertically centered,
-//   - divider: 1dp, surface_variant, inside the container height at the bottom,
-//   - active indicator: 3dp high pill, primary, inset 2dp on each side of the
-//     tab (minimum length 24), sitting on the divider,
-//   - state layer color = the selected content color (primary active /
-//     on_surface_variant inactive — Compose Tab ripple),
-//   - active icon/label = primary (app-supplied), inactive = on_surface_variant.
+// Ported from .ref/material3/TabRow.kt (`TabRowImpl` measure policy,
+// `TabIndicatorOffsetNode`, `TabRowDefaults.PrimaryIndicator`) and
+// .ref/material3/Tab.kt (`TabImpl` placement, `HorizontalTextPadding`) with
+// tokens from .ref/material3/tokens/PrimaryNavigationTabTokens.kt:
+//   - equal tab cells: tabWidth = rowWidth / tabCount, content centered,
+//   - row height = the tallest tab (48 label-only / 64 icon+label via the
+//     `height` option — PrimaryNavigationTabTokens.ContainerHeight /
+//     IconAndLabelTextContainerHeight),
+//   - divider: 1dp HorizontalDivider (outline_variant), at the bottom,
+//   - active indicator: the PRIMARY pill — 3dp tall, RoundedCornerShape(3dp),
+//     primary, anchored at the selected cell's LEADING edge with the tab's
+//     CONTENT width (`TabPosition.left` + `contentWidth`, minimum 24dp),
+//     sitting on the divider,
+//   - state layer = a bounded ripple in the SELECTED content color (primary),
+//     on any tab (Tab.kt: `ripple(color = selectedContentColor)`).
 //
-// The indicator GLIDES between tabs with the theme's default spring (M3E
-// motion); without a timeline it snaps. The selection is a Signal(usize)
-// owned by the app. Items get a `.tab` semantic (checked follows the
-// selection; Enter/Space activates, arrows move the selection).
+// `TabPosition.contentWidth` upstream = intrinsic width minus the `Tab`
+// composable's own 16dp horizontal padding ×2. Klaxon tab children ARE the
+// bare content — their measured width already excludes padding — so the
+// content width is `min(childW, tabW)` with the same 24dp floor.
+//
+// The indicator glides between tabs with the theme's default spring —
+// `TabIndicatorOffsetNode` animates the offset toward `position.left` and the
+// width toward `contentWidth`; RTL renders the mirrored offset (`-left` → the
+// pill hugs the cell's right edge). Without a timeline it snaps. Selection is
+// a Signal(usize) owned by the app. Items get a `.tab` semantic (checked
+// follows the selection; Enter/Space activates, arrows move the selection).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -30,14 +42,18 @@ const Size = ui.layout.Size;
 const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
-/// M3E measurement tokens: indicator inset 2dp per side, minimum length 24.
-const indicator_inset: f32 = 2;
-const indicator_min_w: f32 = 24;
+/// PrimaryNavigationTabTokens: the indicator's minimum content width 24dp,
+/// 3dp height, 3dp corner radius; the divider is a 1dp HorizontalDivider.
+const indicator_min_w: f32 = 24; // "Enforce minimum touch target of 24.dp"
+const indicator_radius: f32 = 3; // ActiveIndicatorShape RoundedCornerShape(3dp)
 
 pub const TabsOptions = struct {
     theme: Theme = theme_mod.light,
-    height: f32 = 64, // M3E: 48 label-only / 64 icon+label
-    indicator_height: f32 = 3, // primary active indicator height
+    /// Row height floor — the tab's declared height upstream:
+    /// PrimaryNavigationTabTokens.ContainerHeight 48 (label-only) /
+    /// IconAndLabelTextContainerHeight 64 (icon+label); taller children grow it.
+    height: f32 = 64,
+    indicator_height: f32 = 3, // ActiveIndicatorHeight
     divider_height: f32 = 1, // bottom divider (inside the container height)
     label: []const u8 = "Tabs", // semantic label (borrowed)
 };
@@ -136,7 +152,15 @@ fn tabsMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const count: f32 = @floatFromInt(n.children.items.len);
     const w = if (std.math.isFinite(c.max_w)) c.max_w else count * 90;
-    return c.constrain(.{ .w = w, .h = s.opts.height });
+    // TabRowImpl: the row height is the tallest tab's intrinsic height (each
+    // Tab declares 48/64/72). `opts.height` plays the declared-height role
+    // since Klaxon children are bare content; a taller child still grows it.
+    const tab_w = if (count > 0) w / count else w;
+    var h: f32 = s.opts.height;
+    for (n.children.items) |child| {
+        h = @max(h, child.measure(.{ .max_w = tab_w }).h);
+    }
+    return c.constrain(.{ .w = w, .h = h });
 }
 
 fn tabsLayout(n: *Node, bounds: Rect) void {
@@ -171,11 +195,18 @@ fn tabsLayout(n: *Node, bounds: Rect) void {
         s.semantics_attached = true;
         syncTabSemantics(n, s);
     }
-    // The indicator target: the selected tab's cell, inset 2dp per side.
+    // TabIndicatorOffsetNode: the pill animates its OFFSET toward
+    // `position.left` (the cell's leading edge) and its WIDTH toward
+    // `position.contentWidth` — min(intrinsic, tabWidth) minus the Tab
+    // composable's padding ×2, floored at 24dp. Klaxon children are bare
+    // content (no embedded padding): contentWidth = min(childW, tabW).
     const sel = @min(s.sig.peek(), count - 1);
     const cell = s.cells.items[sel];
-    const target_w = @max(indicator_min_w, cell.w - indicator_inset * 2);
-    const target_x = cell.x + (cell.w - target_w) / 2;
+    const cs = s.content_sizes.items[sel];
+    const target_w = @max(indicator_min_w, @min(cs.w, cell.w));
+    // Leading-edge anchor: LTR at the cell's left; RTL mirrors to the cell's
+    // right edge (upstream negates the offset under `placeRelative`).
+    const target_x = if (rtl) cell.x + cell.w - target_w else cell.x;
     if (!s.laid_out) {
         // First layout: the indicator appears directly under the selection.
         s.indicator_x = target_x;
@@ -193,23 +224,23 @@ fn tabsPaint(n: *Node, ctx: *kx.Ctx) void {
     const t = s.opts.theme;
     const b = n.bounds;
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, t.colors.surface);
-    const sel = s.sig.peek();
     for (s.cells.items, 0..) |cell, i| {
         const hovered = s.hovered != null and s.hovered.? == i;
         const pressed = s.pressed != null and s.pressed.? == i;
         if (hovered or pressed) {
             const alpha = if (pressed) t.state.pressed else t.state.hover;
-            // State layer color = the selected content color (Compose Tab).
-            const on = if (i == sel) t.colors.primary else t.colors.on_surface_variant;
-            ui.paint.fillRect(ctx, cell.x, cell.y, cell.w, cell.h, theme_mod.stateLayer(t.colors.surface, on, alpha));
+            // Tab.kt: `ripple(bounded = true, color = selectedContentColor)` —
+            // the state layer is the SELECTED content color on every tab.
+            ui.paint.fillRect(ctx, cell.x, cell.y, cell.w, cell.h, theme_mod.stateLayer(t.colors.surface, t.colors.primary, alpha));
         }
     }
-    // Divider (inside the container height, at the bottom).
+    // HorizontalDivider: 1dp outline_variant, at the bottom of the row.
     const dh = s.opts.divider_height;
-    ui.paint.fillRect(ctx, b.x, b.y + b.h - dh, b.w, dh, t.colors.surface_variant);
-    // Active indicator (pill, on the divider).
+    ui.paint.fillRect(ctx, b.x, b.y + b.h - dh, b.w, dh, t.colors.outline_variant);
+    // PrimaryIndicator: a pill at the animated leading-edge offset — 3dp tall,
+    // ActiveIndicatorShape (radius 3 → capsule at 3dp), on the divider.
     const ih = s.opts.indicator_height;
-    ui.paint.fillRRect(ctx, s.indicator_x, b.y + b.h - dh - ih, s.indicator_w, ih, ih / 2, t.colors.primary);
+    ui.paint.fillRRect(ctx, s.indicator_x, b.y + b.h - dh - ih, s.indicator_w, ih, @min(indicator_radius, ih / 2), t.colors.primary);
 }
 
 fn tabsOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -372,14 +403,17 @@ test "tabs: layout splits the width equally; the indicator snaps without a timel
     try std.testing.expectEqual(@as(f32, 0), s.cells.items[0].x);
     try std.testing.expectEqual(@as(f32, 200), s.cells.items[0].w);
     try std.testing.expectEqual(@as(f32, 200), s.cells.items[1].x);
-    // first layout: the indicator sits under tab 0 (inset 2, width 196)
-    try std.testing.expectEqual(@as(f32, 2), s.indicator_x);
-    try std.testing.expectEqual(@as(f32, 196), s.indicator_w);
+    // upstream TabIndicatorOffsetNode: the pill anchors at the selected cell's
+    // leading edge with the tab's content width (min(childW, tabW), ≥24)
+    const w0 = @max(@as(f32, 24), @min(s.content_sizes.items[0].w, @as(f32, 200)));
+    const w1 = @max(@as(f32, 24), @min(s.content_sizes.items[1].w, @as(f32, 200)));
+    try std.testing.expectEqual(@as(f32, 0), s.indicator_x);
+    try std.testing.expectEqual(w0, s.indicator_w);
     // selection change + relayout: snap (no timeline installed)
     sel.set(1);
     row.layout(.{ .x = 0, .y = 0, .w = 400, .h = 64 });
-    try std.testing.expectEqual(@as(f32, 202), s.indicator_x);
-    try std.testing.expectEqual(@as(f32, 196), s.indicator_w);
+    try std.testing.expectEqual(@as(f32, 200), s.indicator_x);
+    try std.testing.expectEqual(w1, s.indicator_w);
 }
 
 test "tabs: with a timeline the indicator glides (spring) to the target" {
@@ -395,17 +429,18 @@ test "tabs: with a timeline the indicator glides (spring) to the target" {
     row.add(try testTab(std.testing.allocator, "Two"));
     row.layout(.{ .x = 0, .y = 0, .w = 400, .h = 64 });
     const s = stateOf(row);
-    try std.testing.expectEqual(@as(f32, 2), s.indicator_x);
+    try std.testing.expectEqual(@as(f32, 0), s.indicator_x);
     sel.set(1);
     row.layout(.{ .x = 0, .y = 0, .w = 400, .h = 64 }); // launches the spring
     try std.testing.expect(tl.hasActive());
     tl.tick(0); // lazy start: the value is still `from`
-    try std.testing.expectEqual(@as(f32, 2), s.indicator_x);
+    try std.testing.expectEqual(@as(f32, 0), s.indicator_x);
     tl.tick(50); // mid-flight: strictly between the two targets
-    try std.testing.expect(s.indicator_x > 2 and s.indicator_x < 202);
-    tl.tick(10_000); // settled: exactly on target
-    try std.testing.expectEqual(@as(f32, 202), s.indicator_x);
-    try std.testing.expectEqual(@as(f32, 196), s.indicator_w);
+    try std.testing.expect(s.indicator_x > 0 and s.indicator_x < 200);
+    tl.tick(10_000); // settled: exactly on target — the cell's leading edge
+    try std.testing.expectEqual(@as(f32, 200), s.indicator_x);
+    const w1 = @max(@as(f32, 24), @min(s.content_sizes.items[1].w, @as(f32, 200)));
+    try std.testing.expectEqual(w1, s.indicator_w);
     try std.testing.expect(!tl.hasActive());
 }
 
@@ -483,10 +518,10 @@ test "golden: tabs paint the surface, the divider and the primary indicator" {
     defer f1.deinit();
     // container
     try std.testing.expect(f1.countColor(t.colors.surface) > 400 * 64 - 3000);
-    // divider: the bottom 1dp row is surface_variant
-    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 63, .w = 400, .h = 1 }, t.colors.surface_variant) == 400);
-    // indicator under tab 0 only
-    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 64 }, t.colors.primary) > 100);
+    // divider: the bottom 1dp row is outline_variant (HorizontalDivider)
+    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 63, .w = 400, .h = 1 }, t.colors.outline_variant) == 400);
+    // content-width pill anchored at tab 0's leading edge only
+    try std.testing.expect(f1.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 64 }, t.colors.primary) > 40);
     try std.testing.expect(f1.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 64 }, t.colors.primary) == 0);
     // select tab 1 (no timeline: snap on relayout)
     sel.set(1);
@@ -495,5 +530,5 @@ test "golden: tabs paint the surface, the divider and the primary indicator" {
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
     try std.testing.expect(f2.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 64 }, t.colors.primary) == 0);
-    try std.testing.expect(f2.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 64 }, t.colors.primary) > 100);
+    try std.testing.expect(f2.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 64 }, t.colors.primary) > 40);
 }

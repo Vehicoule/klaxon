@@ -1,35 +1,57 @@
 // Chip (Phase 2d.2 PR C1, M3E) — the five M3E chip variants: assist,
 // elevated, filter, input, suggestion.
 //
-// Spec: m3.material.io/components/all-chips + Compose {Assist,Elevated,
-// Filter,Input,Suggestion}ChipTokens / Chip.kt:
-//   - all chips: height 32 (ContainerHeight), corner radius 8 (CornerSmall),
-//     horizontal content padding 8 (ContentPadding), icon-label gap 8
-//     (HorizontalSpacing), icon 18 (IconSize), label LabelLarge
-//   - containers: assist/suggestion flat = transparent + outline
-//     OutlineVariant 1dp; elevated = SurfaceContainerLow (elevation 1 — v1
-//     flat); filter/input unselected = transparent + outline 1dp, selected =
-//     SecondaryContainer (no outline)
-//   - labels: assist/elevated OnSurface; suggestion/filter-unselected/input-
-//     unselected OnSurfaceVariant; filter-selected/input-selected
-//     OnSecondaryContainer; disabled OnSurface@0.38
-//   - icons: assist/elevated/suggestion/filter-unselected Primary;
-//     filter-selected OnSecondaryContainer; input selected leading Primary,
-//     trailing OnSecondaryContainer; input unselected OnSurfaceVariant;
-//     disabled OnSurface@0.38
-//   - the filter chip's check mark (when no leading icon is given) shows only
-//     when selected — its visibility follows the signal (the width changes)
-//   - disabled containers: OnSurface@0.12 (elevated, filter/input selected);
-//     disabled outlines: OnSurface@0.12
-//   - state layer: the label color @ hover 0.08 / focus 0.10 / pressed 0.12
+// Ported from .ref/material3/Chip.kt (verbatim behavior):
+//   - Chip()/SelectableChip() + ChipContent: the Surface carries the
+//     container color, the BorderStroke (drawn INSIDE the chip edge) and the
+//     label color as LocalContentColor; content is a Row(minHeight=32,
+//     spacedBy 8dp, centered) inside ContentPadding
+//   - measurement: minHeight 32 (ContainerHeight); horizontal padding =
+//     {Assist,Suggestion,Filter}ChipDefaults.ContentPadding (8dp each side);
+//     the input chip's inputChipPadding: start = 8 with a leading icon else
+//     4 (no avatar in this API), end = 8 with a trailing icon else 4. The
+//     icon-label gap is HorizontalElementsPadding = 8; icons are the token
+//     18dp (LeadingIconSize/IconSize); labels LabelLarge. Measured width
+//     caps at maxChipWidth = 1000
+//   - shape: action chips (assist/elevated/suggestion) use ContainerShape =
+//     CornerSmall (8dp). Selectable chips (filter/input) use the expressive
+//     ChipShapes path — shapeByInteraction: pressed → CornerSmall (8),
+//     selected → CornerFull (16 on the 32dp chip), else CornerMedium (12) —
+//     corner radius animating with FastSpatial (the theme spatial spring)
+//     like upstream's rememberAnimatedShape
+//   - colors (assistChipColors/suggestionChipColors + elevated variants,
+//     filterChipColors, inputChipColors): assist/suggestion flat =
+//     transparent + FlatOutlineColor OutlineVariant 1dp, label OnSurface /
+//     OnSurfaceVariant, icons Primary; elevated = ElevatedContainerColor
+//     SurfaceContainerLow, no border; filter/input unselected = transparent
+//     + unselected outline 1dp (FlatUnselectedOutlineColor /
+//     UnselectedOutlineColor = OutlineVariant), selected = FlatSelected-/
+//     SelectedContainerColor SecondaryContainer with a 0dp border
+//   - label colors per state: selected → OnSecondaryContainer, unselected →
+//     OnSurfaceVariant (filter/input); assist OnSurface / suggestion
+//     OnSurfaceVariant. Leading icons: filter Primary→OnSecondaryContainer;
+//     input OnSurfaceVariant→Primary; trailing: OnSurfaceVariant→
+//     OnSecondaryContainer. Disabled: label/icons OnSurface@0.38; containers
+//     OnSurface@0.12 (elevated + selected); unselected outlines OnSurface
+//     @0.12 (Flat/DisabledUnselectedOutlineOpacity)
+//   - state layer: the Surface's bounded ripple — the content (label)
+//     color @ hover 0.08 / focus 0.10 / pressed 0.12 over the container
 //   - hit target: the painted bounds grown to the 48dp a11y floor per axis
-//   - layout: the content row mirrors in RTL; the children paint clipped to
-//     the chip's bounds (a constrained chip never overflows its neighbors)
+//     (minimumInteractiveComponentSize)
+//   - RTL: the Row's reading order mirrors + start/end padding flips; the
+//     children paint clipped to the chip's bounds (Surface clips content to
+//     the shape — a rect clip here)
+//   - the filter chip's automatic check mark (when no leading icon is
+//     given): upstream animates the leading icon's appear/disappear with
+//     expandHorizontally+fadeIn (FastSpatial/DefaultEffects) — this impl
+//     toggles its visibility instantly (the width still changes layout)
 //
-// v1 deviations (documented, fixed later):
-//   - Flat colors (no elevation shadows — Phase 3); no avatar variant (the
-//     input chip's 24dp avatar); the filter chip's selected check icon is
-//     automatic only when no leading icon is provided.
+// Remaining deviations: elevation shadows are not painted (the elevation
+// tokens are read but shadows aren't drawn); the input chip's 24dp avatar
+// isn't modeled (its padding branch applies start=4 like a no-icon chip);
+// a mid-flight re-press restarts the shape spring from 0 velocity; upstream
+// maps selectable chips to Role.Checkbox — Klaxon keeps its uniform .toggle
+// role.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -67,12 +89,16 @@ pub const ChipOptions = struct {
 };
 
 /// M3E measurement tokens (the *ChipTokens + Chip.kt defaults).
-const chip_h: f32 = 32;
-const chip_radius: f32 = 8; // CornerSmall
+const chip_h: f32 = 32; // ContainerHeight
+const radius_rest: f32 = 8; // ContainerShape = CornerSmall (action chips)
+const radius_unselected: f32 = 12; // ChipsTokens.UnselectedShape = CornerMedium
+const radius_selected: f32 = 16; // ChipsTokens.SelectedShape = CornerFull (on 32h)
+const radius_pressed: f32 = 8; // ChipsTokens.PressedShape = CornerSmall
 const h_padding: f32 = 8;
 const icon_size: f32 = 18;
-const icon_gap: f32 = 8;
+const icon_gap: f32 = 8; // HorizontalElementsPadding
 const outline_width: f32 = 1;
+const max_chip_width: f32 = 1000; // Chip.kt maxChipWidth
 /// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
 const min_target: f32 = 48;
 
@@ -91,6 +117,11 @@ const ChipState = struct {
     trail_child: ?*Node = null,
     pressed: bool = false,
     hovered: bool = false,
+    /// shapeByInteraction's animated corner radius (selectable chips only —
+    /// action chips rest at CornerSmall=8).
+    shape_radius: f32 = radius_rest,
+    /// Animation channel marker (stable address).
+    shape_channel: u8 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
@@ -141,22 +172,43 @@ fn currentColors(s: *ChipState) ChipColors {
     };
 }
 
+/// The chip's start/end padding in reading direction (Chip.kt
+/// paddingValues): flat chips use ContentPadding 8dp each side; the input
+/// chip's inputChipPadding — start = 8 with a leading icon else 4 (no
+/// avatar in this API → the !hasLeadingIcon branch), end = 8 with a
+/// trailing icon else 4.
+fn padStart(s: *ChipState) f32 {
+    if (s.opts.variant == .input) return if (s.lead_child != null) 8 else 4;
+    return h_padding;
+}
+fn padEnd(s: *ChipState) f32 {
+    if (s.opts.variant == .input) return if (s.trail_child != null) 8 else 4;
+    return h_padding;
+}
+
 fn chipMeasure(n: *Node, c: Constraints) Size {
+    const s = stateOf(n);
+    const pad = padStart(s) + padEnd(s);
     var content_w: f32 = 0;
     var content_h: f32 = 0;
     var first = true;
     for (n.children.items) |child| {
         if (!child.visible) continue; // the hidden filter check takes no space
-        const cs = child.measure(c.deflateEdge(.{ .left = h_padding, .top = 0, .right = h_padding, .bottom = 0 }));
+        const cs = child.measure(c.deflateEdge(.{ .left = padStart(s), .top = 0, .right = padEnd(s), .bottom = 0 }));
         if (!first) content_w += icon_gap;
         content_w += cs.w;
         content_h = @max(content_h, cs.h);
         first = false;
     }
-    return c.constrain(.{ .w = content_w + h_padding * 2, .h = chip_h });
+    return c.constrain(.{ .w = @min(content_w + pad, max_chip_width), .h = chip_h });
 }
 
 fn chipLayout(n: *Node, bounds: Rect) void {
+    const s = stateOf(n);
+    // the start/end padding in absolute x (flips in RTL)
+    const rtl = ui.i18n.direction() == .rtl;
+    const pad_l = if (rtl) padEnd(s) else padStart(s);
+    const pad_r = if (rtl) padStart(s) else padEnd(s);
     // the content row [leading?, label, trailing?] centered, gap 8
     var sizes: [3]Size = .{ .{}, .{}, .{} };
     var content_w: f32 = 0;
@@ -169,8 +221,8 @@ fn chipLayout(n: *Node, bounds: Rect) void {
         count += 1;
     }
     if (count > 1) content_w += icon_gap * @as(f32, @floatFromInt(count - 1));
-    const inner_x = bounds.x + h_padding;
-    const inner_w = @max(0, bounds.w - h_padding * 2);
+    const inner_x = bounds.x + pad_l;
+    const inner_w = @max(0, bounds.w - pad_l - pad_r);
     var x = inner_x + @max(0, (inner_w - content_w) / 2);
     var i: usize = 0;
     for (n.children.items) |child| {
@@ -226,13 +278,51 @@ fn chipChildClip(n: *Node) Rect {
     return n.bounds; // the bounds clip pushed in pre_children_paint
 }
 
+/// shapeByInteraction: selectable chips morph pressed → CornerSmall (8),
+/// selected → CornerFull (16), else CornerMedium (12); action chips rest at
+/// ContainerShape = CornerSmall (8). Animated like rememberAnimatedShape —
+/// FastSpatial (the theme spatial spring).
+fn shapeTarget(s: *ChipState) f32 {
+    switch (s.opts.variant) {
+        .filter, .input => {
+            if (s.pressed) return radius_pressed;
+            if (isSelected(s)) return radius_selected;
+            return radius_unselected;
+        },
+        else => return radius_rest,
+    }
+}
+
+fn shapeRadiusCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).shape_radius = v[0];
+    n.markDirty();
+}
+
+fn retargetShape(n: *Node, s: *ChipState) void {
+    const target = shapeTarget(s);
+    if (ui.anim.timeline()) |tl| {
+        if (s.shape_radius == target) return;
+        const from: ui.anim.Vec4 = .{ s.shape_radius, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .from = from,
+            .channel = @ptrCast(&s.shape_channel),
+            .on_update = .{ .fn_ptr = shapeRadiusCb, .userdata = n },
+        });
+    } else {
+        s.shape_radius = target;
+    }
+}
+
 fn chipPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
     const cc = currentColors(s);
+    const radius = @min(s.shape_radius, @min(b.w, b.h) / 2);
     // container
     if (cc.container & 0xFF != 0) {
-        ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, chip_radius, cc.container);
+        ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, cc.container);
     }
     // state layer (enabled only): the label color blended over the container —
     // AT the state alpha over a transparent container (the button fix pattern)
@@ -250,12 +340,13 @@ fn chipPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.withAlphaScaled(cc.on, alpha)
             else
                 theme_mod.stateLayer(cc.container, cc.on, alpha);
-            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, chip_radius, layer);
+            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
         }
     }
-    // outline (flat variants)
+    // outline (flat variants): the BorderStroke draws INSIDE the chip edge —
+    // the ring's outer edge is flush with the bounds
     if (cc.outline & 0xFF != 0) {
-        ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, chip_radius, outline_width, cc.outline);
+        ui.paint.strokeRRect(ctx, b.x + outline_width / 2, b.y + outline_width / 2, b.w - outline_width, b.h - outline_width, @max(0, radius - outline_width / 2), outline_width, cc.outline);
     }
 }
 
@@ -267,12 +358,14 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed = true;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
+            retargetShape(n, s); // pressed → CornerSmall
             n.markDirty();
             return true;
         },
         .up => {
             const was_pressed = s.pressed;
             s.pressed = false;
+            retargetShape(n, s); // released → back to selected/unselected
             n.markDirty();
             // the click lands in the 48dp hit target, not necessarily in the
             // 32-high chip (the a11y floor is the interactive area)
@@ -290,6 +383,7 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
                     s.pressed = false;
+                    retargetShape(n, s); // cancel → back to selected/unselected
                     n.markDirty();
                 }
             }
@@ -297,6 +391,7 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .outside_down => {
             s.pressed = false;
+            retargetShape(n, s); // cancel → back to selected/unselected
             n.markDirty();
             return true;
         },
@@ -361,6 +456,7 @@ fn chipSyncCb(userdata: ?*anyopaque) void {
         }
     }
     if (n.semantics) |sem| sem.checked = isSelected(s);
+    retargetShape(n, s); // the selected change morphs the corner radius
     if (layout_changed) n.markLayoutDirty();
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
@@ -368,6 +464,7 @@ fn chipSyncCb(userdata: ?*anyopaque) void {
 
 fn chipDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.shape_channel));
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = chipSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -399,6 +496,7 @@ pub fn chip(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_click
     s.* = .{ .opts = opts, .sig = sig, .on_click = on_click };
     node.state = s;
     const cc = currentColors(s);
+    s.shape_radius = shapeTarget(s); // rememberAnimatedShape starts at rest
     const t = opts.theme;
     // leading icon (filter without one: a check mark, shown only when
     // selected — its visibility follows the signal in chipSyncCb)
@@ -624,11 +722,12 @@ test "golden: assist chip strokes the outline_variant border, transparent inside
     defer b.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 120, 48);
     defer r.deinit();
-    b.layout(.{ .x = 20.5, .y = 8.5, .w = 80, .h = 32 });
+    b.layout(.{ .x = 20, .y = 8, .w = 80, .h = 32 });
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the top border, mid-edge (half-pixel aligned): outline_variant
+    // the top border, mid-edge — the BorderStroke draws INSIDE the chip
+    // edge (inset 0.5 + 1px band covers pixel row 8 fully)
     try std.testing.expectEqual(t.colors.outline_variant, f.pixelAt(60, 8));
     // inside, away from the label ink: transparent → bg
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(24, 24));
@@ -712,10 +811,11 @@ test "golden: disabled chip paints the OnSurface@0.12 outline" {
     defer b.deinit();
     var r = try golden.Renderer.init(std.testing.allocator, 120, 48);
     defer r.deinit();
-    b.layout(.{ .x = 20.5, .y = 8.5, .w = 80, .h = 32 });
+    b.layout(.{ .x = 20, .y = 8, .w = 80, .h = 32 });
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the top border: on_surface @ 0.12 over white
+    // the top border: on_surface @ 0.12 over white (alpha color, not
+    // pre-composited — the border draws inside the edge now)
     try golden.expectPixelApprox(f, 60, 8, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), 0xFFFFFFFF));
 }
