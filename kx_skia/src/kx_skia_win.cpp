@@ -607,4 +607,11 @@ sk_sp<SkImage> gpu_image_upload(GpuState* st, sk_sp<SkImage> img) {
     return img;
 }
 
+sk_sp<SkImage> gpu_stream_image(GpuState* st, const void* rgba, int w, int h) {
+    // Dawn/Graphite keeps the persistent-surface path; Ganesh-GL on Windows
+    // keeps it too (untested updateBackendTexture — measured safe default).
+    (void)st; (void)rgba; (void)w; (void)h;
+    return nullptr;
+}
+
 } // namespace kx

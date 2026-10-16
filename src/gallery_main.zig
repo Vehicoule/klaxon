@@ -31,7 +31,12 @@ fn SDL_main(argc: c_int, argv: [*:null]?[*:0]u8) callconv(.c) c_int {
     _ = argc;
     _ = argv;
     if (androidProp("debug.klaxon.bench")) {
-        bench.runAndroidSuite() catch return 1;
+        // debug.klaxon.scene=<name> restricts the suite to one scene —
+        // per-scene iteration without the full 33-run cost.
+        var name_buf: [92]u8 = @splat(0);
+        const n = __system_property_get("debug.klaxon.scene", @ptrCast(&name_buf));
+        const only: ?[]const u8 = if (n > 0) name_buf[0..@intCast(n)] else null;
+        bench.runAndroidSuite(only, androidProp("debug.klaxon.phases")) catch return 1;
         return 0;
     }
     galleryMain(.{ .backend = kx.c.KX_BACKEND_GANESH_GLES, .max_frames = 0 }) catch return 1;

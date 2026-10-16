@@ -212,6 +212,13 @@ sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
     return img;
 }
 
+sk_sp<SkImage> gpu_stream_image(GpuState* state, const void* rgba, int w, int h) {
+    // Graphite Metal keeps the persistent-surface path in kx_draw_pixels —
+    // writePixels on a Graphite surface measured fast (0.10ms on video).
+    (void)state; (void)rgba; (void)w; (void)h;
+    return nullptr;
+}
+
 sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_CoreText(nullptr);
 }

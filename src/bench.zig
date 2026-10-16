@@ -3019,23 +3019,46 @@ test "bench: jank counters track the 16.67 ms budget" {
 /// activity's real GLES surface — eglSwapBuffers pacing included — with
 /// the report written to the app's files dir (read it back via
 /// `adb shell run-as <pkg> cat files/bench.json`).
-pub fn runAndroidSuite() !void {
+/// `only` (debug.klaxon.scene): restrict the run to the named scene —
+/// per-scene iteration without the full catalogue's cost.
+/// `phases` (debug.klaxon.phases): print the tick/layout/paint breakdown.
+pub fn runAndroidSuite(only: ?[]const u8, phases: bool) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const scene_names = @typeInfo(BenchScene).@"enum".field_names;
-    var scenes: [scene_names.len]BenchScene = undefined;
-    inline for (scene_names, 0..) |n, i| scenes[i] = @field(BenchScene, n);
+    var scenes: [1]BenchScene = undefined;
+    var many_scenes: [scene_names.len]BenchScene = undefined;
+    var list: []BenchScene = &many_scenes;
+    if (only) |name| {
+        var found = false;
+        inline for (scene_names) |n| {
+            if (std.mem.eql(u8, name, n)) {
+                scenes[0] = @field(BenchScene, n);
+                list = &scenes;
+                found = true;
+            }
+        }
+        if (!found) {
+            sdl.c.SDL_Log("klaxon bench: unknown scene '%s' — running the full suite", name.ptr);
+        }
+    }
+    if (only == null or list.len != 1) {
+        inline for (scene_names, 0..) |n, i| many_scenes[i] = @field(BenchScene, n);
+        list = &many_scenes;
+    }
     var metrics: [scene_names.len]Metrics = undefined;
-    const opts: RunOptions = .{ .windowed = true, .backend = kx.c.KX_BACKEND_GANESH_GLES };
-    for (&scenes, 0..) |*scene, i| {
-        std.debug.print("klaxon bench: {s} ({d}/{d})...\n", .{ scene.name(), i + 1, scenes.len });
-        metrics[i] = runSceneWithOpts(scene.*, allocator, opts) catch |err| {
+    const opts: RunOptions = .{ .windowed = true, .backend = kx.c.KX_BACKEND_GANESH_GLES, .phase_breakdown = phases };
+    var ran: usize = 0;
+    for (list, 0..) |*scene, i| {
+        std.debug.print("klaxon bench: {s} ({d}/{d})...\n", .{ scene.name(), i + 1, list.len });
+        metrics[ran] = runSceneWithOpts(scene.*, allocator, opts) catch |err| {
             sdl.c.SDL_Log("klaxon bench: scene %s failed: %s", @tagName(scene.*).ptr, @errorName(err).ptr);
             return err;
         };
+        ran += 1;
     }
-    const json = try formatReport(allocator, &scenes, &metrics, 0, resolved_backend orelse "ganesh-gles");
+    const json = try formatReport(allocator, list[0..ran], metrics[0..ran], 0, resolved_backend orelse "ganesh-gles");
     const pref = sdl.c.SDL_GetPrefPath("klaxon", "bench") orelse return error.NoPrefPath;
     defer sdl.c.SDL_free(pref);
     const path = try std.fmt.allocPrintSentinel(allocator, "{s}bench.json", .{std.mem.span(pref)}, 0);

@@ -34,11 +34,13 @@
 
 #include "include/core/SkColor.h"
 #include "include/core/SkColorSpace.h"
+#include "include/core/SkData.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSize.h"
 #include "include/core/SkSurface.h"
-#include "include/gpu/ganesh/GrBackendSurface.h"
+#include "include/gpu/GpuTypes.h"                  // skgpu::Mipmapped, GrRenderable
+#include "include/gpu/ganesh/GrBackendSurface.h"    // GrBackendRenderTarget
 #include "include/gpu/ganesh/GrDirectContext.h"
 #include "include/gpu/ganesh/GrTypes.h"
 #include "include/gpu/ganesh/SkImageGanesh.h"
@@ -129,6 +131,12 @@ struct GpuState {
     sk_sp<GrDirectContext> dctx;
     sk_sp<SkSurface> frame_surface;
     sk_sp<SkSurface> warmup_surface; // offscreen target for kx_gpu_warmup
+    // Video-style pixel streaming goes through TextureFromImage's deferred
+    // upload (the GrDirectContext upload arena): updateBackendTexture on a
+    // client-owned backend texture pays ~18ms inline on GLES-class drivers
+    // (measured on the Android emulator's SwiftShader) — it can't defer
+    // client-texture uploads through the arena. GrResourceCache recycles
+    // the per-frame backend texture, so no persistent state is needed.
 
     // --- graphite-vulkan ---
     bool vk_lib_loaded = false;   // SDL_Vulkan_LoadLibrary ref held by the shim
@@ -890,6 +898,25 @@ sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img) {
             return up; // ganesh-gl
     }
     return img;
+}
+
+sk_sp<SkImage> gpu_stream_image(GpuState* state, const void* rgba, int w, int h) {
+    // Ganesh-GL only — Graphite keeps the persistent-surface path.
+    if (!state || !state->dctx || state->gcontext || !rgba || w <= 0 || h <= 0)
+        return nullptr;
+    // Deferred upload through the GrDirectContext arena: TextureFromImage
+    // records the copy+upload as deferred work resolved at the next submit,
+    // so this call stays ~0.4ms (measured on the GLES emulator) where
+    // updateBackendTexture on a client-owned GrBackendTexture pays ~18ms
+    // inline. The pixel copy is required — the deferred read runs after
+    // this call returns.
+    const SkImageInfo info = SkImageInfo::Make(
+        w, h, kRGBA_8888_SkColorType, kUnpremul_SkAlphaType);
+    sk_sp<SkData> data = SkData::MakeWithCopy(rgba, static_cast<size_t>(w) * h * 4);
+    sk_sp<SkImage> img = SkImages::RasterFromData(
+        info, std::move(data), static_cast<size_t>(w) * 4);
+    if (!img) return nullptr;
+    return SkImages::TextureFromImage(state->dctx.get(), img.get());
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {

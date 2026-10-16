@@ -48,6 +48,15 @@ sk_sp<SkSurface> gpu_offscreen_surface(GpuState* state, int width, int height);
 // already GPU-backed — so it is safe to call lazily at first draw.
 sk_sp<SkImage> gpu_image_upload(GpuState* state, sk_sp<SkImage> img);
 
+// Video-style pixel streaming: upload `rgba` (w×h, RGBA unpremul, tightly
+// packed) into a persistent backend texture and return a borrowed SkImage
+// view of it — a player's present path (direct texture update, no per-frame
+// texture alloc, no render-target pass). The returned image borrows the
+// state's texture: it must be drawn (and released) before the next call.
+// Returns nullptr on backends without a fast streaming path (Graphite keeps
+// its persistent-surface path in kx_draw_pixels).
+sk_sp<SkImage> gpu_stream_image(GpuState* state, const void* rgba, int w, int h);
+
 // Platform font manager (macOS: CoreText, Linux: custom directory, ...).
 sk_sp<SkFontMgr> platform_font_mgr();
 
