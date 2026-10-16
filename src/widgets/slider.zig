@@ -43,8 +43,8 @@ const thumb_h: f32 = 44; // HandleHeight
 const inset: f32 = thumb_w / 2; // the track is inset by half the thumb width
 const state_layer_size: f32 = 40;
 const keyboard_step: f32 = 0.05;
-/// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 /// TrackCornerSize — CornerFull on a 16dp track.
 const track_corner: f32 = track_h / 2;
 /// TrackInsideCornerSize — the corners facing the handle gap.
@@ -115,11 +115,13 @@ fn sliderMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = s.opts.default_width, .h = thumb_h });
 }
 
-/// The interactive target: max(width,48) x max(44,48) centered on the node.
+/// The interactive target: max(width,hit) x max(height,hit) centered on the
+/// node — hit = theme.platform.hit_target_min (48 mobile / 24 desktop).
 fn sliderHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x + (b.w - w) / 2, .y = b.y + (b.h - h) / 2, .w = w, .h = h };
 }
 
@@ -423,7 +425,7 @@ test "slider: measures default_width x 44; the hit target floors at 48 high" {
     b.layout(.{ .x = 0, .y = 0, .w = 160, .h = 44 });
     const hb = b.vtable.hit_bounds.?(b);
     try std.testing.expectEqual(@as(f32, 160), hb.w);
-    try std.testing.expectEqual(min_target, hb.h); // 44 -> 48
+    try std.testing.expectEqual(theme_mod.light.platform.hit_target_min, hb.h); // 44 -> 48
     try std.testing.expectEqual(@as(f32, -2), hb.y); // (44-48)/2
 }
 

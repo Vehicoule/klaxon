@@ -80,7 +80,8 @@ const inner_corner: f32 = 8;
 /// (upstream connectedLeading/TrailingButtonPressShape; a pressed middle
 /// item's connectedMiddleButtonPressShape morphs all four).
 const inner_corner_pressed: f32 = 4;
-const min_target: f32 = 48; // a11y touch-target floor
+// The a11y touch-target floor is theme.platform.hit_target_min (48 mobile /
+// 24 desktop) — read from s.opts.theme where used.
 
 const ItemDef = struct {
     label: [:0]const u8, // owned
@@ -199,7 +200,7 @@ fn groupMeasure(n: *Node, c: Constraints) Size {
         if (i > 0) w += space_between;
         w += iw;
     }
-    return c.constrain(.{ .w = w, .h = @max(d.height, min_target) });
+    return c.constrain(.{ .w = w, .h = @max(d.height, s.opts.theme.platform.hit_target_min) });
 }
 
 fn groupLayout(n: *Node, bounds: Rect) void {
@@ -401,11 +402,13 @@ fn groupDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
-/// The interactive target: ≥48dp tall centered on the group — medium/large
-/// heights already exceed it; the smaller ones pad the hit area only.
+/// The interactive target: ≥ hit_target_min tall centered on the group —
+/// medium/large heights already exceed it; the smaller ones pad the hit
+/// area only.
 fn groupHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const h = @max(b.h, min_target);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x, .y = b.y + (b.h - h) / 2, .w = b.w, .h = h };
 }
 

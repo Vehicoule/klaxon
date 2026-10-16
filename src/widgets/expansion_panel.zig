@@ -41,7 +41,14 @@ pub const ExpansionPanelOptions = struct {
 // --- M3E tokens ---
 
 const panel_corner: f32 = 12; // CornerMedium
-const header_h: f32 = 48;
+/// The header is a control row — it rides the platform control height
+/// (theme.platform.control_height: 48dp mobile / 40 desktop).
+fn headerH(t: Theme) f32 {
+    return t.platform.control_height;
+}
+/// The default-theme header height — test convenience; production uses
+/// headerH.
+const header_h: f32 = theme_mod.light.platform.control_height;
 const header_pad: f32 = 16;
 const content_pad: f32 = 16;
 const divider_h: f32 = 1;
@@ -104,7 +111,7 @@ fn epMeasure(n: *Node, c: Constraints) Size {
     w = @max(w, c.min_w);
 
     // Height: header + (expanded ? divider + 2*content_pad + child_h : 0).
-    var h = header_h;
+    var h = headerH(t);
     if (isExpanded(s) and n.children.items.len > 0) {
         const child = n.children.items[0];
         const child_c = Constraints{
@@ -128,7 +135,7 @@ fn epLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     if (isExpanded(s) and n.children.items.len > 0) {
         const child = n.children.items[0];
-        const child_y = bounds.y + header_h + divider_h + content_pad;
+        const child_y = bounds.y + headerH(s.opts.theme) + divider_h + content_pad;
         const child_w = @max(0, bounds.w - content_pad * 2);
         child.layout(.{
             .x = bounds.x + content_pad,
@@ -154,13 +161,13 @@ fn epPaint(n: *Node, ctx: *kx.Ctx) void {
         const alpha = if (s.pressed) t.state.pressed else t.state.hover;
         const layer = theme_mod.stateLayer(t.colors.surface_container, t.colors.on_surface, alpha);
         // Clip the state layer to the header's top half (rounded top corners).
-        ui.paint.fillRRect(ctx, b.x, b.y, b.w, header_h, panel_corner, layer);
+        ui.paint.fillRRect(ctx, b.x, b.y, b.w, headerH(t), panel_corner, layer);
     }
 
     // Title.
     const ts = t.type_scale.title_medium;
     const title_x = b.x + header_pad;
-    const title_y = b.y + (header_h - ts.line_height) / 2 + ts.line_height * 0.8;
+    const title_y = b.y + (headerH(t) - ts.line_height) / 2 + ts.line_height * 0.8;
     ui.paint.text(ctx, s.title, title_x, title_y, ts.size, ts.weight >= 500, t.colors.on_surface);
 
     // Chevron (▼ when collapsed, ▲ when expanded — v1: static glyph swap).
@@ -168,12 +175,12 @@ fn epPaint(n: *Node, ctx: *kx.Ctx) void {
     const chevron_glyph: [:0]const u8 = if (expanded) "\u{25B2}" else "\u{25BC}"; // ▲ / ▼
     const chev_metrics = ui.paint.measureText(chevron_glyph, chevron_size, false);
     const chev_x = b.x + b.w - header_pad - chev_metrics.width;
-    const chev_y = b.y + (header_h - chev_metrics.height) / 2 + chev_metrics.height * 0.8;
+    const chev_y = b.y + (headerH(t) - chev_metrics.height) / 2 + chev_metrics.height * 0.8;
     ui.paint.text(ctx, chevron_glyph, chev_x, chev_y, chevron_size, false, t.colors.on_surface_variant);
 
     // Divider (expanded only).
     if (expanded) {
-        const div_y = b.y + header_h;
+        const div_y = b.y + headerH(t);
         ui.paint.fillRect(ctx, b.x, div_y, b.w, divider_h, t.colors.outline_variant);
     }
 }
@@ -184,7 +191,7 @@ fn epPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     const b = n.bounds;
     // Only the header is tappable.
-    const in_header = ev.y >= b.y and ev.y <= b.y + header_h and ev.x >= b.x and ev.x <= b.x + b.w;
+    const in_header = ev.y >= b.y and ev.y <= b.y + headerH(s.opts.theme) and ev.x >= b.x and ev.x <= b.x + b.w;
 
     switch (ev.phase) {
         .down => {

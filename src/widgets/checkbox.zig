@@ -62,8 +62,8 @@ const box_radius: f32 = 2;
 const outline_width: f32 = 2;
 const check_stroke: f32 = 2;
 const state_layer_size: f32 = 40;
-/// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 
 pub const CheckboxOptions = struct {
     enabled: bool = true,
@@ -166,9 +166,12 @@ fn checkboxMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = box_size, .h = box_size });
 }
 
-/// The interactive target: 48x48 centered on the box.
+/// The interactive target: hit_target_min x hit_target_min centered on the
+/// box (48x48 under the mobile theme).
 fn checkboxHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
+    const min_target = s.opts.theme.platform.hit_target_min;
     return .{
         .x = b.x + (b.w - min_target) / 2,
         .y = b.y + (b.h - min_target) / 2,
@@ -511,6 +514,7 @@ test "checkbox: measures the 18dp box; the 48dp floor is the hit target" {
     try std.testing.expectEqual(box_size, m.h);
     b.layout(.{ .x = 100, .y = 100, .w = 18, .h = 18 });
     const hb = b.vtable.hit_bounds.?(b);
+    const min_target = theme_mod.light.platform.hit_target_min;
     try std.testing.expectEqual(min_target, hb.w);
     try std.testing.expectEqual(min_target, hb.h);
     try std.testing.expectEqual(@as(f32, 100 - 15), hb.x); // (18-48)/2

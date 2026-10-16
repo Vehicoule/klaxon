@@ -104,19 +104,24 @@ const header_h: f32 = 72; // SearchViewTokens FullScreenHeaderContainerHeight
 const collapsed_corner: f32 = 28;
 /// Expansion: AnimationEnterFloatSpec — DurationLong4 + DurationShort2
 /// delay + EasingEmphasizedDecelerate. Collapse: ExitFloatSpec —
-/// DurationMedium3 + the same delay + a linear curve.
-const enter_ms: u32 = 600;
-const enter_delay_ms: u32 = 100;
-const exit_ms: u32 = 350;
-const exit_delay_ms: u32 = 100;
-/// The expanded input field's own crossfade (AnimationForContentFadeIn/Out):
-/// DurationShort2, a DurationShort1 lead-in on enter only.
-const field_ms: u32 = 50;
-const field_delay_ms: u32 = 50;
-const icon_box: f32 = 48; // minimumInteractiveComponentSize
+/// DurationMedium3 + the same delay + a linear curve. The expanded input
+/// field's own crossfade (AnimationForContentFadeIn/Out): DurationShort1,
+/// a DurationShort1 lead-in on enter only. All ride theme.motion.durations.
 const icon_size: f32 = 24;
-const icon_edge: f32 = 16; // the icon visual offset (12 centered + 4 offset)
-const text_start: f32 = 52; // icon_box + (TextFieldPadding 16 - icon padding 12)
+// The icon boxes and the text start ride the a11y interactive minimum —
+// theme.platform.hit_target_min (upstream minimumInteractiveComponentSize;
+// 48dp mobile / 24 desktop).
+fn iconBox(t: Theme) f32 {
+    return t.platform.hit_target_min;
+}
+/// The icon visual's offset from the edge: centered in the box + 4.
+fn iconEdge(t: Theme) f32 {
+    return (iconBox(t) - icon_size) / 2 + 4;
+}
+/// The query text's start: the icon box + (TextFieldPadding 16 - icon pad 12).
+fn textStart(t: Theme) f32 {
+    return iconBox(t) + 4;
+}
 const text_gap_trail: f32 = 4; // the text's end padding before the icon box
 const text_end_no_icon: f32 = 16; // TextFieldPadding without a trailing icon
 const caret_w: f32 = 1;
@@ -220,36 +225,37 @@ fn rowRect(b: Rect, index: usize) Rect {
     };
 }
 
-/// The back button's zone (the start-side 48dp min-interactive box of the
+/// The back button's zone (the start-side min-interactive box of the
 /// header), in parent space.
-fn backZone(b: Rect) Rect {
-    return .{ .x = b.x, .y = b.y, .w = icon_box, .h = header_h };
+fn backZone(t: Theme, b: Rect) Rect {
+    return .{ .x = b.x, .y = b.y, .w = iconBox(t), .h = header_h };
 }
 
-/// The clear button's zone (the end-side 48dp box of the header).
-fn clearZone(b: Rect) Rect {
-    return .{ .x = b.x + b.w - icon_box, .y = b.y, .w = icon_box, .h = header_h };
+/// The clear button's zone (the end-side min-interactive box of the header).
+fn clearZone(t: Theme, b: Rect) Rect {
+    return .{ .x = b.x + b.w - iconBox(t), .y = b.y, .w = iconBox(t), .h = header_h };
 }
 
-/// The trailing fill zone of a suggestion row (the end-side 48dp box).
-fn fillZone(b: Rect, index: usize) Rect {
+/// The trailing fill zone of a suggestion row (the end-side min-interactive
+/// box).
+fn fillZone(t: Theme, b: Rect, index: usize) Rect {
     const r = rowRect(b, index);
-    return .{ .x = r.x + r.w - icon_box, .y = r.y, .w = icon_box, .h = r.h };
+    return .{ .x = r.x + r.w - iconBox(t), .y = r.y, .w = iconBox(t), .h = r.h };
 }
 
 fn contains(z: Rect, x: f32, y: f32) bool {
     return x >= z.x and x < z.x + z.w and y >= z.y and y < z.y + z.h;
 }
 
-fn inBack(b: Rect, x: f32, y: f32) bool {
-    var z = backZone(b);
+fn inBack(s: *SearchViewState, b: Rect, x: f32, y: f32) bool {
+    var z = backZone(s.opts.theme, b);
     if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
     return contains(z, x, y);
 }
 
 fn inClear(s: *SearchViewState, b: Rect, x: f32, y: f32) bool {
     if (!hasText(s)) return false;
-    var z = clearZone(b);
+    var z = clearZone(s.opts.theme, b);
     if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
     return contains(z, x, y);
 }
@@ -268,7 +274,7 @@ fn suggestionAt(s: *SearchViewState, b: Rect, x: f32, y: f32) ?usize {
 /// The point is inside row `index`'s trailing fill affordance.
 fn inFill(s: *SearchViewState, b: Rect, index: usize, x: f32, y: f32) bool {
     if (s.items.items[index].trailing_icon == null) return false;
-    var z = fillZone(b, index);
+    var z = fillZone(s.opts.theme, b, index);
     if (ui.i18n.direction() == .rtl) z.x = mirrorX(b.x, b.w, z.x, z.w, true);
     return contains(z, x, y);
 }
@@ -332,8 +338,8 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     const header_ink = ui.paint.withAlphaScaled(cs.on_surface, field_a);
     const header_muted = ui.paint.withAlphaScaled(cs.on_surface_variant, field_a);
     const header_primary = ui.paint.withAlphaScaled(cs.primary, field_a);
-    // the back button's state layer (a 48dp circle centered in its box)
-    const bz = backZone(b);
+    // the back button's state layer (a circle centered in its box)
+    const bz = backZone(t, b);
     const bx = mirrorX(b.x, b.w, bz.x, bz.w, rtl);
     const back_alpha: f32 = if (s.back_pressed)
         t.state.pressed
@@ -342,17 +348,18 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     else
         0;
     if (back_alpha > 0) {
-        ui.paint.fillRRect(ctx, bx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha * field_a));
+        ui.paint.fillRRect(ctx, bx, b.y + (header_h - iconBox(t)) / 2, iconBox(t), iconBox(t), iconBox(t) / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, back_alpha * field_a));
     }
-    // the arrow visual at 16..40 — a back arrow (pointing at the start edge
-    // in RTL too: the arrow direction mirrors with the layout)
+    // the arrow visual at iconEdge..iconEdge+24 — a back arrow (pointing at
+    // the start edge in RTL too: the arrow direction mirrors with the layout)
     const icon_y = b.y + (header_h - icon_size) / 2;
-    const back_x = mirrorX(b.x, b.w, b.x + icon_edge, icon_size, rtl);
+    const back_x = mirrorX(b.x, b.w, b.x + iconEdge(t), icon_size, rtl);
     paintIcon(ctx, if (rtl) .arrow_right else .arrow_left, back_x, icon_y, header_ink);
 
-    // the clear button (the trailing 48dp box; shown iff the query is non-empty)
+    // the clear button (the trailing min-interactive box; shown iff the
+    // query is non-empty)
     if (hasText(s)) {
-        const z = clearZone(b);
+        const z = clearZone(t, b);
         const zx = mirrorX(b.x, b.w, z.x, z.w, rtl);
         const clear_alpha: f32 = if (s.clear_pressed)
             t.state.pressed
@@ -361,9 +368,9 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         else
             0;
         if (clear_alpha > 0) {
-            ui.paint.fillRRect(ctx, zx, b.y + (header_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, clear_alpha * field_a));
+            ui.paint.fillRRect(ctx, zx, b.y + (header_h - iconBox(t)) / 2, iconBox(t), iconBox(t), iconBox(t) / 2, theme_mod.stateLayer(surface, cs.on_surface_variant, clear_alpha * field_a));
         }
-        const cx = mirrorX(b.x, b.w, b.x + b.w - icon_edge - icon_size, icon_size, rtl);
+        const cx = mirrorX(b.x, b.w, b.x + b.w - iconEdge(t) - icon_size, icon_size, rtl);
         paintIcon(ctx, .close, cx, icon_y, header_muted);
     }
 
@@ -371,13 +378,13 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     // mirrors in RTL — mirroring only the edge would clip the text away) ---
     const style = t.type_scale.body_large;
     const ty = b.y + (header_h - style.line_height) / 2;
-    const right = if (hasText(s)) icon_box + text_gap_trail else text_end_no_icon;
-    const clip_w = b.w - text_start - right;
-    const clip_x = mirrorX(b.x, b.w, b.x + text_start, clip_w, rtl);
+    const right = if (hasText(s)) iconBox(t) + text_gap_trail else text_end_no_icon;
+    const clip_w = b.w - textStart(t) - right;
+    const clip_x = mirrorX(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, header_h);
     if (hasText(s)) {
         const m = ui.paint.measureText(s.text(), style.size, false);
-        const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
+        const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
         ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, header_ink);
         if (focused) {
             // the caret at the end of the text
@@ -386,12 +393,12 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     } else {
         if (s.placeholder.len > 0) {
             const m = ui.paint.measureText(s.placeholder, style.size, false);
-            const tx = mirrorX(b.x, b.w, b.x + text_start, m.width, rtl);
+            const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
             ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, header_muted);
         }
         if (focused) {
             // the caret at the (mirrored) start (empty text)
-            const caret_x = mirrorX(b.x, b.w, b.x + text_start, 0, rtl);
+            const caret_x = mirrorX(b.x, b.w, b.x + textStart(t), 0, rtl);
             ui.paint.fillRect(ctx, caret_x, ty, caret_w, style.line_height, header_primary);
         }
     }
@@ -441,7 +448,7 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         // the label (body_large at 56 from the start, clipped before the
         // trailing affordance)
         const label_x = r.x + row_h_pad + icon_size + row_icon_gap;
-        const trail_w: f32 = if (it.trailing_icon != null) icon_box else row_h_pad;
+        const trail_w: f32 = if (it.trailing_icon != null) iconBox(t) else row_h_pad;
         const max_tw = @max(0, r.w - (label_x - r.x) - trail_w);
         const lclip_x = mirrorX(b.x, b.w, label_x, max_tw, rtl);
         ui.paint.clipRect(ctx, lclip_x, r.y, max_tw, r.h);
@@ -462,7 +469,7 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .down => {
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            if (inBack(b, ev.x, ev.y)) {
+            if (inBack(s, b, ev.x, ev.y)) {
                 s.back_pressed = true;
             } else if (inClear(s, b, ev.x, ev.y)) {
                 s.clear_pressed = true;
@@ -493,7 +500,7 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed_index = -1;
             n.markDirty();
             if (was_back) {
-                if (inBack(b, ev.x, ev.y)) closeSearchView(n, s); // M3: the nav icon dismisses
+                if (inBack(s, b, ev.x, ev.y)) closeSearchView(n, s); // M3: the nav icon dismisses
             } else if (was_clear) {
                 if (inClear(s, b, ev.x, ev.y)) clearQuery(n, s);
             } else if (fill_i >= 0) {
@@ -556,7 +563,7 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
 /// highlight doubles as the hover state — the menu idiom).
 fn updateHover(n: *Node, s: *SearchViewState, x: f32, y: f32) void {
     const b = n.bounds;
-    const bh = inBack(b, x, y);
+    const bh = inBack(s, b, x, y);
     const ch = inClear(s, b, x, y);
     var hi: i32 = -1;
     if (!bh and !ch) {
@@ -743,34 +750,35 @@ fn applyOpen(n: *Node, s: *SearchViewState, open: bool) void {
     }
     syncBackHandler(n, s);
     if (ui.anim.timeline()) |tl| {
+        const dur = s.opts.theme.motion.durations;
         if (open) {
             n.setVisible(true); // paints from the first frame (progress ≥ 0)
             _ = tl.play(.{
-                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, enter_ms, .{ .ease = .emphasized_decelerate }),
+                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, dur.long4, .{ .ease = .emphasized_decelerate }),
                 .from = .{ s.progress, 0, 0, 0 },
-                .delay_ms = enter_delay_ms,
+                .delay_ms = dur.short2,
                 .channel = @ptrCast(&s.progress_channel),
                 .on_update = .{ .fn_ptr = progressCb, .userdata = n },
             });
             _ = tl.play(.{
-                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, field_ms, .{ .ease = .standard_accelerate }),
+                .kind = ui.anim.Animation.tweenAnim(.{ 1, 0, 0, 0 }, dur.short1, .{ .ease = .standard_accelerate }),
                 .from = .{ s.field_alpha, 0, 0, 0 },
-                .delay_ms = field_delay_ms,
+                .delay_ms = dur.short1,
                 .channel = @ptrCast(&s.field_channel),
                 .on_update = .{ .fn_ptr = fieldCb, .userdata = n },
             });
         } else {
             // Stays visible while the exit runs — hideCb clears it at 0.
             _ = tl.play(.{
-                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, exit_ms, .{ .ease = .linear }),
+                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, dur.medium3, .{ .ease = .linear }),
                 .from = .{ s.progress, 0, 0, 0 },
-                .delay_ms = exit_delay_ms,
+                .delay_ms = dur.short2,
                 .channel = @ptrCast(&s.progress_channel),
                 .on_update = .{ .fn_ptr = progressCb, .userdata = n },
                 .on_complete = .{ .fn_ptr = hideCb, .userdata = n },
             });
             _ = tl.play(.{
-                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, field_ms, .{ .ease = .standard_decelerate }),
+                .kind = ui.anim.Animation.tweenAnim(.{ 0, 0, 0, 0 }, dur.short1, .{ .ease = .standard_decelerate }),
                 .from = .{ s.field_alpha, 0, 0, 0 },
                 .channel = @ptrCast(&s.field_channel),
                 .on_update = .{ .fn_ptr = fieldCb, .userdata = n },

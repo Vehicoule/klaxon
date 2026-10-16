@@ -122,7 +122,8 @@ pub fn dimsFor(size: ButtonSize) Dims {
 /// Compose ButtonDefaults.MinWidth — applies to every size (the shared
 /// Button() composable's defaultMinSize).
 const min_width: f32 = 58;
-const min_target: f32 = 48; // a11y touch-target floor
+// The a11y touch-target floor is theme.platform.hit_target_min (48 mobile /
+// 24 desktop) — see buttonHitBounds.
 /// FilledTonalButtonTokens.IconSize (the small tonal icon is 18dp).
 const tonal_icon_small: f32 = 18;
 
@@ -438,12 +439,13 @@ fn buttonDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(n));
 }
 
-/// The interactive target: ≥48×48dp centered on the button — xsmall (32dp)
-/// and small (40dp) heights were below the a11y touch floor.
+/// The interactive target: ≥ hit_target_min² centered on the button —
+/// xsmall (32dp) and small (40dp) heights were below the a11y touch floor.
 fn buttonHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{
         .x = b.x + (b.w - w) / 2,
         .y = b.y + (b.h - h) / 2,

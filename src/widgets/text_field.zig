@@ -108,9 +108,17 @@ pub const TextFieldOptions = struct {
 const container_h: f32 = 56; // OutlinedTextFieldTokens.ContainerHeight / MinHeight
 const h_padding: f32 = 16; // TextFieldPadding
 const top_pad_label: f32 = 8; // TextFieldWithLabelVerticalPadding
-const icon_box: f32 = 48; // minimumInteractiveComponentSize
 const icon_size: f32 = 24; // LeadingIconSize/TrailingIconSize
-const icon_pad: f32 = (icon_box - icon_size) / 2; // textFieldHorizontalIconPadding = 12
+// The icon boxes ride the a11y interactive minimum —
+// theme.platform.hit_target_min (upstream minimumInteractiveComponentSize;
+// 48dp mobile / 24 desktop).
+fn iconBox(t: Theme) f32 {
+    return t.platform.hit_target_min;
+}
+/// textFieldHorizontalIconPadding — the icon's inset inside its box.
+fn iconPad(t: Theme) f32 {
+    return (iconBox(t) - icon_size) / 2;
+}
 const corner: f32 = 4; // CornerExtraSmall (top corners for the filled)
 const outline_w: f32 = 1; // UnfocusedIndicator/BorderThickness
 const outline_w_focus: f32 = 2; // FocusedIndicator/BorderThickness
@@ -251,13 +259,15 @@ fn labelBoxH(s: *TextFieldState) f32 {
 }
 
 /// The horizontal offset of the text/placeholder/label glyphs from the
-/// start edge: the 48dp icon box + (16 - 12) padding with an icon,
+/// start edge: the icon box + (16 - iconPad) padding with an icon,
 /// TextFieldPadding without.
 fn leftOffset(s: *TextFieldState) f32 {
-    return if (s.opts.leading_icon != null) icon_box + h_padding - icon_pad else h_padding;
+    const t = s.opts.theme;
+    return if (s.opts.leading_icon != null) iconBox(t) + h_padding - iconPad(t) else h_padding;
 }
 fn rightOffset(s: *TextFieldState) f32 {
-    return if (s.opts.trailing_icon != null) icon_box + h_padding - icon_pad else h_padding;
+    const t = s.opts.theme;
+    return if (s.opts.trailing_icon != null) iconBox(t) + h_padding - iconPad(t) else h_padding;
 }
 
 /// The container rect: fills the bounds minus the outlined cutout pad on
@@ -469,7 +479,7 @@ fn fieldMetrics(s: *TextFieldState) ui.paint.TextMetrics {
             const last = &s.segs.items[s.segs.items.len - 1];
             const merged = s.segs.allocator.alloc(u8, last.text.len + tail.len + 1) catch @panic("klaxon: out of memory");
             @memcpy(merged[0..last.text.len], last.text);
-            @memcpy(merged[last.text.len ..][0..tail.len], tail);
+            @memcpy(merged[last.text.len..][0..tail.len], tail);
             merged[last.text.len + tail.len] = 0;
             s.segs.allocator.free(@constCast(last.text.ptr)[0 .. last.text.len + 1]);
             last.text = merged[0 .. last.text.len + tail.len :0];
@@ -491,8 +501,7 @@ fn segPush(s: *TextFieldState, piece: [:0]const u8, size: f32) void {
     const buf = s.segs.allocator.alloc(u8, piece.len + 1) catch @panic("klaxon: out of memory");
     @memcpy(buf[0..piece.len], piece);
     buf[piece.len] = 0;
-    seg.* = .{ .text = buf[0..piece.len :0], .size = size,
-        .m = ui.paint.measureText(buf[0..piece.len :0], size, false) };
+    seg.* = .{ .text = buf[0..piece.len :0], .size = size, .m = ui.paint.measureText(buf[0..piece.len :0], size, false) };
 }
 fn freeSeg(s: *TextFieldState, seg: TextFieldState.Seg) void {
     s.segs.allocator.free(@constCast(seg.text.ptr)[0 .. seg.text.len + 1]);
@@ -515,8 +524,8 @@ fn textFieldMeasure(n: *Node, c: Constraints) Size {
     // icon-reduced paddings. The cutout layout drops the label's width as
     // it minimizes (lerp(labelW, 0, progress)) but guarantees the floated
     // label fits: focusedLabelWidth = (labelW + 32) * progress.
-    const lead_w: f32 = if (s.opts.leading_icon != null) icon_box else 0;
-    const trail_w: f32 = if (s.opts.trailing_icon != null) icon_box else 0;
+    const lead_w: f32 = if (s.opts.leading_icon != null) iconBox(t) else 0;
+    const trail_w: f32 = if (s.opts.trailing_icon != null) iconBox(t) else 0;
     const pad_l = leftOffset(s) - lead_w;
     const pad_r = rightOffset(s) - trail_w;
     const text_w = m.width + pad_l + pad_r;
@@ -600,15 +609,15 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         }
     }
 
-    // --- icons: 24dp glyphs centered in 48dp boxes at the container edges
-    // (minimumInteractiveComponentSize — the glyph is inset by 12) ---
+    // --- icons: 24dp glyphs centered in iconBox (the platform's
+    // minimumInteractiveComponentSize) boxes at the container edges ---
     const icon_y = c.y + (c.h - icon_size) / 2;
     if (s.opts.leading_icon) |iname| {
-        const ix = mx(c.x, c.w, c.x + icon_pad, icon_size, rtl);
+        const ix = mx(c.x, c.w, c.x + iconPad(t), icon_size, rtl);
         paintIcon(ctx, iname, ix, icon_y, fc.icon_lead);
     }
     if (s.opts.trailing_icon) |iname| {
-        const ix = mx(c.x, c.w, c.x + c.w - icon_box + icon_pad, icon_size, rtl);
+        const ix = mx(c.x, c.w, c.x + c.w - iconBox(t) + iconPad(t), icon_size, rtl);
         paintIcon(ctx, iname, ix, icon_y, fc.icon_trail);
     }
 
@@ -898,7 +907,7 @@ test "text_field: measures 56/64 (+supporting), MinWidth 280, content width + pa
     const ic = try textField(std.testing.allocator, null, null, null, .{ .leading_icon = .search, .trailing_icon = .close, .initial = "another fairly long piece of input text for measure" });
     defer ic.deinit();
     const tw = ui.paint.measureText("another fairly long piece of input text for measure", 16, false).width;
-    try std.testing.expectApproxEqAbs((icon_box + h_padding - icon_pad) * 2 + tw, ic.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
+    try std.testing.expectApproxEqAbs((iconBox(t) + h_padding - iconPad(t)) * 2 + tw, ic.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
 }
 
 test "text_field: the label floats on focus (expanded centered → minimized)" {
@@ -933,7 +942,7 @@ test "text_field: the label floats on focus (expanded centered → minimized)" {
     const ic = try textField(std.testing.allocator, null, null, null, .{ .label = "Email", .leading_icon = .search });
     defer ic.deinit();
     ic.layout(.{ .x = 0, .y = 0, .w = 260, .h = 64 });
-    try std.testing.expectEqual(icon_box + h_padding - icon_pad, labelRect(ic).?.x);
+    try std.testing.expectEqual(iconBox(theme_mod.light) + h_padding - iconPad(theme_mod.light), labelRect(ic).?.x);
     router.focus(ic);
     try std.testing.expectEqual(h_padding, labelRect(ic).?.x);
     // no label → no label rect
@@ -1074,9 +1083,9 @@ test "text_field: RTL mirrors the chrome (the label moves to the end side)" {
     const lw = ui.paint.measureText("Email", 16, false).width;
     // mirrored: the label's END is at the end-side icon offset (the leading
     // icon moved to the end side): 48dp box + 4dp reduced padding
-    try std.testing.expectEqual(@as(f32, 260 - (icon_box + h_padding - icon_pad) - lw), lr.x);
+    try std.testing.expectEqual(@as(f32, 260 - (iconBox(theme_mod.light) + h_padding - iconPad(theme_mod.light)) - lw), lr.x);
     const tr = textRect(b);
-    try std.testing.expectEqual(icon_box + h_padding - icon_pad, tr.x); // the LTR anchor (paint mirrors it)
+    try std.testing.expectEqual(iconBox(theme_mod.light) + h_padding - iconPad(theme_mod.light), tr.x); // the LTR anchor (paint mirrors it)
 }
 
 test "golden: RTL paints the input text at the end side" {

@@ -85,7 +85,6 @@ const dial_size: f32 = 256; // ClockDialContainerSize
 const label_ring: f32 = 101; // OuterCircleToSizeRatio × 256
 const inner_label_ring: f32 = 69; // InnerCircleToSizeRatio × 256 (the 24h dial's inner circle)
 const max_tap_dist: f32 = 74; // MaxDistance (the 24h ring threshold)
-const label_cell: f32 = 48; // MinimumInteractiveSize
 const knob_d: f32 = 48; // ClockDialSelectorHandleContainerSize
 const track_w: f32 = 2; // ClockDialSelectorTrackContainerWidth
 const center_d: f32 = 8; // ClockDialSelectorCenterContainerSize

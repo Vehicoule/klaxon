@@ -99,8 +99,8 @@ const icon_size: f32 = 18;
 const icon_gap: f32 = 8; // HorizontalElementsPadding
 const outline_width: f32 = 1;
 const max_chip_width: f32 = 1000; // Chip.kt maxChipWidth
-/// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 
 const ChipState = struct {
     opts: ChipOptions,
@@ -248,13 +248,14 @@ fn chipLayout(n: *Node, bounds: Rect) void {
     }
 }
 
-/// The interactive target: the painted bounds grown to the 48dp a11y floor
-/// per axis, centered (a wide chip is clickable along its whole width; a
-/// short chip keeps the 48dp floor vertically).
+/// The interactive target: the painted bounds grown to the a11y floor
+/// (theme.platform.hit_target_min) per axis, centered (a wide chip is
+/// clickable along its whole width; a short chip keeps the floor vertically).
 fn chipHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{
         .x = b.x + (b.w - w) / 2,
         .y = b.y + (b.h - h) / 2,
@@ -570,6 +571,7 @@ test "chip: measures height 32 + content + 16dp padding; the 48dp floor is the h
     try std.testing.expectEqual(tw + 16, m.w); // label_large (14, 500 -> bold) + 8*2
     b.layout(.{ .x = 100, .y = 100, .w = m.w, .h = 32 });
     const hb = b.vtable.hit_bounds.?(b);
+    const min_target = theme_mod.light.platform.hit_target_min;
     try std.testing.expectEqual(@max(m.w, min_target), hb.w);
     try std.testing.expectEqual(min_target, hb.h);
     try std.testing.expectEqual(@as(f32, 100 - 8), hb.y); // (32-48)/2

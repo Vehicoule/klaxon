@@ -146,13 +146,21 @@ pub const Shape = struct {
 /// One elevation level as a raster shadow approximation. M3 specifies
 /// key/ambient umbra+penumbra shadows; the raster backend draws a single
 /// blurred offset shadow — these values approximate the M3 levels.
+///
+/// Reference-only: widgets draw elevation parametrically through
+/// ui.paint.elevationShadow (SkShadowUtils ambient+spot from the elevation
+/// dp), which this per-level table cannot express. It documents the shape
+/// of the M3 levels for consumers that want a stand-in (e.g. an HTML/CSS
+/// export); it is not a widget contract — no widget reads it.
 pub const Shadow = struct {
     dy: f32,
     blur: f32,
     alpha: f32,
 };
 
-/// M3 elevation levels 0-5.
+/// M3 elevation levels 0-5. Descriptive reference only — widgets take an
+/// elevation dp to ui.paint.elevationShadow (the SkShadowUtils ambient+spot
+/// pair); they do not raster from these Shadow values (see the Shadow doc).
 pub const Elevation = struct {
     level0: Shadow,
     level1: Shadow,
@@ -238,6 +246,12 @@ pub const StateLayers = struct {
 
 /// Spacing scale (px). M3 does not publish spacing tokens; this is the
 /// conventional 4-based scale used across M3 implementations.
+///
+/// A scale reference for APP layout (screens, cards-in-a-flow margins) —
+/// not a widget contract: components carry their own padding/gap tokens
+/// (e.g. ButtonDefaults.contentPaddingFor, MenuListItemContainerHeight's
+/// insets), so no widget reads `theme.spacing`. Pair with
+/// `platform.spacing_scale` when an app wants density-aware page margins.
 pub const Spacing = struct {
     xs: f32,
     s: f32,
@@ -367,9 +381,13 @@ pub const Theme = struct {
     colors: ColorScheme = light_colors,
     type_scale: TypeScale = type_scale,
     shape: Shape = shape,
+    /// Descriptive reference of the M3 levels — widgets raster shadows
+    /// parametrically (ui.paint.elevationShadow), not from this table.
     elevation: Elevation = elevation,
     motion: Motion = motion,
     state: StateLayers = state_layers,
+    /// App-layout scale reference — widgets use their own component padding
+    /// tokens, so no widget reads this field.
     spacing: Spacing = spacing,
     platform: PlatformTokens = platform_mobile,
 
@@ -752,7 +770,7 @@ test "theme: fromSeedColor fills every color role — opaque, no sentinel leftov
 
 test "theme: fromSeedColorScheme — all nine M3E variants hold WCAG pairs" {
     inline for (@typeInfo(Scheme).@"enum".field_values) |v| {
-        const cs = Theme.fromSeedColorScheme(0x4285F4FF, false, @enumFromInt(v), 0).colors;
+        const cs = Theme.fromSeedColorScheme(0x4285F4FF, false, @fromBackingInt(@intCast(v)), 0).colors;
         try std.testing.expectEqual(@as(u8, 0xFF), @as(u8, @truncate(cs.primary)));
         // M3 guarantees >= 4.5:1 on the flagship pairs at default contrast.
         try std.testing.expect(contrastRatio(cs.primary, cs.on_primary) >= 4.5);

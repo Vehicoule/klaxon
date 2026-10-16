@@ -53,8 +53,8 @@ const circle_radius: f32 = 9; // IconSize/2 - strokeWidth/2 (the stroke is cente
 const stroke_width: f32 = 2;
 const dot_radius: f32 = 6; // RadioButtonDotSize/2 (the animation target)
 const state_layer_size: f32 = 40;
-/// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 
 pub const RadioOptions = struct {
     enabled: bool = true,
@@ -113,9 +113,12 @@ fn radioMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = circle_size, .h = circle_size });
 }
 
-/// The interactive target: 48x48 centered on the circle.
+/// The interactive target: hit_target_min x hit_target_min centered on the
+/// circle (48x48 under the mobile theme).
 fn radioHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
+    const min_target = s.opts.theme.platform.hit_target_min;
     return .{
         .x = b.x + (b.w - min_target) / 2,
         .y = b.y + (b.h - min_target) / 2,
@@ -361,7 +364,7 @@ test "radio: measures the 24dp node (2dp pad + 20dp icon); the 48dp floor is the
     try std.testing.expectEqual(circle_size, m.h);
     b.layout(.{ .x = 100, .y = 100, .w = 20, .h = 20 });
     const hb = b.vtable.hit_bounds.?(b);
-    try std.testing.expectEqual(min_target, hb.w);
+    try std.testing.expectEqual(theme_mod.light.platform.hit_target_min, hb.w);
     try std.testing.expectEqual(@as(f32, 100 - 14), hb.x); // (20-48)/2
 }
 

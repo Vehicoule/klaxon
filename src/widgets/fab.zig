@@ -131,9 +131,9 @@ fn extDims(t: Theme, size: ExtendedFabSize) ExtDims {
     };
 }
 
-/// Compose minimumInteractiveComponentSize — the a11y floor applies to the
-/// HIT area (hit_bounds), never to the painted container.
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize — the a11y floor applies to the
+// HIT area (hit_bounds), never to the painted container. The value is
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 
 /// The color family's (container, content) pair plus the checked toggle
 /// (solid/on-solid) pair.
@@ -208,12 +208,13 @@ fn fabMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = d.container, .h = d.container });
 }
 
-/// The interactive target: a 48x48 minimum centered on the container
-/// (Compose minimumInteractiveComponentSize).
+/// The interactive target: a hit_target_min minimum centered on the
+/// container (Compose minimumInteractiveComponentSize; 48x48 mobile).
 fn fabHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x + (b.w - w) / 2, .y = b.y + (b.h - h) / 2, .w = w, .h = h };
 }
 
@@ -253,8 +254,7 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     // last-interaction rule means a press while hovered holds level 3 (the
     // press interaction is newer than the hover).
     if (s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius,
-            if (s.hovered and !s.pressed) 8 else 6, t.colors.shadow);
+        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius, if (s.hovered and !s.pressed) 8 else 6, t.colors.shadow);
     }
     // container
     if (cc.container & 0xFF != 0) {
@@ -536,9 +536,10 @@ fn extFabLayout(n: *Node, bounds: Rect) void {
 }
 
 fn extFabHitBounds(n: *Node) Rect {
+    const s = extStateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x + (b.w - w) / 2, .y = b.y + (b.h - h) / 2, .w = w, .h = h };
 }
 
@@ -563,8 +564,7 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
     const cc = extCurrentColors(s);
     const b = n.bounds;
     if (s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius,
-            if (s.hovered) 8 else 6, t.colors.shadow);
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius, if (s.hovered) 8 else 6, t.colors.shadow);
     }
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, cc.container);

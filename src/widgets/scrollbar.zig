@@ -42,7 +42,7 @@ fn stateOf(comptime T: type, n: *Node) *T {
 /// Idle delay before an overlay/auto_hide scrollbar fades out (macOS ~1s).
 const hide_delay_ms: u64 = 800;
 /// Show/hide fade duration.
-const fade_ms: u32 = 150;
+// The show/hide fade rides theme.motion.durations.short3 (150ms).
 
 pub const ScrollbarOptions = struct {
     scroll: *Node, // the scrollable (vtable hooks drive it)
@@ -295,7 +295,7 @@ fn animateAlpha(s: *ScrollbarState, to: f32) void {
     s.anim_to = to;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ to, 0, 0, 0 }, fade_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ to, 0, 0, 0 }, s.opts.theme.motion.durations.short3, .{ .ease = .standard }),
             .from = .{ s.alpha, 0, 0, 0 },
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = sbAnimUpdateCb, .userdata = s.node },

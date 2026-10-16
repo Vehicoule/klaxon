@@ -66,10 +66,21 @@ pub const SearchBarOptions = struct {
 const container_h: f32 = 56; // ContainerHeight
 const min_w: f32 = 360; // SearchBarMinWidth
 const max_w: f32 = 720; // SearchBarMaxWidth
-const icon_box: f32 = 48; // minimumInteractiveComponentSize
 const icon_size: f32 = 24;
-const icon_edge: f32 = 16; // the icon visual offset (12 centered + 4 offset)
-const text_start: f32 = 52; // icon_box + (TextFieldPadding 16 - icon padding 12)
+// The icon boxes and the text start ride the a11y interactive minimum —
+// theme.platform.hit_target_min (upstream minimumInteractiveComponentSize;
+// 48dp mobile / 24 desktop).
+fn iconBox(t: Theme) f32 {
+    return t.platform.hit_target_min;
+}
+/// The icon visual's offset from the edge: centered in the box + 4.
+fn iconEdge(t: Theme) f32 {
+    return (iconBox(t) - icon_size) / 2 + 4;
+}
+/// The query text's start: the icon box + (TextFieldPadding 16 - icon pad 12).
+fn textStart(t: Theme) f32 {
+    return iconBox(t) + 4;
+}
 const text_gap_trail: f32 = 4; // the text's end padding before the icon box
 const text_end_no_icon: f32 = 16; // TextFieldPadding without a trailing icon
 const caret_w: f32 = 1;
@@ -122,15 +133,15 @@ fn hasText(s: *SearchBarState) bool {
     return s.buf.items.len > 0;
 }
 
-/// The clear button's zone (the trailing 48dp min-interactive box), in the
+/// The clear button's zone (the trailing min-interactive box), in the
 /// widget's parent space. Only hot when the text is non-empty.
-fn clearZone(b: Rect) Rect {
-    return .{ .x = b.x + b.w - icon_box, .y = b.y, .w = icon_box, .h = container_h };
+fn clearZone(t: Theme, b: Rect) Rect {
+    return .{ .x = b.x + b.w - iconBox(t), .y = b.y, .w = iconBox(t), .h = container_h };
 }
 
 fn inClear(s: *SearchBarState, b: Rect, x: f32, y: f32) bool {
     if (!hasText(s)) return false;
-    var z = clearZone(b);
+    var z = clearZone(s.opts.theme, b);
     if (ui.i18n.direction() == .rtl) {
         z.x = b.x + b.w - (z.x - b.x) - z.w; // the zone mirrors to the start side
     }
@@ -147,7 +158,7 @@ pub fn textRect(n: *Node) Rect {
     const t = s.opts.theme;
     const b = n.bounds;
     const line_h = t.type_scale.body_large.line_height;
-    return .{ .x = b.x + text_start, .y = b.y + (container_h - line_h) / 2, .w = 0, .h = line_h };
+    return .{ .x = b.x + textStart(t), .y = b.y + (container_h - line_h) / 2, .w = 0, .h = line_h };
 }
 
 fn searchBarMeasure(n: *Node, c: Constraints) Size {
@@ -155,8 +166,8 @@ fn searchBarMeasure(n: *Node, c: Constraints) Size {
     const t = s.opts.theme;
     const str = if (hasText(s)) s.text() else s.placeholder;
     const m = ui.paint.measureText(str, t.type_scale.body_large.size, false);
-    const right = if (hasText(s)) icon_box + text_gap_trail else text_end_no_icon;
-    const w = std.math.clamp(text_start + m.width + right, min_w, max_w);
+    const right = if (hasText(s)) iconBox(t) + text_gap_trail else text_end_no_icon;
+    const w = std.math.clamp(textStart(t) + m.width + right, min_w, max_w);
     return c.constrain(.{ .w = w, .h = container_h });
 }
 
@@ -211,14 +222,14 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
 
     // --- the leading search icon (24dp at 16dp from the start edge) ---
     const icon_y = b.y + (container_h - icon_size) / 2;
-    const lead_x = mx(b.x, b.w, b.x + icon_edge, icon_size, rtl);
+    const lead_x = mx(b.x, b.w, b.x + iconEdge(t), icon_size, rtl);
     paintIcon(ctx, .search, lead_x, icon_y, content);
 
     // --- the clear button (the trailing 48dp box; shown iff text) ---
     if (hasText(s)) {
-        const z = clearZone(b);
+        const z = clearZone(t, b);
         const zx = mx(b.x, b.w, z.x, z.w, rtl);
-        // the state layer over the clear zone (a 48x48 circle clipped to the pill)
+        // the state layer over the clear zone (a circle clipped to the pill)
         if (s.opts.enabled) {
             const alpha: f32 = if (s.clear_pressed)
                 t.state.pressed
@@ -228,21 +239,21 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
                 0;
             if (alpha > 0) {
                 ui.paint.clipRect(ctx, b.x, b.y, b.w, container_h);
-                ui.paint.fillRRect(ctx, zx, z.y + (container_h - icon_box) / 2, icon_box, icon_box, icon_box / 2, theme_mod.stateLayer(container, cs.on_surface_variant, alpha));
+                ui.paint.fillRRect(ctx, zx, z.y + (container_h - iconBox(t)) / 2, iconBox(t), iconBox(t), iconBox(t) / 2, theme_mod.stateLayer(container, cs.on_surface_variant, alpha));
                 ui.paint.clipReset(ctx);
             }
         }
-        // the close icon visual at 16dp from the end edge
-        const cx = mx(b.x, b.w, b.x + b.w - icon_edge - icon_size, icon_size, rtl);
+        // the close icon visual, offset iconEdge from the end edge
+        const cx = mx(b.x, b.w, b.x + b.w - iconEdge(t) - icon_size, icon_size, rtl);
         paintIcon(ctx, .close, cx, icon_y, muted);
     }
 
     // --- text content (clipped between the icons; the whole clip rect
     // mirrors in RTL — mirroring only the edge would clip the text away) ---
     const tr = textRect(n);
-    const right = if (hasText(s)) icon_box + text_gap_trail else text_end_no_icon;
-    const clip_w = b.w - text_start - right;
-    const clip_x = mx(b.x, b.w, b.x + text_start, clip_w, rtl);
+    const right = if (hasText(s)) iconBox(t) + text_gap_trail else text_end_no_icon;
+    const clip_w = b.w - textStart(t) - right;
+    const clip_x = mx(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, container_h);
     const style = t.type_scale.body_large;
     if (hasText(s)) {
@@ -539,13 +550,13 @@ test "search_bar: measures 56 tall; width clamped to [360, 720]" {
     defer long.deinit();
     const lw = ui.paint.measureText("a very long search query that overflows the minimum width for sure", 16, false).width;
     const mw = long.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@min(max_w, @max(min_w, text_start + lw + icon_box + text_gap_trail)), mw.w, 0.001);
+    try std.testing.expectApproxEqAbs(@min(max_w, @max(min_w, textStart(t) + lw + iconBox(t) + text_gap_trail)), mw.w, 0.001);
     // with text the clear button adds the trailing box: 52 + text + 52
     const ic = try searchBar(std.testing.allocator, null, null, null, .{ .initial = "Hi", .theme = t });
     defer ic.deinit();
     const iw = ic.measure(.{ .max_w = 2000, .max_h = 2000 }).w;
     const hw = ui.paint.measureText("Hi", 16, false).width;
-    try std.testing.expectApproxEqAbs(@max(min_w, text_start + hw + icon_box + text_gap_trail), iw, 0.001);
+    try std.testing.expectApproxEqAbs(@max(min_w, textStart(t) + hw + iconBox(t) + text_gap_trail), iw, 0.001);
 }
 
 test "search_bar: click focuses; typing appends; backspace/enter/escape; the clear button clears; disabled swallows" {
@@ -569,7 +580,7 @@ test "search_bar: click focuses; typing appends; backspace/enter/escape; the cle
     try std.testing.expectEqual(@as(u32, 1), changed);
     try std.testing.expectEqualStrings("Hi", b.semantics.?.value); // a11y follows
     // the clear button's zone is the trailing 48dp box: click it
-    const z = clearZone(b.bounds);
+    const z = clearZone(theme_mod.light, b.bounds);
     router.dispatchPointer(b, .{ .phase = .down, .x = z.x + 24, .y = 28, .raw_x = z.x + 24, .raw_y = 28 });
     router.dispatchPointer(b, .{ .phase = .up, .x = z.x + 24, .y = 28, .raw_x = z.x + 24, .raw_y = 28 });
     try std.testing.expectEqualStrings("", text(b)); // cleared
@@ -592,7 +603,7 @@ test "search_bar: click focuses; typing appends; backspace/enter/escape; the cle
     router.dispatchPointer(dis, .{ .phase = .down, .x = 180, .y = 28, .raw_x = 180, .raw_y = 28 });
     try std.testing.expect(!input.isFocused(dis));
     try std.testing.expectEqualStrings("Locked", text(dis));
-    const dz = clearZone(dis.bounds);
+    const dz = clearZone(theme_mod.light, dis.bounds);
     router.dispatchPointer(dis, .{ .phase = .down, .x = dz.x + 24, .y = 28, .raw_x = dz.x + 24, .raw_y = 28 });
     router.dispatchPointer(dis, .{ .phase = .up, .x = dz.x + 24, .y = 28, .raw_x = dz.x + 24, .raw_y = 28 });
     try std.testing.expectEqualStrings("Locked", text(dis)); // not cleared
@@ -648,10 +659,10 @@ test "search_bar: RTL mirrors the chrome (the search icon moves to the end side)
     defer b.deinit();
     b.layout(.{ .x = 0, .y = 0, .w = 360, .h = 56 });
     // the clear zone moved to the START side (mirrored)
-    try std.testing.expect(inClear(stateOf(b), b.bounds, icon_box / 2, 28));
-    try std.testing.expect(!inClear(stateOf(b), b.bounds, 360 - icon_box / 2, 28));
+    try std.testing.expect(inClear(stateOf(b), b.bounds, iconBox(theme_mod.light) / 2, 28));
+    try std.testing.expect(!inClear(stateOf(b), b.bounds, 360 - iconBox(theme_mod.light) / 2, 28));
     // the LTR anchor is unchanged (the paint mirrors it)
-    try std.testing.expectEqual(text_start, textRect(b).x);
+    try std.testing.expectEqual(textStart(theme_mod.light), textRect(b).x);
 }
 
 test "golden: RTL paints the input text at the end side (the clip mirrors with it)" {
@@ -672,14 +683,14 @@ test "golden: RTL paints the input text at the end side (the clip mirrors with i
     defer f.deinit();
     const m = ui.paint.measureText("Hi", 16, false);
     // the text run mirrors to the end side: its right edge is at
-    // b.x + b.w - text_start (the trailing clear zone starts at the end)
-    const mirrored_x = 20 + 380 - text_start - m.width;
+    // b.x + b.w - textStart (the trailing clear zone starts at the end)
+    const mirrored_x = 20 + 380 - textStart(t) - m.width;
     // ink at the mirrored position...
     try std.testing.expect(f.countColorIn(.{ .x = mirrored_x, .y = 28, .w = m.width, .h = 24 }, t.colors.on_surface) > 0);
     // ...and none where LTR would paint (left of the search icon's zone)
     try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 72, .y = 28, .w = m.width, .h = 24 }, t.colors.on_surface));
     // the search icon moved to the end side too (its ink is at the right)
-    try std.testing.expect(f.countColorIn(.{ .x = 20 + 380 - icon_edge - icon_size, .y = 28, .w = 24, .h = 24 }, t.colors.on_surface) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = 20 + 380 - iconEdge(t) - icon_size, .y = 28, .w = 24, .h = 24 }, t.colors.on_surface) > 0);
 }
 
 test "golden: the pill paints SurfaceContainerHigh with rounded ends; the search icon + placeholder ink" {

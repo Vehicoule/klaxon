@@ -84,10 +84,14 @@ fn isClickable(s: *CardState) bool {
 /// rest / hover / focus / pressed / dragged / disabled.
 const elev_rest = [3]f32{ 0, 1, 0 }; // filled 0, elevated L1, outlined 0
 const elev_hover: f32 = 3; // Level2 (all variants)
-const elev_ms: f32 = 150;
+// The elevation tween rides theme.motion.durations.short3 (150ms).
 
 fn variantIndex(s: *CardState) usize {
-    return switch (s.opts.variant) { .filled => 0, .elevated => 1, .outlined => 2 };
+    return switch (s.opts.variant) {
+        .filled => 0,
+        .elevated => 1,
+        .outlined => 2,
+    };
 }
 
 /// The elevation the upstream CardElevation resolves to for the current
@@ -112,7 +116,7 @@ fn retargetElevation(n: *Node, s: *CardState) void {
     s.elev_target = target;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, elev_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, s.opts.theme.motion.durations.short3, .{ .ease = .standard }),
             .from = .{ s.elev, 0, 0, 0 },
             .channel = @ptrCast(&s.elev_channel),
             .on_update = .{ .fn_ptr = elevAnimCb, .userdata = n },
@@ -175,8 +179,7 @@ fn cardPaint(n: *Node, ctx: *kx.Ctx) void {
     // The animated shadow elevation (upstream CardElevation): elevated rests
     // at 1dp, every variant lifts to 3dp on hover, dragged lifts higher.
     if (s.elev > 0) {
-        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, card_radius,
-            s.elev, cs.shadow);
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, card_radius, s.elev, cs.shadow);
     }
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, container);

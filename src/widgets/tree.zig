@@ -36,7 +36,13 @@ pub const TreeOptions = struct {
 };
 
 // --- Tokens ---
-const row_h: f32 = 48;
+/// The row height is a control row — it rides the platform control height
+/// (theme.platform.control_height: 48dp mobile / 40 desktop).
+fn rowH(t: Theme) f32 {
+    return t.platform.control_height;
+}
+/// The default-theme row height — test convenience; production uses rowH.
+const row_h: f32 = theme_mod.light.platform.control_height;
 const indent: f32 = 24;
 const chevron_size: f32 = 24;
 const label_pad: f32 = 8;
@@ -110,7 +116,7 @@ fn treeMeasure(n: *Node, c: Constraints) Size {
             }
         }
     }
-    const h = @as(f32, @floatFromInt(count)) * row_h;
+    const h = @as(f32, @floatFromInt(count)) * rowH(t);
     return .{
         .w = @max(c.min_w, @min(c.max_w, max_w)),
         .h = @max(c.min_h, @min(c.max_h, h)),
@@ -136,13 +142,13 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
         // Hover / pressed / selected background (M3 state layers).
         if (s.opts.tappable and s.pressed == @as(i32, @intCast(vi))) {
             const layer = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.pressed);
-            ui.paint.fillRect(ctx, b.x, row_y, b.w, row_h, layer);
+            ui.paint.fillRect(ctx, b.x, row_y, b.w, rowH(t), layer);
         } else if (s.opts.tappable and s.hovered == @as(i32, @intCast(vi))) {
             const layer = theme_mod.stateLayer(t.colors.surface, t.colors.on_surface, t.state.hover);
-            ui.paint.fillRect(ctx, b.x, row_y, b.w, row_h, layer);
+            ui.paint.fillRect(ctx, b.x, row_y, b.w, rowH(t), layer);
         }
         if (s.selected == @as(i32, @intCast(vi))) {
-            ui.paint.fillRect(ctx, b.x, row_y, b.w, row_h, t.colors.secondary_container);
+            ui.paint.fillRect(ctx, b.x, row_y, b.w, rowH(t), t.colors.secondary_container);
         }
 
         const node = item.node;
@@ -153,17 +159,17 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
         if (has_children) {
             const chev: [:0]const u8 = if (node.expanded) "\u{25BC}" else "\u{25B6}"; // ▼ / ▶
             const cm = ui.paint.measureText(chev, chevron_size, false);
-            ui.paint.text(ctx, chev, x0, row_y + (row_h - cm.height) / 2 + cm.height * 0.8, chevron_size, false, t.colors.on_surface_variant);
+            ui.paint.text(ctx, chev, x0, row_y + (rowH(t) - cm.height) / 2 + cm.height * 0.8, chevron_size, false, t.colors.on_surface_variant);
         }
 
         // Label.
         const lx = x0 + chevron_size + label_pad;
         const lm = ui.paint.measureText(node.label, bs.size, false);
-        const ly = row_y + (row_h - lm.height) / 2 + lm.height * 0.8;
+        const ly = row_y + (rowH(t) - lm.height) / 2 + lm.height * 0.8;
         const label_color = if (s.selected == @as(i32, @intCast(vi))) t.colors.on_secondary_container else t.colors.on_surface;
         ui.paint.text(ctx, node.label, lx, ly, bs.size, false, label_color);
 
-        y += row_h;
+        y += rowH(t);
     }
 }
 
@@ -173,7 +179,7 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
 fn rowAt(s: *TreeState, n: *Node, py: f32) ?usize {
     const dy = py - n.bounds.y;
     if (dy < 0) return null;
-    const vi: usize = @intFromFloat(dy / row_h);
+    const vi: usize = @intFromFloat(dy / rowH(s.opts.theme));
     var list = collectVisible(s, n.allocator) catch return null;
     defer list.deinit();
     if (vi >= list.items.len) return null;
@@ -189,7 +195,7 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
             const b = n.bounds;
             if (ev.y >= b.y and ev.y <= b.y + n.measure(.{ .max_w = b.w, .max_h = 1e9 }).h) {
                 const dy = ev.y - b.y;
-                const vi = if (dy >= 0) @as(i32, @intFromFloat(dy / row_h)) else -1;
+                const vi = if (dy >= 0) @as(i32, @intFromFloat(dy / rowH(s.opts.theme))) else -1;
                 if (vi != s.hovered) {
                     s.hovered = vi;
                     n.markDirty();
@@ -219,7 +225,7 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
     }
     const b = n.bounds;
     const dy2 = ev.y - b.y;
-    const vi = if (dy2 >= 0) @as(usize, @intFromFloat(dy2 / row_h)) else 0;
+    const vi = if (dy2 >= 0) @as(usize, @intFromFloat(dy2 / rowH(s.opts.theme))) else 0;
     var list = collectVisible(s, n.allocator) catch return false;
     defer list.deinit();
     if (vi >= list.items.len) return false;
@@ -322,7 +328,7 @@ test "tree: measure counts visible nodes" {
     const a = std.testing.allocator;
     const root = TreeNode{
         .label = "Root",
-        .children = &.{ .{ .label = "Child1" }, .{ .label = "Child2", .children = &.{ .{ .label = "Grandchild" } } } },
+        .children = &.{ .{ .label = "Child1" }, .{ .label = "Child2", .children = &.{.{ .label = "Grandchild" }} } },
     };
     const n = try tree(a, &root, null, .{});
     defer n.deinit();

@@ -78,8 +78,8 @@ const thumb_padding: f32 = (track_h - handle_on) / 2; // ThumbPadding = 4
 const max_bound: f32 = track_w - handle_on - thumb_padding;
 const icon_size: f32 = 16; // Selected/UnselectedIconSize
 const state_layer_size: f32 = 40;
-/// Compose minimumInteractiveComponentSize (the a11y hit-target floor).
-const min_target: f32 = 48;
+// Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
+// theme.platform.hit_target_min — read from s.opts.theme where used.
 
 pub const SwitchOptions = struct {
     enabled: bool = true,
@@ -222,11 +222,13 @@ fn switchMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = track_w, .h = track_h });
 }
 
-/// The interactive target: max(52,48) x max(32,48) centered on the track.
+/// The interactive target: max(track dims, hit_target_min) centered on the
+/// track (the a11y floor, 48 mobile / 24 desktop).
 fn switchHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const w = @max(b.w, min_target);
-    const h = @max(b.h, min_target);
+    const w = @max(b.w, s.opts.theme.platform.hit_target_min);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x + (b.w - w) / 2, .y = b.y + (b.h - h) / 2, .w = w, .h = h };
 }
 
@@ -489,7 +491,7 @@ test "switch: measures the 52x32 track; the hit target floors at 48 high" {
     b.layout(.{ .x = 100, .y = 100, .w = 52, .h = 32 });
     const hb = b.vtable.hit_bounds.?(b);
     try std.testing.expectEqual(@as(f32, 52), hb.w);
-    try std.testing.expectEqual(min_target, hb.h); // 32 -> 48
+    try std.testing.expectEqual(theme_mod.light.platform.hit_target_min, hb.h); // 32 -> 48
     try std.testing.expectEqual(@as(f32, 100 - 8), hb.y); // (32-48)/2
 }
 

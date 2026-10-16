@@ -73,7 +73,12 @@ const hue_cursor_corner: f32 = 2; // CornerSmall
 const swatch_size: f32 = 48;
 const swatch_corner: f32 = 8; // CornerSmall
 const swatch_stroke: f32 = 1;
-const hex_h: f32 = 48;
+/// The hex entry field is a control — its height rides the platform
+/// control height (theme.platform.control_height: 48dp mobile / 40
+/// desktop).
+fn hexH(t: Theme) f32 {
+    return t.platform.control_height;
+}
 const hex_gap: f32 = 12;
 
 // --- Color helpers (RGB <-> HSV, RGB <-> Hex) ---
@@ -115,17 +120,23 @@ pub fn hsvToRgb(h: f32, s: f32, v: f32) struct { r: u8, g: u8, b: u8 } {
     var gf: f32 = 0;
     var bf: f32 = 0;
     if (hh < 60) {
-        rf = c; gf = x;
+        rf = c;
+        gf = x;
     } else if (hh < 120) {
-        rf = x; gf = c;
+        rf = x;
+        gf = c;
     } else if (hh < 180) {
-        gf = c; bf = x;
+        gf = c;
+        bf = x;
     } else if (hh < 240) {
-        gf = x; bf = c;
+        gf = x;
+        bf = c;
     } else if (hh < 300) {
-        rf = x; bf = c;
+        rf = x;
+        bf = c;
     } else {
-        rf = c; bf = x;
+        rf = c;
+        bf = x;
     }
     return .{
         .r = @intFromFloat(@round((rf + m) * 255)),
@@ -285,8 +296,8 @@ fn previewY() f32 {
     return hueY() + hue_h + section_gap;
 }
 
-fn totalHeight(_: ColorPickerOptions) f32 {
-    return panel_pad + sv_height + section_gap + hue_h + section_gap + hex_h + panel_pad;
+fn totalHeight(opts: ColorPickerOptions) f32 {
+    return panel_pad + sv_height + section_gap + hue_h + section_gap + hexH(opts.theme) + panel_pad;
 }
 
 // --- Measure ---
@@ -314,7 +325,7 @@ fn cpLayout(n: *Node, bounds: Rect) void {
         .x = inner_x + swatch_size + hex_gap,
         .y = bounds.y + previewY(),
         .w = inner_w - swatch_size - hex_gap,
-        .h = hex_h,
+        .h = hexH(s.opts.theme),
     };
 }
 

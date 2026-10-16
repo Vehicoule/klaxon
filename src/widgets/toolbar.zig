@@ -78,7 +78,8 @@ pub const ToolbarOptions = struct {
 const bar_height: f32 = 64; // ContainerHeight
 const bar_outer_height: f32 = 80; // with-FAB min height = FabSizeRange.end (FabMedium)
 const h_pad: f32 = 8; // ContainerLeadingSpace / ContainerTrailingSpace
-const item_cell: f32 = 48; // a standard icon-button cell (the a11y floor)
+// A standard icon-button cell is the a11y floor: theme.platform
+// .hit_target_min (48 mobile / 24 desktop) — read from s.opts.theme.
 const icon_size: f32 = 24; // IconSize
 const divider_w: f32 = 1; // the separator's thickness
 const divider_h: f32 = 24; // the separator's length
@@ -90,8 +91,8 @@ const fab_icon_size: f32 = 24;
 const bar_elevation_expanded: f32 = 1; // ContainerExpandedElevationWithFab = Level1
 const fab_elevation: f32 = 3; // Level2 (default toolbar FAB)
 const fab_elevation_hover: f32 = 6; // Level3
-const expand_ms: u32 = 300; // MotionScheme FastSpatial ~300ms
-const min_target: f32 = 48; // a11y touch-target floor
+// The expand/collapse tween rides theme.motion.durations.medium2 (300ms —
+// upstream MotionScheme FastSpatial ~300ms).
 const shadow_spill: f32 = 16; // paint/damage overflow covering the shadows
 
 const ItemDef = struct {
@@ -144,8 +145,8 @@ fn hasFab(s: *const ToolbarState) bool {
     return s.opts.fab_icon != null;
 }
 
-fn cellW(def: ItemDef) f32 {
-    return if (def.divider) divider_w else item_cell;
+fn cellW(t: Theme, def: ItemDef) f32 {
+    return if (def.divider) divider_w else t.platform.hit_target_min;
 }
 
 /// The virtual slot count: the item cells, then the docked FAB.
@@ -165,7 +166,7 @@ fn pressable(s: *const ToolbarState, idx: i32) bool {
 /// the 8dp leading/trailing spaces around the adjacent cells.
 fn barContentWidth(s: *const ToolbarState) f32 {
     var w: f32 = h_pad * 2;
-    for (s.items.items) |def| w += cellW(def);
+    for (s.items.items) |def| w += cellW(s.opts.theme, def);
     return w;
 }
 
@@ -217,12 +218,13 @@ fn slotRectLtr(s: *const ToolbarState, b: Rect, index: usize) Rect {
     if (index == count) return fabRectLtr(s, b);
     const bar = barRectLtr(s, b);
     var x = bar.x + h_pad;
-    for (0..index) |i| x += cellW(s.items.items[i]);
+    for (0..index) |i| x += cellW(s.opts.theme, s.items.items[i]);
     const def = s.items.items[index];
     if (def.divider) {
         return .{ .x = x, .y = b.y + (b.h - divider_h) / 2, .w = divider_w, .h = divider_h };
     }
-    return .{ .x = x, .y = b.y + (b.h - item_cell) / 2, .w = item_cell, .h = item_cell };
+    const cell = s.opts.theme.platform.hit_target_min;
+    return .{ .x = x, .y = b.y + (b.h - cell) / 2, .w = cell, .h = cell };
 }
 
 fn mirrorX(b: Rect, r: Rect) Rect {
@@ -479,7 +481,7 @@ fn retargetExpand(n: *Node, s: *ToolbarState, target: f32) void {
     s.expand_target = target;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, expand_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, s.opts.theme.motion.durations.medium2, .{ .ease = .standard }),
             .from = .{ s.expand_progress, 0, 0, 0 },
             .channel = @ptrCast(&s.expand_channel),
             .on_update = .{ .fn_ptr = expandCb, .userdata = n },
@@ -516,11 +518,12 @@ fn toolbarDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
-/// The interactive target: ≥48dp tall centered on the container (a
-/// constrained-short pill still meets the a11y touch floor).
+/// The interactive target: ≥ hit_target_min tall centered on the container
+/// (a constrained-short pill still meets the a11y touch floor).
 fn toolbarHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const h = @max(b.h, min_target);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x, .y = b.y + (b.h - h) / 2, .w = b.w, .h = h };
 }
 
@@ -618,13 +621,13 @@ test "toolbar: measures the pill (8dp padding, adjacent 48dp cells); 64dp tall" 
     defer n.deinit();
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     // 8 + 48 + 48 + 1 + 48 + 8 = 161 (cells touch — the upstream Row has no spacing)
-    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + 3 * item_cell + divider_w), sz.w, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + 3 * theme_mod.light.platform.hit_target_min + divider_w), sz.w, 0.001);
     try std.testing.expectEqual(bar_height, sz.h);
     // the FAB sits BESIDE the pill: +8 gap + 56 (FabBaseline), outer height 80
     const f = try toolbar(a, &.{.{ .icon = .plus }}, .{ .fab_icon = .check });
     defer f.deinit();
     const szf = f.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + item_cell + toolbar_fab_gap + fab_min), szf.w, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2 * h_pad + theme_mod.light.platform.hit_target_min + toolbar_fab_gap + fab_min), szf.w, 0.001);
     try std.testing.expectEqual(bar_outer_height, szf.h);
     // an empty toolbar is just the padding
     const e = try toolbar(a, &.{}, .{});

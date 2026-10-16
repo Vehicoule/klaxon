@@ -68,7 +68,7 @@ const max_width: f32 = 560;
 const corner: f32 = 28;
 const icon_size: f32 = 24;
 const scrim_max_alpha: f32 = 0.32;
-const fade_ms: u32 = 200;
+// The scrim+panel fade rides theme.motion.durations.short4 (200ms).
 
 /// AlertDialog.kt — shouldUsePrecisionPointerComponentSizing drives the
 /// density: a mouse window pads 20dp with a 16dp text spacing; touch pads
@@ -219,8 +219,7 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
         return;
     }
     // M3 dialog elevation = 6dp — the panel floats over the scrim.
-    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 6,
-        s.opts.theme.colors.shadow);
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 6, s.opts.theme.colors.shadow);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner, s.opts.theme.colors.surface_container_high);
 }
 
@@ -446,7 +445,7 @@ fn animateAlpha(n: *Node, s: *DialogState, to: f32) void {
     const target: anim.Vec4 = .{ to, scrimTarget(s, to), 0, 0 };
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(target, fade_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(target, s.opts.theme.motion.durations.short4, .{ .ease = .standard }),
             .from = from,
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = dialogAnimUpdateCb, .userdata = n },

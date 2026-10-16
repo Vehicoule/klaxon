@@ -51,7 +51,7 @@ const padding_h: f32 = 8; // PlainTooltipHorizontalPadding
 const padding_v: f32 = 4; // PlainTooltipVerticalPadding
 const anchor_spacing: f32 = 4; // SpacingBetweenTooltipAndAnchor
 const corner: f32 = 4; // CornerExtraSmall
-const fade_ms: u32 = 150;
+// The fade rides theme.motion.durations.short3 (150ms).
 // caret (TooltipDefaults.caretSize = 16×8dp)
 const caret_w: f32 = 16;
 const caret_h: f32 = 8;
@@ -199,7 +199,7 @@ fn setShown(n: *Node, s: *TooltipState, shown: bool) void {
     s.bubble.setVisible(true); // paint while fading (even out)
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, fade_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, s.theme.motion.durations.short3, .{ .ease = .standard }),
             .from = .{ s.alpha, 0, 0, 0 },
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = tooltipAlphaCb, .userdata = n },

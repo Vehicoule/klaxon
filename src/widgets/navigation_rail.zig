@@ -106,7 +106,9 @@ const wnr_top_pad: f32 = 44; // NavigationRailCollapsedTokens.TopSpace
 const expanded_min_w: f32 = 220; // NavigationRailExpandedTokens.ContainerWidthMinimum
 const expanded_max_w: f32 = 360; // NavigationRailExpandedTokens.ContainerWidthMaximum
 const item_hpad: f32 = 20; // WNRItemHorizontalPadding
-const item_min_a11y: f32 = 48; // minimumA11ySize (InteractiveComponentSize)
+// minimumA11ySize (InteractiveComponentSize) — the a11y floor is
+// theme.platform.hit_target_min (48 mobile / 24 desktop), read per-theme
+// where the expanded item width is clamped.
 const pill_lead: f32 = 16; // HorizontalItemTokens.FullWidthLeadingSpace (+ trailing 16)
 const pill_h: f32 = 56; // HorizontalItemTokens.ActiveIndicatorHeight
 const icon_size: f32 = 24; // BaselineItemTokens.IconSize
@@ -190,7 +192,8 @@ fn pillWidth(s: *RailState, b: Rect, def: ItemDef) f32 {
 /// The expanded item's width: constrain(pill + WNRItemHorizontalPadding),
 /// min the a11y size, max the rail's width - WNRItemHorizontalPadding.
 fn expandedItemW(s: *RailState, b: Rect, def: ItemDef) f32 {
-    return std.math.clamp(pillWidth(s, b, def) + item_hpad, item_min_a11y, @max(item_min_a11y, b.w - item_hpad));
+    const a11y = s.opts.theme.platform.hit_target_min;
+    return std.math.clamp(pillWidth(s, b, def) + item_hpad, a11y, @max(a11y, b.w - item_hpad));
 }
 
 /// The item's rect in the widget's parent space.
@@ -265,7 +268,7 @@ fn railMeasure(n: *Node, c: Constraints) Size {
         // max(220, widest item + WNRItemHorizontalPadding)), honoring a
         // nonzero minWidth exactly; fillMaxHeight on the height.
         var widest: f32 = 0;
-        const item_max_w = @max(item_min_a11y, c.max_w - item_hpad);
+        const item_max_w = @max(s.opts.theme.platform.hit_target_min, c.max_w - item_hpad);
         for (s.items.items) |def| {
             const lb: Rect = .{ .x = 0, .y = 0, .w = c.max_w, .h = 0 };
             widest = @max(widest, @min(pillWidth(s, lb, def) + item_hpad, item_max_w));

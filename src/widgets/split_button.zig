@@ -98,7 +98,8 @@ fn dimsFor(size: SplitButtonSize) Dims {
 }
 
 const min_w: f32 = 48; // LeadingButtonMinWidth = TrailingButtonMinWidth
-const min_target: f32 = 48; // a11y touch-target floor
+// The a11y touch-target floor is theme.platform.hit_target_min (48 mobile /
+// 24 desktop) — read from s.opts.theme where used.
 const between: f32 = 2; // BetweenSpace
 
 const SplitState = struct {
@@ -382,11 +383,12 @@ fn splitDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
-/// The interactive target: ≥48dp tall centered on the button — the 40dp
-/// halves were below the a11y touch floor.
+/// The interactive target: ≥ hit_target_min tall centered on the button —
+/// the 40dp halves were below the a11y touch floor.
 fn splitHitBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
-    const h = @max(b.h, min_target);
+    const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{
         .x = b.x,
         .y = b.y + (b.h - h) / 2,

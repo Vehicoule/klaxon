@@ -117,7 +117,8 @@ const item_label_gap: f32 = 8; // ListItemIconLabelSpace
 const item_gap: f32 = 4; // FabMenuBaselineTokens.ListItemBetweenSpace
 const fab_gap: f32 = 8; // FabMenuBaselineTokens.CloseButtonBetweenSpace
 const scrim_alpha: f32 = 0.32; // the M3 scrim opacity
-const min_target: f32 = 48; // a11y touch-target floor
+// The a11y touch-target floor is theme.platform.hit_target_min (48 mobile /
+// 24 desktop) — threaded through fabHitRect.
 
 const ItemDef = struct {
     icon: icon_w.IconName,
@@ -210,12 +211,12 @@ fn itemsRect(s: *FabMenuState, t: Theme, b: Rect) Rect {
     return r;
 }
 
-/// The FAB's interactive rect: the 48dp a11y floor grown around the
-/// container (Compose minimumInteractiveComponentSize).
-fn fabHitRect(b: Rect) Rect {
+/// The FAB's interactive rect: the a11y floor (theme.platform.hit_target_min)
+/// grown around the container (Compose minimumInteractiveComponentSize).
+fn fabHitRect(t: Theme, b: Rect) Rect {
     const fr = fabRect(b);
-    const w = @max(fr.w, min_target);
-    const h = @max(fr.h, min_target);
+    const w = @max(fr.w, t.platform.hit_target_min);
+    const h = @max(fr.h, t.platform.hit_target_min);
     return .{ .x = fr.x + (fr.w - w) / 2, .y = fr.y + (fr.h - h) / 2, .w = w, .h = h };
 }
 
@@ -335,7 +336,7 @@ fn fabMenuPaintBounds(n: *Node) Rect {
 /// open (column hits resolve to this leaf, then the geometry picks the row).
 fn fabMenuHitBounds(n: *Node) Rect {
     const s = stateOf(n);
-    var hb = fabHitRect(n.bounds);
+    var hb = fabHitRect(s.opts.theme, n.bounds);
     if (s.open) hb = ui.node.rectUnion(hb, itemsRect(s, s.opts.theme, n.bounds));
     return hb;
 }
@@ -460,7 +461,7 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.down_raw_y = ev.raw_y;
                 return true;
             }
-            if (fabHitRect(b).contains(ev.x, ev.y)) {
+            if (fabHitRect(t, b).contains(ev.x, ev.y)) {
                 s.fab_pressed = true;
                 s.down_raw_x = ev.raw_x;
                 s.down_raw_y = ev.raw_y;
@@ -477,7 +478,7 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed_item = -1;
             s.fab_pressed = false;
             n.markDirty();
-            if (fab_was and fabHitRect(b).contains(ev.x, ev.y)) {
+            if (fab_was and fabHitRect(t, b).contains(ev.x, ev.y)) {
                 toggleOpen(n, !s.open);
             } else if (item_was >= 0 and itemAt(s, t, b, ev.x, ev.y) == item_was) {
                 itemSelect(n, @intCast(item_was));
@@ -510,7 +511,7 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .enter => {
             s.highlight = itemAt(s, t, b, ev.x, ev.y);
-            s.fab_hovered = fabHitRect(b).contains(ev.x, ev.y);
+            s.fab_hovered = fabHitRect(t, b).contains(ev.x, ev.y);
             n.markDirty();
             return true;
         },
@@ -518,7 +519,7 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
         // re-resolve the cell under the pointer
         .hover_move => {
             const h = itemAt(s, t, b, ev.x, ev.y);
-            const fh = fabHitRect(b).contains(ev.x, ev.y);
+            const fh = fabHitRect(t, b).contains(ev.x, ev.y);
             if (h != s.highlight or fh != s.fab_hovered) {
                 s.highlight = h;
                 s.fab_hovered = fh;

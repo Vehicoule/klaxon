@@ -73,7 +73,8 @@ const item_max_w: f32 = 280; // DropdownMenuItemDefaultMaxWidth
 const menu_h_margin: f32 = 8; // MenuHorizontalMargin — min inset to the window edge
 const panel_v_pad: f32 = 8; // DropdownMenuVerticalPadding
 const panel_radius: f32 = 4; // CornerExtraSmall
-const open_ms: u32 = 150; // scale 0.8→1 + alpha 0→1 (Menu.kt open anim)
+// The open anim (scale 0.8→1 + alpha 0→1, Menu.kt) rides
+// theme.motion.durations.short3 (150ms).
 
 const ItemDef = struct {
     label: [:0]const u8, // owned
@@ -158,7 +159,7 @@ fn retargetOpen(n: *Node, s: *MenuState, target: f32) void {
     s.open_target = target;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, open_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, s.opts.theme.motion.durations.short3, .{ .ease = .standard }),
             .from = .{ s.open_progress, 0, 0, 0 },
             .channel = @ptrCast(&s.open_channel),
             .on_update = .{ .fn_ptr = openAnimCb, .userdata = n },
@@ -451,8 +452,7 @@ fn menuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.translate(ctx, -ox, -oy);
     ui.paint.layerAlpha(ctx, p);
     // M3 menu elevation = 2dp.
-    ui.paint.elevationShadow(ctx, px, b.y + b.h, pw, ph, panel_radius, 2,
-        t.colors.shadow);
+    ui.paint.elevationShadow(ctx, px, b.y + b.h, pw, ph, panel_radius, 2, t.colors.shadow);
     ui.paint.fillRRect(ctx, px, b.y + b.h, pw, ph, panel_radius, t.colors.surface_container);
     for (n.children.items[1..]) |child| { // [0] = the anchor
         if (child.visible) itemPaint(child, ctx);

@@ -56,7 +56,7 @@ const action_bottom_pad: f32 = 4; // ActionButtonBottomPadding
 const separate_btn_extra_y: f32 = 2; // SeparateButtonExtraY
 const two_lines_min_h: f32 = 68; // TwoLinesContainerHeight
 const action_gap: f32 = 8;
-const slide_ms: u32 = 200;
+// The slide/fade-in rides theme.motion.durations.short4 (200ms).
 
 pub const SnackBarOptions = struct {
     text: []const u8 = "",
@@ -310,7 +310,7 @@ fn animateProgress(n: *Node, s: *SnackBarState, to: f32) void {
     s.anim_to = to;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.tweenAnim(.{ to, 0, 0, 0 }, slide_ms, .{ .ease = .standard }),
+            .kind = anim.Animation.tweenAnim(.{ to, 0, 0, 0 }, s.opts.theme.motion.durations.short4, .{ .ease = .standard }),
             .from = .{ s.progress, 0, 0, 0 },
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = snackAnimUpdateCb, .userdata = n },
