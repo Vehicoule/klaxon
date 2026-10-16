@@ -31,11 +31,15 @@
 // unbounded parent (a scroll column), wrap it in a bounded box (e.g.
 // constrainedBox with min_h = max_h).
 //
+//   - modal sheets are swipe-to-dismiss: a drag towards the anchored edge
+//     on unclaimed panel space tracks the finger; a fling past
+//     125.dp/s settles in its direction, a slow release at the nearest
+//     anchor (Hidden/Expanded)
+//
 // v1 deviations (documented, fixed later):
-//   - No detached variant (16dp margin, CornerLarge all corners), no
-//     drag-to-dismiss swipe (the state is signal-driven), no elevation
-//     shadows (the raster shadow pass lands in Phase 3), no body resize on
-//     open (the app's responsive layout), no M3E loading-indicator variant.
+//   - No detached variant (16dp margin, CornerLarge all corners), no body
+//     resize on open (the app's responsive layout), no M3E
+//     loading-indicator variant.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -223,6 +227,13 @@ const panel_bg_vtable = ui.node.VTable{
 const PanelState = struct {
     sheet: *Node,
     offset_x: f32 = 0, // slide offset (towards the anchored edge when closed)
+    // --- swipe-to-dismiss (modal sheets only, upstream SideSheetBehavior) ---
+    drag_active: bool = false,
+    drag_x0: f32 = 0, // raw x at grab
+    drag_p0: f32 = 0, // progress at grab
+    drag_vx: f32 = 0, // smoothed velocity, px/ms (physical direction)
+    drag_last_x: f32 = 0,
+    drag_last_t: u64 = 0,
 };
 
 fn panelStateOf(n: *Node) *PanelState {
@@ -257,6 +268,62 @@ fn panelHitBounds(n: *Node) Rect {
     return .{ .x = b.x + dx, .y = b.y, .w = b.w, .h = b.h };
 }
 
+/// Upstream fling threshold (125.dp/s → px/ms).
+const fling_thresh: f32 = 0.125;
+
+/// Swipe-to-dismiss on a modal sheet: a drag towards the anchored edge
+/// closes the sheet; content children claim their own presses first, so
+/// the drag only starts on unclaimed panel space (the upstream
+/// nested-scroll precedence).
+fn panelOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const ps = panelStateOf(n);
+    const sheet = ps.sheet;
+    const s = stateOf(sheet);
+    switch (ev.phase) {
+        .down => {
+            if (!s.opts.modal or !s.sig.peek() or s.panel_w <= 0) return false;
+            ps.drag_active = true;
+            ps.drag_x0 = ev.raw_x;
+            ps.drag_p0 = s.progress;
+            ps.drag_vx = 0;
+            ps.drag_last_x = ev.raw_x;
+            ps.drag_last_t = ev.time_ms;
+            return true;
+        },
+        .move => {
+            if (!ps.drag_active) return false;
+            const dt = ev.time_ms - ps.drag_last_t;
+            if (dt > 0) {
+                const inst = (ev.raw_x - ps.drag_last_x) / @as(f32, @floatFromInt(dt));
+                ps.drag_vx = ps.drag_vx * 0.6 + inst * 0.4;
+            }
+            ps.drag_last_x = ev.raw_x;
+            ps.drag_last_t = ev.time_ms;
+            // dragging towards the anchored edge reduces progress
+            const p = std.math.clamp(ps.drag_p0 - hideSign(s.opts) * (ev.raw_x - ps.drag_x0) / s.panel_w, 0, 1);
+            if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the finger drives
+            applyProgress(sheet, s, p, p * scrim_max_alpha);
+            return true;
+        },
+        .up, .leave => {
+            if (!ps.drag_active) return ev.phase == .up;
+            ps.drag_active = false;
+            const vx = ps.drag_vx;
+            // A fling settles in its direction, a slow release at the
+            // nearest anchor (Hidden or Expanded — no partial state).
+            const outward = vx * hideSign(s.opts);
+            if (outward > fling_thresh or (ev.phase == .up and @abs(outward) <= fling_thresh and s.progress < 0.5)) {
+                closeSheet(sheet);
+            } else {
+                animateProgress(sheet, s, 1);
+            }
+            return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
 fn panelDeinit(n: *Node) void {
     n.allocator.destroy(panelStateOf(n));
 }
@@ -285,6 +352,7 @@ const panel_vtable = ui.node.VTable{
     .map_paint_rect = panelMapPaintRect,
     .hit_bounds = panelHitBounds,
     .pre_children_hit = panelPreChildrenHit,
+    .on_pointer = panelOnPointer,
     .deinit = panelDeinit,
 };
 
@@ -649,6 +717,62 @@ test "side_sheet: a modal sheet shows the scrim; a scrim click + Escape close it
     try std.testing.expect(!stateOf(st).back_registered);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .escape });
     try std.testing.expect(so.peek()); // standard sheets are not modal barriers
+}
+
+test "side_sheet: a modal sheet is swipe-to-dismiss — a drag to the edge tracks the finger and settles" {
+    var closed: u32 = 0;
+    const cb = Callback{ .fn_ptr = struct {
+        fn f(u: ?*anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(u.?));
+            c.* += 1;
+        }
+    }.f, .userdata = &closed };
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const d = try sideSheet(std.testing.allocator, open, cb, .{
+        .modal = true,
+        .body = try golden.solidBox(std.testing.allocator, 400, 200, 0x112233FF),
+    });
+    defer d.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 400, .h = 200 });
+    const s = stateOf(d);
+    const ps = panelStateOf(s.panel);
+    const on_pointer = s.panel.vtable.on_pointer.?;
+    const pb = s.panel.bounds;
+    // right-anchored (LTR end): a drag rightwards reduces progress
+    _ = on_pointer(s.panel, .{ .phase = .down, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10, .time_ms = 0 });
+    try std.testing.expect(ps.drag_active);
+    _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10 + s.panel_w * 0.6, .raw_y = pb.y + 10, .time_ms = 100 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), s.progress, 0.05);
+    // fast fling outwards dismisses
+    _ = on_pointer(s.panel, .{ .phase = .up, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10 + s.panel_w * 0.6, .raw_y = pb.y + 10, .time_ms = 200 });
+    try std.testing.expect(!open.peek());
+    try std.testing.expectEqual(@as(u32, 1), closed);
+    // a short slow drag settles back open
+    open.set(true);
+    d.layout(.{ .x = 0, .y = 0, .w = 400, .h = 200 });
+    _ = on_pointer(s.panel, .{ .phase = .down, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10, .time_ms = 300 });
+    var t_ms: u64 = 400;
+    var xx = pb.x + 10 + s.panel_w * 0.1;
+    _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = xx, .raw_y = pb.y + 10, .time_ms = t_ms });
+    for (0..5) |_| { // decay the smoothed velocity below the fling threshold
+        xx += 1;
+        t_ms += 100;
+        _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = xx, .raw_y = pb.y + 10, .time_ms = t_ms });
+    }
+    _ = on_pointer(s.panel, .{ .phase = .up, .x = pb.x + 10, .y = pb.y + 10, .raw_x = xx, .raw_y = pb.y + 10, .time_ms = t_ms + 100 });
+    try std.testing.expect(open.peek());
+    try std.testing.expectEqual(@as(f32, 1), s.progress);
+    // a standard sheet does not drag-dismiss
+    const so = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer so.deinit();
+    const st = try sideSheet(std.testing.allocator, so, null, .{
+        .body = try golden.solidBox(std.testing.allocator, 400, 200, 0x112233FF),
+    });
+    defer st.deinit();
+    st.layout(.{ .x = 0, .y = 0, .w = 400, .h = 200 });
+    const sp = stateOf(st).panel;
+    try std.testing.expect(!sp.vtable.on_pointer.?(sp, .{ .phase = .down, .x = 300, .y = 10, .raw_x = 300, .raw_y = 10 }));
 }
 
 test "side_sheet: RTL flips the anchored side (end → the physical left edge)" {
