@@ -1128,11 +1128,14 @@ void kx_layer_close(kx_ctx* ctx) {
         SkPaint paint;
         paint.setAlphaf(L->alpha);
         // Same adaptive downscale as the backdrop path — a blurred layer
-        // has no content above ~1/sigma cycles/px.
+        // has no content above ~1/sigma cycles/px. DEVICE-space
+        // thresholds: a scaled canvas inflates rasterized texels and the
+        // effective sigma alike.
+        const float ds = fabsf(ctx->canvas->getTotalMatrix().getScaleX());
         float scale = 1.f;
-        if (b.width() * b.height() >= 32.f * 1024.f) {
-            if (L->blur_sigma >= 20.f) scale = 0.25f;
-            else if (L->blur_sigma >= 8.f) scale = 0.5f;
+        if (b.width() * b.height() * ds * ds >= 32.f * 1024.f) {
+            if (L->blur_sigma * ds >= 20.f) scale = 0.25f;
+            else if (L->blur_sigma * ds >= 8.f) scale = 0.5f;
         }
         if (scale < 1.f) {
             const SkSamplingOptions linear(SkFilterMode::kLinear);
@@ -2770,10 +2773,16 @@ void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sig
     // on top covers any edge softness); sigma>=20 quarters it. On GPU the
     // same chain trades full-res fragments for two extra render targets —
     // still a win once the band is large.
+    // Thresholds are DEVICE-space: a scaled canvas (mobile display_scale)
+    // inflates both the rasterized texels and the effective sigma — a
+    // 360×40dp band at 2.625x is a ~100Kpx blur at sigma 31.
+    const float ds = fabsf(ctx->canvas->getTotalMatrix().getScaleX());
+    const float dev_area = w * h * ds * ds;
+    const float dev_sigma = sigma * ds;
     float scale = 1.f;
-    if (w * h >= 32.f * 1024.f) {
-        if (sigma >= 20.f) scale = 0.25f;
-        else if (sigma >= 8.f) scale = 0.5f;
+    if (dev_area >= 32.f * 1024.f) {
+        if (dev_sigma >= 20.f) scale = 0.25f;
+        else if (dev_sigma >= 8.f) scale = 0.5f;
     }
     if (scale < 1.f) {
         const SkSamplingOptions linear(SkFilterMode::kLinear);
