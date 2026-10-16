@@ -28,8 +28,8 @@ Port contract per widget:
 | button_group | ButtonGroup.kt | ButtonGroupSmallTokens, ConnectedButtonGroupSmallTokens | **ported** |
 | card | Card.kt | FilledCardTokens, ElevatedCardTokens | pending |
 | carousel | carousel/Carousel.kt + Keylines.kt + KeylineList.kt + Strategy.kt + KeylineSnapPosition.kt | — | **ported** |
-| checkbox | Checkbox.kt | CheckboxTokens | pending |
-| chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | pending |
+| checkbox | Checkbox.kt | CheckboxTokens | ported |
+| chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | ported |
 | date_picker | DatePicker.kt | DatePickerModalTokens | pending |
 | divider | Divider.kt | DividerTokens | **ported** |
 | drawer | NavigationDrawer.kt | — | pending |
@@ -41,16 +41,16 @@ Port contract per widget:
 | menu | Menu.kt | MenuTokens, StandardMenuTokens | pending |
 | nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |
 | navigation_rail | NavigationRail.kt | NavigationRailTokens | **ported** |
-| progress | ProgressIndicator.kt + WavyProgressIndicator.kt | (Linear|Circular)ProgressIndicatorTokens | pending |
+| progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-LinearWavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | ported |
 | pull_to_refresh | pulltorefresh/PullToRefresh.kt | — | pending |
-| radio | RadioButton.kt | RadioButtonTokens | pending |
+| radio | RadioButton.kt | RadioButtonTokens | ported |
 | search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | pending |
 | segmented_button | SegmentedButton.kt | SegmentedButtonTokens | **ported** |
 | side_sheet | NavigationDrawer.kt (side-sheet variant) | SheetBottomTokens | pending |
 | snackbar | Snackbar.kt | SnackbarTokens | pending |
 | split_button | SplitButton.kt | SplitButtonTokens | **ported** |
-| switch | Switch.kt | SwitchTokens | pending |
-| tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | pending |
+| switch | Switch.kt | SwitchTokens | ported |
+| tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | ported |
 | text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | pending |
 | time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | pending |
 | toolbar | FloatingToolbar.kt / DockedToolbarTokens | DockedToolbarTokens | pending |
