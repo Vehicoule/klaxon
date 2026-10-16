@@ -973,7 +973,7 @@ fn chipOnKey(n: *Node, ev: input.KeyEvent) bool {
 }
 fn chipDeinit(n: *Node) void {
     const s = stateOf(ChipState, n);
-    if (s.selected) |sig| sig.unsubscribe(.{ .node = n });
+    if (s.selected) |sig| ui.state.unbindNode(n, sig);
     input.releaseNode(n);
     n.allocator.free(s.label);
     n.allocator.destroy(s);

@@ -94,6 +94,7 @@ pub const SignalBase = struct {
             if (z.base.notify_depth == 0) {
                 // Free the subscriber list while the struct is still alive
                 // (it lives inside the owner), then destroy the owner.
+                z.base.detachBoundNodes();
                 z.base.subscribers.deinit();
                 z.destroy(z.owner);
                 _ = zombie_signals.swapRemove(i);
@@ -155,6 +156,27 @@ pub const SignalBase = struct {
         }
     }
 
+    /// A node bound via bindNode keeps this base in its bound_signals for
+    /// the auto-unbind at deinitBody. A signal dying FIRST must remove
+    /// itself from every bound node's list — otherwise the node's later
+    /// teardown dereferences this (freed) base.
+    fn detachBoundNodes(base: *SignalBase) void {
+        for (base.subscribers.items) |*entry| {
+            const n = switch (entry.sub) {
+                .node => |nd| nd,
+                else => continue,
+            };
+            var i: usize = 0;
+            while (i < n.bound_signals.items.len) {
+                if (n.bound_signals.items[i] == @as(*anyopaque, base)) {
+                    _ = n.bound_signals.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
     pub fn deinit(base: *SignalBase) void {
         if (base.notify_depth > 0) {
             // Deinit'd mid-notify (a subscriber tore down its own signal):
@@ -163,6 +185,7 @@ pub const SignalBase = struct {
             base.dying = true;
             return;
         }
+        base.detachBoundNodes();
         base.subscribers.deinit();
     }
 };
@@ -539,8 +562,35 @@ pub fn Store(comptime T: type) type {
 }
 
 /// Bind a node to a signal: on change, the node is marked dirty (re-rendered).
+/// The binding is recorded on the node — deinitBody unsubscribes it
+/// automatically (unbindNode detaches early). Signals must outlive the
+/// bound node OR be freed inside that node's own deinit (widget-owned
+/// signals are: unbindAll runs first).
 pub fn bindNode(node: *Node, signal: anytype) void {
     signal.subscribe(.{ .node = node });
+    node.bound_signals.append(node.allocator, &signal.base) catch @panic("klaxon: out of memory");
+}
+
+/// Detach a binding made by bindNode before the node's deinit.
+pub fn unbindNode(node: *Node, signal: anytype) void {
+    signal.unsubscribe(.{ .node = node });
+    const base: *SignalBase = &signal.base;
+    for (node.bound_signals.items, 0..) |b, i| {
+        if (b == @as(*anyopaque, base)) {
+            _ = node.bound_signals.swapRemove(i);
+            break;
+        }
+    }
+}
+
+/// deinitBody hook — drop every signal this node is still bound to.
+pub fn unbindAll(node: *Node) void {
+    for (node.bound_signals.items) |b| {
+        const base: *SignalBase = @ptrCast(@alignCast(b));
+        base.unsubscribe(.{ .node = node });
+    }
+    node.bound_signals.deinit(node.allocator);
+    node.bound_signals = .empty;
 }
 
 // --- tests ---

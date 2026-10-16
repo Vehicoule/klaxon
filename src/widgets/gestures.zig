@@ -219,7 +219,7 @@ fn sigBoxPaint(n: *Node, ctx: *kx.Ctx) void {
 }
 fn sigBoxDeinit(n: *Node) void {
     const s: *SigBoxState = @ptrCast(@alignCast(n.state.?));
-    s.sig.unsubscribe(.{ .node = n });
+    ui.state.unbindNode(n, s.sig);
     n.allocator.destroy(s);
 }
 const sig_box_vtable = ui.node.VTable{ .measure = sigBoxMeasure, .layout = sigBoxLayout, .paint = sigBoxPaint, .deinit = sigBoxDeinit };

@@ -9,6 +9,7 @@ const layout_mod = @import("layout.zig");
 const input_mod = @import("input.zig");
 const scroll_mod = @import("scroll.zig");
 const semantics_mod = @import("semantics.zig");
+const state_mod = @import("state.zig");
 
 pub const Paint = paint_mod.Paint;
 pub const Constraints = layout_mod.Constraints;
@@ -274,6 +275,10 @@ pub const Node = struct {
     /// node is part of the tree (paint/hit-test) but is NOT document data —
     /// the registry's treeToValue skips it (the widget rebuilds it).
     internal: bool = false,
+    /// Signals bound via ui.state.bindNode — auto-unsubscribed in deinitBody
+    /// (BEFORE the vtable deinit frees widget-owned signals). Untyped: the
+    /// SignalBase lives in state.zig, which already imports this file.
+    bound_signals: std.ArrayListUnmanaged(*anyopaque) = .empty,
     /// Defer this node's paint to the popup overlay pass: the parent's
     /// children paint loop skips it, and the host paints the open popup's
     /// paint_overlay hook AFTER the tree — so popup content overflowing its
@@ -1232,6 +1237,10 @@ pub const Node = struct {
         // is freed — virtualized lists destroy captured items on scroll.
         input_mod.releaseNode(node);
         semantics_mod.focusNodeDestroyed(node); // drop the a11y focus if it was focused (Phase 2c)
+        // Drop signal subscriptions BEFORE the vtable deinit frees any
+        // widget-owned signals — a dangling .node subscriber would call
+        // markDirty on freed memory at the next notify (UAF).
+        state_mod.unbindAll(node);
         // Drain with pop(), not a captured slice: a child's vtable deinit
         // can mutate this node's child list (a sibling removing itself)
         // — realloc would dangle the slice, a shift would skip a child.
