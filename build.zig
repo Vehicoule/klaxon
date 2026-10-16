@@ -19,7 +19,30 @@ pub fn build(b: *std.Build) void {
     // Default ReleaseFast: the interactive demos (gallery, navigator, …) are
     // what people run — a Debug build makes a theme rebuild ~450ms instead of
     // ~1.5ms and misrepresents the framework. -Doptimize=Debug still works.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // NOTE: not standardOptimizeOption(.preferred_optimize_mode) — Zig 0.17
+    // replaces the -Doptimize flag with -Drelease entirely when a preferred
+    // mode is set, so every -Doptimize=<mode> script silently builds Debug.
+    const optimize: std.builtin.OptimizeMode = blk: {
+        if (b.option([]const u8, "optimize",
+            "Prioritize performance, safety, or binary size (default: fast)")) |s| {
+            if (std.meta.stringToEnum(std.builtin.OptimizeMode, s)) |m| break :blk m;
+            // Zig 0.17 renamed the enum members (ReleaseSmall -> small); keep
+            // the legacy spellings working for packaging scripts and CI.
+            const legacy = std.StaticStringMap(std.builtin.OptimizeMode).initComptime(.{
+                .{ "Debug", .debug },
+                .{ "ReleaseSafe", .safe },
+                .{ "ReleaseFast", .fast },
+                .{ "ReleaseSmall", .small },
+            });
+            break :blk legacy.get(s) orelse
+                @panic("unknown -Doptimize value (expected debug|safe|fast|small)");
+        }
+        break :blk switch (b.graph.release_mode) {
+            .off, .any, .fast => .fast,
+            .safe => .safe,
+            .small => .small,
+        };
+    };
 
     // Phase 3f: wasm32-emscripten web target (docs/specs/phase-3f-wasm-plan.md).
     const is_wasm = target.result.os.tag == .emscripten;
