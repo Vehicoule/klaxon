@@ -189,6 +189,14 @@ fn textPaintBounds(n: *Node) Rect {
 }
 const text_vtable = ui.node.VTable{ .measure = textMeasure, .layout = textLayout, .paint = textPaint, .deinit = textDeinit, .paint_bounds = textPaintBounds, .measure_pure = true };
 
+/// The first-line baseline offset (ascent) of a Text node — the anchor for
+/// baseline-driven layouts (e.g. Compose `paddingFromBaseline` in tooltips).
+/// Call after the node has been measured at the intended constraints.
+pub fn textBaseline(n: *Node) f32 {
+    const s: *TextState = @ptrCast(@alignCast(n.state.?));
+    return s.m.ascent;
+}
+
 pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*Node {
     const node = try Node.create(allocator, &text_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty

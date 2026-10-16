@@ -54,7 +54,7 @@ Port contract per widget:
 | text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt + TextFieldImpl.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | ported |
 | time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | pending |
 | toolbar | FloatingToolbar.kt | FloatingToolbarTokens, FabBaseline/MediumTokens | ported |
-| tooltip | Tooltip.kt | PlainTooltipTokens, RichTooltipTokens | pending |
+| tooltip | Tooltip.kt | PlainTooltipTokens, RichTooltipTokens | **ported** (plain + rich variant, caret, 4-side placement; no popup/long-press machinery) |
 
 No upstream counterpart (Klaxon-native, M3-styled): avatar, calendar,
 color_picker, expansion_panel, stepper, table, tree.
