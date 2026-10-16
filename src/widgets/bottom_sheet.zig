@@ -57,6 +57,10 @@ pub const BottomSheetOptions = struct {
     body: ?*Node = null, // the page content (behind)
     content: ?*Node = null, // the sheet content (panel)
     drag_handle: bool = true,
+    /// Upstream skipPartiallyExpanded: when false and the sheet is taller
+    /// than half the parent, releasing a drag mid-way settles at the
+    /// PartiallyExpanded anchor (the sheet occupies the bottom half).
+    skip_partially: bool = false,
     theme: Theme = theme_mod.light,
     label: []const u8 = "Bottom sheet",
 };
@@ -70,7 +74,11 @@ const SheetState = struct {
     progress: f32 = 0, // 0 = closed, 1 = open (animated)
     anim_to: f32 = 0,
     laid_out: bool = false,
+    last_sig: bool = false, // sig value seen at the last layout (drags don't fight)
     panel_h: f32 = 0, // laid-out panel height (drives the slide offset)
+    /// The PartiallyExpanded anchor as a progress fraction (0 = no partial
+    /// state — the sheet fits inside the bottom half anyway).
+    partial_p: f32 = 0,
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
 };
@@ -211,6 +219,13 @@ const handle_vtable = ui.node.VTable{
 const PanelState = struct {
     sheet: *Node,
     offset_y: f32 = 0, // slide offset (positive = down = hidden)
+    // --- drag-to-dismiss (upstream anchored draggable on the drag handle) ---
+    drag_active: bool = false,
+    drag_y0: f32 = 0, // raw y at grab
+    drag_p0: f32 = 0, // progress at grab
+    drag_vy: f32 = 0, // smoothed velocity, px/ms (positive = down)
+    drag_last_y: f32 = 0,
+    drag_last_t: u64 = 0,
 };
 
 fn panelStateOf(n: *Node) *PanelState {
@@ -245,6 +260,89 @@ fn panelHitBounds(n: *Node) Rect {
     return .{ .x = b.x, .y = b.y + dy, .w = b.w, .h = b.h };
 }
 
+/// Upstream VelocityThreshold (125.dp/s → px/ms). A fling past it settles at
+/// the next anchor in its direction; a slower release at the nearest one.
+const fling_thresh: f32 = 0.125;
+
+/// Drag-to-dismiss: the handle block at the panel's top is the grab zone
+/// (the upstream affordance — content keeps its own interactions).
+fn panelOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const ps = panelStateOf(n);
+    const sheet = ps.sheet;
+    const s = stateOf(sheet);
+    const b = n.bounds;
+    switch (ev.phase) {
+        .down => {
+            const grab_h = if (s.opts.drag_handle) handle_h + handle_v_padding * 2 else @as(f32, 32);
+            const in_grab = ev.y >= b.y and ev.y <= b.y + grab_h; // hit-space = pre-translation bounds
+            if (!s.sig.peek() or s.panel_h <= 0 or !in_grab) return false;
+            ps.drag_active = true;
+            ps.drag_y0 = ev.raw_y;
+            ps.drag_p0 = s.progress;
+            ps.drag_vy = 0;
+            ps.drag_last_y = ev.raw_y;
+            ps.drag_last_t = ev.time_ms;
+            return true;
+        },
+        .move => {
+            if (!ps.drag_active) return false;
+            // smoothed velocity (px/ms)
+            const dt = ev.time_ms - ps.drag_last_t;
+            if (dt > 0) {
+                const inst = (ev.raw_y - ps.drag_last_y) / @as(f32, @floatFromInt(dt));
+                ps.drag_vy = ps.drag_vy * 0.6 + inst * 0.4;
+            }
+            ps.drag_last_y = ev.raw_y;
+            ps.drag_last_t = ev.time_ms;
+            const p = std.math.clamp(ps.drag_p0 - (ev.raw_y - ps.drag_y0) / s.panel_h, 0, 1);
+            if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the finger drives
+            applyProgress(sheet, s, p, p * scrim_max_alpha);
+            return true;
+        },
+        .up, .leave => {
+            if (!ps.drag_active) return ev.phase == .up;
+            ps.drag_active = false;
+            settleSheet(sheet, s, ps.drag_vy);
+            return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Release: settle at an anchor (Hidden / PartiallyExpanded / Expanded) —
+/// a fling takes the next anchor in its direction, else the nearest one.
+fn settleSheet(n: *Node, s: *SheetState, vy_ms: f32) void {
+    const anchors = [3]f32{ 0, s.partial_p, 1 };
+    const p = s.progress;
+    var target: f32 = 1;
+    if (vy_ms > fling_thresh) { // fling down → the anchor just below
+        target = 0;
+        for (anchors) |a| {
+            if (a < p - 0.001 and a > target) target = a;
+        }
+    } else if (vy_ms < -fling_thresh) { // fling up → the anchor just above
+        for (anchors) |a| {
+            if (a > p + 0.001 and a < target) target = a;
+        }
+    } else { // the nearest anchor
+        var best: f32 = 1e9;
+        for (anchors) |a| {
+            const d = @abs(p - a);
+            if (d < best) {
+                best = d;
+                target = a;
+            }
+        }
+    }
+    if (target <= 0.001) {
+        closeSheet(n); // Hidden → the signal + on_closed
+    } else {
+        s.anim_to = target;
+        animateProgress(n, s, target); // PartiallyExpanded or Expanded — still open
+    }
+}
+
 fn panelDeinit(n: *Node) void {
     n.allocator.destroy(panelStateOf(n));
 }
@@ -273,6 +371,7 @@ const panel_vtable = ui.node.VTable{
     .map_paint_rect = panelMapPaintRect,
     .hit_bounds = panelHitBounds,
     .pre_children_hit = panelPreChildrenHit,
+    .on_pointer = panelOnPointer,
     .deinit = panelDeinit,
 };
 
@@ -304,6 +403,9 @@ fn sheetLayout(n: *Node, bounds: Rect) void {
     ph = @min(ph, @max(0, bounds.h - top_margin));
     const py = bounds.y + bounds.h - ph;
     s.panel_h = ph;
+    // The PartiallyExpanded anchor: the sheet occupies the bottom half —
+    // only exists when it doesn't already fit inside it (upstream).
+    s.partial_p = if (!s.opts.skip_partially and ph > bounds.h / 2) (bounds.h / 2) / ph else 0;
     s.panel.layout(.{ .x = px, .y = py, .w = pw, .h = ph });
     // Panel children in factory order: background (fills the panel), the
     // optional drag handle (centered in its block), the content slot (fills
@@ -321,14 +423,18 @@ fn sheetLayout(n: *Node, bounds: Rect) void {
     if (s.opts.content != null and panel.children.items.len > next) {
         panel.children.items[next].layout(.{ .x = px, .y = py + handle_block_h, .w = pw, .h = @max(0, ph - handle_block_h) });
     }
-    const target: f32 = if (s.sig.peek()) 1 else 0;
+    const sig_now = s.sig.peek();
     if (!s.laid_out) {
+        const target: f32 = if (sig_now) 1 else 0;
         s.anim_to = target;
         applyProgress(n, s, target, target * scrim_max_alpha);
         s.laid_out = true;
-    } else if (target != s.anim_to) {
-        animateProgress(n, s, target);
+    } else if (sig_now != s.last_sig) {
+        // The sig changed between layouts (a programmatic set — the drag
+        // settle only touches progress/partial_p and must not fight it).
+        animateProgress(n, s, if (sig_now) 1 else 0);
     }
+    s.last_sig = sig_now;
 }
 
 fn sheetPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -579,6 +685,78 @@ test "bottom_sheet: without a timeline the panel snaps open/closed on the signal
     try std.testing.expectEqual(@as(f32, 0), s.progress);
     try std.testing.expectEqual(s.panel_h, panelStateOf(s.panel).offset_y);
     try std.testing.expect(!s.panel.visible);
+}
+
+test "bottom_sheet: dragging the handle zone moves the sheet; a slow release settles at the nearest anchor" {
+    var closed: u32 = 0;
+    const cb = Callback{ .fn_ptr = struct {
+        fn f(u: ?*anyopaque) void {
+            const c: *u32 = @ptrCast(@alignCast(u.?));
+            c.* += 1;
+        }
+    }.f, .userdata = &closed };
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const d = try bottomSheet(std.testing.allocator, open, cb, .{
+        .body = try golden.solidBox(std.testing.allocator, 320, 400, 0x112233FF),
+        .content = try text_w.text(std.testing.allocator, "Sheet", .{}),
+    });
+    defer d.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 400 });
+    const s = stateOf(d);
+    const ps = panelStateOf(s.panel);
+    const on_pointer = s.panel.vtable.on_pointer.?;
+    const pb = s.panel.bounds;
+    // grab inside the handle zone (the panel's top block)
+    _ = on_pointer(s.panel, .{ .phase = .down, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10, .time_ms = 0 });
+    try std.testing.expect(ps.drag_active);
+    // drag down 60% of the panel height → progress ~0.4
+    _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10 + s.panel_h * 0.6, .time_ms = 100 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), s.progress, 0.01);
+    // slow release: the sheet is short (no partial anchor) → settles at Hidden
+    _ = on_pointer(s.panel, .{ .phase = .up, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10 + s.panel_h * 0.6, .time_ms = 200 });
+    try std.testing.expect(!ps.drag_active);
+    try std.testing.expect(!open.peek()); // dismissed through the signal
+    try std.testing.expectEqual(@as(u32, 1), closed);
+    // a short drag settles back at Expanded
+    open.set(true);
+    d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 400 });
+    _ = on_pointer(s.panel, .{ .phase = .down, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10, .time_ms = 300 });
+    _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10 + s.panel_h * 0.1, .time_ms = 400 });
+    _ = on_pointer(s.panel, .{ .phase = .up, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10 + s.panel_h * 0.1, .time_ms = 500 });
+    try std.testing.expect(open.peek());
+    try std.testing.expectEqual(@as(f32, 1), s.progress);
+}
+
+test "bottom_sheet: a tall sheet settles at the PartiallyExpanded anchor (bottom half)" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    // content taller than half the parent → the partial anchor exists
+    const d = try bottomSheet(std.testing.allocator, open, null, .{
+        .body = try golden.solidBox(std.testing.allocator, 320, 400, 0x112233FF),
+        .content = try golden.solidBox(std.testing.allocator, 300, 260, 0x334455FF),
+    });
+    defer d.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 320, .h = 400 });
+    const s = stateOf(d);
+    // panel_h = 260 + the handle block (52) = 312 > 200 → partial = 200/312
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0 / 312.0), s.partial_p, 0.01);
+    const on_pointer = s.panel.vtable.on_pointer.?;
+    const pb = s.panel.bounds;
+    // drag down to ~55% progress and release slowly → PartiallyExpanded
+    _ = on_pointer(s.panel, .{ .phase = .down, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10, .time_ms = 0 });
+    _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = pb.y + 10 + s.panel_h * 0.45, .time_ms = 100 });
+    // small slow moves decay the smoothed velocity below the fling threshold
+    var t_ms: u64 = 200;
+    var yy = pb.y + 10 + s.panel_h * 0.45;
+    for (0..6) |_| {
+        yy += 1;
+        t_ms += 100;
+        _ = on_pointer(s.panel, .{ .phase = .move, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = yy, .time_ms = t_ms });
+    }
+    _ = on_pointer(s.panel, .{ .phase = .up, .x = pb.x + 10, .y = pb.y + 10, .raw_x = pb.x + 10, .raw_y = yy, .time_ms = t_ms + 100 });
+    try std.testing.expect(open.peek()); // still open
+    try std.testing.expectApproxEqAbs(s.partial_p, s.progress, 0.01);
 }
 
 test "bottom_sheet: the content fills what the handle block leaves (no overlap, no phantom offset)" {

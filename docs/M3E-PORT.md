@@ -23,10 +23,10 @@ Port contract per widget:
 | app_bar | AppBar.kt | AppBarTokens + Small/Medium/Large(Flexible) | **ported** |
 | bottom_app_bar | AppBar.kt | BottomAppBarTokens | **ported** |
 | badge | Badge.kt | BadgeTokens | **ported** |
-| bottom_sheet | ModalBottomSheet.kt + SheetDefaults.kt + DragHandle.kt | SheetBottomTokens, DragHandleTokens | pending |
+| bottom_sheet | ModalBottomSheet.kt + SheetDefaults.kt + DragHandle.kt | SheetBottomTokens, DragHandleTokens | **ported** |
 | button | Button.kt | Button(S-XL)Tokens, Filled/Tonal/Outlined/TextButtonTokens | **ported** |
 | button_group | ButtonGroup.kt | ButtonGroupSmallTokens, ConnectedButtonGroupSmallTokens | **ported** |
-| card | Card.kt | FilledCardTokens, ElevatedCardTokens | pending |
+| card | Card.kt | FilledCardTokens, ElevatedCardTokens, OutlinedCardTokens | **ported** |
 | carousel | carousel/Carousel.kt + Keylines.kt + KeylineList.kt + Strategy.kt + KeylineSnapPosition.kt | — | **ported** |
 | checkbox | Checkbox.kt | CheckboxTokens | ported |
 | chip | Chip.kt | ChipsTokens, FilterChipTokens, InputChipTokens | ported |
@@ -36,7 +36,7 @@ Port contract per widget:
 | fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | **ported** |
 | fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | **ported** |
 | icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | **ported** |
-| list_item | ListItem.kt | ListTokens | pending |
+| list_item | ListItem.kt | ListTokens | **ported** |
 | loading_indicator | LoadingIndicator.kt | LoadingIndicatorTokens | **ported** |
 | menu | Menu.kt | MenuTokens, StandardMenuTokens | **ported** |
 | nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |

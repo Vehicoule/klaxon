@@ -59,7 +59,10 @@ pub const ListItemOptions = struct {
     trailing_icon: ?icon_w.IconName = null,
     /// A short trailing label (label_small, end side).
     trailing_text: []const u8 = "",
-    lines: ListItemLines = .one,
+    /// Upstream derives the item type from the content (overline+supporting
+    /// → three-line, either → two, neither → one). Set explicitly to force
+    /// the container class instead.
+    lines: ?ListItemLines = null,
     enabled: bool = true,
     /// The selected state (fixed when no signal is given — selection is
     /// EXTERNAL state: the click fires on_click, it does not flip).
@@ -108,13 +111,32 @@ fn isClickable(s: *ListItemState) bool {
     return s.on_click != null and s.opts.enabled;
 }
 
-/// The min height per the lines option (ListTokens).
+/// Upstream ListItemType: overline+supporting → three-line, either → two,
+/// neither → one. `opts.lines` forces the container class when set.
+const ItemType = enum { one, two, three };
+fn itemType(s: *ListItemState) ItemType {
+    if (s.opts.lines) |l| return switch (l) { .one => .one, .two => .two, .three => .three };
+    const oh = hasOverline(s);
+    const sh = hasSupporting(s);
+    if (oh and sh) return .three;
+    if (oh or sh) return .two;
+    return .one;
+}
+
+/// The min height per the derived item type (ListTokens).
 fn minHeight(s: *ListItemState) f32 {
-    return switch (s.opts.lines) {
-        .one => 56,
-        .two => 72,
-        .three => 88,
+    return switch (itemType(s)) {
+        .one => 56, // ItemOneLineContainerHeight
+        .two => 72, // ItemTwoLineContainerHeight
+        .three => 88, // ItemThreeLineContainerHeight
     };
+}
+
+/// The vertical padding per type (ListItemVerticalPadding /
+/// ListItemThreeLineVerticalPadding). Three-line items align their content
+/// to the top — the padding IS the visual offset.
+fn verticalPadding(s: *ListItemState) f32 {
+    return if (itemType(s) == .three) 12 else 8;
 }
 
 fn hasOverline(s: *ListItemState) bool {
@@ -180,7 +202,11 @@ fn listItemMeasure(n: *Node, c: Constraints) Size {
         if (has_trail_text) zone_w += ui.paint.measureText(s.trailing_text, t.type_scale.label_small.size, false).width;
         w += icon_gap + zone_w; // TrailingContentStartPadding + the zone
     }
-    return c.constrain(.{ .w = w, .h = @max(minHeight(s), contentHeight(s, t)) });
+    // upstream calculateHeight: max(minHeight, vpad*2 + max(leading, text, trailing))
+    const leading_h: f32 = if (s.opts.leading_icon != null) icon_size else 0;
+    const trailing_h: f32 = if (has_trail_icon or has_trail_text) @max(icon_size, t.type_scale.label_small.line_height) else 0;
+    const h = @max(minHeight(s), verticalPadding(s) * 2 + @max(leading_h, @max(contentHeight(s, t), trailing_h)));
+    return c.constrain(.{ .w = w, .h = h });
 }
 
 fn listItemLayout(n: *Node, bounds: Rect) void {
@@ -226,10 +252,11 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
         }
     }
 
-    // --- the text column (centered vertically; the LTR anchor — each run
-    // mirrors itself once with its measured width) ---
+    // --- the text column (three-line top-aligns at its 12dp padding; the
+    // others center — upstream place()); each run mirrors itself ---
+    const three = itemType(s) == .three;
     const content_h = contentHeight(s, t);
-    var y = b.y + (b.h - content_h) / 2;
+    var y = if (three) b.y + verticalPadding(s) else b.y + (b.h - content_h) / 2;
     const text_x = b.x + h_padding + (if (s.opts.leading_icon != null) icon_size + icon_gap else 0);
     if (hasOverline(s)) {
         const style = t.type_scale.label_small;
@@ -252,7 +279,9 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
     // --- leading icon (start side, vertically centered) ---
     if (s.opts.leading_icon) |iname| {
         const ix = mx(b.x, b.w, b.x + h_padding, icon_size, rtl);
-        paintIcon(ctx, iname, ix, b.y + (b.h - icon_size) / 2, fc.icon);
+        // three-line: the slot top-aligns at the vertical padding; else centered
+        const iy = if (three) b.y + verticalPadding(s) else b.y + (b.h - icon_size) / 2;
+        paintIcon(ctx, iname, ix, iy, fc.icon);
     }
     // --- the trailing zone: [icon?][8dp gap][text?] ending 16dp from the end
     // (sequential — an icon and a text never overlap)
@@ -264,7 +293,7 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
             if (has_trail_text) {
                 const style = t.type_scale.label_small;
                 const m = ui.paint.measureText(s.trailing_text, style.size, false);
-                const ty = b.y + (b.h - m.height) / 2 + m.ascent;
+                const ty = if (three) b.y + verticalPadding(s) + m.ascent else b.y + (b.h - m.height) / 2 + m.ascent;
                 const tx = mx(b.x, b.w, zone_end - m.width, m.width, rtl);
                 ui.paint.text(ctx, s.trailing_text, tx, ty, style.size, false, fc.trailing_text);
                 zone_end -= m.width;
@@ -272,7 +301,8 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
             }
             if (has_trail_icon) {
                 const ix = mx(b.x, b.w, zone_end - icon_size, icon_size, rtl);
-                paintIcon(ctx, s.opts.trailing_icon, ix, b.y + (b.h - icon_size) / 2, fc.icon);
+                const iy = if (three) b.y + verticalPadding(s) else b.y + (b.h - icon_size) / 2;
+                paintIcon(ctx, s.opts.trailing_icon, ix, iy, fc.icon);
             }
         }
     }
@@ -457,6 +487,42 @@ test "list_item: measures the per-lines min heights (56/72/88), content + paddin
     defer both.deinit();
     const tw = ui.paint.measureText("Edit", 11, false).width;
     try std.testing.expectApproxEqAbs(h_padding * 2 + hw + icon_gap + icon_size + 8 + tw + trailing_space, both.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
+}
+
+test "list_item: the item type derives from the content; three-line top-aligns at 12dp" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    // upstream ListItemType: overline+supporting → three, either → two, neither → one
+    const d1 = try listItem(a, null, null, .{ .headline = "T", .overline = "O", .supporting = "S", .theme = t });
+    defer d1.deinit();
+    try std.testing.expectEqual(ItemType.three, itemType(stateOf(d1)));
+    try std.testing.expectEqual(@as(f32, 88), d1.measure(.{ .max_w = 2000, .max_h = 2000 }).h);
+    const d2 = try listItem(a, null, null, .{ .headline = "T", .supporting = "S", .theme = t });
+    defer d2.deinit();
+    try std.testing.expectEqual(ItemType.two, itemType(stateOf(d2)));
+    const d3 = try listItem(a, null, null, .{ .headline = "T", .overline = "O", .theme = t });
+    defer d3.deinit();
+    try std.testing.expectEqual(ItemType.two, itemType(stateOf(d3)));
+    // three-line top-aligns: the overline's ink sits at y = 12 + ascent,
+    // not at the centered offset
+    const three = try listItem(a, null, null, .{ .headline = "Title", .supporting = "Sub", .overline = "Over", .theme = t });
+    defer three.deinit();
+    var r = try golden.Renderer.init(a, 240, 100);
+    defer r.deinit();
+    three.layout(.{ .x = 0, .y = 0, .w = 240, .h = 88 });
+    r.paint(three, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    // the overline's first line is at the top padding — a centered layout
+    // would start ~14px lower (88-60)/2
+    const m = ui.paint.measureText("Over", t.type_scale.label_small.size, false);
+    const ink_y: i32 = @intFromFloat(12 + m.ascent - 1); // near the overline's ink top
+    var found = false;
+    var x: i32 = 16;
+    while (x < 240) : (x += 1) {
+        if (f.pixelAt(x, ink_y) == t.colors.on_surface_variant) { found = true; break; }
+    }
+    try std.testing.expect(found);
 }
 
 test "list_item: click fires on_click (selection is external); the signal drives the state" {

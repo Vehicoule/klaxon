@@ -18,12 +18,14 @@
 // The card is a CONTAINER: its children are document data (they keep their
 // own semantics; a child's own click handler wins the hit test first).
 //
-// v1 deviations (documented, fixed later):
-//   - Flat colors (no elevation shadows — Phase 3: hover/press/drag change
-//     the elevation, not the color).
+//   - The container elevation animates through the interaction states
+//     (upstream CardElevation): elevated rests at Level1; every variant
+//     lifts to Level2 (3dp) on hover; dragged would lift to Level3/4 (the
+//     widget has no drag semantics — the token is documented, unused).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const anim = ui.anim;
 const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
@@ -63,6 +65,11 @@ const CardState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The animated container elevation (dp) — upstream CardElevation
+    /// tweens through the interaction states.
+    elev: f32 = 0,
+    elev_target: f32 = -1, // -1 = uninitialized (first layout sets it)
+    elev_channel: u8 = 0, // channel marker (stable address)
 };
 
 fn stateOf(n: *Node) *CardState {
@@ -71,6 +78,54 @@ fn stateOf(n: *Node) *CardState {
 
 fn isClickable(s: *CardState) bool {
     return s.on_click != null and s.opts.enabled;
+}
+
+/// Upstream {Elevated,Filled,Outlined}CardTokens container elevations (dp):
+/// rest / hover / focus / pressed / dragged / disabled.
+const elev_rest = [3]f32{ 0, 1, 0 }; // filled 0, elevated L1, outlined 0
+const elev_hover: f32 = 3; // Level2 (all variants)
+const elev_ms: f32 = 150;
+
+fn variantIndex(s: *CardState) usize {
+    return switch (s.opts.variant) { .filled => 0, .elevated => 1, .outlined => 2 };
+}
+
+/// The elevation the upstream CardElevation resolves to for the current
+/// interaction state (pressed > focused > hovered; disabled pins its own).
+fn targetElevation(n: *Node, s: *CardState) f32 {
+    if (!s.opts.enabled)
+        return elev_rest[variantIndex(s)]; // DisabledContainerElevation = rest
+    if (s.pressed) return elev_rest[variantIndex(s)]; // Pressed = rest
+    if (input.isFocused(n)) return elev_rest[variantIndex(s)]; // Focus = rest
+    if (s.hovered) return elev_hover;
+    return elev_rest[variantIndex(s)];
+}
+
+fn retargetElevation(n: *Node, s: *CardState) void {
+    const target = targetElevation(n, s);
+    if (s.elev_target < 0) { // first call: snap
+        s.elev = target;
+        s.elev_target = target;
+        return;
+    }
+    if (target == s.elev_target) return;
+    s.elev_target = target;
+    if (anim.timeline()) |tl| {
+        _ = tl.play(.{
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, elev_ms, .{ .ease = .standard }),
+            .from = .{ s.elev, 0, 0, 0 },
+            .channel = @ptrCast(&s.elev_channel),
+            .on_update = .{ .fn_ptr = elevAnimCb, .userdata = n },
+        });
+    } else {
+        s.elev = target;
+    }
+}
+
+fn elevAnimCb(userdata: ?*anyopaque, v: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).elev = v[0];
+    n.markDirty();
 }
 
 fn cardMeasure(n: *Node, c: Constraints) Size {
@@ -91,6 +146,7 @@ fn cardMeasure(n: *Node, c: Constraints) Size {
 
 fn cardLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
+    if (s.elev_target < 0) retargetElevation(n, s); // snap the rest elevation
     const inner_x = bounds.x + s.opts.padding.left;
     const inner_w = @max(0, bounds.w - s.opts.padding.hSum());
     var y = bounds.y + s.opts.padding.top;
@@ -116,11 +172,11 @@ fn cardPaint(n: *Node, ctx: *kx.Ctx) void {
         .elevated => cs.surface_container_low,
         .outlined => cs.surface,
     };
-    // Elevated variant: M3 elevation 1 at rest — the card reads above the
-    // surface through its shadow, not a tint change.
-    if (s.opts.variant == .elevated and s.opts.enabled) {
+    // The animated shadow elevation (upstream CardElevation): elevated rests
+    // at 1dp, every variant lifts to 3dp on hover, dragged lifts higher.
+    if (s.elev > 0) {
         ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, card_radius,
-            1, cs.shadow);
+            s.elev, cs.shadow);
     }
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, container);
@@ -191,11 +247,13 @@ fn cardOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .enter => {
             s.hovered = true;
+            retargetElevation(n, s);
             n.markDirty();
             return true;
         },
         .leave => {
             s.hovered = false;
+            retargetElevation(n, s);
             n.markDirty();
             return true;
         },
@@ -220,8 +278,10 @@ fn cardOnKey(n: *Node, ev: input.KeyEvent) bool {
 }
 
 fn cardDeinit(n: *Node) void {
+    const s = stateOf(n);
+    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.elev_channel));
     input.releaseNode(n);
-    n.allocator.destroy(stateOf(n));
+    n.allocator.destroy(s);
 }
 
 const card_vtable = ui.node.VTable{
