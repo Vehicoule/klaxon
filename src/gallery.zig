@@ -1534,7 +1534,7 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     const col = try layout.column(a, .{ .gap = 12 });
     // Progress indicators: linear determinate (25% / 60% / 100%), linear
     // indeterminate, M3E wavy determinate + indeterminate, circular
-    // determinate + indeterminate.
+    // determinate + indeterminate + wavy circular (det + indet).
     const prog_col = try layout.column(a, .{ .gap = 12 });
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 0.25, .theme = theme }));
     prog_col.add(try progress_w.progressIndicator(a, .{ .progress = 0.6, .theme = theme }));
@@ -1545,6 +1545,8 @@ fn buildFeedbackSection(g: *Gallery, theme: Theme) !*Node {
     const circ_row = try layout.row(a, .{ .gap = 24, .cross_align = .center });
     circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .progress = 0.75, .theme = theme }));
     circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .theme = theme })); // indeterminate
+    circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .progress = 0.75, .wavy = true, .theme = theme }));
+    circ_row.add(try progress_w.progressIndicator(a, .{ .kind = .circular, .wavy = true, .theme = theme })); // indeterminate wavy
     prog_col.add(circ_row);
     col.add(prog_col);
     // Badges: large count badge, small dot badge, max-count badge.
@@ -3126,7 +3128,10 @@ test "zz2: slider value changes must not leave ghost thumbs" {
     while (x < x_end) : (x += 1) {
         const px = f.pixelAt(x, cy);
         const is_thumb = px == t.colors.primary;
-        if (is_thumb and !in_run) { runs += 1; in_run = true; }
+        if (is_thumb and !in_run) {
+            runs += 1;
+            in_run = true;
+        }
         if (!is_thumb) in_run = false;
     }
     try std.testing.expectEqual(@as(u32, 1), runs); // exactly one thumb bar

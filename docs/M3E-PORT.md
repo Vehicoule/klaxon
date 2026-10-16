@@ -41,7 +41,7 @@ Port contract per widget:
 | menu | Menu.kt | MenuTokens, StandardMenuTokens | **ported** |
 | nav_bar | NavigationBar.kt | NavigationBarTokens | **ported** |
 | navigation_rail | NavigationRail.kt | NavigationRailTokens | **ported** |
-| progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-LinearWavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | ported |
+| progress | ProgressIndicator.kt + WavyProgressIndicator.kt + internal-(Linear|Circular)WavyProgressModifiers.kt | (Linear|Circular)ProgressIndicatorTokens | **ported** (linear + circular wavy: star/circle ring geometry, arc-length tables, gap/rotate/wave-scroll; no progress spring or 450ms amplitude morph) |
 | pull_to_refresh | pulltorefresh/PullToRefresh.kt | PullToRefreshTokens | **ported** (nested-drag/capture semantics; arrow indicator + Level2 shadow) |
 | radio | RadioButton.kt | RadioButtonTokens | ported |
 | search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | **ported** (collapsed bar; the expanded view is `search_view` below) |

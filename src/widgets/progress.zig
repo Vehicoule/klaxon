@@ -10,6 +10,14 @@
 //                                   updateDrawPaths (segment extraction,
 //                                   adaptive gap, right-to-left track build),
 //                                   wavy drawStopIndicator
+//   - internal-CircularWavyProgressModifiers.kt
+//                                   CircularShapes.update (star/circle
+//                                   polygons), CircularProgressDrawingCache
+//                                   .updateFullPaths/updateDrawPaths
+//                                   (scale+recenter, segment extraction,
+//                                   offset shift + rotateZ, track gap),
+//                                   drawCircularIndicator, the indeterminate
+//                                   rotate(global + additional + 90)
 //   - tokens/LinearProgressIndicatorTokens.kt, CircularProgressIndicatorTokens.kt
 //
 // What the port reproduces:
@@ -28,12 +36,26 @@
 //   - circular indeterminate: keyframed progress 0.1<->0.87 (Standard easing),
 //     4x90deg additional-rotation schedule (EmphasizedDecelerate) + 1080deg
 //     global rotation over 6000ms
+//   - wavy circular: the RoundedPolygon ring machinery of
+//     internal-CircularWavyProgressModifiers.kt — a normalized circle
+//     (track) / rounded star (active, amplitude 1) flattened into
+//     wrap-around arc-length tables (the PathMeasure), segments cut by arc
+//     length, the track gap taken out of the track only, the wave scroll
+//     = shifted segment + rotateZ(-offset*360), and the indeterminate
+//     rotate(global + additional + 90) wrapping both arcs. Container
+//     48dp (WaveSize), wavelength 15dp, star = circle(numVertices)
+//     vs star(numVertices, innerRadius 0.75, rounding 0.35/0.4,
+//     innerRounding 0.5) — via ui.shapes (the androidx.graphics.shapes
+//     port).
 //
 // Deliberate deviations: upstream animates progress changes with a spring
 // (ProgressAnimationSpec) — Klaxon takes progress as a construction-time
 // value; the wave offset/amplitude micro-animations on attach are skipped
-// (amplitude starts at target). Circular WAVY (CircularWavyProgressIndicator,
-// 48dp) is not yet exposed — `wavy` is linear-only here.
+// (amplitude starts at target). The circle->star Morph exists upstream only
+// for intermediate amplitudes (0<amp<1 during the 450ms amplitude
+// cross-fade); the API here produces amplitude in {0,1} only, so the
+// progress path is the star or the track ring exactly like upstream's
+// no-morph branch (internal-CircularWavyProgressModifiers.kt:1399-1403).
 //
 // Painting: everything emits polylines (kx_stroke_polyline) — the wave path
 // is sampled at ~1px x-resolution into a layout-allocated arc-length table
@@ -42,6 +64,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const anim = ui.anim;
+const shapes = ui.shapes;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
@@ -66,6 +89,9 @@ const stop_trailing_max: f32 = 6; // StopIndicatorTrailingSpace
 const circular_size: f32 = 40; // CircularProgressIndicatorTokens.Size
 const circular_stroke: f32 = 4; // Circular TrackThickness
 const circular_gap: f32 = 4; // Circular TrackActiveSpace
+const circ_wavy_size: f32 = 48; // CircularProgressIndicatorTokens.WaveSize
+const circ_wave_len: f32 = 15; // Circular ActiveWaveWavelength (det + indet)
+const min_circ_verts: usize = 5; // MinCircularVertexCount
 const arc_segments: usize = 48; // per full circle
 const wave_seg_cap: usize = 2048; // emitted segment buffer (adaptive stride)
 const linear_indet_ms: u32 = 1750; // LinearAnimationDuration
@@ -78,7 +104,7 @@ pub const ProgressOptions = struct {
     kind: ProgressKind = .linear,
     /// 0..1 determinate; null = indeterminate (loops forever).
     progress: ?f32 = null,
-    wavy: bool = false, // linear only (M3E)
+    wavy: bool = false, // linear + circular (M3E)
     theme: Theme = theme_mod.light,
 };
 
@@ -122,6 +148,17 @@ const ProgressState = struct {
     path_d: []f32 = &.{}, // cumulative arc length
     path_n: usize = 0,
     path_scale: f32 = 1, // arcLen / pathWidth (upstream progressPathScale)
+    // Circular wavy cache — upstream CircularShapes +
+    // CircularProgressDrawingCache: the normalized circle (track) and the
+    // circle-or-star (progress) outlines flattened into wrap-around
+    // arc-length tables (the PathMeasure). Rebuilt when (w, h, amp-class)
+    // change; freed in deinit. Never allocated per frame.
+    circ_w: f32 = -1,
+    circ_h: f32 = -1,
+    circ_amp: f32 = -1, // progress-path amplitude class: 1 = star, 0 = ring
+    circ_verts: usize = 0, // star vertex count (the wave offset period base)
+    circ_prog: RingTable = .{},
+    circ_trk: RingTable = .{},
 };
 
 fn stateOf(n: *Node) *ProgressState {
@@ -130,9 +167,10 @@ fn stateOf(n: *Node) *ProgressState {
 
 fn progressMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
-    const h: f32 = if (s.opts.kind == .linear) (if (s.opts.wavy) wave_height else linear_thickness) else circular_size;
+    const circ_side: f32 = if (s.opts.wavy) circ_wavy_size else circular_size; // WaveSize vs Size
+    const h: f32 = if (s.opts.kind == .linear) (if (s.opts.wavy) wave_height else linear_thickness) else circ_side;
     // LinearIndicatorWidth = 240dp when unbounded (upstream fixed size).
-    const w: f32 = if (s.opts.kind == .circular) circular_size else (if (std.math.isFinite(c.max_w)) c.max_w else 240);
+    const w: f32 = if (s.opts.kind == .circular) circ_side else (if (std.math.isFinite(c.max_w)) c.max_w else 240);
     return c.constrain(.{ .w = w, .h = h });
 }
 
@@ -142,7 +180,7 @@ fn progressMeasure(n: *Node, c: Constraints) Size {
 /// nothing moves between value writes, so no animation is registered and
 /// the host idles.
 fn wantsPhaseLoop(s: *const ProgressState) bool {
-    return s.opts.progress == null or (s.opts.kind == .linear and s.opts.wavy);
+    return s.opts.progress == null or s.opts.wavy;
 }
 
 fn progressLayout(n: *Node, bounds: Rect) void {
@@ -304,6 +342,217 @@ fn emitWaveSegment(s: *const ProgressState, d0: f32, d1: f32, shift: f32, amp: f
         ys[i] = base_y + half_h + waveY(px, s.cache_lambda / 2, s.cache_h - linear_thickness) * amp;
     }
     return count;
+}
+
+// --- circular wavy (internal-CircularWavyProgressModifiers.kt) ---
+
+/// A closed outline sampled into a wrap-around arc-length table — the
+/// CircularProgressDrawingCache PathMeasure. x/y hold n+1 points (the last
+/// duplicates the first so a segment crossing the wrap interpolates
+/// cleanly); d holds n+1 cumulative lengths, d[n] = the full outline
+/// length. The repeated (doubled) path upstream uses for motion is
+/// equivalent to reading distances mod L.
+const RingTable = struct {
+    x: []f32 = &.{},
+    y: []f32 = &.{},
+    d: []f32 = &.{},
+    n: usize = 0, // real points (excludes the duplicated closing point)
+
+    fn deinit(t: *RingTable, a: std.mem.Allocator) void {
+        if (t.x.len > 0) {
+            a.free(t.x);
+            a.free(t.y);
+            a.free(t.d);
+        }
+        t.* = .{};
+    }
+
+    /// progressPathLength / trackPathLength.
+    fn totalLen(t: *const RingTable) f32 {
+        return if (t.n > 0) t.d[t.n] else 0;
+    }
+
+    /// The outline point at arc length `dist`, wrapping — PathMeasure over
+    /// the closed (doubled) path.
+    fn pointAt(t: *const RingTable, dist: f32) [2]f32 {
+        const dd = @mod(dist, t.d[t.n]);
+        var lo: usize = 0;
+        var hi: usize = t.n;
+        while (hi - lo > 1) {
+            const mid = (lo + hi) / 2;
+            if (t.d[mid] <= dd) lo = mid else hi = mid;
+        }
+        const seg = t.d[hi] - t.d[lo];
+        const f = if (seg > 0) (dd - t.d[lo]) / seg else 0;
+        return .{
+            t.x[lo] + (t.x[hi] - t.x[lo]) * f,
+            t.y[lo] + (t.y[hi] - t.y[lo]) * f,
+        };
+    }
+
+    /// pathMeasure.getSegment + the updateDrawPaths rotateZ / the
+    /// indeterminate withTransform rotation: emit [d0, d1] (~1pt per arc px)
+    /// into xs/ys, rotated `rot_deg` about (px, py) (y-down, positive =
+    /// clockwise — the Compose rotateZ convention), then translated by
+    /// (base_x, base_y). Returns the point count.
+    fn emit(t: *const RingTable, d0: f32, d1: f32, rot_deg: f32, px: f32, py: f32, base_x: f32, base_y: f32, xs: []f32, ys: []f32) usize {
+        if (t.n == 0 or d1 <= d0) return 0;
+        const want: usize = @as(usize, @intFromFloat(@ceil(d1 - d0))) + 1;
+        const count = @min(@max(want, 2), xs.len);
+        const rad = rot_deg * std.math.pi / 180;
+        const c = @cos(rad);
+        const sn = @sin(rad);
+        for (0..count) |i| {
+            const p = t.pointAt(d0 + (d1 - d0) * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(count - 1)));
+            const dx = p[0] - px;
+            const dy = p[1] - py;
+            xs[i] = base_x + px + dx * c - dy * sn;
+            ys[i] = base_y + py + dx * sn + dy * c;
+        }
+        return count;
+    }
+};
+
+/// CircularShapes.update: the vertex count is the circumference at the
+/// stroke-adjusted radius divided by the wavelength, clamped to
+/// MinCircularVertexCount.
+fn circVertexCount(w: f32, h: f32) usize {
+    const r = @min(w, h) / 2 - circular_stroke / 2;
+    if (!(r > 0) or !std.math.isFinite(r)) return min_circ_verts;
+    return @max(min_circ_verts, @as(usize, @intFromFloat(@round(2 * std.math.pi * r / circ_wave_len))));
+}
+
+/// Port of updateFullPaths' scale + processPath: the normalized polygon
+/// outline is scaled by (size - strokeWidth) per axis and translated so its
+/// (approximate cubic) bounds center lands on the size center, then
+/// flattened into a RingTable. Returns a table with n==0 on <2 points.
+fn circBuildTable(a: std.mem.Allocator, poly: *const shapes.RoundedPolygon, w: f32, h: f32) !RingTable {
+    var t: RingTable = .{};
+    errdefer t.deinit(a);
+    const sx = w - circular_stroke; // scaleMatrix.scale(width - stroke.width)
+    const sy = h - circular_stroke;
+    const bb = poly.bounds(); // normalized 0..1 bounds
+    const ox = w / 2 - (bb.min[0] + bb.max[0]) / 2 * sx; // size.center - bounds.center
+    const oy = h / 2 - (bb.min[1] + bb.max[1]) / 2 * sy;
+    var pts = std.array_list.Managed(shapes.Point).init(a);
+    defer pts.deinit();
+    try poly.flatten(0.15 / @min(sx, sy), &pts); // ~0.15px at display scale
+    var np = pts.items.len;
+    // The closed outline's last anchor1 duplicates the first anchor0 — drop
+    // it so the wrap edge (last real point -> first) carries the arc length.
+    while (np > 1 and @abs(pts.items[np - 1][0] - pts.items[0][0]) < 1e-6 and @abs(pts.items[np - 1][1] - pts.items[0][1]) < 1e-6) np -= 1;
+    if (np < 2) return t;
+    t.x = try a.alloc(f32, np + 1);
+    t.y = try a.alloc(f32, np + 1);
+    t.d = try a.alloc(f32, np + 1);
+    var dd: f32 = 0;
+    for (pts.items, 0..) |p, i| {
+        t.x[i] = p[0] * sx + ox;
+        t.y[i] = p[1] * sy + oy;
+        if (i > 0) {
+            const dx = t.x[i] - t.x[i - 1];
+            const dy = t.y[i] - t.y[i - 1];
+            dd += @sqrt(dx * dx + dy * dy);
+        }
+        t.d[i] = dd;
+    }
+    // The wrap edge: last point back to the first (forceClosed = true).
+    t.x[np] = t.x[0];
+    t.y[np] = t.y[0];
+    {
+        const dx = t.x[0] - t.x[np - 1];
+        const dy = t.y[0] - t.y[np - 1];
+        dd += @sqrt(dx * dx + dy * dy);
+    }
+    t.d[np] = dd;
+    t.n = np;
+    return t;
+}
+
+/// Port of CircularShapes.update + CircularProgressDrawingCache
+/// .updateFullPaths: build the track ring (RoundedPolygon.circle(nv)) and
+/// the progress ring (the rounded star at amplitude 1, the track polygon
+/// otherwise — upstream's no-morph branch), both normalized + scaled +
+/// recentered + flattened. Rebuilt when (w, h, amplitude-class) change.
+fn ensureCircPaths(n: *Node, s: *ProgressState, w: f32, h: f32, amp: f32) void {
+    const amp_key: f32 = if (amp >= 1) 1 else 0;
+    if (s.circ_w == w and s.circ_h == h and s.circ_amp == amp_key) return;
+    const a = n.allocator;
+    if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= circular_stroke or h <= circular_stroke) {
+        s.circ_prog.deinit(a);
+        s.circ_trk.deinit(a);
+        return;
+    }
+    const nv = circVertexCount(w, h);
+    // trackPolygon = RoundedPolygon.circle(numVertices).normalized()
+    var track_poly = shapes.circle(a, nv, 1, .{ 0, 0 }) catch {
+        s.circ_prog.deinit(a);
+        s.circ_trk.deinit(a);
+        return;
+    };
+    defer track_poly.deinit();
+    var track_norm = track_poly.normalized(a) catch {
+        s.circ_prog.deinit(a);
+        s.circ_trk.deinit(a);
+        return;
+    };
+    defer track_norm.deinit();
+    var new_trk = circBuildTable(a, &track_norm, w, h) catch {
+        s.circ_prog.deinit(a);
+        s.circ_trk.deinit(a);
+        return;
+    };
+    errdefer new_trk.deinit(a);
+    // getProgressPath (no Morph): the star at amplitude 1, the track ring
+    // otherwise. star(numVerticesPerRadius = nv, innerRadius = 0.75,
+    // rounding = CornerRounding(0.35, smoothing 0.4), innerRounding = 0.5).
+    var new_prog: RingTable = .{};
+    if (amp_key == 1) {
+        var star_poly = shapes.star(a, nv, 1, 0.75, .{ .radius = 0.35, .smoothing = 0.4 }, .{ .radius = 0.5 }, .{ 0, 0 }) catch {
+            new_trk.deinit(a);
+            s.circ_prog.deinit(a);
+            s.circ_trk.deinit(a);
+            return;
+        };
+        defer star_poly.deinit();
+        var star_norm = star_poly.normalized(a) catch {
+            new_trk.deinit(a);
+            s.circ_prog.deinit(a);
+            s.circ_trk.deinit(a);
+            return;
+        };
+        defer star_norm.deinit();
+        new_prog = circBuildTable(a, &star_norm, w, h) catch {
+            new_trk.deinit(a);
+            s.circ_prog.deinit(a);
+            s.circ_trk.deinit(a);
+            return;
+        };
+    } else {
+        new_prog = circBuildTable(a, &track_norm, w, h) catch {
+            new_trk.deinit(a);
+            s.circ_prog.deinit(a);
+            s.circ_trk.deinit(a);
+            return;
+        };
+    }
+    s.circ_prog.deinit(a);
+    s.circ_trk.deinit(a);
+    s.circ_prog = new_prog;
+    s.circ_trk = new_trk;
+    s.circ_verts = nv;
+    s.circ_w = w;
+    s.circ_h = h;
+    s.circ_amp = amp_key;
+}
+
+/// The wave scroll: upstream's offset animation runs one full outline
+/// revolution per (wavelength/waveSpeed * 1000 * vertexCount) ms — with
+/// waveSpeed = wavelength that's vertexCount seconds.
+fn circWaveOffset(s: *const ProgressState) f32 {
+    if (s.circ_verts == 0) return 0;
+    const period = @as(f64, @floatFromInt(s.circ_verts)) * 1000;
+    return @floatCast(@mod(s.elapsed_ms / period, 1));
 }
 
 /// Port of DrawScope.drawLinearIndicator — a straight cap-inset segment at
@@ -520,38 +769,89 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
             }
         },
         .circular => {
-            const cx = b.x + b.w / 2;
-            const cy = b.y + b.h / 2;
-            const r = (@min(b.w, b.h) - circular_stroke) / 2;
-            var xs: [arc_segments]f32 = undefined;
-            var ys: [arc_segments]f32 = undefined;
-            if (s.opts.progress) |p_raw| {
-                // ---- determinate circular ----
-                const sweep = clamp01(p_raw) * 360;
-                const start: f32 = 270;
-                const gap_sweep = (circular_gap + circular_stroke) / (std.math.pi * b.w) * 360;
-                const g = @min(sweep, gap_sweep);
-                // track arc (circularDeterminateTrackColor = track color)
-                const track_sweep = 360 - sweep - 2 * g;
-                if (track_sweep > 0) {
-                    const nt = arcPolyline(&xs, &ys, cx, cy, r, start + sweep + g, track_sweep);
-                    ui.paint.strokePolyline(ctx, xs[0..nt], ys[0..nt], circular_stroke, true, track);
-                }
-                if (sweep > 0) {
-                    const na = arcPolyline(&xs, &ys, cx, cy, r, start, sweep);
-                    ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], circular_stroke, true, active);
+            if (s.opts.wavy) {
+                // ---- wavy circular (CircularWavyProgressModifiers) ----
+                // currentStrokeCapWidth: both strokes are Round →
+                // max(stroke, trackStroke)/2 (0 when taller than wide).
+                const cap_w: f32 = if (b.h > b.w) 0 else circular_stroke / 2;
+                const pcx = b.w / 2; // the progress-path bounds center ==
+                const pcy = b.h / 2; // size center after processPath
+                var xs: [wave_seg_cap]f32 = undefined;
+                var ys: [wave_seg_cap]f32 = undefined;
+                if (s.opts.progress) |p_raw| {
+                    const p = clamp01(p_raw);
+                    const amp = wavyAmplitude(p); // indicatorAmplitude
+                    ensureCircPaths(n, s, b.w, b.h, amp);
+                    const lp = s.circ_prog.totalLen();
+                    const lt = s.circ_trk.totalLen();
+                    const p_stop = p * lp;
+                    // updateDrawPaths: gap + cap insets come out of the
+                    // track only (trackSpacing = 2*insets + gap).
+                    const spacing = 2 * @min(p_stop, cap_w) + @min(p_stop, circular_gap);
+                    const offset: f32 = if (amp > 0) circWaveOffset(s) else 0;
+                    const shift = offset * lp;
+                    const rot_a = @mod(offset * 360, 360);
+                    const t_start = p * lt + spacing;
+                    const t_stop = lt - spacing;
+                    var cnt = s.circ_trk.emit(t_start, t_stop, 0, pcx, pcy, b.x, b.y, &xs, &ys);
+                    if (cnt > 1) ui.paint.strokePolyline(ctx, xs[0..cnt], ys[0..cnt], circular_stroke, true, track);
+                    cnt = s.circ_prog.emit(shift, p_stop + shift, -rot_a, pcx, pcy, b.x, b.y, &xs, &ys);
+                    if (cnt > 1) ui.paint.strokePolyline(ctx, xs[0..cnt], ys[0..cnt], circular_stroke, true, active);
+                } else {
+                    ensureCircPaths(n, s, b.w, b.h, 1);
+                    const lp = s.circ_prog.totalLen();
+                    const lt = s.circ_trk.totalLen();
+                    const t_ms = @mod(elapsed, @as(f32, @floatFromInt(circular_indet_ms)));
+                    const prog = circIndetProgress(t_ms);
+                    const p_stop = prog * lp;
+                    const spacing = 2 * @min(p_stop, cap_w) + @min(p_stop, circular_gap);
+                    // withTransform rotate(global + additional + 90) — baked
+                    // into the emitted points (round caps are rotation
+                    // invariant, so this is pixel-identical).
+                    const rot = (t_ms / @as(f32, @floatFromInt(circular_indet_ms))) * 1080 + circAddRotation(t_ms) + 90;
+                    const shift = circWaveOffset(s) * lp;
+                    const rot_a = @mod(circWaveOffset(s) * 360, 360);
+                    const t_start = prog * lt + spacing;
+                    const t_stop = lt - spacing;
+                    var cnt = s.circ_trk.emit(t_start, t_stop, rot, pcx, pcy, b.x, b.y, &xs, &ys);
+                    if (cnt > 1) ui.paint.strokePolyline(ctx, xs[0..cnt], ys[0..cnt], circular_stroke, true, track);
+                    cnt = s.circ_prog.emit(shift, p_stop + shift, rot - rot_a, pcx, pcy, b.x, b.y, &xs, &ys);
+                    if (cnt > 1) ui.paint.strokePolyline(ctx, xs[0..cnt], ys[0..cnt], circular_stroke, true, active);
                 }
             } else {
-                // ---- indeterminate circular ----
-                const t_ms = @mod(elapsed, @as(f32, @floatFromInt(circular_indet_ms)));
-                const prog = circIndetProgress(t_ms);
-                const sweep = prog * 360;
-                const rot = (t_ms / @as(f32, @floatFromInt(circular_indet_ms))) * 1080 + circAddRotation(t_ms);
-                // indeterminate track color is Transparent upstream — skip
-                // the track arc entirely (same pixels).
-                const cap_off = (180.0 / std.math.pi) * (circular_stroke / (circular_size / 2)) / 2;
-                const na = arcPolyline(&xs, &ys, cx, cy, r, rot + cap_off, @max(sweep, 0.1));
-                ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], circular_stroke, true, active);
+                const cx = b.x + b.w / 2;
+                const cy = b.y + b.h / 2;
+                const r = (@min(b.w, b.h) - circular_stroke) / 2;
+                var xs: [arc_segments]f32 = undefined;
+                var ys: [arc_segments]f32 = undefined;
+                if (s.opts.progress) |p_raw| {
+                    // ---- determinate circular ----
+                    const sweep = clamp01(p_raw) * 360;
+                    const start: f32 = 270;
+                    const gap_sweep = (circular_gap + circular_stroke) / (std.math.pi * b.w) * 360;
+                    const g = @min(sweep, gap_sweep);
+                    // track arc (circularDeterminateTrackColor = track color)
+                    const track_sweep = 360 - sweep - 2 * g;
+                    if (track_sweep > 0) {
+                        const nt = arcPolyline(&xs, &ys, cx, cy, r, start + sweep + g, track_sweep);
+                        ui.paint.strokePolyline(ctx, xs[0..nt], ys[0..nt], circular_stroke, true, track);
+                    }
+                    if (sweep > 0) {
+                        const na = arcPolyline(&xs, &ys, cx, cy, r, start, sweep);
+                        ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], circular_stroke, true, active);
+                    }
+                } else {
+                    // ---- indeterminate circular ----
+                    const t_ms = @mod(elapsed, @as(f32, @floatFromInt(circular_indet_ms)));
+                    const prog = circIndetProgress(t_ms);
+                    const sweep = prog * 360;
+                    const rot = (t_ms / @as(f32, @floatFromInt(circular_indet_ms))) * 1080 + circAddRotation(t_ms);
+                    // indeterminate track color is Transparent upstream — skip
+                    // the track arc entirely (same pixels).
+                    const cap_off = (180.0 / std.math.pi) * (circular_stroke / (circular_size / 2)) / 2;
+                    const na = arcPolyline(&xs, &ys, cx, cy, r, rot + cap_off, @max(sweep, 0.1));
+                    ui.paint.strokePolyline(ctx, xs[0..na], ys[0..na], circular_stroke, true, active);
+                }
             }
         },
     }
@@ -565,6 +865,8 @@ fn progressDeinit(n: *Node) void {
         n.allocator.free(s.path_y);
         n.allocator.free(s.path_d);
     }
+    s.circ_prog.deinit(n.allocator);
+    s.circ_trk.deinit(n.allocator);
     n.allocator.destroy(s);
 }
 
@@ -792,6 +1094,181 @@ test "golden: linear progress paints the track and the active segment" {
     // the left half is the active segment (progress = 0.5)
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(2, 8));
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(60, 8));
+}
+
+test "progress: circular wavy measures 48x48 and builds the ring tables" {
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.6 });
+    defer wavy.deinit();
+    const m = wavy.measure(.{ .max_w = 480, .max_h = 600 });
+    // CircularContainerSize = WaveSize = 48dp (vs 40dp flat circular).
+    try std.testing.expectEqual(@as(f32, 48), m.w);
+    try std.testing.expectEqual(@as(f32, 48), m.h);
+    const s = stateOf(wavy);
+    ensureCircPaths(wavy, s, 48, 48, 1);
+    // CircularShapes.update: numVertices = round(2π·(24−2)/15) = 9.
+    try std.testing.expectEqual(@as(usize, 9), s.circ_verts);
+    // The track ring is a circle at ~21.5 about (24,24): the nominal
+    // 48/2 − 4/2 = 22 shrinks a little under normalization (the approximate
+    // bounds include the corner-control bulge).
+    var tmin: f32 = std.math.inf(f32);
+    var tmax: f32 = 0;
+    for (0..s.circ_trk.n) |i| {
+        const dx = s.circ_trk.x[i] - 24;
+        const dy = s.circ_trk.y[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        tmin = @min(tmin, ri);
+        tmax = @max(tmax, ri);
+    }
+    // The progress star oscillates: outer ~21.5, inner ~19 (0.75 + the
+    // inner corner rounding pulls it in further than the nominal 16.5).
+    var smin: f32 = std.math.inf(f32);
+    var smax: f32 = 0;
+    for (0..s.circ_prog.n) |i| {
+        const dx = s.circ_prog.x[i] - 24;
+        const dy = s.circ_prog.y[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        smin = @min(smin, ri);
+        smax = @max(smax, ri);
+    }
+    try std.testing.expect(tmin > 20 and tmax < 22.5);
+    try std.testing.expect(tmax - tmin < 1.5); // quasi-circle
+    try std.testing.expect(smax > 20 and smax < 22.5);
+    try std.testing.expect(smin > 14 and smin < 20);
+    try std.testing.expect(smax - smin > 2); // the wave is visible
+    // The wrap table closes: duplicated last point, monotone distances.
+    try std.testing.expectEqual(s.circ_prog.x[0], s.circ_prog.x[s.circ_prog.n]);
+    try std.testing.expectEqual(s.circ_prog.y[0], s.circ_prog.y[s.circ_prog.n]);
+    try std.testing.expect(s.circ_prog.d[s.circ_prog.n] > s.circ_prog.d[s.circ_prog.n - 1]);
+    const lt = s.circ_trk.totalLen();
+    const lp = s.circ_prog.totalLen();
+    try std.testing.expectApproxEqAbs(@as(f32, 2 * std.math.pi * 22), lt, 5); // ~138 (faceted)
+    try std.testing.expect(lp > 0.8 * lt and lp < 1.5 * lt);
+    // amplitude 0 → the progress ring is the plain circle (no-morph branch)
+    ensureCircPaths(wavy, s, 48, 48, 0);
+    var fmin: f32 = std.math.inf(f32);
+    var fmax: f32 = 0;
+    for (0..s.circ_prog.n) |i| {
+        const dx = s.circ_prog.x[i] - 24;
+        const dy = s.circ_prog.y[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        fmin = @min(fmin, ri);
+        fmax = @max(fmax, ri);
+    }
+    try std.testing.expect(fmax - fmin < 0.5); // flat ring
+}
+
+test "progress: circular wavy segment emission wraps, rotates and scrolls" {
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.6 });
+    defer wavy.deinit();
+    const s = stateOf(wavy);
+    ensureCircPaths(wavy, s, 48, 48, 1);
+    const lp = s.circ_prog.totalLen();
+    // pointAt wraps like the doubled upstream path: pointAt(0) == pointAt(L)
+    const p0 = s.circ_prog.pointAt(0);
+    const pl = s.circ_prog.pointAt(lp);
+    try std.testing.expectApproxEqAbs(p0[0], pl[0], 0.01);
+    try std.testing.expectApproxEqAbs(p0[1], pl[1], 0.01);
+    var xs: [wave_seg_cap]f32 = undefined;
+    var ys: [wave_seg_cap]f32 = undefined;
+    // half the ring ~69px of arc → tens of points, all on the star band
+    const cnt = s.circ_prog.emit(0, lp / 2, 0, 24, 24, 0, 0, &xs, &ys);
+    try std.testing.expect(cnt > 40);
+    for (0..cnt) |i| {
+        const dx = xs[i] - 24;
+        const dy = ys[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        try std.testing.expect(ri > 14 and ri < 22.5);
+    }
+    // A 90° emitted rotation maps the first point 90° about the center.
+    var xs2: [wave_seg_cap]f32 = undefined;
+    var ys2: [wave_seg_cap]f32 = undefined;
+    _ = s.circ_prog.emit(0, lp / 2, 90, 24, 24, 0, 0, &xs2, &ys2);
+    try std.testing.expectApproxEqAbs(24 - (ys[0] - 24), xs2[0], 0.01); // x' = cx − dy
+    try std.testing.expectApproxEqAbs(24 + (xs[0] - 24), ys2[0], 0.01); // y' = cy + dx
+    // The wave scroll: shifting the segment by the offset changes the
+    // emitted curve (offset = elapsed / (verts·1000)).
+    s.elapsed_ms = 0;
+    const sh0 = circWaveOffset(s) * lp;
+    var xa: [wave_seg_cap]f32 = undefined;
+    var ya: [wave_seg_cap]f32 = undefined;
+    var xb: [wave_seg_cap]f32 = undefined;
+    var yb: [wave_seg_cap]f32 = undefined;
+    _ = s.circ_prog.emit(sh0, 20 + sh0, -@mod(circWaveOffset(s) * 360, 360), 24, 24, 0, 0, &xa, &ya);
+    s.elapsed_ms = 1000; // offset = 1/9 → the wave scrolled one wavelength
+    const sh1 = circWaveOffset(s) * lp;
+    try std.testing.expectApproxEqAbs(lp / 9, sh1, 0.01);
+    _ = s.circ_prog.emit(sh1, 20 + sh1, -@mod(circWaveOffset(s) * 360, 360), 24, 24, 0, 0, &xb, &yb);
+    try std.testing.expect(!std.meta.eql(xa[0..10], xb[0..10]));
+}
+
+test "progress: circular wavy determinate runs the phase loop; flat circular determinate stays static" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.6 });
+    defer wavy.deinit();
+    wavy.layout(.{ .x = 0, .y = 0, .w = 48, .h = 48 });
+    try std.testing.expect(tl.hasActive()); // the wave scrolls
+    tl.tick(0);
+    tl.tick(500);
+    try std.testing.expect(stateOf(wavy).elapsed_ms > 0);
+    // flat circular determinate: nothing moves — no animation at all
+    const flat = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .progress = 0.5 });
+    defer flat.deinit();
+    flat.layout(.{ .x = 0, .y = 0, .w = 40, .h = 40 });
+    try std.testing.expect(!stateOf(flat).loop_running);
+    try std.testing.expectEqual(@as(usize, 1), tl.animations.items.len);
+}
+
+test "golden: circular wavy determinate paints the wavy arc and the track ring" {
+    const t = theme_mod.light;
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.5, .theme = t });
+    defer wavy.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 56, 56);
+    defer r.deinit();
+    wavy.layout(.{ .x = 4, .y = 4, .w = 48, .h = 48 });
+    r.paint(wavy, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // The path starts at 3 o'clock and winds clockwise: at progress 0.5 the
+    // wavy arc covers the bottom half (right -> bottom -> left), the plain
+    // track ring the top half, with the gap on both sides.
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(49, 28)); // arc start (3 o'clock)
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(28, 48)); // bottom of the wave
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(28, 6)); // track top
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(13, 13)); // track upper-left
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(43, 13)); // track upper-right
+    // The active/track gap: a ring-band pixel past the left end is empty,
+    // and the wedge before the arc start holds no full-strength pixel of
+    // either stroke (only cap-edge AA haze).
+    try std.testing.expectEqual(@as(u32, 0x000000FF), f.pixelAt(7, 23)); // past the left end
+    const gap = Rect{ .x = 46, .y = 25, .w = 4, .h = 1 };
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(gap, t.colors.primary));
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(gap, t.colors.secondary_container));
+}
+
+test "golden: circular wavy indeterminate paints a small wavy arc and the track ring" {
+    const t = theme_mod.light;
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .theme = t });
+    defer wavy.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 56, 56);
+    defer r.deinit();
+    // No timeline: the schedules sit at t=0 — sweep 0.1, rotate +90°.
+    wavy.layout(.{ .x = 4, .y = 4, .w = 48, .h = 48 });
+    r.paint(wavy, 0x000000FF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // The 36° wavy arc lands at bottom-left (path 0..36° + 90° -> 90..126°);
+    // the track fills the rest of the ring minus the adjacent gap.
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(20, 45)); // the small arc
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(28, 6)); // track top
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(48, 28)); // track right
+    // The gap between the arc's tail and the track start holds no
+    // full-strength pixel of either (only cap-edge AA haze).
+    const gap = Rect{ .x = 7, .y = 41, .w = 6, .h = 9 };
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(gap, t.colors.primary));
+    try std.testing.expectEqual(@as(u64, 0), f.countColorIn(gap, t.colors.secondary_container));
 }
 
 test "golden: circular determinate paints the ring and a quarter arc" {
