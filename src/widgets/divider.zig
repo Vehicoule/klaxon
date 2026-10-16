@@ -1,8 +1,19 @@
-// Divider widget (Phase 1b P0) — a horizontal or vertical hairline that
-// expands along its main axis (Flutter semantics).
+// Divider (Phase 1b P0) — a horizontal or vertical hairline that expands
+// along its main axis.
+//
+// Upstream: .ref/material3/Divider.kt (HorizontalDivider, VerticalDivider,
+// DividerDefaults) + tokens/DividerTokens.kt:
+//   - Thickness 1dp; Color OutlineVariant
+//   - HorizontalDivider: fillMaxWidth x height(thickness), a stroke of
+//     width=thickness centered at thickness/2 — for a straight solid line
+//     that rasterizes identically to a centered fillRect (our draw).
+//   - VerticalDivider: fillMaxHeight x width(thickness), same centered line.
+//   - `indent`/`end_indent` are Klaxon-only options (upstream has no such
+//     API); they shrink the line on its main axis.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig");
 
 const Node = ui.node.Node;
@@ -13,8 +24,8 @@ const Color = ui.paint.Color;
 
 pub const DividerOptions = struct {
     horizontal: bool = true,
-    thickness: f32 = 1,
-    color: Color = 0x444444FF, // opaque gray (0xRRGGBBAA)
+    thickness: f32 = 1, // DividerTokens.Thickness
+    color: Color = theme_mod.light.colors.outline_variant, // DividerTokens.Color
     indent: f32 = 0,
     end_indent: f32 = 0,
 };

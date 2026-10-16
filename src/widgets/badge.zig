@@ -1,15 +1,22 @@
 // Badge (Phase 2d.1 PR B, M3E batch 1) — small dot + large count badge,
 // and the BadgedBox that anchors one to a content's top-trailing corner.
 //
-// Spec: m3.material.io/components/badges + Compose BadgeTokens / Badge.kt:
-//   - small badge (no content): 6x6, error color, CornerFull (circle)
-//   - large badge (content): error bg, on_error label_small text, CornerFull
-//     (pill), min 16x16, horizontal padding 4, max width 34 (max char count)
-//   - placement (exact Compose BadgedBox math, RTL-aware via the layout
-//     direction): hasContent = badge.w > 6; offsetH = hasContent ? 12 : 6;
-//     offsetV = hasContent ? 14 : 6; badgeX = min(anchor.w - offsetH,
-//     anchor.w - badge.w); badgeY = max(0, offsetV - badge.h) — the badge
-//     overlaps the anchor's top-trailing corner.
+// Upstream: .ref/material3/Badge.kt (Badge, BadgedBox, BadgeDefaults,
+// badgeBounds) + tokens/BadgeTokens.kt:
+//   - small badge (no content): 6x6 (BadgeTokens.Size), Color Error,
+//     Shape CornerFull — a circle
+//   - large badge (content): LargeSize 16 min w/h, LargeShape CornerFull,
+//     LargeColor Error bg, LargeLabelTextColor OnError label at
+//     LargeLabelTextFont (LabelSmall); horizontal padding
+//     BadgeWithContentHorizontalPadding = 4 — NO width cap (the Row wraps
+//     the content; upstream has no max-width token)
+//   - BadgedBox placement (verbatim): hasContent = badge.w > Size(6);
+//     badgeHorizontalOffset = hasContent ? BadgeWithContentHorizontalOffset
+//     (12) : BadgeOffset(6); badgeVerticalOffset = hasContent ?
+//     BadgeWithContentVerticalOffset(14) : BadgeOffset(6);
+//     badgeX = min(anchor.w - offsetH, anchor.w - badge.w);
+//     badgeY = max(0, offsetV - badge.h) — the badge overlaps the anchor's
+//     top-END corner (placeRelative → mirrored in RTL).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -24,11 +31,10 @@ const Size = ui.layout.Size;
 const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
-/// M3E measurement tokens (Compose BadgeTokens + Badge.kt offsets).
-const small_size: f32 = 6;
-const large_min: f32 = 16;
-const large_h_padding: f32 = 4;
-const large_max_w: f32 = 34;
+/// M3E measurement tokens (BadgeTokens + Badge.kt offsets).
+const small_size: f32 = 6; // BadgeTokens.Size
+const large_min: f32 = 16; // BadgeTokens.LargeSize
+const large_h_padding: f32 = 4; // BadgeWithContentHorizontalPadding
 const offset_small: f32 = 6; // BadgeOffset
 const offset_large_h: f32 = 12; // BadgeWithContentHorizontalOffset
 const offset_large_v: f32 = 14; // BadgeWithContentVerticalOffset
@@ -50,7 +56,9 @@ fn stateOf(n: *Node) *BadgeState {
 fn badgeMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     if (s.opts.label == null) return c.constrain(.{ .w = small_size, .h = small_size });
-    // large badge: text + horizontal padding, min 16 high (label_small)
+    // large badge: Row defaultMinSize(minW=minH=LargeSize) +
+    // padding(horizontal = BadgeWithContentHorizontalPadding) — the row
+    // wraps the widest child + the 4dp side padding; no upstream width cap.
     var w: f32 = 0;
     var h: f32 = large_min;
     for (n.children.items) |child| {
@@ -58,7 +66,7 @@ fn badgeMeasure(n: *Node, c: Constraints) Size {
         w = @max(w, cs.w);
         h = @max(h, cs.h);
     }
-    w = @min(@max(large_min, w + large_h_padding * 2), large_max_w);
+    w = @max(large_min, w + large_h_padding * 2);
     return c.constrain(.{ .w = w, .h = h });
 }
 
@@ -106,9 +114,11 @@ pub fn badge(allocator: std.mem.Allocator, opts: BadgeOptions) !*Node {
     node.state = s;
     if (opts.label) |label| {
         const t = opts.theme;
+        const ls = t.type_scale.label_small; // BadgeTokens.LargeLabelTextFont
         node.add(try text_w.text(allocator, label, .{
-            .size = t.type_scale.label_small.size,
-            .color = t.colors.on_error,
+            .size = ls.size,
+            .bold = ls.weight >= 500,
+            .color = t.colors.on_error, // BadgeTokens.LargeLabelTextColor
         }));
         ui.semantics.attach(node, .{ .role = .text, .label = label }); // Phase 2c
     }
@@ -197,7 +207,10 @@ test "badge: small dot measures 6x6; large pill fits the label + padding" {
     const mb = big.measure(.{ .max_w = 100, .max_h = 100 });
     try std.testing.expect(mb.w >= large_min);
     try std.testing.expect(mb.h >= large_min);
-    try std.testing.expect(mb.w <= large_max_w);
+    // upstream has no width cap: w = label width + 2x4 padding
+    const ls = theme_mod.light.type_scale.label_small;
+    const lw = ui.paint.measureText("99+", ls.size, ls.weight >= 500).width;
+    try std.testing.expectApproxEqAbs(@max(large_min, lw + large_h_padding * 2), mb.w, 0.001);
 }
 
 test "badged_box: the badge overlaps the content's top-trailing corner" {

@@ -3,30 +3,46 @@
 // Signal(usize) (single choice = tab-group semantics: the arrow keys move
 // AND select).
 //
-// Spec: m3.material.io/components/navigation-rail + Compose NavigationRail.kt
-// (the collapsed rail + NavigationRailItem) / WideNavigationRail.kt +
-// NavigationItem.kt (the expanded rail + the start-icon item) + the
-// NavigationRail*Tokens:
-//   - container: Surface, CornerNone; collapsed width 96 (ContainerWidth),
-//     expanded width clamp(max item width, 220, 360) (ContainerWidthMinimum /
-//     Maximum); content top padding 44 (TopSpace); items 56dp tall
-//     (NavigationRailItemHeight = ActiveIndicatorWidth), 4dp apart
-//     (ItemVerticalSpace)
-//   - collapsed (icon-only): the active indicator is a 56x56 CIRCLE
-//     (CornerFull; IndicatorVerticalPaddingNoLabel = (56-24)/2 = 16 → the
-//     indicator is 24+32 = 56 tall), the 24dp icon centered on it
-//   - expanded (icon + label row): the active indicator is a 56dp-tall pill
-//     (CornerFull) of width label_w + 64 (icon 24 + IconLabelSpace 8 + label
-//     + 2x16 FullWidthLeadingSpace), starting at x = 20
-//     (WNRItemHorizontalPadding); the icon at pill_x + 16, the label
-//     (LabelLarge 14/20/500) at icon_x + 24 + 8, both vertically centered
-//   - colors: active indicator SecondaryContainer; active icon
-//     OnSecondaryContainer; active label OnSecondaryContainer (start-icon
-//     position — selectedTextColorStartIconPosition = ItemActiveIcon);
-//     inactive icon + label OnSurfaceVariant; disabled OnSurfaceVariant @
-//     0.38 (DisabledAlpha)
-//   - state layer: OnSecondaryContainer over the INDICATOR only (the ripple
-//     is mapped to the indicator) at hover 0.08 / focus 0.10 / pressed 0.12
+// Upstream (collapsed): .ref/material3/WideNavigationRail.kt's
+// WideNavigationRailLayout at expanded = false + NavigationItem.kt's
+// AnimatedNavigationItemLayout at iconPositionProgress = 0 (the
+// WideNavigationRailItem top-icon item):
+//   - container Surface/CornerNone/Level0; CollapsedRailWidth =
+//     NavigationRailCollapsedTokens.ContainerWidth = 96 fixed (a narrower
+//     parent caps it); ContentPadding = (0, TopSpace 44, 0, 0); items
+//     Arrangement.Top, spacedBy ItemVerticalSpace 4
+//   - labeled item (placeAnimatedLabelAndIcon at progress 0): width =
+//     constrain(max(labelW, icon 24 + 2*indicatorHPad 16 + 2*itemHPad 20)
+//     = 96) — the item always spans the rail; content height = indicator
+//     32 + IconLabelSpace 4 + labelH, minHeight'd to TopIconItemMinHeight
+//     (ContainerHeight) 64 by the rail and vertically centered in it. The
+//     56x32 CornerFull indicator sits at x = 20 (centered in 96), the
+//     icon 4 inside it, the LabelMedium label centered at
+//     indicator_bottom + IconLabelSpace.
+//   - icon-only item (placeIcon via TopIconOrIconOnlyMeasurePolicy): the
+//     56x56 CornerFull circle centered in the 96x64 item
+//   - colors: active icon OnSecondaryContainer, active label Secondary
+//     (ItemActiveLabelText), inactive both OnSurfaceVariant, disabled
+//     OnSurfaceVariant @ 0.38, indicator SecondaryContainer, state layer
+//     OnSecondaryContainer over the indicator only
+//   - the plain NavigationRail.kt widget (widthIn(min = 80), 4dp
+//     padding, spacedBy 4) is NOT what this widget models: it has no
+//     expanded state — Klaxon's `expanded` flag is WideNavigationRail's
+//
+// Upstream (expanded): .ref/material3/WideNavigationRail.kt +
+// NavigationItem.kt (the start-icon item at progress 1):
+//   - ContentPadding top = NavigationRailCollapsedTokens.TopSpace 44;
+//     items spacedBy 0 (the collapsed WNR's 4 is not used when expanded)
+//   - rail width = coerceAtMost(360, max(220, widestItemWidth +
+//     WNRItemHorizontalPadding 20)) where an item's width = pill + 20 →
+//     rail = clamp(220, pill + 40, 360), capped by the parent's max
+//   - the item is a start-icon row at x = 0 of width pill + 20 and height
+//     56: the pill (56 tall, CornerFull, width = icon 24 + IconLabelSpace
+//     8 + label + 2*16 expanded padding) starts at x = 20, the icon at
+//     +16 inside it, the LabelLarge label at icon + 24 + 8 — all
+//     vertically centered
+//   - active icon + label OnSecondaryContainer (start-icon position);
+//     inactive OnSurfaceVariant; same state-layer tokens
 //   - input: a click selects (and focuses the group); up/down arrows move
 //     the selection, skipping disabled items and wrapping; a drag past the
 //     touch slop (ui/gestures.SLOP, raw coords) is a scroll, not a press
@@ -35,13 +51,12 @@
 // chrome painted by the widget (skip_children — document children never
 // serialize; the items come from the options array).
 //
-// v1 deviations (documented, fixed later):
-//   - Collapsed = icon-only items (the collapsed-with-label top-icon layout,
-//     56x32 pill + LabelMedium below, is a follow-up — alwaysShowLabel).
-//   - No header (FAB) / footer slots, no modal variant (SurfaceContainer,
-//     CornerLarge, Level2 + scrim), no collapsed<->expanded animation (the
-//     state switch is instant, like the text field's label float).
-//   - No item badges. RTL mirrors the expanded row; the label run stays LTR.
+// Deviations: NavRailItem.label is required — an empty string is treated
+// as the upstream label == null case (the 56x56 circle; upstream would
+// keep the labeled layout for an empty-string label). No header (FAB) /
+// footer slots, no modal variant (SurfaceContainer, CornerLarge, Level2 +
+// scrim), no collapsed<->expanded animation (the state switch is
+// instant). RTL mirrors the expanded row; the label run stays LTR.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -68,7 +83,7 @@ pub const NavRailItem = struct {
 
 pub const NavigationRailOptions = struct {
     /// Expanded rails show icon+label rows (220-360dp); collapsed rails are
-    /// icon-only (96dp).
+    /// the narrow NavigationRail (80dp, label under the icon).
     expanded: bool = false,
     /// The fixed selection when no signal is given (with one, the signal is
     /// the source of truth and this is only the fallback).
@@ -76,22 +91,26 @@ pub const NavigationRailOptions = struct {
     theme: Theme = theme_mod.light,
 };
 
-// --- M3E tokens (the NavigationRail*Tokens + the WideNavigationRail vals) ---
-const collapsed_w: f32 = 96; // ContainerWidth
-const expanded_min_w: f32 = 220; // ContainerWidthMinimum
-const expanded_max_w: f32 = 360; // ContainerWidthMaximum
-const top_space: f32 = 44; // TopSpace
-const item_gap: f32 = 4; // ItemVerticalSpace
-const item_h: f32 = 56; // NavigationRailItemHeight (= ActiveIndicatorWidth)
-const icon_size: f32 = 24;
-// collapsed icon-only: the indicator is a 56x56 circle (CornerFull)
-const circle_d: f32 = 56; // 24 + 2 * (56-24)/2
-// expanded: the pill is 56 tall; the item leads 20; the icon pads 16 inside
-// the pill; the icon-label gap is 8
-const item_lead: f32 = 20; // WNRItemHorizontalPadding
-const pill_icon_pad: f32 = 16; // FullWidthLeadingSpace
-const icon_label_gap: f32 = 8; // HorizontalItemTokens.IconLabelSpace
+// --- WideNavigationRail.kt (collapsed) ---
+const collapsed_w: f32 = 96; // CollapsedRailWidth = NavigationRailCollapsedTokens.ContainerWidth
+const collapsed_top: f32 = 44; // ContentPadding.top = WNRTopPadding = CollapsedTokens.TopSpace
+const item_gap: f32 = 4; // NavigationRailCollapsedTokens.ItemVerticalSpace (collapsed spacedBy)
+const item_h_min: f32 = 64; // TopIconItemMinHeight = NavigationRailBaselineItemTokens.ContainerHeight
+const indicator_w: f32 = 56; // VerticalItemTokens.ActiveIndicatorWidth = icon + 2*16
+const ind_h_label: f32 = 32; // VerticalItemTokens.ActiveIndicatorHeight = icon + 2*4
+const ind_h_nolabel: f32 = 56; // icon + 2*WNRItemNoLabelIndicatorPadding(16) — the circle
+const ind_ivp: f32 = (ind_h_label - icon_size) / 2; // ItemTopIconIndicatorVerticalPadding = 4
+const col_icon_label_gap: f32 = 4; // VerticalItemTokens.IconLabelSpace (indicator->label)
+// --- WideNavigationRail.kt (expanded) ---
+const wnr_top_pad: f32 = 44; // NavigationRailCollapsedTokens.TopSpace
+const expanded_min_w: f32 = 220; // NavigationRailExpandedTokens.ContainerWidthMinimum
+const expanded_max_w: f32 = 360; // NavigationRailExpandedTokens.ContainerWidthMaximum
+const item_hpad: f32 = 20; // WNRItemHorizontalPadding
+const item_min_a11y: f32 = 48; // minimumA11ySize (InteractiveComponentSize)
+const pill_lead: f32 = 16; // HorizontalItemTokens.FullWidthLeadingSpace (+ trailing 16)
 const pill_h: f32 = 56; // HorizontalItemTokens.ActiveIndicatorHeight
+const icon_size: f32 = 24; // BaselineItemTokens.IconSize
+const icon_label_gap: f32 = 8; // HorizontalItemTokens.IconLabelSpace
 
 const ItemDef = struct {
     label: [:0]const u8, // owned
@@ -130,41 +149,74 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
 
 /// Item `index`'s rect in NODE-LOCAL space (Semantics.child_bounds).
 fn railChildBounds(n: *Node, index: usize) Rect {
-    return itemRect(.{ .x = 0, .y = 0, .w = n.bounds.w, .h = n.bounds.h }, index);
+    return itemGeom(stateOf(n), .{ .x = 0, .y = 0, .w = n.bounds.w, .h = n.bounds.h }, index);
 }
 
-/// The item's rect in the widget's parent space (top-aligned stack).
-fn itemRect(b: Rect, i: usize) Rect {
-    return .{
-        .x = b.x,
-        .y = b.y + top_space + @as(f32, @floatFromInt(i)) * (item_h + item_gap),
-        .w = b.w,
-        .h = item_h,
-    };
+/// The item's label metrics against the item's type style (collapsed:
+/// LabelMedium — VerticalItemTokens.LabelTextFont; expanded: LabelLarge —
+/// HorizontalItemTokens.LabelTextFont).
+fn labelMetrics(s: *RailState, def: ItemDef) ui.paint.TextMetrics {
+    const ls = if (s.opts.expanded) s.opts.theme.type_scale.label_large else s.opts.theme.type_scale.label_medium;
+    return ui.paint.measureText(def.label, ls.size, ls.weight >= 500);
+}
+
+/// The collapsed labeled item's verticals (placeAnimatedLabelAndIcon at
+/// progress 0, inside the TopIconItemMinHeight item the rail imposes):
+/// content = indicator 32 + IconLabelSpace 4 + label, ≥ 64 tall, and the
+/// Box(contentAlignment = Center) centers it — so the indicator's top is
+/// (h - content)/2, the icon 4 inside it, the label at
+/// indicator_bottom + IconLabelSpace.
+fn collapsedVerticals(lm: ui.paint.TextMetrics) struct { h: f32, ind_y: f32 } {
+    const content_h = ind_h_label + col_icon_label_gap + lm.height;
+    const h = @max(item_h_min, content_h);
+    return .{ .h = h, .ind_y = (h - content_h) / 2 };
+}
+
+/// The collapsed item's height: a labeled item is max(64, 36 + labelH);
+/// an icon-only item is max(64, 56) = 64 (the 56-circle centered).
+fn collapsedItemH(s: *RailState, def: ItemDef) f32 {
+    if (def.label.len == 0) return item_h_min;
+    return collapsedVerticals(labelMetrics(s, def)).h;
+}
+
+/// The expanded item's pill width: icon 24 + IconLabelSpace 8 + label +
+/// 2*16 (the start-icon indicator's expanded horizontal padding). The
+/// label is measured within itemMaxWidth - (icon + gap) like upstream.
+fn pillWidth(s: *RailState, b: Rect, def: ItemDef) f32 {
+    const lw = @min(labelMetrics(s, def).width, @max(0, b.w - item_hpad - icon_size - icon_label_gap));
+    return icon_size + icon_label_gap + lw + pill_lead * 2;
+}
+
+/// The expanded item's width: constrain(pill + WNRItemHorizontalPadding),
+/// min the a11y size, max the rail's width - WNRItemHorizontalPadding.
+fn expandedItemW(s: *RailState, b: Rect, def: ItemDef) f32 {
+    return std.math.clamp(pillWidth(s, b, def) + item_hpad, item_min_a11y, @max(item_min_a11y, b.w - item_hpad));
+}
+
+/// The item's rect in the widget's parent space.
+///   collapsed: placeRelative(0, y) — the item spans the rail's full
+///     width, stacked below the 44dp top padding with 4dp between items
+///   expanded: a start-icon row at x = 0 of width pill + 20 and height 56,
+///     top padding 44, no spacing (mirrored in RTL)
+fn itemGeom(s: *RailState, b: Rect, i: usize) Rect {
+    if (s.opts.expanded) {
+        const def = s.items.items[i];
+        const w = expandedItemW(s, b, def);
+        const x = if (ui.i18n.direction() == .rtl) b.x + b.w - w else b.x; // placeRelative(0, y)
+        return .{ .x = x, .y = b.y + wnr_top_pad + @as(f32, @floatFromInt(i)) * pill_h, .w = w, .h = pill_h };
+    }
+    var y = b.y + collapsed_top;
+    for (s.items.items[0..i]) |prev| y += collapsedItemH(s, prev) + item_gap;
+    return .{ .x = b.x, .y = y, .w = b.w, .h = collapsedItemH(s, s.items.items[i]) };
 }
 
 /// The item under the point (-1 = none), in the widget's parent space.
 fn itemAt(s: *RailState, b: Rect, x: f32, y: f32) i32 {
-    if (x < b.x or x >= b.x + b.w) return -1;
-    const count = s.items.items.len;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const r = itemRect(b, i);
-        if (y >= r.y and y < r.y + r.h) return @intCast(i);
+    for (s.items.items, 0..) |_, i| {
+        const r = itemGeom(s, b, i);
+        if (x >= r.x and x < r.x + r.w and y >= r.y and y < r.y + r.h) return @intCast(i);
     }
     return -1;
-}
-
-/// The expanded item's pill width (icon + gap + label + 2x16 padding).
-fn pillWidth(s: *RailState, def: ItemDef) f32 {
-    const ls = s.opts.theme.type_scale.label_large;
-    const lw = ui.paint.measureText(def.label, ls.size, ls.weight >= 500).width;
-    return icon_size + icon_label_gap + lw + pill_icon_pad * 2;
-}
-
-fn contentHeight(s: *RailState) f32 {
-    const count: f32 = @floatFromInt(s.items.items.len);
-    return top_space + count * item_h + @max(0, count - 1) * item_gap;
 }
 
 /// Select an item: the state + the signal (if any) + focus + the a11y
@@ -208,15 +260,33 @@ pub fn selectedIndex(n: *Node) usize {
 
 fn railMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
-    const h = if (std.math.isFinite(c.max_h)) c.max_h else contentHeight(s);
     if (s.opts.expanded) {
-        var w: f32 = expanded_min_w;
+        // WideNavigationRailLayout, expanded: width = coerceAtMost(360,
+        // max(220, widest item + WNRItemHorizontalPadding)), honoring a
+        // nonzero minWidth exactly; fillMaxHeight on the height.
+        var widest: f32 = 0;
+        const item_max_w = @max(item_min_a11y, c.max_w - item_hpad);
         for (s.items.items) |def| {
-            w = @max(w, item_lead + pillWidth(s, def));
+            const lb: Rect = .{ .x = 0, .y = 0, .w = c.max_w, .h = 0 };
+            widest = @max(widest, @min(pillWidth(s, lb, def) + item_hpad, item_max_w));
         }
-        return c.constrain(.{ .w = @min(w, expanded_max_w), .h = h });
+        var w = @min(expanded_max_w, @min(c.max_w, @max(@min(expanded_min_w, c.max_w), widest + item_hpad)));
+        if (c.min_w > 0) w = c.min_w;
+        const h = if (std.math.isFinite(c.max_h)) c.max_h else wnr_top_pad + @as(f32, @floatFromInt(s.items.items.len)) * pill_h;
+        return c.constrain(.{ .w = w, .h = h });
     }
-    return c.constrain(.{ .w = collapsed_w, .h = h });
+    // WideNavigationRailLayout, collapsed: width = actualMinWidth =
+    // CollapsedRailWidth coerceAtMost the parent's max (a nonzero
+    // minWidth wins exactly); fillMaxHeight on the height.
+    var w = @min(collapsed_w, c.max_w);
+    if (c.min_w > 0) w = c.min_w;
+    var h = collapsed_top; // ContentPadding.top; bottom padding is 0
+    for (s.items.items, 0..) |def, i| {
+        if (i > 0) h += item_gap; // ItemVerticalSpace between items
+        h += collapsedItemH(s, def);
+    }
+    const height = if (std.math.isFinite(c.max_h)) c.max_h else h;
+    return c.constrain(.{ .w = w, .h = height });
 }
 
 fn railLayout(n: *Node, bounds: Rect) void {
@@ -238,16 +308,11 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
     const cs = t.colors;
     const rtl = ui.i18n.direction() == .rtl;
-    const mx = struct {
-        fn f(bx: f32, bw: f32, x: f32, w: f32, rtl_flag: bool) f32 {
-            return if (rtl_flag) bx + bw - (x - bx) - w else x;
-        }
-    }.f;
-    const ls = t.type_scale.label_large;
+    const ls = if (s.opts.expanded) t.type_scale.label_large else t.type_scale.label_medium;
     const bold = ls.weight >= 500;
     const group_focused = input.isFocused(n);
 
-    // the container
+    // the container (Surface, CornerNone)
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, cs.surface);
 
     // the items clip to the rail's bounds: an overflowing destination never
@@ -255,40 +320,86 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
     for (s.items.items, 0..) |def, i| {
         const idx: i32 = @intCast(i);
-        const ir = itemRect(b, i);
+        const ir = itemGeom(s, b, i);
         const selected = i == s.selected;
-        const lm = ui.paint.measureText(def.label, ls.size, bold);
-        // content colors
-        const fg: Color = if (!def.enabled)
+        const has_label = def.label.len > 0;
+        const lm = labelMetrics(s, def);
+        // content colors: the icon is ItemActiveIcon (OnSecondaryContainer);
+        // the label is ItemActiveLabelText (Secondary) in the collapsed
+        // top-icon position and ItemActiveIcon (OnSecondaryContainer) in
+        // the expanded start-icon position; disabled is the inactive color
+        // at DisabledAlpha.
+        const icon_c: Color = if (!def.enabled)
             ui.paint.withAlphaScaled(cs.on_surface_variant, 0.38)
         else if (selected)
             cs.on_secondary_container
         else
             cs.on_surface_variant;
+        const label_c: Color = if (!def.enabled)
+            ui.paint.withAlphaScaled(cs.on_surface_variant, 0.38)
+        else if (!selected)
+            cs.on_surface_variant
+        else if (s.opts.expanded)
+            cs.on_secondary_container
+        else
+            cs.secondary;
         // the indicator geometry (LTR, then mirrored per element in RTL)
         var ind_x: f32 = undefined;
         var ind_y: f32 = undefined;
         var ind_w: f32 = undefined;
         var ind_h: f32 = undefined;
         var icon_x: f32 = undefined;
+        var icon_y: f32 = undefined;
         var label_x: f32 = 0;
+        var label_y: f32 = 0;
         if (s.opts.expanded) {
-            const pw = pillWidth(s, def);
-            const pill_ltr = ir.x + item_lead;
-            ind_x = mx(b.x, b.w, pill_ltr, pw, rtl);
+            const pw = pillWidth(s, b, def);
+            // placeRelative offsets inside the ITEM: the pill leads
+            // WNRItemHorizontalPadding, the icon leads
+            // FullWidthLeadingSpace inside it, the label follows the icon +
+            // IconLabelSpace. The item rect is already mirrored (itemGeom),
+            // so the elements mirror within it — the pill ends up at the
+            // item's near edge (ir.w - 20 - pw = 0 for a tight item).
+            const im = struct {
+                x: f32,
+                w: f32,
+                rtl: bool,
+                fn f(self: @This(), off: f32, w: f32) f32 {
+                    return if (self.rtl) self.x + self.w - off - w else self.x + off;
+                }
+            }{ .x = ir.x, .w = ir.w, .rtl = rtl };
+            ind_x = im.f(item_hpad, pw);
             ind_y = ir.y;
             ind_w = pw;
             ind_h = pill_h;
-            icon_x = mx(b.x, b.w, pill_ltr + pill_icon_pad, icon_size, rtl);
-            label_x = mx(b.x, b.w, pill_ltr + pill_icon_pad + icon_size + icon_label_gap, lm.width, rtl);
-        } else {
-            ind_x = ir.x + (ir.w - circle_d) / 2;
-            ind_y = ir.y + (ir.h - circle_d) / 2;
-            ind_w = circle_d;
-            ind_h = circle_d;
+            icon_x = im.f(item_hpad + pill_lead, icon_size);
+            icon_y = ir.y + (pill_h - icon_size) / 2;
+            label_x = im.f(item_hpad + pill_lead + icon_size + icon_label_gap, lm.width);
+            label_y = ir.y + (pill_h - lm.height) / 2;
+        } else if (has_label) {
+            // placeAnimatedLabelAndIcon at progress 0: the 56x32 indicator
+            // centered horizontally (= x + itemHPad 20 in a 96 item), its
+            // top at the centered content's top; the icon 4 inside it; the
+            // label centered at indicator_bottom + IconLabelSpace 4.
+            const v = collapsedVerticals(lm);
+            ind_x = ir.x + (ir.w - indicator_w) / 2;
+            ind_y = ir.y + v.ind_y;
+            ind_w = indicator_w;
+            ind_h = ind_h_label;
             icon_x = ir.x + (ir.w - icon_size) / 2;
+            icon_y = ir.y + v.ind_y + ind_ivp;
+            label_x = ir.x + (ir.w - lm.width) / 2;
+            label_y = ir.y + v.ind_y + ind_h_label + col_icon_label_gap;
+        } else {
+            // placeIcon: the 56x56 circle + icon centered in the item.
+            ind_x = ir.x + (ir.w - ind_h_nolabel) / 2;
+            ind_y = ir.y + (ir.h - ind_h_nolabel) / 2;
+            ind_w = ind_h_nolabel;
+            ind_h = ind_h_nolabel;
+            icon_x = ir.x + (ir.w - icon_size) / 2;
+            icon_y = ir.y + (ir.h - icon_size) / 2;
         }
-        // the active indicator (CornerFull: a circle collapsed, a pill expanded)
+        // the active indicator (CornerFull: a pill, or the icon-only circle)
         if (selected) {
             ui.paint.fillRRect(ctx, ind_x, ind_y, ind_w, ind_h, ind_h / 2, cs.secondary_container);
         }
@@ -307,14 +418,12 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.fillRRect(ctx, ind_x, ind_y, ind_w, ind_h, ind_h / 2, theme_mod.stateLayer(base, cs.on_secondary_container, alpha));
             }
         }
-        // the icon (24dp, vertically centered)
-        const icon_y = ir.y + (ir.h - icon_size) / 2;
-        paintIcon(ctx, def.icon, icon_x, icon_y, fg);
-        // the label (expanded only; LabelLarge, vertically centered, clipped)
-        if (s.opts.expanded) {
-            ui.paint.clipRect(ctx, ir.x, ir.y, ir.w, ir.h);
-            ui.paint.text(ctx, def.label, label_x, ir.y + (ir.h - lm.height) / 2 + lm.ascent, ls.size, bold, fg);
-            ui.paint.clipReset(ctx);
+        // the icon (24dp)
+        paintIcon(ctx, def.icon, icon_x, icon_y, icon_c);
+        // the label: LabelMedium under the icon (collapsed) / LabelLarge
+        // inside the pill (expanded); the rail-bounds clip covers overflow
+        if (has_label) {
+            ui.paint.text(ctx, def.label, label_x, label_y + lm.ascent, ls.size, bold, label_c);
         }
     }
     ui.paint.clipReset(ctx); // the rail-bounds clip
@@ -499,17 +608,21 @@ test "navigation_rail: measures the collapsed 96dp width; expanded clamps to [22
     defer c.deinit();
     const m = c.measure(.{ .max_w = 2000, .max_h = std.math.inf(f32) });
     try std.testing.expectEqual(collapsed_w, m.w);
-    try std.testing.expectEqual(contentHeight(stateOf(c)), m.h); // 44 + 2*56 + 4
+    // 44dp top + item(64) + 4 gap + item(64); no bottom padding
+    const s = stateOf(c);
+    try std.testing.expectEqual(collapsed_top + collapsedItemH(s, s.items.items[0]) + item_gap + collapsedItemH(s, s.items.items[1]), m.h);
     // fills a bounded height
     const mf = c.measure(.{ .max_w = 2000, .max_h = 400 });
     try std.testing.expectEqual(@as(f32, 400), mf.h);
-    // expanded: max(label_w + 84) clamped to [220, 360]
+    // expanded: the rail is the widest item (pill + 20) + 20 clamped to
+    // [220, 360] — item + pill are capped by the parent's max width
     const e = try navigationRail(a, &items, null, null, .{ .expanded = true, .theme = t });
     defer e.deinit();
     const ls = t.type_scale.label_large;
     const lw = ui.paint.measureText("Music", ls.size, true).width;
+    const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     const em = e.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@max(expanded_min_w, item_lead + icon_size + icon_label_gap + lw + pill_icon_pad * 2), em.w, 0.001);
+    try std.testing.expectApproxEqAbs(@max(expanded_min_w, pw + item_hpad * 2), em.w, 0.001);
     // a long label clamps at 360
     const long = try navigationRail(a, &.{.{ .label = "A very long destination label that overflows" }}, null, null, .{ .expanded = true, .theme = t });
     defer long.deinit();
@@ -534,10 +647,11 @@ test "navigation_rail: click selects (signal + on_change + focus); arrows move A
     n.layout(.{ .x = 0, .y = 0, .w = 96, .h = 400 });
     try std.testing.expectEqual(@as(usize, 0), selectedIndex(n));
     try std.testing.expectEqualStrings("Home", n.semantics.?.value);
-    // click the 3rd item (the 2nd is disabled): y = 44 + 2*60 + 28
-    const y3 = top_space + 2 * (item_h + item_gap) + item_h / 2;
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 48, .y = y3, .raw_x = 48, .raw_y = y3 });
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 48, .y = y3, .raw_x = 48, .raw_y = y3 });
+    // click the 3rd item (the 2nd is disabled)
+    const r3 = itemGeom(stateOf(n), n.bounds, 2);
+    const y3 = r3.y + r3.h / 2;
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 40, .y = y3, .raw_x = 40, .raw_y = y3 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 40, .y = y3, .raw_x = 40, .raw_y = y3 });
     try std.testing.expectEqual(@as(usize, 2), selectedIndex(n));
     try std.testing.expectEqual(@as(usize, 2), sig.peek()); // the signal round-trips
     try std.testing.expectEqual(@as(u32, 1), count); // on_change fired
@@ -565,7 +679,7 @@ test "navigation_rail: semantics — role group, focusable, value follows the se
     try std.testing.expectEqual(@as(usize, 1), selectedIndex(n));
 }
 
-test "golden: collapsed — the selected item paints the 56x56 circle indicator + OnSecondaryContainer icon" {
+test "golden: collapsed — the selected item paints the 56x32 pill + OnSecondaryContainer icon + Secondary label" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try navigationRail(a, &.{
@@ -579,23 +693,36 @@ test "golden: collapsed — the selected item paints the 56x56 circle indicator 
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
+    const s = stateOf(n);
+    const ir = itemGeom(s, n.bounds, 0);
+    const lm = labelMetrics(s, s.items.items[0]);
+    const v = collapsedVerticals(lm);
     // the rail background: surface
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(15, 15));
-    // the first item's circle: centered (x = 10 + (96-56)/2 = 30), y = 10 + 44 = 54
-    const cx = 10 + (96 - circle_d) / 2 + circle_d / 2;
-    const cy = 10 + top_space + circle_d / 2;
-    // the circle's interior (4dp inside the left edge — the edge itself is
+    // the first item's 56x32 pill: centered horizontally, at the centered
+    // content's top + 16 (its vertical center)
+    const ind_x = ir.x + (ir.w - indicator_w) / 2;
+    const ind_y = ir.y + v.ind_y;
+    // the pill's interior (4dp inside the left edge — the edge itself is
     // AA'd and Skia's rrect fill rounding differs ±1): secondary_container
-    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(@as(i32, @intFromFloat(cx - circle_d / 2)) + 4, @intFromFloat(cy)));
-    // the exact circle corner stays background (a circle, not a square)
-    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@intFromFloat(cx - circle_d / 2), @intFromFloat(cy - circle_d / 2)));
-    // the icon ink (on_secondary_container) at the center
-    try std.testing.expect(f.countColorIn(.{ .x = cx - 12, .y = cy - 12, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
-    // the second (unselected) item: no indicator — plain surface at its center
-    const cy2 = 10 + top_space + (item_h + item_gap) + item_h / 2;
-    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@intFromFloat(cx), @intFromFloat(cy2 - circle_d / 2)));
-    // the unselected icon ink (on_surface_variant)
-    try std.testing.expect(f.countColorIn(.{ .x = cx - 12, .y = cy2 - 12, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0);
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(@as(i32, @intFromFloat(ind_x)) + 4, @intFromFloat(ind_y + 16)));
+    // above the pill stays background
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@intFromFloat(ind_x + 28), @intFromFloat(ind_y - 1)));
+    // the icon ink (on_secondary_container) inside the pill
+    try std.testing.expect(f.countColorIn(.{ .x = ir.x + (ir.w - 24) / 2, .y = ir.y + v.ind_y + ind_ivp, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
+    // the LabelMedium label ink (secondary) below the icon
+    const label_y = ir.y + v.ind_y + ind_h_label + col_icon_label_gap;
+    try std.testing.expect(f.countColorIn(.{ .x = ir.x, .y = label_y, .w = ir.w, .h = lm.height }, t.colors.secondary) > 0);
+    // the second (unselected) item: no indicator — plain surface in the
+    // indicator zone; on_surface_variant icon + label ink
+    const ir2 = itemGeom(s, n.bounds, 1);
+    const v2 = collapsedVerticals(labelMetrics(s, s.items.items[1]));
+    // the zone's left edge (off the centered 24dp icon) stays surface
+    const ind2_x = ir2.x + (ir2.w - indicator_w) / 2;
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@as(i32, @intFromFloat(ind2_x)) + 2, @intFromFloat(ir2.y + v2.ind_y + 16)));
+    try std.testing.expect(f.countColorIn(.{ .x = ir2.x + (ir2.w - 24) / 2, .y = ir2.y + v2.ind_y + ind_ivp, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0);
+    const label2_y = ir2.y + v2.ind_y + ind_h_label + col_icon_label_gap;
+    try std.testing.expect(f.countColorIn(.{ .x = ir2.x, .y = label2_y, .w = ir2.w, .h = lm.height }, t.colors.on_surface_variant) > 0);
 }
 
 test "golden: expanded — the selected item paints the pill (label_w + 64) at x = 20 + icon + label ink" {
@@ -608,15 +735,15 @@ test "golden: expanded — the selected item paints the pill (label_w + 64) at x
     defer n.deinit();
     const ls = t.type_scale.label_large;
     const lw = ui.paint.measureText("Music", ls.size, true).width;
-    const pw = icon_size + icon_label_gap + lw + pill_icon_pad * 2;
+    const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     var r = try golden.Renderer.init(a, 300, 200);
     defer r.deinit();
     n.layout(.{ .x = 10, .y = 10, .w = 260, .h = 180 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
-    // the second item's row: y = 10 + 44 + 60 = 114
-    const iy = 10 + top_space + (item_h + item_gap);
+    // the second item's row: y = 10 + 44 + 56 = 110 (items space 0 apart)
+    const iy = 10 + wnr_top_pad + pill_h;
     // the pill: x = 10 + 20 = 30, w = pw, h = 56 → its interior midpoints
     // (4dp inside the edges — the edges themselves are AA'd)
     try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(34, @intFromFloat(iy + pill_h / 2)));
@@ -624,14 +751,14 @@ test "golden: expanded — the selected item paints the pill (label_w + 64) at x
     // just past the pill: surface again
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(@as(i32, @intFromFloat(30 + pw)) + 4, @intFromFloat(iy + pill_h / 2)));
     // the icon ink (on_secondary_container) at pill_x + 16
-    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_icon_pad, .y = iy + 16, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_lead, .y = iy + 16, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
     // the label ink (on_secondary_container, start-icon position) at icon_x + 32
-    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_icon_pad + icon_size + icon_label_gap, .y = iy + 18, .w = lw, .h = 20 }, t.colors.on_secondary_container) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_lead + icon_size + icon_label_gap, .y = iy + 18, .w = lw, .h = 20 }, t.colors.on_secondary_container) > 0);
     // the first (unselected) item: no pill
-    const iy0 = 10 + top_space;
+    const iy0 = 10 + wnr_top_pad;
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(30, @intFromFloat(iy0 + pill_h / 2)));
     // the unselected label ink (on_surface_variant)
-    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_icon_pad + icon_size + icon_label_gap, .y = iy0 + 18, .w = 60, .h = 20 }, t.colors.on_surface_variant) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_lead + icon_size + icon_label_gap, .y = iy0 + 18, .w = 60, .h = 20 }, t.colors.on_surface_variant) > 0);
 }
 
 test "golden: a hovered item paints the OnSecondaryContainer state layer over the indicator" {
@@ -642,16 +769,20 @@ test "golden: a hovered item paints the OnSecondaryContainer state layer over th
     var r = try golden.Renderer.init(a, 120, 200);
     defer r.deinit();
     n.layout(.{ .x = 10, .y = 10, .w = 96, .h = 180 });
-    // hover the 2nd (unselected) item: y = 10 + 44 + 60 + 28
-    const y2 = 10 + top_space + (item_h + item_gap) + item_h / 2;
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .enter, .x = 58, .y = y2 });
+    // hover the 2nd (unselected) item
+    const s = stateOf(n);
+    const ir2 = itemGeom(s, n.bounds, 1);
+    const y2 = ir2.y + ir2.h / 2;
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .enter, .x = ir2.x + ir2.w / 2, .y = y2 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
     // the state layer: on_secondary_container @ 0.08 over the surface, at
-    // the circle's left edge midpoint (the unselected indicator zone)
-    const cx = 10 + (96 - circle_d) / 2;
-    try golden.expectPixelApprox(f, @intFromFloat(cx), @intFromFloat(y2), golden.blendOver(theme_mod.stateLayer(t.colors.surface, t.colors.on_secondary_container, t.state.hover), 0xFFFFFFFF));
+    // the pill's left edge midpoint (the unselected indicator zone)
+    const v2 = collapsedVerticals(labelMetrics(s, s.items.items[1]));
+    const ind_x = ir2.x + (ir2.w - indicator_w) / 2;
+    const ind_y = ir2.y + v2.ind_y;
+    try golden.expectPixelApprox(f, @as(i32, @intFromFloat(ind_x)) + 1, @intFromFloat(ind_y + ind_h_label / 2), golden.blendOver(theme_mod.stateLayer(t.colors.surface, t.colors.on_secondary_container, t.state.hover), 0xFFFFFFFF));
 }
 
 test "navigation_rail: hover_move re-resolves the item under the pointer" {
@@ -662,15 +793,17 @@ test "navigation_rail: hover_move re-resolves the item under the pointer" {
     const n = try navigationRail(a, &.{ .{ .label = "A" }, .{ .label = "B" }, .{ .label = "C" } }, null, null, .{});
     defer n.deinit();
     n.layout(.{ .x = 0, .y = 0, .w = 96, .h = 400 });
+    const s = stateOf(n);
     // hover the 1st item, then move across to the 3rd within the leaf
-    router.dispatchPointer(n, .{ .phase = .move, .x = 48, .y = top_space + 10 });
-    try std.testing.expectEqual(@as(i32, 0), stateOf(n).hovered);
-    const y3 = top_space + 2 * (item_h + item_gap) + 10;
-    router.dispatchPointer(n, .{ .phase = .move, .x = 48, .y = y3 });
-    try std.testing.expectEqual(@as(i32, 2), stateOf(n).hovered);
+    const r0 = itemGeom(s, n.bounds, 0);
+    router.dispatchPointer(n, .{ .phase = .move, .x = r0.x + r0.w / 2, .y = r0.y + 10 });
+    try std.testing.expectEqual(@as(i32, 0), s.hovered);
+    const r2 = itemGeom(s, n.bounds, 2);
+    router.dispatchPointer(n, .{ .phase = .move, .x = r2.x + r2.w / 2, .y = r2.y + 10 });
+    try std.testing.expectEqual(@as(i32, 2), s.hovered);
     // moving above the items clears the highlight (leave)
-    router.dispatchPointer(n, .{ .phase = .move, .x = 48, .y = 10 });
-    try std.testing.expectEqual(@as(i32, -1), stateOf(n).hovered);
+    router.dispatchPointer(n, .{ .phase = .move, .x = 40, .y = 1 });
+    try std.testing.expectEqual(@as(i32, -1), s.hovered);
 }
 
 test "navigation_rail: RTL mirrors the expanded row (the icon sits at the end side)" {
@@ -686,34 +819,59 @@ test "navigation_rail: RTL mirrors the expanded row (the icon sits at the end si
     defer n.deinit();
     const ls = t.type_scale.label_large;
     const lw = ui.paint.measureText("Home", ls.size, true).width;
-    const pw = icon_size + icon_label_gap + lw + pill_icon_pad * 2;
+    const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     var r = try golden.Renderer.init(a, 300, 200);
     defer r.deinit();
     n.layout(.{ .x = 10, .y = 10, .w = 260, .h = 180 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
-    const iy = 10 + top_space;
-    // the pill is mirrored: x = 10 + 260 - 20 - pw (interior midpoint — the
-    // edges are AA'd)
-    const pill_x = 10 + 260 - item_lead - pw;
+    const iy = 10 + wnr_top_pad;
+    // the pill is mirrored: the item sits at the end edge (x = 260 - pw -
+    // 20), its pill at the item's near edge → 10 + 260 - 20 - pw
+    const pill_x = 10 + 260 - item_hpad - pw;
     try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(@as(i32, @intFromFloat(pill_x)) + 4, @intFromFloat(iy + pill_h / 2)));
     // the icon ink moved to the end side (pill end - 16 - 24)
-    try std.testing.expect(f.countColorIn(.{ .x = pill_x + pw - pill_icon_pad - icon_size, .y = iy + 16, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
+    try std.testing.expect(f.countColorIn(.{ .x = pill_x + pw - pill_lead - icon_size, .y = iy + 16, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
 }
 
-test "navigation_rail: an empty rail measures the top space (44), not 40" {
+test "navigation_rail: an empty rail measures the padding, not the items" {
     const a = std.testing.allocator;
     const n = try navigationRail(a, &.{}, null, null, .{});
     defer n.deinit();
     const m = n.measure(.{ .max_w = 2000, .max_h = std.math.inf(f32) });
-    try std.testing.expectEqual(top_space, m.h); // 44 + 0 items + max(0, -1) gap
+    try std.testing.expectEqual(collapsed_top, m.h); // collapsed: 44 top, 0 bottom
+    const e = try navigationRail(a, &.{}, null, null, .{ .expanded = true });
+    defer e.deinit();
+    const em = e.measure(.{ .max_w = 2000, .max_h = std.math.inf(f32) });
+    try std.testing.expectEqual(wnr_top_pad, em.h); // expanded: 44 top
+}
+
+test "golden: an icon-only collapsed item paints the 56x56 circle" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const n = try navigationRail(a, &.{.{ .label = "", .icon = .home }}, null, null, .{ .selected = 0, .theme = t });
+    defer n.deinit();
+    var r = try golden.Renderer.init(a, 120, 120);
+    defer r.deinit();
+    n.layout(.{ .x = 10, .y = 10, .w = 96, .h = 100 });
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    // the item spans the 96-wide rail at y = 10 + 44 = 54; the 56x56
+    // circle centers in the 64-tall item → x = 10 + (96-56)/2 = 30,
+    // y = 54 + 4 = 58; center at (58, 86)
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(34, 86));
+    // the exact circle corner stays background (a circle, not a square)
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(30, 58));
+    // the icon ink (on_secondary_container) at the center
+    try std.testing.expect(f.countColorIn(.{ .x = 46, .y = 74, .w = 24, .h = 24 }, t.colors.on_secondary_container) > 0);
 }
 
 test "golden: an overflowing rail clips its items to its bounds" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
-    // 4 items need 44 + 4*56 + 3*4 = 280; the rail gets 180 — the last two
+    // 4 items need 44 + 4*64 + 3*4 = 312; the rail gets 180 — the last two
     // items overflow and must not paint below the rail's bottom edge (190)
     const n = try navigationRail(a, &.{ .{ .label = "A" }, .{ .label = "B" }, .{ .label = "C" }, .{ .label = "D" } }, null, null, .{ .selected = 3, .theme = t });
     defer n.deinit();
@@ -723,17 +881,21 @@ test "golden: an overflowing rail clips its items to its bounds" {
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
-    // the 4th (selected) item's circle would center at y = 10 + 44 + 3*60 + 28
-    // = 262 — far below the rail's bottom edge: nothing paints there
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(58, 200));
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(58, 210));
-    // the 3rd item (y = 174..230) is clipped at the bottom edge: nothing of it
-    // paints below y = 190
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(58, 195));
+    const s = stateOf(n);
+    // the 4th (selected) item sits below the rail's bottom edge: nothing
+    // paints there
+    const r3 = itemGeom(s, n.bounds, 3);
+    try std.testing.expect(r3.y + r3.h > 190);
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(50, 200));
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(50, 210));
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(50, 195));
     // control: inside the rail the unselected items paint normally — no
-    // indicator (surface at the circle interior), but their icon ink shows
-    const cx = 10 + (96 - circle_d) / 2 + 4;
-    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@intFromFloat(cx), 82));
-    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@intFromFloat(cx), 142));
-    try std.testing.expect(f.countColorIn(.{ .x = 46, .y = 130, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0); // item 1's icon
+    // indicator (surface in the indicator zone), but their icon ink shows
+    const r1 = itemGeom(s, n.bounds, 1);
+    const v1 = collapsedVerticals(labelMetrics(s, s.items.items[1]));
+    const ind_x = r1.x + (r1.w - indicator_w) / 2;
+    const ind_y = r1.y + v1.ind_y;
+    // the zone's left edge (off the centered 24dp icon) stays surface
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(@as(i32, @intFromFloat(ind_x)) + 2, @intFromFloat(ind_y + 16)));
+    try std.testing.expect(f.countColorIn(.{ .x = r1.x + (r1.w - 24) / 2, .y = r1.y + v1.ind_y + ind_ivp, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0); // item 1's icon
 }

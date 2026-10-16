@@ -1,25 +1,24 @@
 // Bottom app bar widget (Phase 2d.5, M3E batch 4) — the M3E bottom app bar.
 //
-// Spec: m3.material.io/components/bottom-app-bar + Compose AppBar.kt
-// (BottomAppBar) / BottomAppBarTokens:
-//   - container height 80, color surface_container, shape CornerNone,
-//   - content padding 4 all around (BottomAppBarHorizontalPadding =
-//     16 - 12 — the icon buttons' own 12dp touch-target expansion makes
-//     the visual icon land 16dp from the bar edge),
-//   - the actions row packs at the start edge, vertically centered,
-//     and fills the width up to the FAB (Row weight(1f), Arrangement.Start),
-//   - an optional FAB docks at the END edge: FAB top = content top + 8
-//     (12 - 4), FAB end edge = content end - 12 (16 - 4) → the standard
-//     56dp FAB sits vertically centered with a 16dp end margin,
-//   - RTL: `start`/`end` follow the text direction — the FAB docks at the
-//     left and the actions flow right-to-left.
+// Upstream: .ref/material3/AppBar.kt (BottomAppBar, BottomAppBarLayout,
+// BottomAppBarDefaults) + tokens/BottomAppBarTokens.kt:
+//   - ContainerHeight 80, ContainerColor SurfaceContainer, ContainerShape
+//     CornerNone, ContainerElevation 0 (BottomAppBarDefaults overrides the
+//     Level2 token — flat IS the upstream render)
+//   - Row: fillMaxWidth x height(ContainerHeight),
+//     padding(all = BottomAppBarContentPadding(4)), Arrangement.Start,
+//     Alignment.CenterVertically
+//   - actions in a weight(1f) Row at the start; the FAB sits in a trailing
+//     Box with padding(top = FABVerticalPadding(8), end =
+//     FABHorizontalPadding(12)) → FAB top = 4 + 8 = 12 and its end edge
+//     lands 4 + 12 = 16 inside the bar's end edge (the standard 56dp FAB
+//     ends up vertically centered)
+//   - placeRelative → RTL mirrors the whole layout: the FAB docks at the
+//     left and the actions flow right-to-left
 //
 // The bar owns no interaction: the actions/fab slots are ordinary widgets
 // (icon buttons, FABs) with their own semantics. The widget is a pure
 // chrome container: measure/layout/paint + a group semantic.
-//
-// Elevation (M3 level 2) is approximated flat: the framework paints tonal
-// containers without shadow geometry — see docs/specs for the deviation.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -32,9 +31,9 @@ const Constraints = ui.layout.Constraints;
 const Size = ui.layout.Size;
 const Theme = theme_mod.Theme;
 
-/// M3E measurement tokens (Compose AppBar.kt):
-///   content padding 4 (= 16 - IconButton's 12dp touch expansion),
-///   extra FAB padding top 8 (= 12 - 4) and end 12 (= 16 - 4).
+/// AppBar.kt BottomAppBar section (verbatim):
+///   BottomAppBarContentPadding = 4 on all sides; the FAB box carries
+///   padding(top = FABVerticalPadding = 8, end = FABHorizontalPadding = 12).
 const content_padding: f32 = 4;
 const fab_padding_top: f32 = 8;
 const fab_padding_end: f32 = 12;

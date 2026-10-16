@@ -1,18 +1,37 @@
 // Navigation bar widget (Phase 2d.1, M3E batch 1) — bottom navigation bar.
 //
-// Spec: m3.material.io/components/navigation-bar (M3E) + Compose
-// NavigationBarTokens / NavigationBarVerticalItemTokens:
-//   - container height 80 (tall), color surface_container,
-//   - items split the width equally (64dp minimum touch width each); an
-//     item is passive content — `destination()` builds the M3E icon+label
-//     content and recolors it on selection — the bar owns the interaction,
-//   - active indicator: 56x32 pill (corner full), color secondary_container,
-//     centered on the item's icon (wrapping the icon, not the label);
-//     active label/icon colors are the app's (M3E: secondary /
-//     on_secondary_container — destination() supplies them), inactive
-//     on_surface_variant,
+// Upstream: .ref/material3/NavigationBar.kt (NavigationBar,
+// NavigationBarItem's NavigationBarItemLayout / placeLabelAndIcon /
+// placeIcon) + tokens/NavigationBarTokens.kt and
+// NavigationBarVerticalItemTokens.kt:
+//   - NavigationBarTokens: TallContainerHeight 80 (NavigationBarHeight),
+//     ContainerColor SurfaceContainer, ContainerElevation Level0 (flat)
+//   - items are a weight(1f) Row with
+//     Arrangement.spacedBy(NavigationBarItemHorizontalPadding = 8): equal
+//     cells with 8dp gaps between them — the gaps belong to no item
+//   - the item layout (placeLabelAndIcon):
+//       contentHeight = icon(24) + IndicatorVerticalPadding(4) +
+//         NavigationBarIndicatorToLabelPadding(4) + labelH
+//       contentVerticalPadding = max((minHeight 80 - contentHeight)/2, 4)
+//       icon at contentVerticalPadding; label 8dp below the icon's bottom;
+//       the item's layout height = contentHeight + 2*cvp, centered in the
+//       cell (the bar's Row does not stretch items vertically)
+//   - active indicator: ActiveIndicatorWidth 56 x ActiveIndicatorHeight 32
+//     = icon + 2*IndicatorHorizontalPadding(16) x icon + 2*IVP(4),
+//     CornerFull, SecondaryContainer, centered on the icon
+//   - item ink: active icon OnSecondaryContainer, active label Secondary,
+//     inactive both OnSurfaceVariant — destination() supplies the colors
+//   - unbounded measure: an item's natural width = icon +
+//     2*NavigationBarItemToIconMinimumPadding(44)
 //   - state layers: on_secondary_container over the active indicator,
-//     on_surface_variant over the indicator zone when inactive.
+//     on_surface_variant over the indicator zone when inactive (the
+//     upstream ripple's LocalContentColor equivalent)
+//
+// Deviations: Klaxon nodes are content-sized, so a generic child's "icon"
+// is its content top — the destination() child reproduces the upstream
+// icon-first content exactly; icon-only children take the same formula
+// (which is still exact, since IVP = 4 in both axes). Compose animates the
+// indicator width 0→full on selection; Klaxon paints the final state.
 //
 // The selection is a Signal(usize) owned by the app; the bar subscribes
 // (visual + semantic sync) and unsubscribes at deinit. Items get a `.tab`
@@ -33,14 +52,16 @@ const Size = ui.layout.Size;
 const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
-/// M3E measurement tokens: active indicator 56x32, icon 24, item horizontal
-/// padding 8 (the indicator never exceeds item width - 16), item minimum
-/// touch width 64.
-const indicator_w: f32 = 56;
-const indicator_h: f32 = 32;
-const icon_size: f32 = 24;
-const item_padding_h: f32 = 8;
-const min_item_w: f32 = 64;
+/// NavigationBar.kt / tokens, verbatim:
+const item_min_h: f32 = 80; // NavigationBarTokens.TallContainerHeight (NavigationBarHeight)
+const indicator_w: f32 = 56; // NavigationBarVerticalItemTokens.ActiveIndicatorWidth = icon + 2*IndicatorHorizontalPadding
+const indicator_h: f32 = 32; // NavigationBarVerticalItemTokens.ActiveIndicatorHeight = icon + 2*IndicatorVerticalPadding
+const icon_size: f32 = 24; // NavigationBarVerticalItemTokens.IconSize
+const ind_h_pad: f32 = (indicator_w - icon_size) / 2; // IndicatorHorizontalPadding = 16
+const ind_v_pad: f32 = (indicator_h - icon_size) / 2; // IndicatorVerticalPadding = 4
+const ind_to_label: f32 = 4; // NavigationBarIndicatorToLabelPadding
+const item_gap: f32 = 8; // NavigationBarItemHorizontalPadding (Row spacedBy)
+const item_min_icon_pad: f32 = 44; // NavigationBarItemToIconMinimumPadding
 
 pub const NavBarOptions = struct {
     theme: Theme = theme_mod.light,
@@ -105,21 +126,43 @@ fn focusedItem(n: *Node) ?usize {
     return null;
 }
 
+/// placeLabelAndIcon/placeIcon verticals for one item: the item's layout
+/// frame is contentHeight + 2*contentVerticalPadding (≥ the item's 80dp
+/// defaultMinSize), centered in the cell. Returns the frame's top offset
+/// and the contentVerticalPadding — the child's top sits at frame + cvp
+/// and the indicator at frame + cvp - IndicatorVerticalPadding.
+fn itemVerticals(content_h: f32) struct { frame_h: f32, cvp: f32 } {
+    const cvp = @max((item_min_h - content_h) / 2, ind_v_pad);
+    return .{ .frame_h = content_h + cvp * 2, .cvp = cvp };
+}
+
 fn navBarMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const count: f32 = @floatFromInt(n.children.items.len);
-    var w = if (std.math.isFinite(c.max_w)) c.max_w else count * 80;
-    // M3E: each destination keeps a 64dp minimum touch width — the request
-    // asks for it; a tighter parent still wins through constrain().
-    w = @max(w, count * min_item_w);
-    return c.constrain(.{ .w = w, .h = s.opts.height });
+    const gaps = @max(0, count - 1) * item_gap;
+    // Unbounded width: an item's natural width is its icon +
+    // 2*NavigationBarItemToIconMinimumPadding (upstream ignores the label).
+    const w = if (std.math.isFinite(c.max_w)) c.max_w else count * (icon_size + item_min_icon_pad * 2) + gaps;
+    // The row is defaultMinSize(minHeight = TallContainerHeight); an item's
+    // layout height is max(80, contentH + IVP + IndicatorToLabelPadding +
+    // IVP) — a taller item grows the bar.
+    var h = s.opts.height;
+    const loose: Constraints = .{ .max_w = c.max_w, .max_h = c.max_h };
+    for (n.children.items) |child| {
+        const cs = child.measure(loose);
+        h = @max(h, cs.h + ind_v_pad * 2);
+    }
+    return c.constrain(.{ .w = w, .h = h });
 }
 
 fn navBarLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     const count = n.children.items.len;
     if (count == 0) return;
-    const item_w = bounds.w / @as(f32, @floatFromInt(count));
+    // Arrangement.spacedBy(NavigationBarItemHorizontalPadding) between
+    // weight(1f) cells: equal cells with 8dp gaps that belong to no item.
+    const gaps = @as(f32, @floatFromInt(count - 1)) * item_gap;
+    const cell_w = @max(0, (bounds.w - gaps) / @as(f32, @floatFromInt(count)));
     if (s.cells.items.len != count) {
         s.cells.clearRetainingCapacity();
         s.content_sizes.clearRetainingCapacity();
@@ -128,17 +171,20 @@ fn navBarLayout(n: *Node, bounds: Rect) void {
             s.content_sizes.append(.{}) catch @panic("klaxon: out of memory");
         }
     }
-    const loose: Constraints = .{ .max_w = item_w, .max_h = bounds.h };
+    const loose: Constraints = .{ .max_w = cell_w, .max_h = bounds.h };
     const rtl = ui.i18n.direction() == .rtl;
     for (n.children.items, 0..) |child, i| {
         const cs = child.measure(loose);
         // RTL: cell 0 is the rightmost — index order mirrors visually.
-        const x = if (rtl) bounds.x + bounds.w - @as(f32, @floatFromInt(i + 1)) * item_w else bounds.x + @as(f32, @floatFromInt(i)) * item_w;
-        s.cells.items[i] = .{ .x = x, .y = bounds.y, .w = item_w, .h = bounds.h };
+        const x = if (rtl) bounds.x + bounds.w - (@as(f32, @floatFromInt(i)) + 1) * (cell_w + item_gap) + item_gap else bounds.x + @as(f32, @floatFromInt(i)) * (cell_w + item_gap);
+        s.cells.items[i] = .{ .x = x, .y = bounds.y, .w = cell_w, .h = bounds.h };
         s.content_sizes.items[i] = cs;
+        // The item's layout frame (content + 2*cvp) centers in the cell;
+        // inside it the content starts cvp from the top.
+        const v = itemVerticals(cs.h);
         child.layout(.{
-            .x = x + (item_w - cs.w) / 2,
-            .y = bounds.y + (bounds.h - cs.h) / 2,
+            .x = x + (cell_w - cs.w) / 2,
+            .y = bounds.y + (bounds.h - v.frame_h) / 2 + v.cvp,
             .w = cs.w,
             .h = cs.h,
         });
@@ -156,14 +202,13 @@ fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, t.colors.surface_container);
     const sel = s.sig.peek();
     for (s.cells.items, 0..) |cell, i| {
-        // Indicator zone: 56 wide max (item width - 2*8), 32 high, centered
-        // horizontally; vertically it wraps the ICON, not the label — the
-        // item's content is laid out icon-first (the bar centers the
-        // content block), so the pill's center is the icon's center:
-        // content_top + icon/2 - pill/2.
-        const iw = @min(indicator_w, cell.w - item_padding_h * 2);
-        const content_h = s.content_sizes.items[i].h;
-        const iy = cell.y + (cell.h - content_h) / 2 - (indicator_h - icon_size) / 2;
+        // Upstream: the indicator is icon + 2*IndicatorHorizontalPadding
+        // (16) wide x icon + 2*IndicatorVerticalPadding (4) high — 56x32
+        // for the 24dp icon — centered horizontally, and vertically at
+        // contentVerticalPadding - IVP (it wraps the icon, not the label).
+        const iw = indicator_w;
+        const v = itemVerticals(s.content_sizes.items[i].h);
+        const iy = cell.y + (cell.h - v.frame_h) / 2 + v.cvp - ind_v_pad;
         const ix = cell.x + (cell.w - iw) / 2;
         const hovered = s.hovered != null and s.hovered.? == i;
         const pressed = s.pressed != null and s.pressed.? == i;
@@ -306,13 +351,18 @@ pub fn navBar(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), o
 // navBar()'s children are passive content — but the M3E destination look
 // (icon over label, ink recoloring on selection) is what the bar's
 // indicator math assumes. `destination` builds exactly that: a 24dp icon
-// at the content's top, the label_medium label 4dp below, both recolored
-// from the parent bar's selection at paint time — active: the icon inks
-// on_secondary_container (it sits on the secondary_container pill) and the
-// label inks secondary; inactive: on_surface_variant. A destination used
-// outside a nav bar paints the inactive colors of the light theme.
+// at the content's top, the label_medium label
+// IndicatorVerticalPadding + NavigationBarIndicatorToLabelPadding (8dp)
+// below the icon's bottom, both recolored from the parent bar's selection
+// at paint time — active: the icon inks on_secondary_container (it sits on
+// the secondary_container pill) and the label inks secondary
+// (NavigationBarTokens.ItemActiveLabelTextColor); inactive:
+// on_surface_variant. A destination used outside a nav bar paints the
+// inactive colors of the light theme.
 
-const dest_icon_label_gap: f32 = 4;
+/// label top = icon bottom + IndicatorVerticalPadding (4) +
+/// NavigationBarIndicatorToLabelPadding (4).
+const dest_icon_label_gap: f32 = ind_v_pad + ind_to_label;
 
 const DestState = struct {
     icon: icon_w.IconName,
@@ -415,7 +465,7 @@ test "nav_bar: measure fills the width and reports the M3E height" {
     try std.testing.expectEqual(@as(f32, 80), m.h);
 }
 
-test "nav_bar: layout splits the width equally and centers the content" {
+test "nav_bar: layout splits the width into equal cells with 8dp gaps" {
     const sel = try ui.state.Signal(usize).init(std.testing.allocator, 0);
     defer sel.deinit();
     const bar = try navBar(std.testing.allocator, sel, .{});
@@ -426,13 +476,15 @@ test "nav_bar: layout splits the width equally and centers the content" {
     bar.add(b);
     bar.layout(.{ .x = 0, .y = 0, .w = 400, .h = 80 });
     const s = stateOf(bar);
+    // upstream Row: weight(1f) cells + spacedBy(8) → (400-8)/2 cells
     try std.testing.expectEqual(@as(usize, 2), s.cells.items.len);
     try std.testing.expectEqual(@as(f32, 0), s.cells.items[0].x);
-    try std.testing.expectEqual(@as(f32, 200), s.cells.items[0].w);
-    try std.testing.expectEqual(@as(f32, 200), s.cells.items[1].x);
+    try std.testing.expectEqual(@as(f32, 196), s.cells.items[0].w);
+    try std.testing.expectEqual(@as(f32, 204), s.cells.items[1].x);
     // the content is centered in its cell
-    try std.testing.expectEqual(@as(f32, (200 - a.bounds.w) / 2), a.bounds.x);
-    try std.testing.expectEqual(@as(f32, (80 - a.bounds.h) / 2), a.bounds.y);
+    try std.testing.expectEqual(@as(f32, (196 - a.bounds.w) / 2), a.bounds.x);
+    const v = itemVerticals(a.bounds.h);
+    try std.testing.expectEqual(@as(f32, (80 - v.frame_h) / 2 + v.cvp), a.bounds.y);
 }
 
 test "nav_bar: items get .tab semantics with checked following the selection" {
