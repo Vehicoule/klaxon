@@ -36,8 +36,11 @@
 // minutes to the nearest minute; in 24h the tap's radius picks the ring);
 // tapping AM/PM flips the period (12h). OK fires on_select, Cancel on_cancel.
 //
+//   - autoSwitchToMinute (opts.auto_switch_to_minute, default on): releasing
+//     a dial gesture in the hour mode advances to the minute dial.
+//
 // v1 deviations (documented, fixed later):
-//   - No text-input variant, no auto-switch hour→minute after a selection.
+//   - No text-input variant.
 //   - en strings only ("AM"/"PM", Cancel/OK).
 //   - No per-label hover on the dial; no keyboard navigation yet.
 const std = @import("std");
@@ -61,6 +64,9 @@ pub const TimePickerOptions = struct {
     width: f32 = 360,
     /// 24-hour mode: no AM/PM toggle, the hour plate shows 00..23.
     is_24h: bool = false,
+    /// Compose autoSwitchToMinute (default true): after an hour selection
+    /// (dial tap release or drag end) the dial advances to the minute mode.
+    auto_switch_to_minute: bool = true,
 };
 
 pub const DialMode = enum { hour, minute };
@@ -525,6 +531,9 @@ fn tpOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .up => {
             if (s.dragging) {
                 s.dragging = false;
+                // upstream onTap/onDragEnd: after an hour pick the dial
+                // auto-advances to the minute mode (autoSwitchToMinute)
+                if (s.mode == .hour and s.opts.auto_switch_to_minute) s.mode = .minute;
                 n.markDirty();
                 return true;
             }
@@ -806,7 +815,9 @@ test "time_picker: the 24h dial is a dual ring (outer 0..11, inner 12..23)" {
     const a = std.testing.allocator;
     const sig = try ui.state.Signal(i32).init(a, 630); // 10:30
     defer sig.deinit();
-    const n = try timePicker(a, sig, null, null, .{ .is_24h = true });
+    // the ring-geometry test taps the hour dial repeatedly — hold it in the
+    // hour mode (upstream autoSwitchToMinute would advance after each pick)
+    const n = try timePicker(a, sig, null, null, .{ .is_24h = true, .auto_switch_to_minute = false });
     defer n.deinit();
     n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
     const c = dialCenter(n);
@@ -827,6 +838,40 @@ test "time_picker: the 24h dial is a dual ring (outer 0..11, inner 12..23)" {
     try std.testing.expectEqual(@as(i32, 30), sig.peek());
     // the a11y value follows (24h format)
     try std.testing.expectEqualStrings("00:30", n.semantics.?.value);
+}
+
+test "time_picker: releasing an hour-dial gesture auto-switches to the minute dial" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(i32).init(a, 630); // 10:30
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{}); // auto_switch_to_minute = true
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
+    const c = dialCenter(n);
+    try std.testing.expectEqual(DialMode.hour, dialMode(n));
+    // a tap on the hour dial: selects AND advances (upstream onTap)
+    router.dispatchPointer(n, .{ .phase = .down, .x = c[0] + 101, .y = c[1], .raw_x = c[0] + 101, .raw_y = c[1] });
+    router.dispatchPointer(n, .{ .phase = .up, .x = c[0] + 101, .y = c[1], .raw_x = c[0] + 101, .raw_y = c[1] });
+    try std.testing.expectEqual(@as(i32, 3 * 60 + 30), sig.peek()); // 3 selected
+    try std.testing.expectEqual(DialMode.minute, dialMode(n));
+    // a minute-dial tap stays in minute mode
+    router.dispatchPointer(n, .{ .phase = .down, .x = c[0], .y = c[1] - 101, .raw_x = c[0], .raw_y = c[1] - 101 });
+    router.dispatchPointer(n, .{ .phase = .up, .x = c[0], .y = c[1] - 101, .raw_x = c[0], .raw_y = c[1] - 101 });
+    try std.testing.expectEqual(DialMode.minute, dialMode(n));
+    try std.testing.expectEqual(@as(i32, 3 * 60), sig.peek()); // minute 00
+    // back to hour via the plate: the hour plate restores the hour dial
+    const hp = plateRect(n.bounds, .hour, false);
+    router.dispatchPointer(n, .{ .phase = .down, .x = hp.x + 4, .y = hp.y + 4, .raw_x = hp.x + 4, .raw_y = hp.y + 4 });
+    router.dispatchPointer(n, .{ .phase = .up, .x = hp.x + 4, .y = hp.y + 4, .raw_x = hp.x + 4, .raw_y = hp.y + 4 });
+    try std.testing.expectEqual(DialMode.hour, dialMode(n));
+    // a drag ending on the hour dial also advances (upstream onDragEnd)
+    router.dispatchPointer(n, .{ .phase = .down, .x = c[0] + 101, .y = c[1], .raw_x = c[0] + 101, .raw_y = c[1] });
+    router.dispatchPointer(n, .{ .phase = .move, .x = c[0], .y = c[1] + 101, .raw_x = c[0], .raw_y = c[1] + 101 });
+    router.dispatchPointer(n, .{ .phase = .up, .x = c[0], .y = c[1] + 101, .raw_x = c[0], .raw_y = c[1] + 101 });
+    try std.testing.expectEqual(DialMode.minute, dialMode(n));
 }
 
 test "time_picker: the app drives the time (two-way signal, clamped)" {

@@ -30,10 +30,16 @@
 // "Today" is injected (opts.today) or read from the system clock (UTC) —
 // deterministic tests inject it.
 //
+//   - The year picker (YearPickerMenuButton + the YearPicker grid): the
+//     month-year label is a TextButton + ArrowDropDown (rotated when open)
+//     toggling a scrollable 3-column year grid (72×36 CornerFull cells,
+//     16dp row gap, wheel + drag scroll, current year = 1dp Primary
+//     outline + Primary label, selected = Primary + OnPrimary); a year
+//     tap closes the picker and pages to that year's same month.
+//
 // v1 deviations (documented, fixed later):
-//   - No date-input mode, no range selection, no year picker (the month-year
-//     label is static — no dropdown arrow), no docked variant, no swipe
-//     paging (chevron paging instead, the desktop idiom).
+//   - No date-input mode, no range selection, no docked variant, no swipe
+//     paging on the day grid (chevron paging, the desktop idiom).
 //   - en strings only (month/weekday names, "Select date", Cancel/OK).
 //   - UTC dates (epoch days); no timezone/locale calendar model.
 //   - The headline color follows the Compose token (OnSurfaceVariant; the
@@ -87,6 +93,20 @@ const chevron_hit: f32 = 40;
 const chevron_icon: f32 = 24;
 const min_year: i64 = 1900; // DatePickerDefaults.YearRange
 const max_year: i64 = 2100;
+// the year picker (DatePicker.kt YearPicker + YearPickerMenuButton):
+// LazyVerticalGrid of 3 columns (YearsInRow), 72×36 cells
+// (SelectionYearContainerWidth/Height), 16dp vertical spacing
+// (YearsVerticalPadding), CircleShape state layer; the menu button is a
+// TextButton + ArrowDropDown (rotated 180° when expanded)
+const year_cols: usize = 3;
+const year_cell_w: f32 = 72;
+const year_cell_h: f32 = 36;
+const year_vgap: f32 = 16; // YearsVerticalPadding
+const year_row_h: f32 = year_cell_h + year_vgap; // 52
+const year_menu_icon: f32 = 18;
+const year_menu_gap: f32 = 8; // ButtonDefaults.IconSpacing
+const year_menu_h: f32 = 40;
+const year_menu_pad: f32 = 12;
 
 /// The supported civil-date range (the year range), as UTC epoch days.
 pub const min_epoch_day: i64 = daysFromCivil(min_year, 1, 1); // 1900-01-01
@@ -247,6 +267,8 @@ const Zone = union(enum) {
     prev,
     next,
     day: i64, // the epoch day
+    year_menu, // the month-year TextButton (toggles the year picker)
+    year: i64, // a year cell
     cancel,
     ok,
 };
@@ -264,6 +286,11 @@ const DpState = struct {
     pressed: Zone = .none,
     down_x: f32 = 0,
     down_y: f32 = 0,
+    /// The year-picker menu: open replaces the day grid with the scrollable
+    /// year list; year_scroll is the grid's pixel offset.
+    year_open: bool = false,
+    year_scroll: f32 = 0,
+    year_dragging: bool = false, // a drag-scroll owns the gesture until .up
     /// The a11y value (the headline, or the owned title when nothing is
     /// selected) — Phase 2c. Points into value_buf or at title_z.
     value_buf: [32]u8 = std.mem.zeroes([32]u8),
@@ -344,6 +371,84 @@ fn cellRect(b: Rect, col: usize, row: usize) Rect {
     };
 }
 
+// --- year picker geometry ---
+
+/// The area the year grid occupies: it replaces the weekday row + the day
+/// grid (the AnimatedVisibility region, ≈ upstream's 48×7−1 = 335dp).
+const year_grid_y_off: f32 = header_h + nav_h;
+const year_grid_h: f32 = weekday_row_h + grid_h; // 336
+
+fn yearGridMetrics(b: Rect) struct { x: f32, w: f32, gap: f32, y: f32, h: f32 } {
+    const w = b.w - 2 * h_pad;
+    return .{
+        .x = b.x + h_pad,
+        .w = w,
+        .gap = (w - @as(f32, year_cols) * year_cell_w) / (@as(f32, year_cols) + 1), // SpaceEvenly
+        .y = b.y + year_grid_y_off,
+        .h = year_grid_h,
+    };
+}
+
+/// The total scrollable height of the year grid (67 rows of 52).
+fn yearContentH() f32 {
+    const rows = (max_year - min_year + 1 + year_cols - 1) / year_cols;
+    return @as(f32, @floatFromInt(rows)) * year_row_h - year_vgap;
+}
+
+/// Max scroll offset (content − viewport); the grid is never shorter than
+/// the viewport (3468 > 336) but clamp defensively.
+fn yearMaxScroll() f32 {
+    return @max(0, yearContentH() - year_grid_h);
+}
+
+/// The year at grid cell `i` (row-major, min_year first) — always valid.
+fn yearAtCell(i: usize) i64 {
+    return min_year + @as(i64, @intCast(i));
+}
+
+/// A year cell's rect in window coords (before clipping) given the scroll.
+fn yearCellRect(b: Rect, i: usize, scroll: f32) Rect {
+    const g = yearGridMetrics(b);
+    const col: f32 = @floatFromInt(i % year_cols);
+    const row: f32 = @floatFromInt(i / year_cols);
+    return .{
+        .x = g.x + g.gap + col * (year_cell_w + g.gap),
+        .y = g.y + row * year_row_h - scroll,
+        .w = year_cell_w,
+        .h = year_cell_h,
+    };
+}
+
+/// The month-year menu button's rect (TextButton: label + icon spacing +
+/// ArrowDropDown, wrapped in its hit area).
+fn yearMenuRect(n: *Node) Rect {
+    const s = stateOf(n);
+    const b = n.bounds;
+    const ls = s.opts.theme.type_scale.label_large;
+    var my_buf: [32]u8 = undefined;
+    const my = formatMonthYear(s.disp.peek(), &my_buf);
+    const my_m = ui.paint.measureText(my, ls.size, ls.weight >= 500);
+    return .{
+        .x = b.x + h_pad - 4,
+        .y = b.y + header_h + (nav_h - year_menu_h) / 2,
+        .w = 4 + my_m.width + year_menu_gap + year_menu_icon + year_menu_pad,
+        .h = year_menu_h,
+    };
+}
+
+/// Open the year menu with the upstream scroll: the displayed year's row
+/// sits one row below the viewport top (initialFirstVisibleItemIndex =
+/// displayedYear − first − YearsInRow).
+fn openYearMenu(n: *Node) void {
+    const s = stateOf(n);
+    s.year_open = true;
+    const dy = civilFromDays(s.disp.peek()).y;
+    const idx: i64 = dy - min_year - @as(i64, @intCast(year_cols));
+    const row = @divFloor(@max(0, idx), @as(i64, @intCast(year_cols)));
+    s.year_scroll = std.math.clamp(@as(f32, @floatFromInt(row)) * year_row_h, 0, yearMaxScroll());
+    n.markDirty();
+}
+
 fn chevronRects(b: Rect) struct { prev: Rect, next: Rect } {
     const right = b.x + b.w - h_pad;
     const y = b.y + header_h + (nav_h - chevron_hit) / 2;
@@ -373,10 +478,35 @@ fn footerRects(n: *Node) FooterRects {
 
 /// The interactive zone at (x, y) — window coordinates.
 fn zoneAt(n: *Node, x: f32, y: f32) Zone {
+    const s = stateOf(n);
     const b = n.bounds;
     const fr = footerRects(n);
     if (fr.cancel.contains(x, y)) return .cancel;
     if (fr.ok.contains(x, y)) return .ok;
+    if (yearMenuRect(n).contains(x, y)) return .year_menu;
+    if (s.year_open) {
+        // the chevrons are hidden while the picker is open (MonthsNavigation
+        // collapses to Arrangement.Start); hits resolve against the year grid
+        const g = yearGridMetrics(b);
+        if (x >= g.x and x < g.x + g.w and y >= g.y and y < g.y + g.h) {
+            const row_f = (y - g.y + s.year_scroll) / year_row_h;
+            const lx = x - g.x - g.gap;
+            const col_f = lx / (year_cell_w + g.gap);
+            if (row_f >= 0 and col_f >= 0) {
+                const row: usize = @intFromFloat(row_f);
+                const col: usize = @intFromFloat(col_f);
+                if (col < year_cols) {
+                    const in_cell = lx - @as(f32, @floatFromInt(col)) * (year_cell_w + g.gap) <= year_cell_w and
+                        (y - g.y + s.year_scroll) - @as(f32, @floatFromInt(row)) * year_row_h <= year_cell_h;
+                    if (in_cell) {
+                        const i = row * year_cols + col;
+                        if (i < max_year - min_year + 1) return .{ .year = yearAtCell(i) };
+                    }
+                }
+            }
+        }
+        return .none;
+    }
     const chev = chevronRects(b);
     if (canPrev(n) and chev.prev.contains(x, y)) return .prev;
     if (canNext(n) and chev.next.contains(x, y)) return .next;
@@ -467,18 +597,33 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
     const hl_box_y = b.y + header_h - headline_pad_bottom - hl.line_height;
     ui.paint.text(ctx, headline, b.x + 24, hl_box_y + (hl.line_height - hl_m.height) / 2 + hl_m.ascent, hl.size, hl_bold, cs.on_surface_variant);
     ui.paint.fillRect(ctx, b.x, b.y + header_h - 1, b.w, 1, cs.outline_variant);
-    // the month/year nav row: the label + the chevrons
+    // the month/year nav row: the menu button (TextButton + ArrowDropDown,
+    // rotated 180° while the year picker is open) + the chevrons (hidden
+    // while open — MonthsNavigation collapses to Arrangement.Start)
     var my_buf: [32]u8 = undefined;
     const my = formatMonthYear(s.disp.peek(), &my_buf);
     const my_m = ui.paint.measureText(my, ls.size, bold);
     const nav_cy = b.y + header_h + nav_h / 2;
+    const yr = yearMenuRect(n);
+    if (std.meta.eql(s.hover, .year_menu) or std.meta.eql(s.pressed, .year_menu)) {
+        const alpha = if (std.meta.eql(s.pressed, .year_menu)) t.state.pressed else t.state.hover;
+        ui.paint.fillRRect(ctx, yr.x, yr.y, yr.w, yr.h, yr.h / 2, theme_mod.stateLayer(0, cs.on_surface_variant, alpha));
+    }
     ui.paint.text(ctx, my, b.x + h_pad, nav_cy - my_m.height / 2 + my_m.ascent, ls.size, bold, cs.on_surface_variant);
-    const chev = chevronRects(b);
-    paintChevron(n, ctx, chev.prev, .chevron_left, .prev, canPrev(n));
-    paintChevron(n, ctx, chev.next, .chevron_right, .next, canNext(n));
-    // the weekday row
+    paintIcon(ctx, if (s.year_open) .triangle_up else .triangle_down, b.x + h_pad + my_m.width + year_menu_gap, nav_cy - year_menu_icon / 2, year_menu_icon, cs.on_surface_variant);
+    if (!s.year_open) {
+        const chev = chevronRects(b);
+        paintChevron(n, ctx, chev.prev, .chevron_left, .prev, canPrev(n));
+        paintChevron(n, ctx, chev.next, .chevron_right, .next, canNext(n));
+    }
     const bl = t.type_scale.body_large;
     const bl_bold = bl.weight >= 500;
+    if (s.year_open) {
+        paintYearGrid(n, ctx, b, bl.size, bl_bold);
+        paintFooter(n, ctx);
+        return;
+    }
+    // the weekday row
     const g = gridMetrics(b);
     const weekday_y = b.y + header_h + nav_h;
     for (0..7) |col| {
@@ -512,9 +657,57 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.text(ctx, dstr, cr.x + (cell - dm.width) / 2, cr.y + (cell - dm.height) / 2 + dm.ascent, bl.size, bl_bold, fg);
     }
     // the footer
+    paintFooter(n, ctx);
+}
+
+fn paintFooter(n: *Node, ctx: *kx.Ctx) void {
     const fr = footerRects(n);
     paintTextButton(n, ctx, fr.cancel, "Cancel", .cancel);
     paintTextButton(n, ctx, fr.ok, "OK", .ok);
+}
+
+/// The year picker grid (DatePicker.kt YearPicker): a clipped, scrollable
+/// LazyVerticalGrid — 3 columns, 72×36 CornerFull cells, 16dp row gap.
+/// Selected year = the displayed month's year (Primary + OnPrimary);
+/// the current year carries the 1dp Primary outline + Primary label;
+/// the rest are OnSurfaceVariant BodyLarge.
+fn paintYearGrid(n: *Node, ctx: *kx.Ctx, b: Rect, size: f32, bold: bool) void {
+    const s = stateOf(n);
+    const t = s.opts.theme;
+    const cs = t.colors;
+    const g = yearGridMetrics(b);
+    const disp_year = civilFromDays(s.disp.peek()).y;
+    const cur_year = civilFromDays(s.today).y;
+    ui.paint.save(ctx);
+    ui.paint.clipRect(ctx, g.x, g.y, g.w, g.h);
+    const first: usize = @intFromFloat(@max(0, s.year_scroll / year_row_h));
+    const last: usize = @min(@as(usize, @intCast(max_year - min_year + 1)), (first + 8) * year_cols + year_cols);
+    var i = first * year_cols;
+    while (i < last) : (i += 1) {
+        const y = yearAtCell(i);
+        const cr = yearCellRect(b, i, s.year_scroll);
+        if (cr.y > g.y + g.h or cr.y + cr.h < g.y) continue;
+        const is_sel = y == disp_year;
+        const is_cur = y == cur_year;
+        const is_hover = std.meta.eql(s.hover, Zone{ .year = y });
+        const is_pressed = std.meta.eql(s.pressed, Zone{ .year = y });
+        if (is_sel) {
+            ui.paint.fillRRect(ctx, cr.x, cr.y, cr.w, cr.h, cr.h / 2, cs.primary);
+        } else {
+            if (is_cur) ui.paint.strokeRRect(ctx, cr.x, cr.y, cr.w, cr.h, cr.h / 2, 1, cs.primary);
+            if (is_hover or is_pressed) {
+                const alpha = if (is_pressed) t.state.pressed else t.state.hover;
+                ui.paint.fillRRect(ctx, cr.x, cr.y, cr.w, cr.h, cr.h / 2, theme_mod.stateLayer(0, cs.on_surface_variant, alpha));
+            }
+        }
+        var ybuf: [8]u8 = undefined;
+        const ystr = std.fmt.bufPrintSentinel(&ybuf, "{d}", .{y}, 0) catch break;
+        const ym = ui.paint.measureText(ystr, size, bold);
+        const fg: Color = if (is_sel) cs.on_primary else if (is_cur) cs.primary else cs.on_surface_variant;
+        ui.paint.text(ctx, ystr, cr.x + (cr.w - ym.width) / 2, cr.y + (cr.h - ym.height) / 2 + ym.ascent, size, bold, fg);
+    }
+    ui.paint.clipReset(ctx);
+    ui.paint.restore(ctx);
 }
 
 // --- input ---
@@ -534,19 +727,35 @@ fn dpOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .up => {
             const was = s.pressed;
             s.pressed = .none;
+            const was_dragging = s.year_dragging;
+            s.year_dragging = false;
             n.markDirty();
+            if (was_dragging) return true; // the scroll consumed the gesture
             if (std.meta.activeTag(was) == .none) return false;
             if (!std.meta.eql(zoneAt(n, ev.x, ev.y), was)) return true; // released outside: no action
             activate(n, s, was);
             return true;
         },
         .move => {
+            // a drag in the open year grid scrolls it (LazyVerticalGrid)
+            if (s.year_dragging) {
+                s.year_scroll = std.math.clamp(s.year_scroll - (ev.raw_y - s.down_y), 0, yearMaxScroll());
+                s.down_y = ev.raw_y;
+                s.hover = zoneAt(n, ev.x, ev.y);
+                n.markDirty();
+                return true;
+            }
             // A drag beyond the touch slop cancels the press (button.zig's
             // pattern); the move is NOT claimed (it keeps bubbling).
             if (std.meta.activeTag(s.pressed) != .none) {
                 const dx = ev.raw_x - s.down_x;
                 const dy = ev.raw_y - s.down_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    if (s.year_open and std.meta.activeTag(s.pressed) == .year and @abs(dy) > @abs(dx)) {
+                        // a vertical drag off a year cell scrolls the grid
+                        s.year_dragging = true;
+                        s.down_y = ev.raw_y;
+                    }
                     s.pressed = .none;
                     n.markDirty();
                 }
@@ -554,6 +763,7 @@ fn dpOnPointer(n: *Node, ev: input.PointerEvent) bool {
             return false;
         },
         .outside_down => {
+            s.year_dragging = false;
             if (std.meta.activeTag(s.pressed) != .none) {
                 s.pressed = .none;
                 n.markDirty();
@@ -577,12 +787,26 @@ fn dpOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 fn activate(n: *Node, s: *DpState, z: Zone) void {
-    _ = n;
     switch (z) {
         .none => {},
         .prev => s.disp.set(shiftMonth(s.disp.peek(), -1)),
         .next => s.disp.set(shiftMonth(s.disp.peek(), 1)),
         .day => |d| s.sel.set(d),
+        .year_menu => {
+            if (s.year_open) {
+                s.year_open = false;
+                n.markDirty();
+            } else {
+                openYearMenu(n);
+            }
+        },
+        .year => |y| {
+            // upstream: selecting a year closes the picker and pages the
+            // displayed month to that year's same month
+            const c = civilFromDays(s.disp.peek());
+            s.year_open = false;
+            s.disp.set(firstOfMonth(y, c.m));
+        },
         .cancel => {
             if (s.on_cancel) |cb| cb.fn_ptr(cb.userdata);
         },
@@ -590,6 +814,20 @@ fn activate(n: *Node, s: *DpState, z: Zone) void {
             if (s.on_select) |cb| cb.fn_ptr(cb.userdata);
         },
     }
+}
+
+/// Mouse wheel / touchpad scroll over the open year grid (LazyVerticalGrid).
+fn dpOnScroll(n: *Node, ev: input.ScrollEvent) bool {
+    const s = stateOf(n);
+    if (!s.year_open) return false;
+    const g = yearGridMetrics(n.bounds);
+    if (!(ev.x >= g.x and ev.x < g.x + g.w and ev.y >= g.y and ev.y < g.y + g.h)) return false;
+    // delta_y negative = scroll down (the scroll_view wheel convention,
+    // 48px per click)
+    s.year_scroll = std.math.clamp(s.year_scroll - ev.delta_y * 48, 0, yearMaxScroll());
+    s.hover = zoneAt(n, ev.x, ev.y);
+    n.markDirty();
+    return true;
 }
 
 // --- signals + a11y ---
@@ -637,6 +875,7 @@ const dp_vtable = ui.node.VTable{
     .paint = dpPaint,
     .deinit = dpDeinit,
     .on_pointer = dpOnPointer,
+    .on_scroll = dpOnScroll,
 };
 
 fn dupeZ(allocator: std.mem.Allocator, s: []const u8) ![:0]const u8 {
@@ -889,6 +1128,86 @@ test "date_picker: the app drives the selection + the displayed month (two-way s
     try std.testing.expectEqual(daysFromCivil(2027, 1, 1), dayAtCell(n, 5).?);
 }
 
+test "date_picker: the month-year button opens the year picker; a year tap pages and closes it" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const f = try dpFixture(a);
+    defer f[1].deinit(); // LIFO: the node deinits first (it unsubscribes)
+    defer f[2].deinit();
+    defer f[0].deinit();
+    const n = f[0];
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
+    const s = stateOf(n);
+    try std.testing.expect(!s.year_open);
+    // tap the menu button → the picker opens, scrolled so the displayed year
+    // (2026) sits one row below the top (upstream initialFirstVisibleItemIndex)
+    const yr = yearMenuRect(n);
+    const tapAt = struct {
+        fn go(r: *input.InputRouter, node: *Node, x: f32, y: f32) void {
+            r.dispatchPointer(node, .{ .phase = .down, .x = x, .y = y, .raw_x = x, .raw_y = y });
+            r.dispatchPointer(node, .{ .phase = .up, .x = x, .y = y, .raw_x = x, .raw_y = y });
+        }
+    }.go;
+    tapAt(&router, n, yr.x + 8, yr.y + yr.h / 2);
+    try std.testing.expect(s.year_open);
+    // the 2026 cell (item 126 → row 42) is in view, one row below the top
+    const idx26: usize = @intCast(2026 - min_year);
+    const r2026 = yearCellRect(n.bounds, idx26, s.year_scroll);
+    const g = yearGridMetrics(n.bounds);
+    try std.testing.expect(r2026.y >= g.y and r2026.y < g.y + 2 * year_row_h);
+    // the chevrons are not hit zones while open
+    const chev = chevronRects(n.bounds);
+    try std.testing.expect(std.meta.activeTag(zoneAt(n, chev.next.x + 2, chev.next.y + 2)) != .next);
+    // tap the 2030 cell → closes and pages to October 2030
+    const idx30: usize = @intCast(2030 - min_year);
+    const r2030 = yearCellRect(n.bounds, idx30, s.year_scroll);
+    try std.testing.expect(std.meta.eql(zoneAt(n, r2030.x + 4, r2030.y + 4), Zone{ .year = 2030 }));
+    tapAt(&router, n, r2030.x + 4, r2030.y + 4);
+    try std.testing.expect(!s.year_open);
+    try std.testing.expectEqual(daysFromCivil(2030, 10, 1), displayedMonth(n));
+    // reopen + close via the same button (the toggle)
+    tapAt(&router, n, yr.x + 8, yr.y + yr.h / 2);
+    try std.testing.expect(s.year_open);
+    tapAt(&router, n, yr.x + 8, yr.y + yr.h / 2);
+    try std.testing.expect(!s.year_open);
+}
+
+test "date_picker: the year grid scrolls on the wheel and on a vertical drag" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const f = try dpFixture(a);
+    defer f[1].deinit(); // LIFO: the node deinits first (it unsubscribes)
+    defer f[2].deinit();
+    defer f[0].deinit();
+    const n = f[0];
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
+    const s = stateOf(n);
+    openYearMenu(n);
+    const g = yearGridMetrics(n.bounds);
+    const gy = g.y + 20;
+    const s0 = s.year_scroll;
+    // wheel down over the grid scrolls deeper (delta_y negative = down)
+    router.dispatchScroll(n, .{ .x = g.x + 20, .y = gy, .delta_y = -2 });
+    try std.testing.expectEqual(s0 + 96, s.year_scroll);
+    // wheel outside the grid area is not claimed
+    try std.testing.expect(!dpOnScroll(n, .{ .x = 10, .y = n.bounds.y + 10, .delta_y = -1 }));
+    // a vertical drag off a year cell scrolls; a tap still selects
+    const idx30: usize = @intCast(2030 - min_year);
+    const r2030 = yearCellRect(n.bounds, idx30, s.year_scroll);
+    router.dispatchPointer(n, .{ .phase = .down, .x = r2030.x + 4, .y = r2030.y + 4, .raw_x = r2030.x + 4, .raw_y = r2030.y + 4 });
+    router.dispatchPointer(n, .{ .phase = .move, .x = r2030.x + 4, .y = r2030.y - 60, .raw_x = r2030.x + 4, .raw_y = r2030.y - 60 }); // drag up 60+ → scrolling
+    try std.testing.expect(s.year_dragging);
+    const s1 = s.year_scroll;
+    router.dispatchPointer(n, .{ .phase = .move, .x = r2030.x + 4, .y = r2030.y - 120, .raw_x = r2030.x + 4, .raw_y = r2030.y - 120 });
+    try std.testing.expect(s.year_scroll > s1);
+    router.dispatchPointer(n, .{ .phase = .up, .x = r2030.x + 4, .y = r2030.y - 120, .raw_x = r2030.x + 4, .raw_y = r2030.y - 120 });
+    try std.testing.expect(s.year_open); // the drag didn't select/close
+}
+
 test "golden: the M3E date picker panel (container, header, grid, selected + today, footer)" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
@@ -926,4 +1245,37 @@ test "golden: the M3E date picker panel (container, header, grid, selected + tod
     const fr = footerRects(n);
     try std.testing.expect(f2.countColorApproxIn(fr.ok, t.colors.primary) > 0);
     try std.testing.expect(f2.countColorApproxIn(fr.cancel, t.colors.primary) > 0);
+}
+
+test "golden: the open year picker paints the year grid (selected/current/plain years)" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const f = try dpFixture(a);
+    defer f[1].deinit();
+    defer f[2].deinit();
+    defer f[0].deinit();
+    const n = f[0];
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
+    const s = stateOf(n);
+    openYearMenu(n);
+    var r = try golden.Renderer.init(a, 360, 564);
+    defer r.deinit();
+    r.paint(n, 0xFFFFFFFF);
+    var f2 = try r.readback(a);
+    defer f2.deinit();
+    // the displayed year (2026) is a solid Primary cell
+    const idx26: usize = @intCast(2026 - min_year);
+    const r2026 = yearCellRect(n.bounds, idx26, s.year_scroll);
+    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(@intFromFloat(r2026.x + 8), @intFromFloat(r2026.y + 8)));
+    // the current year (2026 IS today here — use a different fixture year:
+    // today = 2026 → the current year IS the selected year; check a plain
+    // year instead: 2027 unselected = container, no Primary)
+    const idx27: usize = @intCast(2027 - min_year);
+    const r2027 = yearCellRect(n.bounds, idx27, s.year_scroll);
+    try std.testing.expectEqual(@as(usize, 0), f2.countColorApproxIn(.{ .x = r2027.x + 2, .y = r2027.y + 2, .w = r2027.w - 4, .h = r2027.h - 4 }, t.colors.primary));
+    // the year label has OnSurfaceVariant ink
+    try std.testing.expect(f2.countNotIn(.{ .x = r2027.x, .y = r2027.y, .w = r2027.w, .h = r2027.h }, t.colors.surface_container_high) > 0);
+    // the dropdown icon (rotated up while open) sits after the label
+    const yr = yearMenuRect(n);
+    try std.testing.expect(f2.countNotIn(.{ .x = yr.x + yr.w - year_menu_icon - year_menu_pad, .y = yr.y + 8, .w = year_menu_icon + 8, .h = yr.h - 16 }, t.colors.surface_container_high) > 0);
 }
