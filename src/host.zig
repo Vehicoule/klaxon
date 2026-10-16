@@ -121,7 +121,11 @@ fn forcedDpr() f32 {
     if (dpr_latched == null) {
         dpr_latched = 0;
         if (std.c.getenv("KLAXON_DPR")) |v| {
-            dpr_latched = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
+            const parsed = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
+            // inf/nan/garbage → ignore: a non-finite scale turns every
+            // downstream intFromFloat(surface_px) into a panic. 16× is
+            // far past any real display (Retina = 2).
+            if (parsed > 0 and std.math.isFinite(parsed)) dpr_latched = @min(parsed, 16);
         }
     }
     return dpr_latched.?;
@@ -901,13 +905,21 @@ pub const Host = struct {
                 // display_scale ≠ 1 on HiDPI), rounded out to cover the AA
                 // fringe.
                 const s = host.display_scale;
-                const px0: c_int = @intFromFloat(@floor(d.x * s));
-                const py0: c_int = @intFromFloat(@floor(d.y * s));
+                // Clamp INTO the pixel surface: d is already intersected
+                // with the logical surface, but floor/ceil in float can
+                // still land 1px outside (e.g. 360*1.5 = 540.000…1 → ceil
+                // 541). The readback clamps its copy again — an unclamped
+                // rect here would desync the upload size/pitch from the
+                // bytes actually read (OOB texels + smearing).
+                const px0: c_int = @max(0, @as(c_int, @intFromFloat(@floor(d.x * s))));
+                const py0: c_int = @max(0, @as(c_int, @intFromFloat(@floor(d.y * s))));
+                const px1: c_int = @min(host.pixel_width, @as(c_int, @intFromFloat(@ceil((d.x + d.w) * s))));
+                const py1: c_int = @min(host.pixel_height, @as(c_int, @intFromFloat(@ceil((d.y + d.h) * s))));
                 host.present_rect = if (!fullPresentForced()) .{
                     .x = px0,
                     .y = py0,
-                    .w = @as(c_int, @intFromFloat(@ceil((d.x + d.w) * s))) - px0,
-                    .h = @as(c_int, @intFromFloat(@ceil((d.y + d.h) * s))) - py0,
+                    .w = @max(0, px1 - px0),
+                    .h = @max(0, py1 - py0),
                 } else null; // A/B: force the full-surface upload
             }
         } else {

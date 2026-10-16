@@ -295,8 +295,14 @@ pub fn imageDrawAtlas(ctx: *kx.Ctx, id: u64, xforms: []const SpriteXform) void {
 /// directly; kx_image_quad is the wire type.)
 pub const ImageQuad = extern struct {
     image: u64,
-    sx: f32, sy: f32, sw: f32, sh: f32, // source rect (sw/sh <= 0 = full image)
-    dx: f32, dy: f32, dw: f32, dh: f32, // destination rect
+    sx: f32,
+    sy: f32,
+    sw: f32,
+    sh: f32, // source rect (sw/sh <= 0 = full image)
+    dx: f32,
+    dy: f32,
+    dw: f32,
+    dh: f32, // destination rect
 };
 
 // --- Row atlas + sprite batch (ABI 0.18.0) ---
@@ -421,8 +427,7 @@ pub fn shadowRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, el
 /// elevation_grid values.
 pub fn elevationShadow(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, level: f32, shadow_color: Color) void {
     if (!(level > 0)) return; // NaN/0 = flat
-    shadowRRect(ctx, x, y, w, h, radius, level,
-        withAlphaScaled(shadow_color, 0.15), withAlphaScaled(shadow_color, 0.38), false);
+    shadowRRect(ctx, x, y, w, h, radius, level, withAlphaScaled(shadow_color, 0.15), withAlphaScaled(shadow_color, 0.38), false);
 }
 
 /// Path verbs for fillPath/strokePath — pts consumed per verb.
@@ -431,11 +436,32 @@ pub const PathVerb = enum(i32) { move = 0, line = 1, quad = 2, cubic = 3, close 
 /// Fill an arbitrary path (verbs: move/line/quad/cubic/close). fill_rule:
 /// 0 winding, 1 even-odd.
 pub fn fillPath(ctx: *kx.Ctx, pts: []const f32, verbs: []const i32, color: Color, fill_rule: bool) void {
+    if (!pathArgsOk(pts, verbs)) return;
     kx.c.kx_fill_path(ctx, pts.ptr, verbs.ptr, @intCast(verbs.len), color, @intFromBool(fill_rule));
 }
 /// Stroke an arbitrary path.
 pub fn strokePath(ctx: *kx.Ctx, pts: []const f32, verbs: []const i32, stroke_w: f32, color: Color, fill_rule: bool) void {
+    if (!pathArgsOk(pts, verbs)) return;
     kx.c.kx_stroke_path(ctx, pts.ptr, verbs.ptr, @intCast(verbs.len), stroke_w, color, @intFromBool(fill_rule));
+}
+
+/// The verb stream consumes pts independently — the C ABI carries no pts
+/// length, so a short buffer would be read out of bounds. Validate here:
+/// every verb's float count must fit the slice (unknown verbs are dropped
+/// by the shim but still must not over-claim).
+fn pathArgsOk(pts: []const f32, verbs: []const i32) bool {
+    var need: usize = 0;
+    for (verbs) |v| {
+        need += switch (v) {
+            0, 1 => 2,
+            2 => 4,
+            3 => 6,
+            4 => 0,
+            else => return false,
+        };
+        if (need > pts.len) return false;
+    }
+    return true;
 }
 
 pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {

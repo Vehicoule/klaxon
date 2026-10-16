@@ -926,16 +926,12 @@ pub const Node = struct {
                     else
                         0;
                     if (img != 0) {
-                        paint_mod.imageDrawRegion(ctx, img,
-                            node.retained_slot[0], node.retained_slot[1],
-                            node.retained_slot[2], node.retained_slot[3],
-                            bx, by, @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
+                        paint_mod.imageDrawRegion(ctx, img, node.retained_slot[0], node.retained_slot[1], node.retained_slot[2], node.retained_slot[3], bx, by, @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
                         return true;
                     }
                     node.retained_atlas = false; // atlas gone — re-rasterize below
                 } else {
-                    kx.c.kx_draw_image(ctx, node.retained_image, bx, by,
-                        @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
+                    kx.c.kx_draw_image(ctx, node.retained_image, bx, by, @floatFromInt(node.retained_w), @floatFromInt(node.retained_h));
                     return true;
                 }
             }
@@ -1019,14 +1015,13 @@ pub const Node = struct {
         node.retained_pr = pr;
         if (use_atlas) {
             const img = paint_mod.atlasImage(ctx);
-            if (img == 0) { node.retained_atlas = false; return false; }
-            paint_mod.imageDrawRegion(ctx, img,
-                node.retained_slot[0], node.retained_slot[1],
-                node.retained_slot[2], node.retained_slot[3],
-                ix, iy, @floatFromInt(iw), @floatFromInt(ih));
+            if (img == 0) {
+                node.retained_atlas = false;
+                return false;
+            }
+            paint_mod.imageDrawRegion(ctx, img, node.retained_slot[0], node.retained_slot[1], node.retained_slot[2], node.retained_slot[3], ix, iy, @floatFromInt(iw), @floatFromInt(ih));
         } else {
-            kx.c.kx_draw_image(ctx, node.retained_image, ix, iy,
-                @floatFromInt(iw), @floatFromInt(ih));
+            kx.c.kx_draw_image(ctx, node.retained_image, ix, iy, @floatFromInt(iw), @floatFromInt(ih));
         }
         return true;
     }
@@ -1154,20 +1149,32 @@ pub const Node = struct {
     /// strict ancestor's pre_children_hit, root-first. Used to deliver
     /// pointer events with local coordinates to captured nodes (Phase 1f).
     pub fn mapPointToParentSpace(node: *Node, px: f32, py: f32) HitPoint {
-        var chain: [64]*Node = undefined;
+        var stack_chain: [64]*Node = undefined;
         var depth: usize = 0;
         var n = node.parent;
+        while (n) |p| : (n = p.parent) depth += 1;
+        // Deeper than 64: fall back to a heap chain rather than silently
+        // dropping ancestors (the transforms then map to the wrong space).
+        const chain = if (depth <= stack_chain.len)
+            stack_chain[0..depth]
+        else
+            node.allocator.alloc(*Node, depth) catch {
+                // OOM: map without transforms rather than crash — a drag
+                // lands offset but the app stays alive.
+                return .{ .x = px, .y = py };
+            };
+        defer if (depth > stack_chain.len) node.allocator.free(chain);
+        var i: usize = 0;
+        n = node.parent;
         while (n) |p| : (n = p.parent) {
-            if (depth < chain.len) {
-                chain[depth] = p;
-                depth += 1;
-            }
+            chain[i] = p;
+            i += 1;
         }
         var x = px;
         var y = py;
-        while (depth > 0) {
-            depth -= 1;
-            const a = chain[depth];
+        while (i > 0) {
+            i -= 1;
+            const a = chain[i];
             if (a.vtable.pre_children_hit) |pre| {
                 const p = pre(a, x, y);
                 x = p.x;

@@ -221,7 +221,7 @@ pub fn flexMeasure(node: *Node, c: Constraints, axis: Axis, gap: f32, padding: f
         0;
     var main_total: f32 = 0;
     var cross_max: f32 = 0;
-    var flex_total: u32 = 0;
+    var flex_total: u64 = 0; // weights sum — u32 overflows past ~4G total
     var non_flex_main: f32 = 0;
     for (node.children.items) |child| {
         if (child.flex > 0) {
@@ -294,7 +294,7 @@ pub fn flexLayout(
     // axis; flex children (Expanded) share the REMAINING main space, tight,
     // by weight (natural size on an unbounded main axis).
     var natural_main: f32 = padding * 2;
-    var flex_total: u32 = 0;
+    var flex_total: u64 = 0; // weights sum — u32 overflows past ~4G total
     var non_flex_main: f32 = 0;
     // Non-flex children take the natural main size when this flex was
     // measured unbounded (scroll content — see m_main_unbounded); a bounded

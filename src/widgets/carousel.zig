@@ -194,7 +194,7 @@ fn lowestCostArrangement(available: f32, spacing: f32, target_small: f32, small_
 /// multiBrowseKeylineList: the arrangement the strategy fits to the
 /// viewport (then trimmed to the item count: smalls then mediums drop).
 fn multiBrowseArrangement(viewport: f32, preferred: f32, spacing: f32, item_count: usize) ?Arrangement {
-    if (viewport <= 0 or preferred <= 0) return null;
+    if (!std.math.isFinite(viewport) or viewport <= 0 or preferred <= 0) return null;
     const small_counts_1 = [_]u32{1};
     const small_counts_0 = [_]u32{0};
     const small_counts_none = [_]u32{0};
@@ -208,8 +208,10 @@ fn multiBrowseArrangement(viewport: f32, preferred: f32, spacing: f32, item_coun
     const target_medium = (target_large + target_small) / 2;
 
     const min_avail_large = viewport - target_medium * 1 - max_small * 1;
-    const min_large_count: u32 = @intFromFloat(@max(1, @floor(min_avail_large / target_large)));
-    const max_large_count: u32 = @intFromFloat(@ceil(viewport / target_large));
+    // Ratios are clamped before the int casts: absurd inputs (a 1e9px
+    // viewport or a 0.01dp item) would otherwise overflow u32 → panic.
+    const min_large_count: u32 = @intFromFloat(@min(4096, @max(1, @floor(min_avail_large / target_large))));
+    const max_large_count: u32 = @intFromFloat(@min(4096, @ceil(viewport / target_large)));
 
     var large_buf: [8]u32 = undefined;
     var ln: usize = 0;
@@ -252,9 +254,12 @@ fn mediumChildSize(large_size: f32, remaining: f32) f32 {
 
 /// uncontainedKeylineList: F full items + (optionally) one cut-off medium.
 fn uncontainedArrangement(viewport: f32, item_width: f32, spacing: f32) ?Arrangement {
-    if (viewport <= 0 or item_width <= 0) return null;
+    if (!std.math.isFinite(viewport) or viewport <= 0 or item_width <= 0) return null;
     const large_size = @min(item_width + spacing, viewport);
-    const large_count: u32 = @intFromFloat(@max(1, @floor(viewport / large_size)));
+    // spacing == -item_width (or worse) collapses the item size to ≤0 —
+    // the count division below would produce inf → intFromFloat panic.
+    if (large_size <= 0) return null;
+    const large_count: u32 = @intFromFloat(@min(4096, @max(1, @floor(viewport / large_size))));
     const remaining = viewport - @as(f32, @floatFromInt(large_count)) * large_size;
     const medium_count: u32 = if (remaining > 0) 1 else 0;
     const medium_size = mediumChildSize(large_size, remaining);
@@ -836,11 +841,13 @@ fn computeStrategy(n: *Node, s: *CarouselState) void {
 
 /// The scroll offset of the nearest item-focal snap — getSnapPositionOffset
 /// evaluated per item, nearest wins (singleAdvanceFlingBehavior's target).
-fn snapOffset(s: *CarouselState, offset: f32) f32 {
+fn snapOffset(s: *CarouselState, item_count: usize, offset: f32) f32 {
     const st = &s.keylines;
     const count = s.scroll.content + s.opts.item_spacing; // n*stride
-    if (st.stride <= 0 or st.offset_max <= 0) return 0;
-    const n: usize = @intFromFloat(@max(1, @round(count / st.stride)));
+    if (st.stride <= 0 or st.offset_max <= 0 or !std.math.isFinite(count)) return 0;
+    // Bound the candidate count by the real item count before the cast —
+    // a denormal stride would otherwise produce a huge/hanging loop.
+    const n: usize = @intFromFloat(@max(1, @round(@min(count / st.stride, @as(f32, @floatFromInt(item_count))))));
     var best: f32 = 0;
     var best_d: f32 = std.math.inf(f32);
     for (0..n) |i| {
@@ -875,7 +882,7 @@ fn snapNow(n: *Node, s: *CarouselState) void {
 /// immediately (headless tests).
 fn settleSnap(n: *Node, s: *CarouselState, v: f32) void {
     const projected = s.scroll.offset + v * 260; // ms: decay horizon
-    const target = snapOffset(s, projected);
+    const target = snapOffset(s, n.children.items.len, projected);
     if (ui.anim.timeline()) |tl| {
         const from: ui.anim.Vec4 = .{ s.scroll.offset, 0, 0, 0 };
         _ = tl.play(.{
@@ -1265,7 +1272,7 @@ test "carousel drag: moves the content, snaps to an item on release" {
     // the offset is a snap candidate (item-focal under an alignment) and
     // snapping again is a no-op
     const snapped = s.scroll.offset;
-    try std.testing.expectApproxEqAbs(snapped, snapOffset(s, snapped), 0.01);
+    try std.testing.expectApproxEqAbs(snapped, snapOffset(s, c.children.items.len, snapped), 0.01);
     // it moved from the free-drag offset to the snap
     try std.testing.expect(snapped != 100);
 }

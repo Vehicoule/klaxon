@@ -91,8 +91,14 @@ pub fn visibleRange(item_count: usize, stride: f32, viewport: f32, offset: f32, 
     if (item_count == 0 or viewport <= 0 or stride <= 0) return .{ .first = 0, .last = 0 };
     const margin_f: f32 = @floatFromInt(margin);
     const count_f: f32 = @floatFromInt(item_count);
-    const first_f = @max(0, @floor(offset / stride) - margin_f);
-    const last_f = @min(count_f, @ceil((offset + viewport) / stride) + margin_f);
+    const start = offset / stride;
+    const end = (offset + viewport) / stride;
+    // Denormal strides (or an inf offset) make the ratios non-finite:
+    // every row sits at ~the same y — the honest window is the whole
+    // range rather than a panic in the int casts below.
+    if (!std.math.isFinite(start) or !std.math.isFinite(end)) return .{ .first = 0, .last = item_count };
+    const first_f = @min(count_f, @max(0, @floor(start) - margin_f));
+    const last_f = @min(count_f, @ceil(end) + margin_f);
     const first: usize = @intFromFloat(@max(0, first_f));
     const last: usize = @intFromFloat(@max(@as(f32, @floatFromInt(first)), last_f));
     return .{ .first = first, .last = last };

@@ -689,7 +689,13 @@ fn navDeinit(n: *Node) void {
         }
     }
     s.nav.setOnChange(null);
-    for (s.heroes.items) |h| n.allocator.free(h.tag);
+    for (s.heroes.items) |h| {
+        // Registered heroes hold a back-pointer to this state; a hero that
+        // outlives the view (reparented page, deinit order) must not
+        // unregister through a freed pointer.
+        heroStateOf(h.hero).nav = null;
+        n.allocator.free(h.tag);
+    }
     s.heroes.deinit();
     s.pages_ui.deinit();
     n.allocator.destroy(s);
