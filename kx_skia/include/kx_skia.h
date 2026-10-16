@@ -72,6 +72,13 @@
 //            clip — the outlined text field's label cutout knocks a real
 //            gap in the border (Compose's ClipOp.Difference) instead of a
 //            surface-colored patch that assumes a flat background.
+//   0.21.0 — kx_set_text_direction / kx_get_text_direction: process-global
+//            paragraph bidi base level (SkParagraph TextDirection). The
+//            framework mirrors the current locale's direction into it —
+//            RTL base puts trailing neutrals + weak-direction runs on the
+//            correct side. Applies to every paragraph built afterwards;
+//            the text cache keys on it. Additive, no behavior change until
+//            set (default stays LTR).
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -158,6 +165,14 @@ float kx_text_layout_height(kx_text_layout* layout);
 float kx_text_layout_baseline(kx_text_layout* layout); // first line, alphabetic
 void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y);
 void kx_text_layout_destroy(kx_text_layout* layout);
+
+// Paragraph base direction (0.21.0) — process-global: the bidi base level
+// every paragraph is built against (kx_draw_text* misses AND
+// kx_text_layout handles). 0 = LTR (default), non-zero = RTL. The
+// framework mirrors the current locale's direction into it; an RTL base
+// puts trailing neutrals + weak-direction runs on the correct side.
+void kx_set_text_direction(int rtl);
+int kx_get_text_direction(void);
 
 // Real rendering primitives (0.16.0).
 // Push a content-blur layer: ops until the matching kx_restore rasterize

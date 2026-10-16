@@ -305,6 +305,15 @@ protected:
         if (auto it = fCharCache.find(h); it != fCharCache.end()) return it->second;
         sk_sp<SkTypeface> tf = fBase->matchFamilyStyleCharacter(
                 familyName, style, bcp47, bcp47Count, character);
+        // Generic character fallback: every SkFontMgr_Custom port used here
+        // (directory/embedded/empty — Android, Linux, Windows, WASM, the iOS
+        // directory path) hard-returns nullptr from its override, so an
+        // uncovered codepoint shaped to .notdef even when an installed family
+        // covered it. Scan the manager's own family list once per cache key;
+        // hits AND misses are memoized below, so this runs at most once per
+        // (family, style, locale, codepoint) and a permanently-uncovered
+        // codepoint never re-scans.
+        if (!tf) tf = scanForCoverage(style, bcp47, bcp47Count, character);
         if (fCharCache.size() + fCharMisses.size() >= kCacheCap) return tf;
         if (tf) fCharCache.emplace(h, tf);
         else fCharMisses.insert(h);
@@ -331,10 +340,80 @@ protected:
 
 private:
     static constexpr size_t kCacheCap = 8192; // codepoints × styles in play at once
+    // Covering-scan bounds: family counts are the files a loader found —
+    // hundreds at most on real systems; the cap only guards a pathological
+    // manager. Styles within one family are likewise a handful of faces.
+    static constexpr int kScanFamilyCap = 1024;
+    static constexpr int kScanStyleCap = 64;
     sk_sp<SkFontMgr> fBase;
     mutable std::unordered_map<uint64_t, sk_sp<SkTypeface>> fCharCache;
     mutable std::unordered_set<uint64_t> fCharMisses;
     mutable std::unordered_map<uint64_t, sk_sp<SkTypeface>> fStyleCache;
+
+    // Covering-face scan for base managers without character fallback.
+    // Walks the base manager's family list in ITS order (a directory
+    // loader's file order) and returns the first face whose cmap maps the
+    // codepoint (unicharToGlyph != 0 — glyph 0 is .notdef). The style-
+    // matched face is probed first per family, then its siblings (cmap
+    // differences across weights exist — one weight may carry a codepoint
+    // another lacks). Bounded by kScanFamilyCap and early exit on the first
+    // cover; the caller memoizes per (family, style, locale, codepoint).
+    //
+    // Locale: family name is the only cheap signal SkFontMgr exposes.
+    // SkParagraph marks emoji fallback with the und-Zsye script tag
+    // (FontCollection's defaultEmojiFallback), so when it appears a first
+    // pass prefers families named *emoji* — a monochrome face covering the
+    // codepoint must not win over the color font. For every other tag
+    // there is no script→family table to rank by (Han variants, RTL
+    // shaping differences): first-covering in loader order is the honest
+    // limit, and the result is still keyed by the full locale list.
+    sk_sp<SkTypeface> scanForCoverage(const SkFontStyle& style,
+                                      const char* bcp47[], int bcp47Count,
+                                      SkUnichar character) const {
+        const int n = std::min(fBase->countFamilies(), kScanFamilyCap);
+        const bool emojiFirst = localePrefersEmoji(bcp47, bcp47Count);
+        for (int pass = emojiFirst ? 0 : 1; pass < 2; ++pass) {
+            for (int i = 0; i < n; ++i) {
+                sk_sp<SkFontStyleSet> set = fBase->createStyleSet(i);
+                if (!set) continue;
+                sk_sp<SkTypeface> tf = set->matchStyle(style);
+                if (!tf) continue;
+                if (pass == 0) {
+                    SkString name;
+                    tf->getFamilyName(&name);
+                    if (!containsFold(name.c_str(), "emoji")) continue;
+                }
+                if (tf->unicharToGlyph(character) != 0) return tf;
+                const int m = std::min(set->count(), kScanStyleCap);
+                for (int j = 0; j < m; ++j) {
+                    sk_sp<SkTypeface> alt = set->createTypeface(j);
+                    if (alt && alt->unicharToGlyph(character) != 0) return alt;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    // True when a locale tag carries the emoji script (ISO 15924 "Zsye").
+    static bool localePrefersEmoji(const char* bcp47[], int bcp47Count) {
+        for (int i = 0; i < bcp47Count; ++i) {
+            if (containsFold(bcp47[i], "zsye")) return true;
+        }
+        return false;
+    }
+
+    // Case-insensitive substring over ASCII letters ('x'|0x20 folds only
+    // ASCII case pairs — UTF-8 bytes can never alias a letter needle).
+    static bool containsFold(const char* hay, const char* needle) {
+        if (!hay || !needle || !*needle) return false;
+        for (const char* p = hay; *p; ++p) {
+            const char* q = p;
+            const char* r = needle;
+            while (*q && *r && ((*q | 0x20) == (*r | 0x20))) { ++q; ++r; }
+            if (!*r) return true;
+        }
+        return false;
+    }
 
     static uint64_t styleKey(const char* familyName, const SkFontStyle& style) {
         uint64_t h = 14695981039346656037ull;
@@ -368,7 +447,9 @@ static bool kx_typeface_covers(SkTypeface* tf, const char* utf8) {
 // The paragraph font collection: platform manager as the default resolver
 // (pinned to the platform default family when one exists — the same face
 // the legacy path resolved), with font fallback ENABLED so CJK/Arabic/
-// emoji runs resolve through system fallback fonts automatically —
+// emoji runs resolve uncovered codepoints through the wrapped manager's
+// character match — CoreText's native system fallback on macOS, the
+// caching manager's own covering-scan on the SkFontMgr_Custom platforms —
 // replacing the hand-rolled kx_typeface_covers single-fallback guess.
 static sk_sp<skia::textlayout::FontCollection>& kx_font_collection() {
     static sk_sp<skia::textlayout::FontCollection> fc = [] {
@@ -451,6 +532,14 @@ private:
     SkPaint fg;
 };
 
+// Paragraph base direction (0.21.0): process-global like the font manager —
+// the bidi base level every paragraph is built against (text-cache misses
+// and kx_text_layout handles alike). The framework mirrors the current
+// locale's direction here; RTL base puts trailing neutrals and
+// weak-direction runs on the correct side (SkParagraph's own default is
+// LTR). 0 = LTR, 1 = RTL.
+static int kx_paragraph_dir = 0;
+
 // Build + lay out a single-style paragraph: the shared miss path for the
 // text cache (0.15.0). Layout is UNCONSTRAINED (huge width): longestLine
 // then equals the intrinsic width and the paragraph still performs real
@@ -471,6 +560,15 @@ static std::unique_ptr<skia::textlayout::Paragraph> kx_build_paragraph(
     ts.setForegroundPaintID(0);
     if (letter_spacing != 0.0f) ts.setLetterSpacing(letter_spacing);
     ParagraphStyle ps;
+    // Bidi base level follows the process-global direction (0.21.0) — the
+    // current locale, not SkParagraph's fixed LTR default.
+    ps.setTextDirection(kx_paragraph_dir ? TextDirection::kRtl
+                                         : TextDirection::kLtr);
+    // Always left-anchored: layout width is ~infinite (intrinsic sizing),
+    // so the default kStart would resolve to kRight under RTL and shift
+    // every line ~max_width px — the caller anchors the run at its own x
+    // and the bidi reorder happens INSIDE it.
+    ps.setTextAlign(TextAlign::kLeft);
     auto builder = ParagraphBuilder::make(ps, kx_font_collection(), kx_unicode());
     if (!builder) return nullptr; // no ICU/no font collection — caller falls back
     builder->pushStyle(ts);
@@ -579,6 +677,7 @@ struct KxTextSlot {
     uint64_t hash = 0;
     float size = 0.0f;
     bool bold = false;
+    int dir = 0; // paragraph base direction the entry was built under
     KxTextSlotState state = KxTextSlotState::kEmpty;
     uint64_t last_used = 0; // LRU tick
     size_t utf16_len = 0;   // text-index space length (updateForegroundPaint)
@@ -801,7 +900,12 @@ int kx_text_cache_victim(uint64_t h) {
 // resolution + coverage fallback + shaping + metrics) and the result is
 // inserted; hits only refresh the LRU tick.
 KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
-    const uint64_t h = kx_text_key_hash(text, len, size, bold);
+    // Only bidi-relevant strings depend on the paragraph base direction:
+    // simple-path entries (pure strong-LTR runs) are direction-agnostic and
+    // stay shared across locales instead of splitting the cache.
+    const int dir = kx_text_simple(text, len) ? 0 : kx_paragraph_dir;
+    const uint64_t h = kx_text_key_hash(text, len, size, bold) ^
+                       (static_cast<uint64_t>(dir) * 0x9E3779B97F4A7C15ull);
     const uint64_t tick = ++kx_text_cache_tick;
     const size_t mask = kTextCacheCap - 1;
     size_t i = h & mask;
@@ -813,6 +917,7 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
         if (s.state == KxTextSlotState::kTombstone) {
             if (insert_at < 0) insert_at = static_cast<int>(i);
         } else if (s.hash == h && s.size == size && s.bold == bold &&
+                   s.dir == dir &&
                    s.text.size() == len && std::memcmp(s.text.data(), text, len) == 0) {
             s.last_used = tick;
             return &s;
@@ -833,6 +938,7 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     s.hash = h;
     s.size = size;
     s.bold = bold;
+    s.dir = dir;
     s.last_used = tick;
     s.utf16_len = kx_utf16_len(text, len);
     // Simple single-run strings take the direct shaper (same HarfBuzz,
@@ -3268,7 +3374,18 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.20.0";
+    return "0.21.0";
+}
+
+// Paragraph base direction (0.21.0) — the bidi base level every paragraph
+// is built against. The framework mirrors the current locale's direction
+// into this process-global; apps without i18n can set it directly.
+void kx_set_text_direction(int rtl) {
+    kx_paragraph_dir = rtl ? 1 : 0;
+}
+
+int kx_get_text_direction(void) {
+    return kx_paragraph_dir;
 }
 
 float kx_canvas_scale(kx_ctx* ctx) {
@@ -3288,10 +3405,19 @@ struct kx_text_layout {
 };
 
 kx_text_layout* kx_text_layout_begin(float max_width) {
-    if (!(max_width > 0.0f)) max_width = 1e9f; // <=0 = unconstrained
+    const bool constrained = max_width > 0.0f;
+    if (!constrained) max_width = 1e9f; // <=0 = unconstrained
     auto* l = new kx_text_layout;
     l->max_width = max_width;
     skia::textlayout::ParagraphStyle ps;
+    // Bidi base level follows the process-global direction (0.21.0).
+    ps.setTextDirection(kx_paragraph_dir ? skia::textlayout::TextDirection::kRtl
+                                         : skia::textlayout::TextDirection::kLtr);
+    if (!constrained) {
+        // Unconstrained layout is intrinsic measurement: kStart+RTL would
+        // resolve to kRight and shift lines ~1e9 px — pin the left edge.
+        ps.setTextAlign(skia::textlayout::TextAlign::kLeft);
+    }
     l->builder = skia::textlayout::ParagraphBuilder::make(ps, kx_font_collection(), kx_unicode());
     if (!l->builder) { delete l; return nullptr; }
     return l;

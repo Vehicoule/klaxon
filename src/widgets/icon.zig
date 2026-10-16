@@ -82,10 +82,31 @@ pub fn codepoint(name: IconName) u21 {
     };
 }
 
+/// Directional icons that auto-mirror under RTL (Compose's
+/// `Icons.AutoMirrored` contract): arrows/chevrons and the disclosure
+/// triangles point INTO the reading direction. Media controls (play,
+/// pause, stop), clock glyphs (history) and brand/abstract shapes stay
+/// literal — upstream deliberately never mirrors those.
+pub fn autoMirrored(name: IconName) bool {
+    return switch (name) {
+        .arrow_left, .arrow_right, .chevron_left, .chevron_right, .triangle_left, .triangle_right, .north_west => true,
+        else => false,
+    };
+}
+
+/// The icon's horizontal mirror under RTL — false for non-directional
+/// names and under LTR. The widget's `auto_mirror` option is the opt-out.
+pub fn mirrorNow(name: IconName, auto_mirror: bool) bool {
+    return auto_mirror and autoMirrored(name) and ui.i18n.direction() == .rtl;
+}
+
 pub const IconOptions = struct {
     size: f32 = 24,
     color: Color = 0x000000FF, // opaque black (0xRRGGBBAA)
     label: []const u8 = "", // accessibility label (alt text, Phase 2c)
+    /// Directional icons mirror under RTL (Compose AutoMirrored). Set
+    /// false for an arrow that must keep its literal direction.
+    auto_mirror: bool = true,
 };
 
 const IconState = struct {
@@ -111,7 +132,7 @@ fn iconPaint(n: *Node, ctx: *kx.Ctx) void {
     const size = s.opts.size;
     const ox = n.bounds.x + (n.bounds.w - size) / 2;
     const oy = n.bounds.y + (n.bounds.h - size) / 2;
-    drawIcon(ctx, s.name, ox, oy, size / 24.0, s.opts.color);
+    drawIconMirrored(ctx, s.name, ox, oy, size / 24.0, s.opts.color, mirrorNow(s.name, s.opts.auto_mirror));
 }
 
 // --- icon tile cache ---
@@ -131,6 +152,9 @@ const IconKey = struct {
     fx: u16, // fractional origin ×256 inside the tile
     fy: u16,
     color: Color,
+    /// The tile rasterizes the mirrored geometry — part of the key so an
+    /// RTL frame never blits an LTR tile (and vice versa).
+    mirror: bool,
     /// Device scale the tile was rasterized at (ABI 0.19.0: the atlas/
     /// offscreen pass consumes it internally). Quarter-step quantized —
     /// always ≥ the true scale so a scale-animating icon re-rasterizes a
@@ -170,8 +194,7 @@ fn iconBlit(e: *const IconEntry, ctx: *kx.Ctx, tx: f32, ty: f32) void {
     if (e.atlas) {
         const img = ui.paint.atlasImage(ctx);
         if (img != 0) {
-            ui.paint.imageDrawRegion(ctx, img, e.slot[0], e.slot[1], e.slot[2], e.slot[3],
-                tx, ty, @floatFromInt(e.key.tw), @floatFromInt(e.key.th));
+            ui.paint.imageDrawRegion(ctx, img, e.slot[0], e.slot[1], e.slot[2], e.slot[3], tx, ty, @floatFromInt(e.key.tw), @floatFromInt(e.key.th));
             return;
         }
     }
@@ -181,9 +204,20 @@ fn iconBlit(e: *const IconEntry, ctx: *kx.Ctx, tx: f32, ty: f32) void {
 
 /// Draw a built-in icon into a `24*k` box at (ox,oy). Shared by the icon
 /// widget and widgets that paint icons inline (navigation rail, FAB, etc.).
+/// Directional names auto-mirror under RTL (Compose AutoMirrored).
 var icon_cache_off: ?bool = null; // env latch — KX_NO_ICON_CACHE disables
 
 pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
+    drawIconMirrored(ctx, name, ox, oy, k, color, mirrorNow(name, true));
+}
+
+/// The literal-glyph variant for callers that picked the direction
+/// themselves (e.g. a "next" chevron drawn from explicit layout math).
+pub fn drawIconLiteral(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
+    drawIconMirrored(ctx, name, ox, oy, k, color, false);
+}
+
+fn drawIconMirrored(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color, mirror: bool) void {
     const size = 24 * k;
     if (size <= 0) return;
     // Inside the ATLAS write pass (a retained row's own rasterize, a
@@ -192,7 +226,7 @@ pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: C
     // offscreen pass may blit tiles safely (different surfaces).
     if (icon_cache_off == null) icon_cache_off = std.c.getenv("KX_NO_ICON_CACHE") != null;
     if (icon_cache_off.? or ui.paint.inAtlasPass(ctx)) {
-        drawIconGeometry(ctx, name, ox, oy, k, color);
+        drawIconGeometry(ctx, name, ox, oy, k, color, mirror);
         return;
     }
     // Snapped tile covering the ink + 1px stroke overhang — the fractional
@@ -213,6 +247,7 @@ pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: C
         .fx = @intFromFloat(@round((ox - tx) * 256)),
         .fy = @intFromFloat(@round((oy - ty) * 256)),
         .color = color,
+        .mirror = mirror,
         .ds_q = ds_q,
     };
     const gen = ui.paint.atlasGen(ctx);
@@ -236,19 +271,19 @@ pub fn drawIcon(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: C
         // atlas_begin already translated to the slot origin — shift the
         // icon's absolute coords into the tile like the offscreen path.
         ui.paint.translate(ctx, -tx, -ty);
-        drawIconGeometry(ctx, name, ox, oy, k, color);
+        drawIconGeometry(ctx, name, ox, oy, k, color, mirror);
         ui.paint.atlasEnd(ctx);
         e.atlas = true;
         e.atlas_gen = gen;
         ok = true;
     } else if (ui.paint.offscreenBegin(ctx, tw, th)) {
         ui.paint.translate(ctx, -tx, -ty);
-        drawIconGeometry(ctx, name, ox, oy, k, color);
+        drawIconGeometry(ctx, name, ox, oy, k, color, mirror);
         e.image = ui.paint.offscreenEndImage(ctx);
         ok = e.image != 0;
     }
     if (!ok) { // nested offscreen pass — paint directly, cache nothing
-        drawIconGeometry(ctx, name, ox, oy, k, color);
+        drawIconGeometry(ctx, name, ox, oy, k, color, mirror);
         return;
     }
     var slot_idx: usize = undefined;
@@ -593,12 +628,15 @@ const max_glyph_pts = blk: {
     break :blk m;
 };
 
-/// The icon's vector geometry — the pre-cache paint body.
-fn drawIconGeometry(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color) void {
+/// The icon's vector geometry — the pre-cache paint body. `mirror` flips
+/// the 24dp box horizontally (RTL AutoMirrored icons): x ↦ ox + (24−x)·k.
+/// The fill rule is unchanged — mirroring preserves point order, so the
+/// winding interpretation is untouched.
+fn drawIconGeometry(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, color: Color, mirror: bool) void {
     const g = glyphFor(name);
     var pts: [max_glyph_pts]f32 = undefined;
     for (g.pts, 0..) |p, i| {
-        pts[i] = (if (i % 2 == 0) ox else oy) + p * k;
+        pts[i] = (if (i % 2 == 0) ox + if (mirror) (24 - p) * k else p * k else oy + p * k);
     }
     // Material path data is authored for the nonzero (winding) fill rule.
     ui.paint.fillPath(ctx, pts[0..g.pts.len], g.verbs, color, false);

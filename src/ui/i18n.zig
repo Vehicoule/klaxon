@@ -13,15 +13,21 @@
 //   - Number/date formatting: per-locale tables (separators, date patterns,
 //     month names) for en/fr/ja/ar. Pure Zig — the ICU binding (full CLDR
 //     tables, native digits) is the documented upgrade path.
+//   - Resolution chain: `tr(key)`/`setLocale(tag)` resolve a tag exact →
+//     base language (fr-CA → fr) → the fallback locale → the key itself.
+//     A regional request never fails while a base-language catalog exists.
 //   - Direction: the current locale's direction is process-global
 //     (`direction()`, like the input router / timeline) — the layout layer
-//     mirrors horizontal flex, alignment and start/end insets/text-align.
+//     mirrors horizontal flex, alignment and start/end insets/text-align,
+//     and the paragraph engine's bidi base level follows it (RTL text's
+//     trailing neutrals land on the correct side).
 //   - Runtime switching: `setLocale` flips a signal — localized widgets
 //     re-render; when the direction flips, `on_direction_changed` fires so
 //     the app can mark the root layout-dirty (RTL re-mirrors the layout).
 const std = @import("std");
 const state_mod = @import("state.zig");
 const node_mod = @import("node.zig");
+const paint_mod = @import("paint.zig");
 
 /// Text direction (drives the layout mirror, Phase 2b.2).
 pub const Direction = enum { ltr, rtl };
@@ -50,7 +56,8 @@ pub const Locale = struct {
     // Number formatting.
     decimal_sep: []const u8 = ".",
     group_sep: []const u8 = ",",
-    // Date formatting (pattern tokens: y, M, d — repeats set the width).
+    // Date formatting (pattern tokens: y, M, d — repeats set the width;
+    // ICU quoting: '...' is literal text, '' is a literal quote).
     date_short: []const u8 = "M/d/yy",
     date_medium: []const u8 = "MMM d, y",
     date_long: []const u8 = "MMMM d, y",
@@ -190,9 +197,22 @@ pub const Locale = struct {
         var year_buf: [8]u8 = undefined;
         var num_buf: [8]u8 = undefined;
         var i: usize = 0;
+        var quoted = false; // inside '...' (ICU literal quoting)
         while (i < pattern.len) {
             const ch = pattern[i];
-            if (ch != 'y' and ch != 'M' and ch != 'd') {
+            // ICU quoting: ' toggles literal mode, '' emits a literal quote;
+            // quoted y/M/d are plain text (es: "d 'de' MMMM 'de' y").
+            if (ch == '\'') {
+                if (i + 1 < pattern.len and pattern[i + 1] == '\'') {
+                    try buf.append('\'');
+                    i += 2;
+                    continue;
+                }
+                quoted = !quoted;
+                i += 1;
+                continue;
+            }
+            if (quoted or (ch != 'y' and ch != 'M' and ch != 'd')) {
                 try buf.append(ch);
                 i += 1;
                 continue;
@@ -236,11 +256,19 @@ pub const Locale = struct {
     }
 };
 
-// --- Per-locale format data (en/fr/ja/ar built in; ICU is the upgrade path) ---
+// --- Per-locale format data (en/fr/ja/ar/es built in; ICU is the upgrade path) ---
 
 /// Apply the built-in format data (separators, date patterns, month names)
 /// for a known locale tag. Unknown tags keep the English defaults.
 pub fn applyFormatData(loc: *Locale) void {
+    // Direction default: RTL-script languages are RTL unless the caller
+    // pinned a direction (addArb / addLocale sets direction_explicit).
+    const base_dir = if (std.mem.indexOfScalar(u8, loc.tag, '-')) |i| loc.tag[0..i] else loc.tag;
+    if (!loc.direction_explicit and defaultRtl(base_dir)) loc.direction = .rtl;
+    applyFormatData0(loc);
+}
+
+fn applyFormatData0(loc: *Locale) void {
     const base = if (std.mem.indexOfScalar(u8, loc.tag, '-')) |i| loc.tag[0..i] else loc.tag;
     if (std.mem.eql(u8, base, "fr")) {
         loc.decimal_sep = ",";
@@ -311,7 +339,6 @@ pub fn applyFormatData(loc: *Locale) void {
         loc.weekday_short = .{ "日", "月", "火", "水", "木", "金", "土" };
         loc.weekday_letter = .{ "日", "月", "火", "水", "木", "金", "土" };
     } else if (std.mem.eql(u8, base, "ar")) {
-        if (!loc.direction_explicit) loc.direction = .rtl;
         loc.date_short = "d/M/y";
         loc.date_medium = "d MMM y";
         loc.date_long = "d MMMM y";
@@ -344,6 +371,43 @@ pub fn applyFormatData(loc: *Locale) void {
         });
         loc.weekday_short = .{ "أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت" };
         loc.weekday_letter = .{ "ح", "ن", "ث", "ر", "خ", "ج", "س" };
+    } else if (std.mem.eql(u8, base, "es")) {
+        // CLDR es: 1.234,56 — dates "d/M/yy", long form uses the quoted
+        // literal 'de' ("7 de octubre de 2026").
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "d/M/yy";
+        loc.date_medium = "d MMM y";
+        loc.date_long = "d 'de' MMMM 'de' y";
+        setMonths(loc, &.{
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        }, &.{
+            "ene",
+            "feb",
+            "mar",
+            "abr",
+            "may",
+            "jun",
+            "jul",
+            "ago",
+            "sept",
+            "oct",
+            "nov",
+            "dic",
+        });
+        loc.weekday_short = .{ "dom", "lun", "mar", "mié", "jue", "vie", "sáb" };
+        loc.weekday_letter = .{ "D", "L", "M", "X", "J", "V", "S" };
     }
     // en: defaults
 }
@@ -360,13 +424,31 @@ fn setMonths(loc: *Locale, long: *const [12][]const u8, short: *const [12][]cons
     loc.months_owned = true;
 }
 
+/// Languages written in RTL scripts (CLDR): the default direction for a
+/// tag whose caller did not pin one — `addArb`'s explicit `dir` always wins.
+/// "iw" is the legacy Java code for Hebrew; the -Arab script variants cover
+/// the languages that are LTR in Latin script but RTL in Arabic script.
+const rtl_languages = [_][]const u8{
+    "ar", "fa",  "he",  "iw", "ur", "ps", "sd", "ug", "yi", "ckb", "ku",
+    "dv", "syr", "nqo",
+};
+
+/// CLDR default direction for a base-language tag ("fa-IR" → "fa").
+fn defaultRtl(base: []const u8) bool {
+    for (rtl_languages) |l| {
+        if (std.mem.eql(u8, base, l)) return true;
+    }
+    return false;
+}
+
 // --- Plural (ARB `{count, plural, ...}` + CLDR categories) ---
 
 pub const PluralCategory = enum { zero, one, two, few, many, other };
 
 /// CLDR plural category for a locale tag and count (en/fr/ja/ar built in;
-/// the default rule is one/other like English). CLDR operands run on |n|
-/// — a negative count resolves exactly like its positive.
+/// the default rule is one/other like English — es, de, it, pt and most
+/// European languages share it). CLDR operands run on |n| — a negative
+/// count resolves exactly like its positive.
 pub fn pluralCategory(tag: []const u8, n: i64) PluralCategory {
     const base = if (std.mem.indexOfScalar(u8, tag, '-')) |i| tag[0..i] else tag;
     const u: u64 = @intCast(@abs(n));
@@ -663,6 +745,9 @@ pub const I18n = struct {
             if (i18n.current == null) i18n.current = loc;
         }
         applyFormatData(loc);
+        // Paragraph base direction follows whatever the active catalog is
+        // (covers first-registration of an RTL locale too).
+        if (current_i18n == i18n) syncTextDirection();
         if (replaced_current) |old_dir| {
             // Hot reload of the active locale: set() with the NEW tag slice
             // (the old one is freed — a bare notify() would leave
@@ -696,14 +781,17 @@ pub const I18n = struct {
     // Locales may also be embedded at compile time (@embedFile) — see the
     // i18n demo (src/locales/*.arb).
 
-    /// Switch the current locale at runtime (no restart). Localized widgets
+    /// Switch the current locale at runtime (no restart). The tag resolves
+    /// like `tr` — a regional tag falls back to a registered base language
+    /// (setLocale("fr-CA") picks the "fr" catalog). Localized widgets
     /// re-render via the locale signal; a direction flip fires
     /// `on_direction_changed`.
     pub fn setLocale(i18n: *I18n, tag: []const u8) !void {
-        const loc = i18n.locales.get(tag) orelse return error.UnknownLocale;
+        const loc = i18n.resolveTag(tag) orelse return error.UnknownLocale;
         const old_dir = i18n.direction();
         i18n.current = loc;
         i18n.locale_sig.set(loc.tag); // notifies → widgets re-render
+        if (current_i18n == i18n) syncTextDirection();
         if (i18n.direction() != old_dir) {
             // Direction is process-global: every layout mirrors off it —
             // bump the epoch so clean subtrees re-lay once even untouched.
@@ -721,16 +809,54 @@ pub const I18n = struct {
         return .ltr;
     }
 
-    /// Resolve a message: current locale → fallback locale → the key.
-    /// Borrowed slice (no allocation).
+    /// Resolve a tag to a registered catalog: the exact tag first, then
+    /// each base-language prefix ("fr-CA" → "fr") — Flutter-style locale
+    /// fallback. Null when nothing matches.
+    pub fn resolveTag(i18n: *const I18n, tag: []const u8) ?*Locale {
+        var t = tag;
+        while (t.len > 0) {
+            if (i18n.locales.get(t)) |l| return l;
+            const i = std.mem.lastIndexOfScalar(u8, t, '-') orelse break;
+            t = t[0..i];
+        }
+        return null;
+    }
+
+    /// The catalogs consulted for a key, in order: the current locale and
+    /// its base-language ancestors (fr-CA → fr), then the fallback tag the
+    /// same way — "fr-CA → fr → en". De-duplicated (each catalog once).
+    fn chainLocales(i18n: *const I18n, buf: *[6]*Locale) []*Locale {
+        var n: usize = 0;
+        if (i18n.current) |c| i18n.pushTagChain(buf, &n, c.tag);
+        i18n.pushTagChain(buf, &n, i18n.fallback);
+        return buf[0..n];
+    }
+
+    fn pushTagChain(i18n: *const I18n, buf: *[6]*Locale, n: *usize, tag0: []const u8) void {
+        var t = tag0;
+        while (t.len > 0) {
+            if (i18n.locales.get(t)) |l| {
+                var seen = false;
+                for (buf[0..n.*]) |e| {
+                    if (e == l) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen and n.* < buf.len) {
+                    buf[n.*] = l;
+                    n.* += 1;
+                }
+            }
+            const i = std.mem.lastIndexOfScalar(u8, t, '-') orelse break;
+            t = t[0..i];
+        }
+    }
+
+    /// Resolve a message: current locale → base languages → fallback
+    /// locale → the key. Borrowed slice (no allocation).
     pub fn tr(i18n: *const I18n, key: []const u8) []const u8 {
-        if (i18n.current) |cur| {
-            if (cur.messages.get(key)) |msg| return msg;
-        }
-        if (i18n.locales.get(i18n.fallback)) |fb| {
-            if (fb.messages.get(key)) |msg| return msg;
-        }
-        return key;
+        return i18n.trTagged(key).msg;
     }
 
     /// Resolve + interpolate (`{name}` placeholders from the args struct).
@@ -741,11 +867,9 @@ pub const I18n = struct {
     /// Resolve a message and the tag of the locale that provided it (plural
     /// rules must follow the message's locale, not the active one).
     fn trTagged(i18n: *const I18n, key: []const u8) struct { msg: []const u8, tag: []const u8 } {
-        if (i18n.current) |cur| {
-            if (cur.messages.get(key)) |msg| return .{ .msg = msg, .tag = cur.tag };
-        }
-        if (i18n.locales.get(i18n.fallback)) |fb| {
-            if (fb.messages.get(key)) |msg| return .{ .msg = msg, .tag = fb.tag };
+        var buf: [6]*Locale = undefined;
+        for (i18n.chainLocales(&buf)) |l| {
+            if (l.messages.get(key)) |msg| return .{ .msg = msg, .tag = l.tag };
         }
         return .{ .msg = key, .tag = if (i18n.current) |c| c.tag else "" };
     }
@@ -784,6 +908,7 @@ var current_i18n: ?*I18n = null;
 
 pub fn setCurrent(i: ?*I18n) void {
     current_i18n = i;
+    syncTextDirection();
 }
 
 pub fn current() ?*I18n {
@@ -794,6 +919,14 @@ pub fn current() ?*I18n {
 pub fn direction() Direction {
     if (current_i18n) |i| return i.direction();
     return .ltr;
+}
+
+/// Push the process-global direction into the paragraph engine — the bidi
+/// base level every paragraph (simple draw and kx_text_layout) is built
+/// against. An RTL base puts trailing neutrals and weak-direction runs on
+/// the correct side; kept in sync by setCurrent/setLocale/addLocale.
+fn syncTextDirection() void {
+    paint_mod.setTextDirection(direction() == .rtl);
 }
 
 // --- tests ---

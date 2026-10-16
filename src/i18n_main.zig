@@ -138,7 +138,7 @@ fn buildTree(app: *App) !*Node {
 
     // locale switcher
     const sw = try widgets.layout.row(a, .{ .gap = 8 });
-    inline for (.{ "en", "fr", "ja", "ar" }) |tag| {
+    inline for (.{ "en", "fr", "ja", "ar", "es" }) |tag| {
         sw.add(try localeButton(app, tag));
     }
     col.add(sw);
@@ -169,6 +169,7 @@ fn onFrame(ctx: ?*anyopaque, frame: u64) void {
         30 => app.i18n.setLocale("fr") catch |e| std.debug.print("setLocale: {s}\n", .{@errorName(e)}),
         150 => app.i18n.setLocale("ar") catch |e| std.debug.print("setLocale: {s}\n", .{@errorName(e)}),
         300 => app.i18n.setLocale("ja") catch |e| std.debug.print("setLocale: {s}\n", .{@errorName(e)}),
+        375 => app.i18n.setLocale("es") catch |e| std.debug.print("setLocale: {s}\n", .{@errorName(e)}),
         450 => app.i18n.setLocale("en") catch |e| std.debug.print("setLocale: {s}\n", .{@errorName(e)}),
         else => {},
     }
@@ -207,6 +208,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try i18n.addArb("fr", @embedFile("locales/fr.arb"), .ltr);
     try i18n.addArb("ja", @embedFile("locales/ja.arb"), .ltr);
     try i18n.addArb("ar", @embedFile("locales/ar.arb"), .rtl);
+    try i18n.addArb("es", @embedFile("locales/es.arb"), .ltr);
     i18n_mod.setCurrent(i18n); // process-global: the layout reads the direction
     defer i18n_mod.setCurrent(null);
     try i18n.setLocale("en");
@@ -240,7 +242,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) });
 
-    std.debug.print("klaxon i18n (Skia {s}) — 4 locales (en/fr/ja/ar), {d}x{d}\n", .{ host.stats.backend, width, height });
+    std.debug.print("klaxon i18n (Skia {s}) — 5 locales (en/fr/ja/ar/es), {d}x{d}\n", .{ host.stats.backend, width, height });
     try host.run(root, max_frames, onFrame, &app);
     std.debug.print("rendered {d} frames, last frame {d:.2} ms, done\n", .{ host.stats.frames, host.stats.frame_time_ms });
 }
@@ -252,6 +254,7 @@ test "demo: the tree lays out and survives locale switches (incl. RTL flip)" {
     try i18n.addArb("fr", @embedFile("locales/fr.arb"), .ltr);
     try i18n.addArb("ja", @embedFile("locales/ja.arb"), .ltr);
     try i18n.addArb("ar", @embedFile("locales/ar.arb"), .rtl);
+    try i18n.addArb("es", @embedFile("locales/es.arb"), .ltr);
     i18n_mod.setCurrent(i18n);
     defer i18n_mod.setCurrent(null);
     try i18n.setLocale("en");
@@ -282,7 +285,7 @@ test "demo: the tree lays out and survives locale switches (incl. RTL flip)" {
     recompute(&app);
     root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
     // cycle the locales (incl. the RTL flip) and re-layout each time
-    inline for (.{ "fr", "ar", "ja", "en" }) |tag| {
+    inline for (.{ "fr", "ar", "ja", "es", "en" }) |tag| {
         try i18n.setLocale(tag);
         root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
     }

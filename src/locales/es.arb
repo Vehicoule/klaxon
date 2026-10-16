@@ -1,0 +1,15 @@
+{
+  "@@locale": "es",
+  "app_title": "Demo i18n de Klaxon",
+  "@app_title": { "description": "Título de la ventana" },
+  "greeting": "¡Hola {name}!",
+  "@greeting": { "description": "Saludo con un parámetro con nombre" },
+  "items": "{count, plural, =0 {Ningún elemento} one {# elemento} other {# elementos}}",
+  "@items": { "description": "Número de elementos (plural)" },
+  "direction_label": "Dirección del texto",
+  "direction_value": "Izquierda → derecha",
+  "locale_label": "Idioma",
+  "number_label": "Número",
+  "date_label": "Fecha",
+  "rtl_hint": "Cambia a AR para invertir el diseño (RTL)"
+}

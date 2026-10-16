@@ -164,6 +164,21 @@ pub fn text(ctx: *kx.Ctx, str: [:0]const u8, x: f32, baseline_y: f32, size: f32,
 
 // --- Text metrics (layout-time; ctx-independent, fonts are process-global) ---
 
+/// Paragraph base direction (ABI 0.21.0) — process-global: the bidi base
+/// level every paragraph is built against, simple `text()` draws and
+/// `textLayoutBegin` paragraphs alike. `ui.i18n` keeps it synced to the
+/// current locale; apps without i18n may set it directly. An RTL base puts
+/// trailing neutrals and weak-direction runs on the correct side — without
+/// it SkParagraph defaults to an LTR base.
+pub fn setTextDirection(rtl: bool) void {
+    kx.c.kx_set_text_direction(@intFromBool(rtl));
+}
+
+/// The paragraph base direction (false = LTR) — tests + diagnostics.
+pub fn textDirectionRtl() bool {
+    return kx.c.kx_get_text_direction() != 0;
+}
+
 pub const TextMetrics = kx.c.kx_text_metrics;
 
 pub fn measureText(str: [:0]const u8, size: f32, bold: bool) TextMetrics {
@@ -470,8 +485,58 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 
 // --- tests ---
 
-test "kx ABI version reports 0.20.0 (difference clip)" {
-    try std.testing.expectEqualStrings("0.20.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.21.0 (paragraph base direction)" {
+    try std.testing.expectEqualStrings("0.21.0", std.mem.span(kx.c.kx_abi_version()));
+}
+
+test "paragraph base direction setter round-trips (default LTR)" {
+    defer kx.c.kx_set_text_direction(0); // never leak a flipped direction
+    try std.testing.expect(kx.c.kx_get_text_direction() == 0);
+    kx.c.kx_set_text_direction(1);
+    try std.testing.expect(kx.c.kx_get_text_direction() != 0);
+    kx.c.kx_set_text_direction(0);
+    try std.testing.expect(kx.c.kx_get_text_direction() == 0);
+}
+
+fn inkEdges(s: [:0]const u8) !struct { u64, u64 } {
+    const golden = @import("../golden.zig");
+    var r = try golden.Renderer.init(std.testing.allocator, 240, 60);
+    defer r.deinit();
+    r.beginFrame();
+    kx.c.kx_clear(r.ctx, 0xFFFFFFFF);
+    kx.c.kx_draw_text_styled(r.ctx, s, 10, 40, 24, false, 0x000000FF);
+    r.endFrame();
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const left = f.countNotIn(.{ .x = 10, .y = 0, .w = 30, .h = 60 }, 0xFFFFFFFF);
+    const text_w = kx.c.kx_measure_text(s, 24, false).width;
+    const right = f.countNotIn(.{ .x = 10 + @max(0, text_w - 30), .y = 0, .w = 30, .h = 60 }, 0xFFFFFFFF);
+    return .{ left, right };
+}
+
+test "paragraph base direction orders bidi runs (0.21.0)" {
+    // "שלום!!" — an RTL word + two trailing NEUTRAL marks. Under an LTR
+    // base the bangs take LTR and land AFTER the word (right side); under
+    // an RTL base they merge into the RTL run and land on the LEFT. The
+    // Hebrew glyphs are dense, the bangs a few px wide — left/right ink
+    // mass flips unambiguously.
+    const s = "שלום!!";
+    const ltr = try inkEdges(s);
+    kx.c.kx_set_text_direction(1);
+    const rtl = try inkEdges(s);
+    kx.c.kx_set_text_direction(0);
+    // Reorder applied: the bangs are the same ink wherever they land —
+    // LTR puts them in the right window, RTL in the left one.
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(rtl[0])), @as(f32, @floatFromInt(ltr[1])), 20);
+    try std.testing.expect(ltr[0] > 0 and rtl[1] > 0); // the word mirrored to the other edge
+    try std.testing.expect(ltr[0] != rtl[0] or ltr[1] != rtl[1]); // profiles differ
+    // A pure-Latin run is direction-agnostic: identical under either base.
+    const a1 = try inkEdges("hello!");
+    kx.c.kx_set_text_direction(1);
+    const a2 = try inkEdges("hello!");
+    kx.c.kx_set_text_direction(0);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(a1[0])), @as(f32, @floatFromInt(a2[0])), 1);
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(a1[1])), @as(f32, @floatFromInt(a2[1])), 1);
 }
 
 test "shaped text paints ink inside the measured box" {

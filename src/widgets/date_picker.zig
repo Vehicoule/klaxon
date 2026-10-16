@@ -40,12 +40,21 @@
 // v1 deviations (documented, fixed later):
 //   - No date-input mode, no range selection, no docked variant, no swipe
 //     paging on the day grid (chevron paging, the desktop idiom).
-//   - en strings only (month/weekday names, "Select date", Cancel/OK).
-//   - UTC dates (epoch days); no timezone/locale calendar model.
+//   - Header/footer strings are en-only ("Select date", Cancel/OK); the
+//     month/weekday names already route through the active locale.
+//   - UTC dates (epoch days); no timezone/locale calendar model (the grid
+//     is always Sunday-first — RTL mirrors it, it does not re-order it).
 //   - The headline color follows the Compose token (OnSurfaceVariant; the
 //     m3e-canvas oracle paints OnSurface — the Compose token + matraic-m3e
 //     agree, they win).
 //   - No keyboard navigation within the grid (arrows/home/end) yet.
+//
+// RTL: the whole panel mirrors like upstream's placeRelative layout —
+// header text to the start edge, the month-year button + chevrons to the
+// start edge (chevron glyphs auto-mirror), the weekday columns and the
+// day/year grids read right-to-left, the footer anchors to the left.
+// `zoneAt` maps the hit point into the unmirrored (LTR) space once, so
+// paint + hit-testing stay in lockstep.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -380,10 +389,22 @@ fn gridMetrics(b: Rect) struct { x: f32, w: f32, gap: f32 } {
     return .{ .x = b.x + h_pad, .w = w, .gap = (w - 7 * cell) / 8 };
 }
 
+fn rtl() bool {
+    return i18n_mod.direction() == .rtl;
+}
+
+/// Mirror a horizontal span inside the container (RTL): the left edge of
+/// an LTR rect at `x` becomes `2·bx + bw − x − w`. Same idiom as app_bar's
+/// placeRelative mirroring.
+fn mx(b: Rect, x: f32, w: f32) f32 {
+    return if (rtl()) 2 * b.x + b.w - x - w else x;
+}
+
 fn cellRect(t: Theme, b: Rect, col: usize, row: usize) Rect {
     const g = gridMetrics(b);
+    const lx = g.x + g.gap + @as(f32, @floatFromInt(col)) * (cell + g.gap);
     return .{
-        .x = g.x + g.gap + @as(f32, @floatFromInt(col)) * (cell + g.gap),
+        .x = mx(b, lx, cell),
         .y = b.y + gridYOff(t) + @as(f32, @floatFromInt(row)) * rowH(t) + (rowH(t) - cell) / 2,
         .w = cell,
         .h = cell,
@@ -433,7 +454,7 @@ fn yearCellRect(t: Theme, b: Rect, i: usize, scroll: f32) Rect {
     const col: f32 = @floatFromInt(i % year_cols);
     const row: f32 = @floatFromInt(i / year_cols);
     return .{
-        .x = g.x + g.gap + col * (year_cell_w + g.gap),
+        .x = mx(b, g.x + g.gap + col * (year_cell_w + g.gap), year_cell_w),
         .y = g.y + row * year_row_h - scroll,
         .w = year_cell_w,
         .h = year_cell_h,
@@ -449,10 +470,11 @@ fn yearMenuRect(n: *Node) Rect {
     var my_buf: [32]u8 = undefined;
     const my = formatMonthYear(s.disp.peek(), &my_buf);
     const my_m = ui.paint.measureText(my, ls.size, ls.weight >= 500);
+    const w = 4 + my_m.width + year_menu_gap + year_menu_icon + year_menu_pad;
     return .{
-        .x = b.x + h_pad - 4,
+        .x = mx(b, b.x + h_pad - 4, w),
         .y = b.y + header_h + (nav_h - year_menu_h) / 2,
-        .w = 4 + my_m.width + year_menu_gap + year_menu_icon + year_menu_pad,
+        .w = w,
         .h = year_menu_h,
     };
 }
@@ -473,9 +495,11 @@ fn openYearMenu(n: *Node) void {
 fn chevronRects(b: Rect) struct { prev: Rect, next: Rect } {
     const right = b.x + b.w - h_pad;
     const y = b.y + header_h + (nav_h - chevron_hit) / 2;
+    // Mirrored under RTL the group anchors to the start edge and reads
+    // [next][prev] — the same visual order flip Compose's Row does.
     return .{
-        .prev = .{ .x = right - 2 * chevron_hit, .y = y, .w = chevron_hit, .h = chevron_hit },
-        .next = .{ .x = right - chevron_hit, .y = y, .w = chevron_hit, .h = chevron_hit },
+        .prev = .{ .x = mx(b, right - 2 * chevron_hit, chevron_hit), .y = y, .w = chevron_hit, .h = chevron_hit },
+        .next = .{ .x = mx(b, right - chevron_hit, chevron_hit), .y = y, .w = chevron_hit, .h = chevron_hit },
     };
 }
 
@@ -491,9 +515,12 @@ fn footerRects(n: *Node) FooterRects {
     const cancel_w = cancel_m.width + 2 * footer_pad_x;
     const right = n.bounds.x + n.bounds.w - footer_pad_bottom;
     const y = n.bounds.y + footerYOff(s.opts.theme);
+    const b = n.bounds;
+    // End-aligned like upstream's Arrangement.End — the START edge under
+    // RTL, where the mirrored order reads [OK][Cancel].
     return .{
-        .cancel = .{ .x = right - ok_w - footer_gap - cancel_w, .y = y, .w = cancel_w, .h = footer_h },
-        .ok = .{ .x = right - ok_w, .y = y, .w = ok_w, .h = footer_h },
+        .cancel = .{ .x = mx(b, right - ok_w - footer_gap - cancel_w, cancel_w), .y = y, .w = cancel_w, .h = footer_h },
+        .ok = .{ .x = mx(b, right - ok_w, ok_w), .y = y, .w = ok_w, .h = footer_h },
     };
 }
 
@@ -501,6 +528,11 @@ fn footerRects(n: *Node) FooterRects {
 fn zoneAt(n: *Node, x: f32, y: f32) Zone {
     const s = stateOf(n);
     const b = n.bounds;
+    // All chrome mirrors under RTL: rect zones are already mirrored (the
+    // helpers produce the painted rects), the grid-fraction math maps the
+    // point into the unmirrored (LTR) space once — paint and hit-testing
+    // stay in lockstep either way.
+    const lx = if (rtl()) 2 * b.x + b.w - x else x;
     const fr = footerRects(n);
     if (fr.cancel.contains(x, y)) return .cancel;
     if (fr.ok.contains(x, y)) return .ok;
@@ -511,13 +543,13 @@ fn zoneAt(n: *Node, x: f32, y: f32) Zone {
         const g = yearGridMetrics(s.opts.theme, b);
         if (x >= g.x and x < g.x + g.w and y >= g.y and y < g.y + g.h) {
             const row_f = (y - g.y + s.year_scroll) / year_row_h;
-            const lx = x - g.x - g.gap;
-            const col_f = lx / (year_cell_w + g.gap);
+            const gx = lx - g.x - g.gap;
+            const col_f = gx / (year_cell_w + g.gap);
             if (row_f >= 0 and col_f >= 0) {
                 const row: usize = @intFromFloat(row_f);
                 const col: usize = @intFromFloat(col_f);
                 if (col < year_cols) {
-                    const in_cell = lx - @as(f32, @floatFromInt(col)) * (year_cell_w + g.gap) <= year_cell_w and
+                    const in_cell = gx - @as(f32, @floatFromInt(col)) * (year_cell_w + g.gap) <= year_cell_w and
                         (y - g.y + s.year_scroll) - @as(f32, @floatFromInt(row)) * year_row_h <= year_cell_h;
                     if (in_cell) {
                         const i = row * year_cols + col;
@@ -534,13 +566,13 @@ fn zoneAt(n: *Node, x: f32, y: f32) Zone {
     const g = gridMetrics(b);
     const gy = b.y + gridYOff(s.opts.theme);
     if (y >= gy and y < gy + gridH(s.opts.theme) and x >= g.x and x < g.x + g.w) {
-        const lx = x - g.x - g.gap;
+        const gx = lx - g.x - g.gap;
         const ly = y - gy - (rowH(s.opts.theme) - cell) / 2;
-        if (lx >= 0 and ly >= 0) {
-            const col = @as(usize, @intFromFloat(lx / (cell + g.gap)));
+        if (gx >= 0 and ly >= 0) {
+            const col = @as(usize, @intFromFloat(gx / (cell + g.gap)));
             const row = @as(usize, @intFromFloat(ly / rowH(s.opts.theme)));
             if (col < 7 and row < grid_rows) {
-                const in_cell_x = lx - @as(f32, @floatFromInt(col)) * (cell + g.gap) <= cell;
+                const in_cell_x = gx - @as(f32, @floatFromInt(col)) * (cell + g.gap) <= cell;
                 const in_cell_y = ly - @as(f32, @floatFromInt(row)) * rowH(s.opts.theme) <= cell;
                 if (in_cell_x and in_cell_y) {
                     if (dayAtCell(n, row * 7 + col)) |d| return .{ .day = d };
@@ -609,14 +641,14 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
     const title_m = ui.paint.measureText(s.title_z, ls.size, bold);
-    ui.paint.text(ctx, s.title_z, b.x + 24, b.y + title_pad_top + (ls.line_height - title_m.height) / 2 + title_m.ascent, ls.size, bold, cs.on_surface_variant);
+    ui.paint.text(ctx, s.title_z, mx(b, b.x + 24, title_m.width), b.y + title_pad_top + (ls.line_height - title_m.height) / 2 + title_m.ascent, ls.size, bold, cs.on_surface_variant);
     const hl = t.type_scale.headline_large;
     const hl_bold = hl.weight >= 500;
     var hl_buf: [32]u8 = undefined;
     const headline: [:0]const u8 = if (s.sel.peek()) |d| formatDay(d, &hl_buf) else s.title_z;
     const hl_m = ui.paint.measureText(headline, hl.size, hl_bold);
     const hl_box_y = b.y + header_h - headline_pad_bottom - hl.line_height;
-    ui.paint.text(ctx, headline, b.x + 24, hl_box_y + (hl.line_height - hl_m.height) / 2 + hl_m.ascent, hl.size, hl_bold, cs.on_surface_variant);
+    ui.paint.text(ctx, headline, mx(b, b.x + 24, hl_m.width), hl_box_y + (hl.line_height - hl_m.height) / 2 + hl_m.ascent, hl.size, hl_bold, cs.on_surface_variant);
     ui.paint.fillRect(ctx, b.x, b.y + header_h - 1, b.w, 1, cs.outline_variant);
     // the month/year nav row: the menu button (TextButton + ArrowDropDown,
     // rotated 180° while the year picker is open) + the chevrons (hidden
@@ -630,8 +662,8 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
         const alpha = if (std.meta.eql(s.pressed, .year_menu)) t.state.pressed else t.state.hover;
         ui.paint.fillRRect(ctx, yr.x, yr.y, yr.w, yr.h, yr.h / 2, theme_mod.stateLayer(0, cs.on_surface_variant, alpha));
     }
-    ui.paint.text(ctx, my, b.x + h_pad, nav_cy - my_m.height / 2 + my_m.ascent, ls.size, bold, cs.on_surface_variant);
-    paintIcon(ctx, if (s.year_open) .triangle_up else .triangle_down, b.x + h_pad + my_m.width + year_menu_gap, nav_cy - year_menu_icon / 2, year_menu_icon, cs.on_surface_variant);
+    ui.paint.text(ctx, my, mx(b, b.x + h_pad, my_m.width), nav_cy - my_m.height / 2 + my_m.ascent, ls.size, bold, cs.on_surface_variant);
+    paintIcon(ctx, if (s.year_open) .triangle_up else .triangle_down, mx(b, b.x + h_pad + my_m.width + year_menu_gap, year_menu_icon), nav_cy - year_menu_icon / 2, year_menu_icon, cs.on_surface_variant);
     if (!s.year_open) {
         const chev = chevronRects(b);
         paintChevron(n, ctx, chev.prev, .chevron_left, .prev, canPrev(n));
@@ -644,12 +676,13 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
         paintFooter(n, ctx);
         return;
     }
-    // the weekday row
+    // the weekday row (RTL mirrors the columns: the week still runs
+    // Sunday→Saturday but reads right-to-left)
     const g = gridMetrics(b);
     const weekday_y = b.y + header_h + nav_h;
     for (0..7) |col| {
         const cx = g.x + g.gap + @as(f32, @floatFromInt(col)) * (cell + g.gap) + cell / 2;
-        const wl = weekdayLetter(col);
+        const wl = weekdayLetter(if (rtl()) 6 - col else col);
         const lm = ui.paint.measureText(wl, bl.size, bl_bold);
         ui.paint.text(ctx, wl, cx - lm.width / 2, weekday_y + (weekdayRowH(t) - lm.height) / 2 + lm.ascent, bl.size, bl_bold, cs.on_surface);
     }
