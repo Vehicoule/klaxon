@@ -73,13 +73,15 @@ static bool kx_prof_on();
 static uint64_t kx_prof_ns();
 static void kx_prof(const char* name, uint64_t t0);
 
+void kx_clip_rect_diff(kx_ctx* ctx, float x, float y, float w, float h);
+
 // One op recorded inside an alpha layer (0.12.0). The flat union keeps every
 // argument needed to replay the draw later; only the variants in use carry
 // data (xs/ys for polylines/polygons/clip paths, cols for gradient stops,
 // text for string draws, child for nested layers).
 struct KxRecOp {
     enum class K : uint8_t {
-        Save, Restore, Translate, Scale, Rotate, ClipRect, ClipPath, ClipRRect,
+        Save, Restore, Translate, Scale, Rotate, ClipRect, ClipPath, ClipRRect, ClipRectDiff,
         Clear, FillRect, FillRRect, FillRRectCorners, StrokeRRect,
         StrokeRRectCorners, StrokePolyline, FillPolygon, FillRRectGradient,
         FillPath, StrokePath, ShadowRRect, BackdropBlur,
@@ -1180,6 +1182,9 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 break;
             case KxRecOp::K::ClipRRect:
                 kx_clip_rrect(ctx, op.f[0], op.f[1], op.f[2], op.f[3], op.f[4]);
+                break;
+            case KxRecOp::K::ClipRectDiff:
+                kx_clip_rect_diff(ctx, op.f[0], op.f[1], op.f[2], op.f[3]);
                 break;
             case KxRecOp::K::Clear: kx_clear(ctx, op.color); break;
             case KxRecOp::K::FillRect:
@@ -3020,6 +3025,24 @@ void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h) {
     ctx->canvas->clipRect(SkRect::MakeXYWH(x, y, w, h), SkClipOp::kIntersect, true);
 }
 
+void kx_clip_rect_diff(kx_ctx* ctx, float x, float y, float w, float h) {
+    if (!ctx || !ctx->canvas) return;
+    if (kx_recording(ctx)) {
+        KxRecLayer* L = ctx->layers.back().get();
+        L->depth++;
+        KxRecOp op{KxRecOp::K::ClipRectDiff};
+        op.f[0] = x; op.f[1] = y; op.f[2] = w; op.f[3] = h;
+        L->ops.push_back(std::move(op));
+        return;
+    }
+    kx_sprite_flush(ctx); // pending sprites drew under the OLD clip
+    ctx->canvas->save();
+    // Difference: the rect becomes a hole — the outlined text field's label
+    // cutout knocks a real gap in the border instead of painting a
+    // surface-colored patch over the stroke (Compose's ClipOp.Difference).
+    ctx->canvas->clipRect(SkRect::MakeXYWH(x, y, w, h), SkClipOp::kDifference, true);
+}
+
 void kx_clip_path(kx_ctx* ctx, const float* xs, const float* ys, int count, int aa) {
     if (!ctx || !ctx->canvas || !xs || !ys || count < 3 || count > 0x100000) return;
     if (kx_recording(ctx)) {
@@ -3245,7 +3268,7 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.19.0";
+    return "0.20.0";
 }
 
 float kx_canvas_scale(kx_ctx* ctx) {

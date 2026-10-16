@@ -68,6 +68,10 @@
 //            kx_atlas_begin now rasterize at the enclosing canvas's device
 //            scale (returned slots/images hold device pixels; callers keep
 //            blitting at logical dst rects). New kx_canvas_scale getter.
+//   0.20.0 — kx_clip_rect_diff (SkClipOp::kDifference): a rect hole in the
+//            clip — the outlined text field's label cutout knocks a real
+//            gap in the border (Compose's ClipOp.Difference) instead of a
+//            surface-colored patch that assumes a flat background.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -209,6 +213,9 @@ void kx_rotate(kx_ctx* ctx, float degrees);
 // is retained between frames: repainting the tree clipped to the damaged
 // region is the dirty-rect path (Phase 1e).
 void kx_clip_rect(kx_ctx* ctx, float x, float y, float w, float h);
+// Difference clip (0.20.0): the rect is cut OUT of the clip — a hole for
+// subsequent draws (label cutouts, badge gaps). Same save/reset contract.
+void kx_clip_rect_diff(kx_ctx* ctx, float x, float y, float w, float h);
 // Anti-aliased rounded-rect intersect clip — the animated shape morphs of
 // the SearchView expansion (corner radius lerps toward 0). A radius ≤ 0
 // falls back to a rect clip. Balanced by kx_clip_reset.

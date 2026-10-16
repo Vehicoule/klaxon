@@ -27,7 +27,7 @@
 //     is 52 with an icon (48 + TextFieldPadding - horizontalIconPadding) and
 //     16 without
 //   - the label animates: labelProgress (InputPhase transition, FastSpatial
-//     spring — theme.motion.springs.spatial_spring) lerps position, box
+//     spring — theme.motion.springs.fast_spatial) lerps position, box
 //     height (24→16) and font size (bodyLarge→bodySmall); focused-or-has-
 //     text minimizes. Filled: x is fixed at the text offset, y lerps
 //     centered→8 (contentPaddingWithLabel top). Outlined: x lerps
@@ -61,10 +61,9 @@
 //
 // Remaining deviations:
 //   - Single-line only (no MultiLine lineLimits, no prefix/suffix/counter).
-//   - The outlined cutout is a surface-colored patch over the stroke —
-//     upstream clips the border draw with ClipOp.Difference, which the
-//     paint API doesn't expose; the patch assumes a surface-toned
-//     background.
+//   - The outlined cutout now clips the border stroke with
+//     ClipOp.Difference (kx_clip_rect_diff, ABI 0.20.0) — a real hole like
+//     upstream; the background shows through on any surface.
 //   - The label's font size lerps but its weight/tracking don't (upstream
 //     lerps the full TextStyle); label/indicator colors snap on the phase
 //     transition rather than animating FastEffects; the placeholder alpha
@@ -229,7 +228,7 @@ fn syncPhase(n: *Node, s: *TextFieldState) void {
     const target = labelTarget(s);
     if (ui.anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = ui.anim.Animation.springAnim(.{ s.label_progress, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, .{ 0, 0, 0, 0 }),
+            .kind = ui.anim.Animation.springAnim(.{ s.label_progress, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, .{ 0, 0, 0, 0 }),
             .from = .{ s.label_progress, 0, 0, 0 },
             .channel = @ptrCast(&s.label_channel),
             .on_update = .{ .fn_ptr = labelProgressCb, .userdata = n },
@@ -344,7 +343,6 @@ const FieldColors = struct {
     icon_trail: Color,
     supporting: Color,
     caret: Color,
-    cutout: Color, // the outlined cutout patch = the surface behind the field
 };
 
 fn currentColors(s: *TextFieldState, focused: bool) FieldColors {
@@ -368,7 +366,6 @@ fn currentColors(s: *TextFieldState, focused: bool) FieldColors {
             .icon_trail = dis,
             .supporting = dis,
             .caret = dis,
-            .cutout = cs.surface,
         };
     }
     if (s.opts.@"error") {
@@ -385,7 +382,6 @@ fn currentColors(s: *TextFieldState, focused: bool) FieldColors {
             .icon_trail = cs.@"error", // ErrorTrailingIconColor
             .supporting = cs.@"error", // ErrorSupportingColor
             .caret = cs.@"error", // ErrorFocusCaretColor
-            .cutout = cs.surface,
         };
     }
     return .{
@@ -401,7 +397,6 @@ fn currentColors(s: *TextFieldState, focused: bool) FieldColors {
         .icon_trail = cs.on_surface_variant, // (Focus)TrailingIconColor
         .supporting = cs.on_surface_variant, // (Focus)SupportingColor
         .caret = cs.primary, // CaretColor
-        .cutout = cs.surface,
     };
 }
 
@@ -589,15 +584,19 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         }
     } else {
         if (fc.outline & 0xFF != 0) {
-            ui.paint.strokeRRect(ctx, c.x, c.y, c.w, c.h, corner, fc.outline_w, fc.outline);
-        }
-        // outlineCutout: erase the top edge behind the label — the hole is
-        // anchored at the minimized position (startPadding + the measured
-        // label width scaled by labelProgress) with 4dp inner padding.
-        if (fc.outline & 0xFF != 0 and hasLabel(s) and s.label_progress > 0) {
-            const cut_w = ui.paint.measureText(s.label, labelSize(s, t), false).width * s.label_progress;
-            const patch_x = mx(c.x, c.w, c.x + h_padding - cutout_pad, cut_w + cutout_pad * 2, rtl);
-            ui.paint.fillRect(ctx, patch_x, c.y - fc.outline_w / 2 - 0.5, cut_w + cutout_pad * 2, fc.outline_w + 1, fc.cutout);
+            // outlineCutout: Compose clips the border stroke with
+            // ClipOp.Difference — a REAL hole behind the label (whatever
+            // background shows through), not a surface-colored patch.
+            if (hasLabel(s) and s.label_progress > 0) {
+                const cut_w = ui.paint.measureText(s.label, labelSize(s, t), false).width * s.label_progress;
+                const hole_x = mx(c.x, c.w, c.x + h_padding - cutout_pad, cut_w + cutout_pad * 2, rtl);
+                // ±2px past the stroke's outer edge so no AA fringe survives.
+                ui.paint.clipRectDiff(ctx, hole_x, c.y - fc.outline_w - 2, cut_w + cutout_pad * 2, fc.outline_w * 2 + 4);
+                ui.paint.strokeRRect(ctx, c.x, c.y, c.w, c.h, corner, fc.outline_w, fc.outline);
+                ui.paint.clipReset(ctx);
+            } else {
+                ui.paint.strokeRRect(ctx, c.x, c.y, c.w, c.h, corner, fc.outline_w, fc.outline);
+            }
         }
     }
 

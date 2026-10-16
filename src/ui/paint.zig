@@ -62,6 +62,14 @@ pub fn clipRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32) void
     kx.c.kx_clip_rrect(ctx, x, y, w, h, radius);
 }
 
+/// Difference clip (ABI 0.20.0): the rect is cut OUT of the clip — draws
+/// skip that area entirely (Compose's ClipOp.Difference — the outlined
+/// text field's label cutout is a real hole, not a surface-colored patch).
+/// Balanced with clipReset.
+pub fn clipRectDiff(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32) void {
+    kx.c.kx_clip_rect_diff(ctx, x, y, w, h);
+}
+
 pub fn clipReset(ctx: *kx.Ctx) void {
     kx.c.kx_clip_reset(ctx);
 }
@@ -436,8 +444,8 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 
 // --- tests ---
 
-test "kx ABI version reports 0.19.0 (HiDPI raster passes)" {
-    try std.testing.expectEqualStrings("0.19.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.20.0 (difference clip)" {
+    try std.testing.expectEqualStrings("0.20.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "shaped text paints ink inside the measured box" {
