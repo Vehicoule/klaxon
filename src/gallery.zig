@@ -2569,10 +2569,13 @@ test "gallery: the M3E navigation rails select on click and follow the signal" {
     const sy = widgets.scroll_view.scrollOffset(sv);
     const b = nr.bounds;
     try std.testing.expectEqual(@as(usize, 0), g.nr_selected.peek());
-    // click the 3rd item (y = bounds.y + 44 + 2*60 + 28, x = center)
-    const y3 = b.y + 44 + 2 * 60 + 28 - sy;
-    router.dispatchPointer(g.root, .{ .phase = .down, .x = b.x + 48, .y = y3, .raw_x = b.x + 48, .raw_y = y3 });
-    router.dispatchPointer(g.root, .{ .phase = .up, .x = b.x + 48, .y = y3, .raw_x = b.x + 48, .raw_y = y3 });
+    // click the 3rd item — the row's rect comes from the a11y geometry
+    // (node-local child_bounds → window coords via the scroll offset)
+    const r3 = nr.semantics.?.child_bounds.?(nr, 2);
+    const x3 = b.x + r3.x + r3.w / 2;
+    const y3 = b.y + r3.y + r3.h / 2 - sy;
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = x3, .y = y3, .raw_x = x3, .raw_y = y3 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = x3, .y = y3, .raw_x = x3, .raw_y = y3 });
     try std.testing.expectEqual(@as(usize, 2), g.nr_selected.peek()); // the signal round-trips
     try std.testing.expectEqual(@as(usize, 2), navigation_rail_w.selectedIndex(nr));
     try std.testing.expectEqual(@as(u32, 1), g.nr_change.peek()); // on_change fired
@@ -2580,12 +2583,14 @@ test "gallery: the M3E navigation rails select on click and follow the signal" {
     // the external signal moves the selection
     g.nr_selected.set(0);
     try std.testing.expectEqual(@as(usize, 0), navigation_rail_w.selectedIndex(nr));
-    // the expanded rail: click its 2nd item (same item rows)
+    // the expanded rail: click its 2nd item (same a11y-derived row rect)
     const ne = g.refs.nr_exp_m3e;
     const be = ne.bounds;
-    const y2 = be.y + 44 + 60 + 28 - sy;
-    router.dispatchPointer(g.root, .{ .phase = .down, .x = be.x + 40, .y = y2, .raw_x = be.x + 40, .raw_y = y2 });
-    router.dispatchPointer(g.root, .{ .phase = .up, .x = be.x + 40, .y = y2, .raw_x = be.x + 40, .raw_y = y2 });
+    const re = ne.semantics.?.child_bounds.?(ne, 1);
+    const x2 = be.x + re.x + re.w / 2;
+    const y2 = be.y + re.y + re.h / 2 - sy;
+    router.dispatchPointer(g.root, .{ .phase = .down, .x = x2, .y = y2, .raw_x = x2, .raw_y = y2 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = x2, .y = y2, .raw_x = x2, .raw_y = y2 });
     try std.testing.expectEqual(@as(usize, 1), g.nr_exp_selected.peek());
     try std.testing.expectEqual(@as(usize, 1), navigation_rail_w.selectedIndex(ne));
     try std.testing.expectEqual(@as(u32, 1), g.nr_exp_change.peek());
@@ -2923,9 +2928,12 @@ test "gallery: FABs + carousel + bottom app bar are wired (batch 2d.5)" {
     _ = widgets.scroll_view.setScrollOffset(sv, @max(0.0, cb.y - sv.bounds.y));
     const sy2 = widgets.scroll_view.scrollOffset(sv);
     try std.testing.expectEqual(@as(f32, 0), carousel_w.scrollOffset(g.refs.carousel_mb));
+    // a sub-half-stride drag snaps back to the nearest item (Compose
+    // behavior); push past the halfway point so the release settles
+    // forward onto the next item slot.
     router.dispatchPointer(g.root, .{ .phase = .down, .x = cb.x + cb.w / 2, .y = cb.y + cb.h / 2 - sy2 });
-    router.dispatchPointer(g.root, .{ .phase = .move, .x = cb.x + cb.w / 2 - 60, .y = cb.y + cb.h / 2 - sy2 });
-    router.dispatchPointer(g.root, .{ .phase = .up, .x = cb.x + cb.w / 2 - 60, .y = cb.y + cb.h / 2 - sy2 });
+    router.dispatchPointer(g.root, .{ .phase = .move, .x = cb.x + cb.w / 2 - 220, .y = cb.y + cb.h / 2 - sy2 });
+    router.dispatchPointer(g.root, .{ .phase = .up, .x = cb.x + cb.w / 2 - 220, .y = cb.y + cb.h / 2 - sy2 });
     try std.testing.expect(carousel_w.scrollOffset(g.refs.carousel_mb) > 0);
     // the bottom app bar's docked FAB fires its counter
     const bb = g.refs.bab_fab.bounds;
