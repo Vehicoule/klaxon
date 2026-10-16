@@ -75,9 +75,11 @@
 //     typing/backspace/delete/left/right apply AT the caret. Selection is
 //     real too: drag or shift+arrows/home/end extend the range (primary
 //     @0.4 highlight, collapsed anchors, delete replaces the range).
-//     Still missing: no clipboard (cut/copy/paste), no selection handles
-//     or double-click word select, no TextSelectionColors customization,
-//     and arrows move by codepoint, not grapheme cluster.
+//     Cmd/Ctrl+A/C/X/V ride the platform clipboard (ui.clipboard — the
+//     host installs SDL's impl); paste strips line terminators to stay
+//     single-line. Still missing: no selection handles or double-click
+//     word select, no undo, no TextSelectionColors customization, and
+//     arrows move by codepoint, not grapheme cluster.
 //   - RTL mirrors the chrome; the text run itself stays LTR (no bidi —
 //     same as text.zig); under RTL arrow keys still move logically.
 const std = @import("std");
@@ -987,112 +989,176 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
             n.markDirty(); // repaint only — comp is not a committed edit
             return true;
         },
-        .key_down => switch (ev.key) {
-            .backspace => {
-                if (s.comp.items.len > 0) {
-                    // An open composition eats the backspace (codepoint
-                    // first); the platform re-sends text_editing anyway.
-                    while (s.comp.items.len > 0) {
-                        const last = s.comp.items[s.comp.items.len - 1];
-                        s.comp.items.len -= 1;
-                        if ((last & 0xC0) != 0x80) break;
+        .key_down => {
+            // Clipboard + select-all chords (Cmd on Apple, Ctrl elsewhere —
+            // the platform's shortcut modifier arrives as `ev.command`).
+            if (ev.command) {
+                const sel = selRange(s);
+                switch (ev.chr) {
+                    'a' => { // select all: anchor start, caret end
+                        s.sel_anchor = 0;
+                        moveCaret(n, s, s.buf.items.len, true);
+                        return true;
+                    },
+                    'c' => { // copy the open range; collapsed = no-op
+                        if (sel.hi > sel.lo) ui.clipboard.set(s.buf.items[sel.lo..sel.hi]);
+                        return true;
+                    },
+                    'x' => { // cut = copy + delete the range
+                        if (sel.hi > sel.lo) {
+                            ui.clipboard.set(s.buf.items[sel.lo..sel.hi]);
+                            deleteRange(s, sel.lo, sel.hi);
+                            resetBlink(s);
+                            applyEdit(n, s);
+                        }
+                        return true;
+                    },
+                    'v' => { // paste: replaces the selection, inserts at caret
+                        const clip = ui.clipboard.get(n.allocator) orelse return true;
+                        defer n.allocator.free(clip);
+                        if (clip.len == 0) return true;
+                        // Single-line: line terminators don't paste (upstream
+                        // filters them through the IME pipeline).
+                        var scratch: ?[]u8 = null;
+                        defer if (scratch) |b| n.allocator.free(b);
+                        var ins: []const u8 = clip;
+                        if (std.mem.indexOfAny(u8, clip, "\r\n") != null) {
+                            const b = n.allocator.alloc(u8, clip.len) catch @panic("klaxon: out of memory");
+                            var w: usize = 0;
+                            for (clip) |ch| {
+                                if (ch == '\r' or ch == '\n') continue;
+                                b[w] = ch;
+                                w += 1;
+                            }
+                            scratch = b;
+                            ins = b[0..w];
+                        }
+                        if (ins.len == 0) return true;
+                        if (s.buf.items.len + ins.len - (sel.hi - sel.lo) > ui.state.TextSignal.max_len) return true;
+                        if (sel.hi > sel.lo) deleteRange(s, sel.lo, sel.hi);
+                        const at = s.caret;
+                        s.buf.ensureUnusedCapacity(ins.len + 1) catch @panic("klaxon: out of memory");
+                        const tl = s.buf.items.len - at;
+                        std.mem.copyBackwards(u8, s.buf.items.ptr[at + ins.len ..][0..tl], s.buf.items[at..][0..tl]);
+                        @memcpy(s.buf.items.ptr[at..][0..ins.len], ins);
+                        s.buf.items.len += ins.len;
+                        s.caret = at + ins.len;
+                        s.sel_anchor = s.caret;
+                        setSentinel(&s.buf);
+                        resetBlink(s);
+                        applyEdit(n, s);
+                        return true;
+                    },
+                    else => return true, // unknown chord — still consumed
+                }
+            }
+            switch (ev.key) {
+                .backspace => {
+                    if (s.comp.items.len > 0) {
+                        // An open composition eats the backspace (codepoint
+                        // first); the platform re-sends text_editing anyway.
+                        while (s.comp.items.len > 0) {
+                            const last = s.comp.items[s.comp.items.len - 1];
+                            s.comp.items.len -= 1;
+                            if ((last & 0xC0) != 0x80) break;
+                        }
+                        s.comp_cursor = @intCast(s.comp.items.len);
+                        setSentinel(&s.comp);
+                        n.markDirty();
+                        return true;
                     }
-                    s.comp_cursor = @intCast(s.comp.items.len);
+                    // An open selection eats the delete — upstream clears the
+                    // range, not the codepoint before the caret.
+                    const sel = selRange(s);
+                    if (sel.hi > sel.lo) {
+                        deleteRange(s, sel.lo, sel.hi);
+                        resetBlink(s);
+                        applyEdit(n, s);
+                        return true;
+                    }
+                    // Delete the codepoint ending AT the caret.
+                    if (s.caret == 0) return true;
+                    var start = s.caret;
+                    while (start > 0 and (s.buf.items[start - 1] & 0xC0) == 0x80) start -= 1;
+                    start -= 1;
+                    deleteRange(s, start, s.caret);
+                    resetBlink(s);
+                    applyEdit(n, s);
+                    return true;
+                },
+                .delete => {
+                    const sel = selRange(s);
+                    if (sel.hi > sel.lo) {
+                        deleteRange(s, sel.lo, sel.hi);
+                        resetBlink(s);
+                        applyEdit(n, s);
+                        return true;
+                    }
+                    // Forward delete: the codepoint STARTING at the caret.
+                    if (s.caret >= s.buf.items.len or s.comp.items.len > 0) return true;
+                    const l = std.unicode.utf8ByteSequenceLength(s.buf.items[s.caret]) catch 1;
+                    const end = @min(s.buf.items.len, s.caret + l);
+                    deleteRange(s, s.caret, end);
+                    resetBlink(s);
+                    applyEdit(n, s);
+                    return true;
+                },
+                // Logical caret motion — one codepoint per press (upstream
+                // moves by grapheme cluster; a cluster-aware step needs the
+                // paragraph's break iterator, tracked as a deviation). Under
+                // RTL this moves logically, not visually. Shift extends the
+                // selection; a plain arrow over an open selection collapses
+                // onto the range's edge (upstream caret-collapse semantics).
+                .left => {
+                    const sel = selRange(s);
+                    if (sel.hi > sel.lo and !ev.shift) {
+                        moveCaret(n, s, sel.lo, false); // collapse to the start
+                        return true;
+                    }
+                    var p = s.caret;
+                    while (p > 0) {
+                        p -= 1;
+                        if ((s.buf.items[p] & 0xC0) != 0x80) break;
+                    }
+                    moveCaret(n, s, p, ev.shift);
+                    return true;
+                },
+                .right => {
+                    const sel = selRange(s);
+                    if (sel.hi > sel.lo and !ev.shift) {
+                        moveCaret(n, s, sel.hi, false); // collapse to the end
+                        return true;
+                    }
+                    var p = s.caret;
+                    if (p < s.buf.items.len) {
+                        p += 1;
+                        while (p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p += 1;
+                    }
+                    moveCaret(n, s, p, ev.shift);
+                    return true;
+                },
+                .home => {
+                    moveCaret(n, s, 0, ev.shift); // single line: the run start
+                    return true;
+                },
+                .end => {
+                    moveCaret(n, s, s.buf.items.len, ev.shift); // the run end
+                    return true;
+                },
+                .enter => {
+                    if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
+                    return true;
+                },
+                .escape => {
+                    s.comp.clearRetainingCapacity();
+                    s.comp_cursor = 0;
                     setSentinel(&s.comp);
+                    input.requestFocus(null);
                     n.markDirty();
                     return true;
-                }
-                // An open selection eats the delete — upstream clears the
-                // range, not the codepoint before the caret.
-                const sel = selRange(s);
-                if (sel.hi > sel.lo) {
-                    deleteRange(s, sel.lo, sel.hi);
-                    resetBlink(s);
-                    applyEdit(n, s);
-                    return true;
-                }
-                // Delete the codepoint ending AT the caret.
-                if (s.caret == 0) return true;
-                var start = s.caret;
-                while (start > 0 and (s.buf.items[start - 1] & 0xC0) == 0x80) start -= 1;
-                start -= 1;
-                deleteRange(s, start, s.caret);
-                resetBlink(s);
-                applyEdit(n, s);
-                return true;
-            },
-            .delete => {
-                const sel = selRange(s);
-                if (sel.hi > sel.lo) {
-                    deleteRange(s, sel.lo, sel.hi);
-                    resetBlink(s);
-                    applyEdit(n, s);
-                    return true;
-                }
-                // Forward delete: the codepoint STARTING at the caret.
-                if (s.caret >= s.buf.items.len or s.comp.items.len > 0) return true;
-                const l = std.unicode.utf8ByteSequenceLength(s.buf.items[s.caret]) catch 1;
-                const end = @min(s.buf.items.len, s.caret + l);
-                deleteRange(s, s.caret, end);
-                resetBlink(s);
-                applyEdit(n, s);
-                return true;
-            },
-            // Logical caret motion — one codepoint per press (upstream
-            // moves by grapheme cluster; a cluster-aware step needs the
-            // paragraph's break iterator, tracked as a deviation). Under
-            // RTL this moves logically, not visually. Shift extends the
-            // selection; a plain arrow over an open selection collapses
-            // onto the range's edge (upstream caret-collapse semantics).
-            .left => {
-                const sel = selRange(s);
-                if (sel.hi > sel.lo and !ev.shift) {
-                    moveCaret(n, s, sel.lo, false); // collapse to the start
-                    return true;
-                }
-                var p = s.caret;
-                while (p > 0) {
-                    p -= 1;
-                    if ((s.buf.items[p] & 0xC0) != 0x80) break;
-                }
-                moveCaret(n, s, p, ev.shift);
-                return true;
-            },
-            .right => {
-                const sel = selRange(s);
-                if (sel.hi > sel.lo and !ev.shift) {
-                    moveCaret(n, s, sel.hi, false); // collapse to the end
-                    return true;
-                }
-                var p = s.caret;
-                if (p < s.buf.items.len) {
-                    p += 1;
-                    while (p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p += 1;
-                }
-                moveCaret(n, s, p, ev.shift);
-                return true;
-            },
-            .home => {
-                moveCaret(n, s, 0, ev.shift); // single line: the run start
-                return true;
-            },
-            .end => {
-                moveCaret(n, s, s.buf.items.len, ev.shift); // the run end
-                return true;
-            },
-            .enter => {
-                if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
-                return true;
-            },
-            .escape => {
-                s.comp.clearRetainingCapacity();
-                s.comp_cursor = 0;
-                setSentinel(&s.comp);
-                input.requestFocus(null);
-                n.markDirty();
-                return true;
-            },
-            else => {},
+                },
+                else => {},
+            }
         },
     }
     return false;
@@ -1864,4 +1930,61 @@ test "golden: the selection paints a primary@0.4 highlight over the range" {
     }
     try std.testing.expect(h_diff > 4); // the H band highlights
     try std.testing.expectEqual(@as(u32, 0), i_diff); // the i stays plain
+}
+
+test "text_field: Cmd/Ctrl chords — select-all, copy, cut, paste (single-line strips newlines)" {
+    // A test clipboard the host would have installed (ui.clipboard is
+    // backend-agnostic: the widget never sees SDL).
+    const Clip = struct {
+        var slot: [256]u8 = undefined;
+        var len: usize = 0;
+        fn getImpl(allocator: std.mem.Allocator) ?[]u8 {
+            if (len == 0) return null;
+            return allocator.dupe(u8, slot[0..len]) catch null;
+        }
+        fn setImpl(str: []const u8) void {
+            len = @min(str.len, slot.len);
+            @memcpy(slot[0..len], str[0..len]);
+        }
+    };
+    ui.clipboard.install(.{ .get = Clip.getImpl, .set = Clip.setImpl });
+    defer ui.clipboard.install(.{});
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "hello" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    router.focus(b);
+    // Ctrl/Cmd+A selects all
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'a' });
+    try std.testing.expectEqual(@as(usize, 0), s.sel_anchor);
+    try std.testing.expectEqual(@as(usize, 5), s.caret);
+    // copy — buffer unchanged
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'c' });
+    try std.testing.expectEqualStrings("hello", Clip.slot[0..Clip.len]);
+    try std.testing.expectEqualStrings("hello", text(b));
+    // cut — clipboard + emptied buffer
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'x' });
+    try std.testing.expectEqualStrings("hello", Clip.slot[0..Clip.len]);
+    try std.testing.expectEqual(@as(usize, 0), text(b).len);
+    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    // paste with newlines — stripped (single-line)
+    const nl = "he\nllo\r!";
+    @memcpy(Clip.slot[0..nl.len], nl);
+    Clip.len = nl.len;
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'v' });
+    try std.testing.expectEqualStrings("hello!", text(b));
+    try std.testing.expectEqual(@as(usize, 6), s.caret);
+    // paste over a selection replaces it
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'a' });
+    Clip.len = 2;
+    @memcpy(Clip.slot[0..2], "xy");
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'v' });
+    try std.testing.expectEqualStrings("xy", text(b));
+    // no command → a plain 'v' key_down does nothing (real typing arrives
+    // as text_input)
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .chr = 'v' });
+    try std.testing.expectEqualStrings("xy", text(b));
 }

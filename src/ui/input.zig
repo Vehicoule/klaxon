@@ -77,6 +77,13 @@ pub const KeyEvent = struct {
     key: Key = .unknown, // key_down
     text: []const u8 = "", // text_input / text_editing (UTF-8, borrowed)
     shift: bool = false, // modifier (Phase 2c: Shift+Tab = focus previous)
+    /// The platform's primary shortcut modifier — Cmd on macOS/iOS, Ctrl
+    /// elsewhere (Android, Linux, Windows). True for key_down shortcut
+    /// chords (Ctrl+A/C/X/V) — SDL doesn't emit text_input for those.
+    command: bool = false,
+    /// The lowercased ASCII letter the key names (a–z), 0 for non-letters —
+    /// shortcuts identify the chord without growing the Key enum.
+    chr: u8 = 0,
     // text_editing (SDL_EVENT_TEXT_EDITING): IME composition/preedit. `text`
     // is the full composing string; comp_start/comp_len are SDL's cursor /
     // selection offsets within it (bytes on the SDL3 side we consume).

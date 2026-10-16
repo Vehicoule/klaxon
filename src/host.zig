@@ -232,6 +232,10 @@ pub const Host = struct {
             return error.SdlInit;
         }
         errdefer sdl.c.SDL_Quit();
+        // The widget layer's clipboard rides SDL (installed once; widgets
+        // stay SDL-free). The allocator feeds SDL_SetClipboardText copies.
+        clipboard_allocator = allocator;
+        ui.clipboard.install(.{ .get = clipboardGetImpl, .set = clipboardSetImpl });
         const t_sdl = sdl.c.SDL_GetTicksNS();
 
         // PPM dumps go through kx_readback_rgba — raster surfaces only.
@@ -618,6 +622,26 @@ pub const Host = struct {
             .input = .{},
             .timeline = anim.Timeline.init(allocator),
         };
+    }
+
+    /// The widget layer's clipboard rides SDL on every platform (installed
+    /// in init above — ui.clipboard keeps widgets SDL-free).
+    var clipboard_allocator: ?std.mem.Allocator = null;
+    fn clipboardSetImpl(text: []const u8) void {
+        const alloc = clipboard_allocator orelse return;
+        // SDL_SetClipboardText wants a C string — copy with a sentinel.
+        const z = alloc.alloc(u8, text.len + 1) catch return;
+        defer alloc.free(z);
+        @memcpy(z[0..text.len], text);
+        z[text.len] = 0;
+        _ = sdl.c.SDL_SetClipboardText(z.ptr);
+    }
+    fn clipboardGetImpl(alloc: std.mem.Allocator) ?[]u8 {
+        const p = sdl.c.SDL_GetClipboardText() orelse return null;
+        defer sdl.c.SDL_free(@ptrCast(p));
+        const str = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+        if (str.len == 0) return null;
+        return alloc.dupe(u8, str) catch null;
     }
 
     /// Pointer cursors (Phase 2d-0.5, desktop): map the hovered node to a
@@ -1378,10 +1402,16 @@ pub const Host = struct {
                 if (event.key.key == sdl.c.SDLK_ESCAPE or event.key.key == sdl.c.SDLK_AC_BACK) {
                     _ = host.input.dispatchBack();
                 } else {
+                    const shortcut_mod: u32 = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
+                        sdl.c.SDL_KMOD_LGUI | sdl.c.SDL_KMOD_RGUI // Cmd
+                    else
+                        sdl.c.SDL_KMOD_LCTRL | sdl.c.SDL_KMOD_RCTRL; // Ctrl
                     const ev = input_mod.KeyEvent{
                         .kind = .key_down,
                         .key = sdlKeyToKey(event.key.key),
                         .shift = (event.key.mod & (sdl.c.SDL_KMOD_LSHIFT | sdl.c.SDL_KMOD_RSHIFT)) != 0,
+                        .command = (event.key.mod & shortcut_mod) != 0,
+                        .chr = if (event.key.key >= 'a' and event.key.key <= 'z') @intCast(event.key.key) else 0,
                     };
                     // Tab moves the keyboard focus (Phase 2c) — never reaches the tree.
                     if (ev.key == .tab) {
