@@ -47,7 +47,7 @@ Port contract per widget:
 | search_bar | SearchBar.kt | SearchBarTokens, SearchViewTokens | pending |
 | segmented_button | SegmentedButton.kt | SegmentedButtonTokens | **ported** |
 | side_sheet | NavigationDrawer.kt (side-sheet variant) | SheetBottomTokens | pending |
-| snackbar | Snackbar.kt | SnackbarTokens | pending |
+| snackbar | Snackbar.kt | SnackbarTokens | ported |
 | split_button | SplitButton.kt | SplitButtonTokens | **ported** |
 | switch | Switch.kt | SwitchTokens | ported |
 | tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | ported |

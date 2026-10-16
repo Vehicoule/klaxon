@@ -1,30 +1,31 @@
-// SnackBar (Phase 2d.1 PR B, M3E batch 1) — snackbar with action, dismiss
-// icon and auto-dismiss timeout.
+// SnackBar — 1:1 port of Compose material3 Snackbar.kt.
 //
-// Spec: m3.material.io/components/snackbar + Compose SnackbarTokens /
-// Snackbar.kt (OneRowSnackbar):
-//   - container: inverse_surface, CornerExtraSmall (4dp), elevation level3
-//     (not drawn in v1), max width 600, min height 48 (single line)
-//   - text: body_medium, inverse_on_surface, 14dp vertical padding, 16dp
-//     start padding
-//   - action: a text button, inverse_primary, label_large
-//   - dismiss action: a 24dp icon button, inverse_on_surface; container end
-//     padding 8dp without a dismiss action, 0 with one
-//   - motion: slide-up + fade (M3); v1 animates with a tween, snaps without
-//     a timeline
-//   - behavior: shown/hidden by a Signal(bool); auto-dismisses after
-//     timeout_ms (default 4000, M3) via a timeline ticker (the host wakes for
-//     pending timed work — the timeout fires even at idle). The action press
-//     and the dismiss icon both hide it; on_dismiss fires on any dismissal.
+// Upstream sources (.ref/material3, androidx-main):
+//   - Snackbar.kt: OneRowSnackbar (text + action + dismiss row layout),
+//     NewLineButtonSnackbar (action_on_new_line two-row Column), the
+//     SnackbarHost 12dp bottom margin + SnackbarHostState timeout behavior
+//   - tokens/SnackbarTokens.kt: ContainerColor InverseSurface, shape
+//     CornerExtraSmall (4dp), elevation Level3 (6dp), SingleLine 48 /
+//     TwoLines 68 heights, SupportingText InverseOnSurface BodyMedium,
+//     ActionLabelTextColor InversePrimary LabelLarge, IconColor
+//     InverseOnSurface 24dp
+//   - constants (Snackbar.kt file privates): ContainerMaxWidth 600,
+//     HorizontalSpacing 16, TextEndExtraSpacing 8, SnackbarVerticalPadding
+//     14, HeightToFirstLine 30, LongButtonVerticalOffset 12,
+//     ActionButtonBottomPadding 4, SeparateButtonExtraY 2
 //
-// Structure: the snackbar node holds an internal background child (the
-// container surface — inside the slide/fade transform) and internal content
-// children: the text, the optional action button, the optional dismiss icon
-// button. The widget SELF-POSITIONS: it is meant to be a fill child of a Stack
-// (its bounds may be the whole window) and lays its content out at the
-// bottom-center with a 12dp margin (Compose SnackbarHost's job). Hit-testing
-// covers the content rect only — an overlay snackbar never shadows the
-// content below it.
+// Ported: the row layout (text start, action+dismiss end, end padding 8
+// without dismiss / 0 with), the new-line variant (action+dismiss row
+// aligned end under the text, container fillMaxWidth up to 600), RTL
+// mirroring (upstream placeRelative), the slide-up+fade enter/exit, the
+// auto-dismiss ticker on the timeline, dismiss-on-action-press.
+//
+// Deviations: the text is a single-line label (upstream wraps BodyMedium
+// over two lines — our text widget doesn't wrap; the action_on_new_line
+// variant covers the long-text cases); the paddingFromBaseline text top
+// offset is approximated as 30 - 0.8*textH (no font baseline plumbing);
+// slide/fade is a 200ms standard-ease tween (upstream uses the platform
+// in/out animation).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -42,18 +43,27 @@ const Color = ui.paint.Color;
 const Theme = theme_mod.Theme;
 
 /// M3E measurement tokens (Compose SnackbarTokens / Snackbar.kt).
-const max_width: f32 = 600;
-const min_height: f32 = 48;
-const corner: f32 = 4;
-const start_padding: f32 = 16;
+const max_width: f32 = 600; // ContainerMaxWidth
+const min_height: f32 = 48; // SingleLineContainerHeight
+const corner: f32 = 4; // ContainerShape CornerExtraSmall
+const start_padding: f32 = 16; // HorizontalSpacing
 const end_padding: f32 = 8; // TextEndExtraSpacing (0 when a dismiss action)
+const button_side_spacing: f32 = 8; // HorizontalSpacingButtonSide
 const vertical_padding: f32 = 14; // SnackbarVerticalPadding
+const first_line_h: f32 = 30; // HeightToFirstLine (new-line variant)
+const long_btn_v_off: f32 = 12; // LongButtonVerticalOffset
+const action_bottom_pad: f32 = 4; // ActionButtonBottomPadding
+const separate_btn_extra_y: f32 = 2; // SeparateButtonExtraY
+const two_lines_min_h: f32 = 68; // TwoLinesContainerHeight
 const action_gap: f32 = 8;
 const slide_ms: u32 = 200;
 
 pub const SnackBarOptions = struct {
     text: []const u8 = "",
     action_label: ?[]const u8 = null,
+    /// upstream actionOnNewLine — the action + dismiss move to a second row
+    /// (recommended when the text is long / the action label is wide).
+    action_on_new_line: bool = false,
     dismiss: bool = true, // show the dismiss icon button
     timeout_ms: u32 = 4000, // 0 = no auto-dismiss
     bottom_margin: f32 = 12, // from the parent's bottom edge (SnackbarHost)
@@ -89,6 +99,23 @@ fn stateOf(n: *Node) *SnackBarState {
 
 fn snackMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
+    if (s.opts.action_on_new_line and s.opts.action_label != null) {
+        // NewLineButtonSnackbar: the container fills the width (cap 600);
+        // the height = text zone (baseline 30 + 12 bottom) + the
+        // action/dismiss row + the column's bottom 2dp.
+        const w = @min(c.max_w, max_width);
+        var row_h: f32 = 0;
+        var i: usize = 2; // [bg, text, action?, dismiss?] — action at 2
+        while (i < n.children.items.len) : (i += 1) {
+            const cs = n.children.items[i].measure(.{ .max_w = w, .max_h = c.max_h });
+            row_h = @max(row_h, cs.h);
+        }
+        const text = n.children.items[1];
+        const ts = text.measure(.{ .max_w = w - start_padding - button_side_spacing, .max_h = c.max_h });
+        const text_zone = @max(0, first_line_h - 0.8 * ts.h) + ts.h + long_btn_v_off;
+        const h = @max(two_lines_min_h, text_zone + row_h + separate_btn_extra_y);
+        return c.constrain(.{ .w = w, .h = h });
+    }
     var content_w: f32 = 0;
     var content_h: f32 = 0;
     for (n.children.items) |child| {
@@ -122,28 +149,59 @@ fn snackLayout(n: *Node, bounds: Rect) void {
     const b = s.content;
     // background fills the content rect
     s.bg.layout(b);
-    // content row: text start-aligned, action + dismiss end-aligned
-    // (Compose OneRowSnackbar), vertically centered.
-    // Children: [bg, text, (action), (dismiss)].
-    const mid_y = b.y + b.h / 2;
-    const end_pad: f32 = if (s.opts.dismiss) 0 else end_padding;
-    var end_x = b.x + b.w - end_pad;
-    // walk the content children from the end: dismiss, then action. The
-    // text-action gap is reserved by the measure (it widens the content
-    // rect), so walking back from the right edge keeps it — no extra
-    // subtraction here.
-    var i = n.children.items.len;
-    while (i > 1) {
-        i -= 1;
-        const child = n.children.items[i];
-        const cs = child.measure(.{ .max_w = b.w, .max_h = b.h });
-        end_x -= cs.w;
-        child.layout(.{ .x = end_x, .y = mid_y - cs.h / 2, .w = cs.w, .h = cs.h });
+    const rtl = ui.i18n.direction() == .rtl;
+    if (s.opts.action_on_new_line and s.opts.action_label != null and n.children.items.len > 2) {
+        // NewLineButtonSnackbar: Column { text(+baseline pads); Row(End)
+        // {action, dismiss} } — the row sits at the container's end.
+        const text = n.children.items[1];
+        const ts = text.measure(.{ .max_w = b.w - start_padding - button_side_spacing, .max_h = b.h });
+        const tx = if (rtl) b.x + b.w - start_padding - ts.w else b.x + start_padding;
+        text.layout(.{ .x = tx, .y = b.y + @max(0, first_line_h - 0.8 * ts.h), .w = ts.w, .h = ts.h });
+        // the action row (children 2..end = [action, dismiss]) End-aligned,
+        // bottom = b.bottom - separate_btn_extra_y - action_bottom_pad
+        var row_w: f32 = 0;
+        var row_h: f32 = 0;
+        for (2..n.children.items.len) |i| {
+            const cs = n.children.items[i].measure(.{ .max_w = b.w, .max_h = b.h });
+            row_w += cs.w;
+            row_h = @max(row_h, cs.h);
+        }
+        const row_y = b.y + b.h - separate_btn_extra_y - row_h;
+        var cx = if (rtl) b.x + @as(f32, if (s.opts.dismiss) 0 else button_side_spacing) else b.x + b.w - row_w - @as(f32, if (s.opts.dismiss) 0 else button_side_spacing);
+        for (2..n.children.items.len) |i| {
+            const child = n.children.items[i];
+            const cs = child.measure(.{ .max_w = b.w, .max_h = b.h });
+            // upstream Row default verticalAlignment = Top
+            child.layout(.{ .x = cx, .y = row_y, .w = cs.w, .h = cs.h });
+            cx += cs.w;
+        }
+    } else {
+        // OneRowSnackbar: text start-aligned, action + dismiss end-aligned,
+        // vertically centered. Children: [bg, text, (action), (dismiss)].
+        const mid_y = b.y + b.h / 2;
+        const end_pad: f32 = if (s.opts.dismiss) 0 else end_padding;
+        // walk the trailing children from the end edge: dismiss, then
+        // action (mirrored in RTL — the end edge is the LEFT)
+        var i = n.children.items.len;
+        var cursor: f32 = if (rtl) b.x + end_pad else b.x + b.w - end_pad;
+        while (i > 1) {
+            i -= 1;
+            const child = n.children.items[i];
+            const cs = child.measure(.{ .max_w = b.w, .max_h = b.h });
+            if (rtl) {
+                child.layout(.{ .x = cursor, .y = mid_y - cs.h / 2, .w = cs.w, .h = cs.h });
+                cursor += cs.w;
+            } else {
+                cursor -= cs.w;
+                child.layout(.{ .x = cursor, .y = mid_y - cs.h / 2, .w = cs.w, .h = cs.h });
+            }
+        }
+        // the text (index 1) at the start
+        const text = n.children.items[1];
+        const cs = text.measure(.{ .max_w = b.w, .max_h = b.h });
+        const tx = if (rtl) b.x + b.w - start_padding - cs.w else b.x + start_padding;
+        text.layout(.{ .x = tx, .y = mid_y - cs.h / 2, .w = cs.w, .h = cs.h });
     }
-    // the text (index 1) at the start
-    const text = n.children.items[1];
-    const cs = text.measure(.{ .max_w = b.w, .max_h = b.h });
-    text.layout(.{ .x = b.x + start_padding, .y = mid_y - cs.h / 2, .w = cs.w, .h = cs.h });
     const target: f32 = if (s.sig.peek()) 1 else 0;
     if (!s.laid_out) {
         s.anim_to = target;
@@ -436,6 +494,47 @@ test "snackbar: content-sized, min height 48, capped at 600 wide" {
     try std.testing.expect(m.h >= min_height);
     try std.testing.expect(m.w <= max_width);
     try std.testing.expect(m.w > start_padding);
+}
+
+test "snackbar: action_on_new_line — full width, text top, action row bottom-end" {
+    const visible = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer visible.deinit();
+    const sb = try snackBar(std.testing.allocator, visible, null, null, .{
+        .text = "A long message that wraps the action",
+        .action_label = "Undo",
+        .dismiss = true,
+        .action_on_new_line = true,
+        .timeout_ms = 0,
+    });
+    defer sb.deinit();
+    sb.layout(.{ .x = 0, .y = 0, .w = 500, .h = 300 });
+    const s = stateOf(sb);
+    // the container fills the width (upstream fillMaxWidth, cap 600)
+    try std.testing.expectEqual(@as(f32, 500), s.content.w);
+    // children: [bg, text, action, dismiss]
+    const tb = sb.children.items[1].bounds;
+    const ab = sb.children.items[2].bounds;
+    const db = sb.children.items[3].bounds;
+    // text in the top zone (baseline ~30dp), action row at the bottom end
+    try std.testing.expect(tb.y < ab.y);
+    try std.testing.expectApproxEqAbs(ab.y, db.y, 1.0);
+    try std.testing.expectApproxEqAbs(db.x + db.w, s.content.x + s.content.w, 1.0);
+    try std.testing.expect(ab.x + ab.w <= db.x + 1.0);
+    // the container bottom = row bottom + SeparateButtonExtraY (2)
+    const row_bottom = @max(ab.y + ab.h, db.y + db.h);
+    try std.testing.expectApproxEqAbs(s.content.y + s.content.h, row_bottom + separate_btn_extra_y, 1.0);
+    // without the flag the same options stay one-row
+    const sb2 = try snackBar(std.testing.allocator, visible, null, null, .{
+        .text = "A long message that wraps the action",
+        .action_label = "Undo",
+        .dismiss = true,
+        .timeout_ms = 0,
+    });
+    defer sb2.deinit();
+    sb2.layout(.{ .x = 0, .y = 0, .w = 500, .h = 300 });
+    const t2 = sb2.children.items[1].bounds;
+    const a2 = sb2.children.items[2].bounds;
+    try std.testing.expectApproxEqAbs(t2.y + t2.h / 2, a2.y + a2.h / 2, 1.0);
 }
 
 test "snackbar: hidden by default; show snaps (no timeline); dismiss icon closes it" {
