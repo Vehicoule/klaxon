@@ -902,8 +902,11 @@ int kx_text_cache_victim(uint64_t h) {
 KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     // Only bidi-relevant strings depend on the paragraph base direction:
     // simple-path entries (pure strong-LTR runs) are direction-agnostic and
-    // stay shared across locales instead of splitting the cache.
-    const int dir = kx_text_simple(text, len) ? 0 : kx_paragraph_dir;
+    // stay shared across locales instead of splitting the cache. Under the
+    // LTR base (the common case) dir is always 0 — skip the UTF-8 scan so
+    // cache hits pay nothing for the feature.
+    const int dir = kx_paragraph_dir == 0 ? 0
+                                          : (kx_text_simple(text, len) ? 0 : kx_paragraph_dir);
     const uint64_t h = kx_text_key_hash(text, len, size, bold) ^
                        (static_cast<uint64_t>(dir) * 0x9E3779B97F4A7C15ull);
     const uint64_t tick = ++kx_text_cache_tick;
