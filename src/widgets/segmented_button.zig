@@ -45,8 +45,10 @@
 // v1 deviations (documented):
 //   - Multi-choice (`segmentedButtonMulti`) is a u64 bitmask — selectable
 //     segments cap at 64; a click/space toggles, arrows move the cursor.
-//   - A squeezed segment clips its label (upstream wraps to a second
-//     line via IntrinsicSize.Min; Klaxon labels paint single-line).
+//   - A squeezed segment wraps its label through the paragraph ABI
+//     (IntrinsicSize.Min parity — the row grows past ContainerHeight by
+//     the 8dp vertical ButtonVerticalPadding); the label's wrap budget
+//     excludes the reserved icon slot + gap.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -112,6 +114,13 @@ const ItemDef = struct {
     icon: ?icon_w.IconName,
     enabled: bool,
     anim: CheckAnim,
+    /// Cached wrapped-label layout for a squeezed segment (built through
+    /// the paragraph ABI — HarfBuzz shaping + ICU line breaking). Keyed
+    /// on the laid-out width and the baked span color; null when the
+    /// label fits single-line at the last probe.
+    wrap: ?*ui.paint.TextLayout = null,
+    wrap_w: f32 = -1,
+    wrap_fg: u32 = 0,
 };
 
 const SegState = struct {
@@ -171,6 +180,32 @@ fn segWidth(s: *SegState, t: Theme) f32 {
         sum += seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText(def.label, ls.size, bold).width;
     }
     return @max(seg_min_w, sum / @as(f32, @floatFromInt(count)));
+}
+
+/// The label's width budget inside a segment of width `w` — the reserved
+/// icon slot + gap and the 12dp side pads never yield to text.
+fn labelBudget(w: f32) f32 {
+    return @max(w - seg_h_pad * 2 - icon_size - icon_gap, 1);
+}
+
+/// The wrapped label layout for a squeezed segment — the paragraph ABI
+/// (ShaperLayout wrap + ICU line breaking), cached on the item keyed by
+/// (width, ink). `fg = null` is a metrics probe: reuse whatever layout is
+/// cached at that width without rebuilding for color.
+fn wrappedLabel(def: *ItemDef, ls: anytype, avail_w: f32, fg: ?Color) ?*ui.paint.TextLayout {
+    if (def.wrap == null or def.wrap_w != avail_w or (fg != null and def.wrap_fg != fg.?)) {
+        if (def.wrap) |l| ui.paint.textLayoutDestroy(l);
+        const l = ui.paint.textLayoutBegin(avail_w) orelse {
+            def.wrap = null;
+            return null;
+        };
+        const ink = fg orelse @as(u32, 0xFF000000); // probe: any ink shapes the same
+        ui.paint.textLayoutSpan(l, def.label, ui.paint.textStyle(ls.size, @intCast(ls.weight), 0, ls.letter_spacing, ink));
+        def.wrap = l;
+        def.wrap_w = avail_w;
+        def.wrap_fg = ink;
+    }
+    return def.wrap;
 }
 
 /// The segment's rect in LTR space (the segments overlap by the border
@@ -396,9 +431,29 @@ fn segMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const count = s.items.items.len;
     if (count == 0) return c.constrain(.{});
-    const w = segWidth(s, s.opts.theme);
+    const t = s.opts.theme;
+    const w = segWidth(s, t);
     const total_w = @as(f32, @floatFromInt(count)) * w - @as(f32, @floatFromInt(count - 1)) * border_w;
-    return c.constrain(.{ .w = total_w, .h = seg_height });
+    var h = seg_height;
+    // A squeezed row wraps labels (upstream: the Row's IntrinsicSize.Min
+    // makes the label's measured height grow the segment past
+    // ContainerHeight; vertical content padding = ButtonVerticalPadding
+    // 8dp). Probe each label at its share of the offered width.
+    if (total_w > c.max_w) {
+        const per_w = @max((c.max_w + @as(f32, @floatFromInt(count - 1)) * border_w) / @as(f32, @floatFromInt(count)), 0);
+        const avail = labelBudget(per_w);
+        const ls = t.type_scale.label_large;
+        const bold = ls.weight >= 500;
+        for (s.items.items) |*def| {
+            const iw = ui.paint.measureText(def.label, ls.size, bold).width;
+            if (iw > avail) {
+                if (wrappedLabel(def, ls, avail, null)) |l| {
+                    h = @max(h, ui.paint.textLayoutHeight(l) + 16);
+                }
+            }
+        }
+    }
+    return c.constrain(.{ .w = total_w, .h = h });
 }
 
 fn segLayout(n: *Node, bounds: Rect) void {
@@ -423,7 +478,7 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     const b = n.bounds;
     const cs = t.colors;
     const count = s.items.items.len;
-    const def = s.items.items[i];
+    const def = &s.items.items[i]; // the wrap cache mutates through this
     const idx: i32 = @intCast(i);
     const sh = segShape(b, i, count, w);
     const sr = sh.sr;
@@ -475,9 +530,14 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     // states (upstream: the icon lambda is the whole slot — a checked
     // icon does NOT yield to the check); with no icon the default
     // SegmentedButtonDefaults.Icon paints the check when selected.
-    const cw = icon_size + icon_gap + lm.width;
+    // A label wider than its budget wraps (IntrinsicSize.Min grows the
+    // segment — segMeasure reports the wrapped height).
+    const wrap = if (lm.width > labelBudget(sr.w)) wrappedLabel(def, ls, labelBudget(sr.w), fg) else null;
+    const label_w = if (wrap) |l| ui.paint.textLayoutWidth(l) else lm.width;
+    const label_h = if (wrap) |l| ui.paint.textLayoutHeight(l) else lm.height;
+    const cw = icon_size + icon_gap + label_w;
     const cx = sr.x + (sr.w - cw) / 2;
-    const baseline = sr.y + (sr.h - lm.height) / 2 + lm.ascent;
+    const baseline = sr.y + (sr.h - label_h) / 2 + if (wrap) |l| ui.paint.textLayoutBaseline(l) else lm.ascent;
     const icon_y = sr.y + (sr.h - icon_size) / 2;
     if (def.icon) |iname| {
         paintIcon(ctx, iname, cx, icon_y, icon_size, fg);
@@ -492,7 +552,10 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
         0
     else
         std.math.lerp(-(icon_size + icon_gap) / 2, 0, def.anim.a);
-    ui.paint.text(ctx, def.label, cx + icon_size + icon_gap + label_off, baseline, ls.size, bold, fg);
+    if (wrap) |l|
+        ui.paint.textLayoutPaint(ctx, l, cx + icon_size + icon_gap + label_off, baseline)
+    else
+        ui.paint.text(ctx, def.label, cx + icon_size + icon_gap + label_off, baseline, ls.size, bold, fg);
     ui.paint.clipReset(ctx); // restores
     // border — upstream disabled*BorderColor = OutlineColor @ 0.12 (the
     // DisabledOutlineColor OnSurface token is not the one the colors use)
@@ -635,6 +698,7 @@ fn segDeinit(n: *Node) void {
     input.releaseNode(n);
     for (s.items.items) |*def| {
         if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&def.anim.chan)); // the cb points into this item
+        if (def.wrap) |l| ui.paint.textLayoutDestroy(l);
         n.allocator.free(def.label);
     }
     s.items.deinit();
@@ -1122,4 +1186,29 @@ test "segmented_button: i18n — the framework label localizes + re-resolves on 
     // the segment children survive (app labels, verbatim)
     try std.testing.expectEqual(@as(usize, 2), sem.children.len);
     try std.testing.expectEqualStrings("Day", sem.children[0].label);
+}
+
+test "segmented_button: a squeezed segment wraps its label and the row grows" {
+    const a = std.testing.allocator;
+    const n = try segmentedButton(a, &.{
+        .{ .label = "A" },
+        .{ .label = "A very long segment label that wraps" },
+        .{ .label = "C" },
+    }, null, null, .{});
+    defer n.deinit();
+    const s = stateOf(n);
+    // Unconstrained: single-line labels at the 40dp container height.
+    const wide = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    try std.testing.expectEqual(seg_height, wide.h);
+    try std.testing.expect(s.items.items[1].wrap == null); // no wrap cached yet
+    // Squeeze to 300px → ~101px segments → the middle label wraps over
+    // multiple lines (IntrinsicSize.Min grows the row past 40dp).
+    const tight = n.measure(.{ .max_w = 300, .max_h = 2000 });
+    try std.testing.expect(tight.h > seg_height);
+    try std.testing.expect(s.items.items[1].wrap != null); // paragraph cached
+    try std.testing.expect(s.items.items[0].wrap == null); // "A" still fits
+    // The wrapped layout is narrower than the single-line intrinsic.
+    const ls = theme_mod.light.type_scale.label_large;
+    const iw = ui.paint.measureText(s.items.items[1].label, ls.size, true).width;
+    try std.testing.expect(ui.paint.textLayoutWidth(s.items.items[1].wrap.?) < iw);
 }

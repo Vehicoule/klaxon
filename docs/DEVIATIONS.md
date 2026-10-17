@@ -48,10 +48,10 @@ Each widget's header carries the same list; these are the tracked ones
 - `segmented_button.zig` — the check icon is upstream's
   AnimatedVisibility (fade + scale-in from bottom-left, instant exit,
   the label offset springing concurrently) and the equal width is the
-  weight(1f) mean over the intrinsic contents; remaining gaps: a
-  squeezed segment clips its label (upstream wraps) and the
-  multi-choice row (`segmentedButtonMulti`) is a u64 bitmask capped at
-  64 segments.
+  weight(1f) mean over the intrinsic contents; squeezed segments wrap
+  their label through the paragraph ABI and the row grows past
+  ContainerHeight. Remaining gap: the multi-choice row
+  (`segmentedButtonMulti`) is a u64 bitmask capped at 64 segments.
 - `icon_button.zig` — no deviations: upstream IconButton.kt carries no
   elevation/shadow either (the variants are flat); shape morphs spring
   via the timeline (AnimatedShape parity).
