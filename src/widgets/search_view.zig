@@ -497,7 +497,7 @@ fn caretAt(n: *Node, s: *SearchViewState, x: f32, y: f32) usize {
     const b = n.bounds;
     const tx = mirrorX(b.x, b.w, b.x + textStart(s.opts.theme), m.width, ui.i18n.direction() == .rtl);
     const ty = b.y + (header_h - style.line_height) / 2;
-    return text_edit.caretFromPoint(str, x - tx, y - ty, style.size);
+    return s.edit.caretAt(x - tx, y - ty, style.size);
 }
 
 fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {

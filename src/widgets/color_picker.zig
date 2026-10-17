@@ -691,7 +691,7 @@ fn hexCaretFromPoint(s: *CPState, px: f32, py: f32) usize {
     const ts = t.type_scale.body_large;
     const hx = s.hex_rect;
     const top = hx.y + (hx.h - ts.line_height) / 2;
-    return text_edit.caretFromPoint(s.hex_edit.text(), px - (hx.x + 16), py - top, ts.size);
+    return s.hex_edit.caretAt(px - (hx.x + 16), py - top, ts.size);
 }
 
 /// The digit text's x offset inside numeric field `i` (past the "R  "
@@ -709,7 +709,7 @@ fn chanCaretFromPoint(s: *CPState, i: usize, px: f32, py: f32) usize {
     const ts = t.type_scale.body_large;
     const fr = s.chan_rects[i];
     const top = fr.y + (fr.h - ts.line_height) / 2;
-    return text_edit.caretFromPoint(s.chan_edits[i].text(), px - chanTextX(s, i), py - top, ts.size);
+    return s.chan_edits[i].caretAt(px - chanTextX(s, i), py - top, ts.size);
 }
 
 // --- Hit test ---

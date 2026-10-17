@@ -4,7 +4,7 @@
 // 500ms blink ticker, and the editing operations — insert at caret, range
 // deletes, grapheme-cluster arrows/home/end, Cmd/Ctrl+A/C/X/V chords.
 //
-// The widget owns the GEOMETRY (where the run paints → caretFromPoint's
+// The widget owns the GEOMETRY (where the run paints → `caretAt`'s
 // run origin) and the edit follow-ups (layout dirty, signal mirror, a11y
 // notify, on_changed) through the `apply_edit` callback — this module owns
 // the buffer/offsets/blink that must behave identically everywhere.
@@ -53,6 +53,12 @@ pub const Edit = struct {
     ticker: ?ui.anim.Timeline.Ticker = null,
     /// The owning node — the tick/move callbacks mark it dirty.
     node: ?*Node = null,
+    /// Hit-test paragraph memo: `caretAt` rebuilds the layout only when the
+    /// buffer's content hash or the probe size moved — a press-drag would
+    /// otherwise pay an O(text) paragraph build per pointer event.
+    hit_layout: ?*ui.paint.TextLayout = null,
+    hit_key: u64 = 0,
+    hit_size: f32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) Edit {
         return .{
@@ -67,6 +73,7 @@ pub const Edit = struct {
         if (e.ticker) |t| {
             if (ui.anim.timeline()) |tl| tl.removeTicker(t);
         }
+        if (e.hit_layout) |l| ui.paint.textLayoutDestroy(l);
         e.buf.deinit();
         e.comp.deinit();
     }
@@ -428,6 +435,37 @@ pub const Edit = struct {
         }
         return false;
     }
+
+    /// The byte offset of the grapheme boundary nearest a point in the
+    /// run's own space (`px/py` are already relative to the run's painted
+    /// left/top) — SkParagraph's getGlyphPositionAtCoordinate, Compose's
+    /// TextLayoutResult.getOffsetForPosition. The probe builds under LTR:
+    /// the text widgets paint the run in logical order (the text-run-LTR
+    /// deviation), so the hit test must agree with what is on screen. Falls
+    /// back to the run's near edge when the paragraph can't build. The
+    /// paragraph is memoized on (content hash, size): drags reuse it.
+    pub fn caretAt(e: *Edit, px: f32, py: f32, size: f32) usize {
+        const str = e.text();
+        if (str.len == 0) return 0;
+        const key = std.hash.Wyhash.hash(0, str);
+        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size) {
+            if (e.hit_layout) |old| ui.paint.textLayoutDestroy(old);
+            const l = ui.paint.textLayoutBegin(0) orelse { // fields clip
+                e.hit_layout = null;
+                return if (px <= 0) 0 else str.len;
+            };
+            const prev_rtl = ui.paint.textDirectionRtl();
+            ui.paint.setTextDirection(false);
+            defer ui.paint.setTextDirection(prev_rtl);
+            ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(size, 400, 0, 0, 0xFF0000FF));
+            e.hit_layout = l;
+            e.hit_key = key;
+            e.hit_size = size;
+        }
+        const pos = ui.paint.textLayoutPositionAt(e.hit_layout.?, px, py);
+        if (pos < 0) return if (px <= 0) 0 else str.len;
+        return utf16ToByteIndex(str, @intCast(pos));
+    }
 };
 
 /// Write the null sentinel at items[len]. Grows if the buffer is exactly
@@ -461,28 +499,6 @@ pub fn utf16ToByteIndex(str: []const u8, pos16: usize) usize {
         i += l;
     }
     return i;
-}
-
-/// The byte offset of the grapheme boundary nearest a point in the run's
-/// own space (`px/py` are already relative to the run's painted left/top).
-/// SkParagraph's getGlyphPositionAtCoordinate — Compose's
-/// TextLayoutResult.getOffsetForPosition. The probe builds under LTR: the
-/// text widgets paint the run in logical order (the text-run-LTR
-/// deviation), so the hit test must agree with what is on screen.
-/// Falls back to the run's near edge when the paragraph can't build.
-pub fn caretFromPoint(str: [:0]const u8, px: f32, py: f32, size: f32) usize {
-    if (str.len == 0) return 0;
-    const l = ui.paint.textLayoutBegin(0) orelse { // no wrap — fields clip
-        return if (px <= 0) 0 else str.len;
-    };
-    defer ui.paint.textLayoutDestroy(l);
-    const prev_rtl = ui.paint.textDirectionRtl();
-    ui.paint.setTextDirection(false);
-    defer ui.paint.setTextDirection(prev_rtl);
-    ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(size, 400, 0, 0, 0xFF0000FF));
-    const pos = ui.paint.textLayoutPositionAt(l, px, py);
-    if (pos < 0) return if (px <= 0) 0 else str.len;
-    return utf16ToByteIndex(str, @intCast(pos));
 }
 
 fn caretTickCb(userdata: ?*anyopaque, now_ms: u64) void {

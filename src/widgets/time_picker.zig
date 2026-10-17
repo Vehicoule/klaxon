@@ -1148,7 +1148,7 @@ fn fieldCaretFromPoint(n: *Node, s: *TpState, which: DialMode, x: f32, y: f32) u
     const dm = s.opts.theme.type_scale.display_medium;
     const m = ui.paint.measureText(str, dm.size, dm.weight >= 500);
     const tx = r.x + (r.w - m.width) / 2;
-    return text_edit.caretFromPoint(str, x - tx, y - r.y, dm.size);
+    return e.caretAt(x - tx, y - r.y, dm.size);
 }
 
 fn tpOnPointer(n: *Node, ev: input.PointerEvent) bool {

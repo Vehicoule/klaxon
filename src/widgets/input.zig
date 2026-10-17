@@ -581,7 +581,7 @@ fn inputCaretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
     const str = s.edit.text();
     const m = ui.paint.measureText(str, s.opts.size, false);
     const text_top = n.bounds.y + (n.bounds.h - m.height) / 2;
-    return text_edit.caretFromPoint(str, px - (n.bounds.x + s.opts.padding.left), py - text_top, s.opts.size);
+    return s.edit.caretAt(px - (n.bounds.x + s.opts.padding.left), py - text_top, s.opts.size);
 }
 
 fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {

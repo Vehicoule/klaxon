@@ -567,7 +567,7 @@ fn runLeft(n: *Node, run_w: f32) f32 {
 /// painted run's space first (the run's mirrored left + line-box top).
 fn caretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
     const m = fieldMetrics(s);
-    return text_edit.caretFromPoint(s.text(), px - runLeft(n, m.width), py - textRect(n).y, bodyLarge(s.opts.theme).size);
+    return s.edit.caretAt(px - runLeft(n, m.width), py - textRect(n).y, bodyLarge(s.opts.theme).size);
 }
 
 /// The x of a byte offset inside the run (run-space): whole segments

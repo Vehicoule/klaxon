@@ -304,7 +304,7 @@ fn caretAt(n: *Node, s: *SearchBarState, x: f32, y: f32) usize {
     const m = ui.paint.measureText(str, s.opts.theme.type_scale.body_large.size, false);
     const b = n.bounds;
     const tx = if (ui.i18n.direction() == .rtl) b.x + b.w - (tr.x - b.x) - m.width else tr.x;
-    return text_edit.caretFromPoint(str, x - tx, y - tr.y, s.opts.theme.type_scale.body_large.size);
+    return s.edit.caretAt(x - tx, y - tr.y, s.opts.theme.type_scale.body_large.size);
 }
 
 fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
