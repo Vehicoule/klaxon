@@ -195,17 +195,9 @@ const TextFieldState = struct {
     /// (content = its laid-out height, viewport = the text region's
     /// clamped height). Untouched single-line.
     scroll: ui.scroll.ScrollState = .{},
-    /// The painted paragraph memo (multiline): the whole buffer as one
-    /// single-span TextLayout wrapped at edit.wrap_width — the SAME
-    /// constraint the hit layout (text_edit.hitLayout) builds at, so
-    /// what paints is what hit-tests. Keyed on (content hash, wrap,
-    /// size, ink): the ink bakes into the span, so a state-color change
-    /// rebuilds (the wrappedLabel pattern in segmented_button).
-    para: ?*ui.paint.TextLayout = null,
-    para_key: u64 = 0,
-    para_wrap: f32 = 0,
-    para_ink: u32 = 0,
-    para_size: f32 = 0,
+    // The painted paragraph IS the Edit's shared hit layout (one
+    // SkParagraph build per edit — see paragraph()): memo fields there,
+    // nothing per-widget here.
     /// Scroll-to-caret arm: set by every caret-moving path (edits, key
     /// motion, taps/drags, a wrap change) and consumed by
     /// paintMultilineText. Wheel scrolling alone leaves it clear — the
@@ -403,28 +395,14 @@ fn syncWrap(n: *Node, s: *TextFieldState) void {
 /// metrics-only probe that reuses whatever ink is cached while a real
 /// draw rebuilds on a color change (wrappedLabel's pattern). null when
 /// the paragraph backend is missing — callers fall back to plain text.
+/// The wrapped paragraph — the Edit's shared hit layout. The span bakes
+/// the bodyLarge style + ink; `ink = null` is a metrics probe (shaping is
+/// ink-independent — reuses whatever ink is cached). One layout per
+/// content/wrap/state change serves measure, paint AND hit-testing.
 fn paragraph(s: *TextFieldState, ink: ?Color) ?*ui.paint.TextLayout {
-    const str = s.edit.text();
-    if (str.len == 0) return null;
     const style = bodyLarge(s.opts.theme);
-    const key = std.hash.Wyhash.hash(0, str);
-    if (s.para == null or s.para_key != key or s.para_wrap != s.edit.wrap_width or
-        s.para_size != style.size or (ink != null and s.para_ink != ink.?))
-    {
-        if (s.para) |old| ui.paint.textLayoutDestroy(old);
-        const l = ui.paint.textLayoutBegin(s.edit.wrap_width) orelse {
-            s.para = null;
-            return null;
-        };
-        const use_ink: u32 = ink orelse @as(u32, 0xFF000000); // probe: any ink shapes the same
-        ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(style.size, @intCast(style.weight), 0, style.letter_spacing, use_ink));
-        s.para = l;
-        s.para_key = key;
-        s.para_wrap = s.edit.wrap_width;
-        s.para_ink = use_ink;
-        s.para_size = style.size;
-    }
-    return s.para;
+    if (ink) |i| s.edit.hit_ink = i;
+    return s.edit.hitLayout(style.size);
 }
 
 /// The visible text height under lineLimits — the wrapped line count
@@ -1270,8 +1248,7 @@ fn textFieldScrollSetOffset(n: *Node, value: f32) void {
 
 fn textFieldDeinit(n: *Node) void {
     const s = stateOf(n);
-    s.edit.deinit(); // the blink ticker + both buffers + the hit layout
-    if (s.para) |l| ui.paint.textLayoutDestroy(l); // the painted paragraph memo
+    s.edit.deinit(); // the blink ticker + both buffers + the shared layout
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.label_channel)); // the channel writes into state
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = textFieldSyncCb, .userdata = n } });
     input.releaseNode(n);
@@ -1350,6 +1327,13 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     setSentinel(&s.edit.buf); // null-terminates the (possibly empty) buffer
     s.edit.caret = s.edit.buf.items.len; // the caret starts at the end (Compose parity)
     s.edit.sel_anchor = s.edit.caret; // collapsed — nothing selected at birth
+    // The shared hit/paint layout bakes the real bodyLarge span — weight
+    // + letter spacing hit-test at paint accuracy (single-line taps land
+    // on the spaced glyphs), and multiline paints the same object.
+    const hit_style = bodyLarge(opts.theme);
+    s.edit.hit_weight = @intCast(hit_style.weight);
+    s.edit.hit_spacing = hit_style.letter_spacing;
+    s.edit.hit_ink = opts.theme.colors.on_surface; // input ink in every enabled state
     node.state = s;
     ui.semantics.attach(node, .{
         .role = .text_field,
@@ -2155,7 +2139,10 @@ test "golden: the selection paints a primary@0.4 highlight over the range" {
         while (x < @as(i32, @intFromFloat(@floor(36 + m_h.width)))) : (x += 1) {
             if (f_sel.pixelAt(x, y) != f_plain.pixelAt(x, y)) h_diff += 1;
         }
-        x = @intFromFloat(@ceil(36 + m_h.width));
+        // The H's selection box extends ~letter_spacing past the bare "H"
+        // measure (SkParagraph range rects include the trailing advance)
+        // — probe the i band a pixel in.
+        x = @intFromFloat(@ceil(36 + m_h.width + 1));
         while (x < @as(i32, @intFromFloat(@floor(36 + m_all.width)))) : (x += 1) {
             if (f_sel.pixelAt(x, y) != f_plain.pixelAt(x, y)) i_diff += 1;
         }

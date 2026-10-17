@@ -73,6 +73,15 @@ pub const Edit = struct {
     /// width so hit geometry agrees with the wrap on screen.
     wrap_width: f32 = 0,
     hit_wrap: f32 = 0,
+    /// The span style the hit layout bakes — the owning widget sets them
+    /// from its paint style (theme-fixed at construction; `hit_ink` may
+    /// follow state colors). Defaults keep the old neutral span. A widget
+    /// that paints `hitLayout` verbatim (multiline text_field) updates
+    /// hit_ink per frame — a color change rebuilds the shared layout.
+    hit_weight: i32 = 400,
+    hit_spacing: f32 = 0,
+    hit_ink: u32 = 0xFF0000FF,
+    hit_style_baked: struct { weight: i32 = 400, spacing: f32 = 0, ink: u32 = 0xFF0000FF } = .{},
     /// The sticky column consecutive up/down arrows aim at — the caret
     /// x the motion started from (Compose's vertical-motion x). Cleared
     /// by every non-vertical key and by taps.
@@ -541,12 +550,20 @@ pub const Edit = struct {
     /// arrow stepping all agree with what is on screen (a mirrored RTL
     /// run hit-tests its glyphs where they are painted). Keyed on
     /// (content hash, size, direction); drags and arrows reuse it.
-    fn hitLayout(e: *Edit, size: f32) ?*ui.paint.TextLayout {
+    /// The shared text layout — memoized on (content, size, wrap,
+    /// direction, and the baked span style). Widgets set hit_weight /
+    /// hit_spacing / hit_ink from their paint style so the SAME layout
+    /// object can be painted verbatim (text_field's multiline path does —
+    /// one SkParagraph build per edit, not one per query) AND hit-tested
+    /// at paint accuracy (the span carries the real letter spacing).
+    pub fn hitLayout(e: *Edit, size: f32) ?*ui.paint.TextLayout {
         const str = e.text();
         if (str.len == 0) return null;
         const key = std.hash.Wyhash.hash(0, str);
         const rtl = ui.paint.textDirectionRtl();
-        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size or e.hit_rtl != rtl or e.hit_wrap != e.wrap_width) {
+        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size or e.hit_rtl != rtl or e.hit_wrap != e.wrap_width or
+            e.hit_style_baked.weight != e.hit_weight or e.hit_style_baked.spacing != e.hit_spacing or e.hit_style_baked.ink != e.hit_ink)
+        {
             if (e.hit_layout) |old| ui.paint.textLayoutDestroy(old);
             // wrap_width constrains the layout — soft wraps hit-test
             // where they paint; 0 stays unconstrained (single-line).
@@ -554,12 +571,13 @@ pub const Edit = struct {
                 e.hit_layout = null;
                 return null;
             };
-            ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(size, 400, 0, 0, 0xFF0000FF));
+            ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(size, e.hit_weight, 0, e.hit_spacing, e.hit_ink));
             e.hit_layout = l;
             e.hit_key = key;
             e.hit_size = size;
             e.hit_rtl = rtl;
             e.hit_wrap = e.wrap_width;
+            e.hit_style_baked = .{ .weight = e.hit_weight, .spacing = e.hit_spacing, .ink = e.hit_ink };
         }
         return e.hit_layout;
     }
