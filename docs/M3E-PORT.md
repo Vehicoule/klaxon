@@ -37,7 +37,7 @@ Port contract per widget:
 | date_picker | DatePicker.kt | DatePickerModalTokens | **ported** (calendar + YearPickerMenuButton/YearPicker grid; no date-input/range/docked) |
 | divider | Divider.kt | DividerTokens | **ported** |
 | drawer | NavigationDrawer.kt | NavigationDrawerTokens | ported (modal/dismissible/permanent) |
-| fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | **ported** |
+| fab | FloatingActionButton.kt | FabTokens, Fab(S/M/L)Tokens, ExtendedFab*, Fab*ContainerTokens | **ported** (tonal-elevation gate wired on both containers — Level3; no-op: containers are `*Container` roles, never `surface`) |
 | fab_menu | FloatingActionButtonMenu.kt | FabMenuBaselineTokens | **ported** |
 | icon_button | IconButton.kt | IconButtonTokens, Filled/Tonal(S/X/XL)IconButtonTokens | **ported** |
 | list_item | ListItem.kt | ListTokens | **ported** |
@@ -57,7 +57,7 @@ Port contract per widget:
 | switch | Switch.kt | SwitchTokens | ported |
 | tabs | Tab.kt + TabRow.kt | TabTokens, Primary/SecondaryNavigationTabTokens | ported |
 | text_field | TextField.kt + OutlinedTextField.kt + TextFieldDefaults.kt + TextFieldImpl.kt | FilledTextFieldTokens, OutlinedTextFieldTokens | ported |
-| time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | **ported** (dial + autoSwitchToMinute; no text-input variant) |
+| time_picker | TimePicker.kt | TimePickerTokens, TimeInputTokens | **ported** (dial + autoSwitchToMinute; no text-input variant; dialog-panel tonal gate wired — Level3; no-op: container is `SurfaceContainer{,High}`) |
 | toolbar | FloatingToolbar.kt | FloatingToolbarTokens, FabBaseline/MediumTokens | ported |
 | tooltip | Tooltip.kt | PlainTooltipTokens, RichTooltipTokens | **ported** (plain + rich variant, caret, 4-side placement; no popup/long-press machinery) |
 

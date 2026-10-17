@@ -53,6 +53,33 @@ pub fn contrastRatio(a: Color, b: Color) f32 {
     return (hi + 0.05) / (lo + 0.05);
 }
 
+/// `copy(alpha = a)` — the color with its alpha channel REPLACED (clamped
+/// to 0..1); contrast with ui.paint.withAlphaScaled, which scales it.
+fn withAlpha(c: Color, a: f32) Color {
+    const byte: u32 = @intFromFloat(std.math.clamp(@round(std.math.clamp(a, 0, 1) * 255), 0, 255));
+    return (c & 0xFFFFFF00) | byte;
+}
+
+/// androidx Color.compositeOver (ui-graphics Color.kt): Porter-Duff
+/// source-over in straight sRGB channels — out_a = sa + da·(1−sa),
+/// out_c = (sc·sa + dc·da·(1−sa)) / out_a (component 0 when out_a == 0).
+fn compositeOver(src: Color, dst: Color) Color {
+    const sa = @as(f32, @floatFromInt(src & 0xFF)) / 255.0;
+    const da = @as(f32, @floatFromInt(dst & 0xFF)) / 255.0;
+    const oa = sa + da * (1 - sa);
+    const chan = struct {
+        fn f(sc: u32, dc: u32, _sa: f32, _da: f32, _oa: f32) u32 {
+            if (_oa <= 0) return 0;
+            const v = (@as(f32, @floatFromInt(sc)) * _sa + @as(f32, @floatFromInt(dc)) * _da * (1 - _sa)) / _oa;
+            return @intFromFloat(std.math.clamp(@round(v), 0, 255));
+        }
+    }.f;
+    const a: u32 = @intFromFloat(std.math.clamp(@round(oa * 255), 0, 255));
+    return (chan((src >> 24) & 0xFF, (dst >> 24) & 0xFF, sa, da, oa) << 24) |
+        (chan((src >> 16) & 0xFF, (dst >> 16) & 0xFF, sa, da, oa) << 16) |
+        (chan((src >> 8) & 0xFF, (dst >> 8) & 0xFF, sa, da, oa) << 8) | a;
+}
+
 /// M3 color roles — one scheme (light or dark). Baseline values published by
 /// Google; M3E keeps the same roles.
 pub const ColorScheme = struct {
@@ -93,6 +120,32 @@ pub const ColorScheme = struct {
     surface_dim: Color,
     scrim: Color,
     shadow: Color,
+
+    /// Upstream ColorScheme.surfaceColorAtElevation (ColorScheme.kt:1157):
+    /// the M3 tonal-elevation overlay — `surface_tint` at alpha
+    /// `(4.5·ln(e+1)+2)/100` composited over `surface`. Elevation ≤ 0 →
+    /// `surface` unchanged.
+    pub fn surfaceColorAtElevation(cs: ColorScheme, elevation_dp: f32) Color {
+        if (elevation_dp <= 0) return cs.surface;
+        const alpha = (4.5 * @log(elevation_dp + 1) + 2) / 100;
+        return compositeOver(withAlpha(cs.surface_tint, alpha), cs.surface);
+    }
+
+    /// Upstream ColorScheme.applyTonalElevation (ColorScheme.kt:1566): the
+    /// overlay applies ONLY when `background` IS the scheme `surface` AND
+    /// tonal elevation is `enabled` (the LocalTonalElevationEnabled local —
+    /// supplied by Theme.tonal_elevation_enabled). A surface_container_*
+    /// container fails the gate and passes through unchanged — which is why
+    /// M3E's default token set paints zero tonal elevation (every elevated
+    /// container resolves to a surface_container_* role, and every
+    /// `surface` container sits at Level0).
+    ///
+    /// Upstream also accumulates LocalAbsoluteTonalElevation down the
+    /// Surface tree; Klaxon has no Surface primitive or tree locals — each
+    /// widget's own elevation is the whole term.
+    pub fn applyTonalElevation(cs: ColorScheme, background: Color, elevation_dp: f32, enabled: bool) Color {
+        return if (background == cs.surface and enabled) cs.surfaceColorAtElevation(elevation_dp) else background;
+    }
 };
 
 /// M3E dynamic-scheme variant — which DynamicScheme algorithm generates the
@@ -379,6 +432,12 @@ const platform_desktop: PlatformTokens = .{
 pub const Theme = struct {
     name: []const u8 = "light",
     colors: ColorScheme = light_colors,
+    /// Mirrors upstream LocalTonalElevationEnabled (ColorScheme.kt:1582):
+    /// when false, applyTonalElevation never resolves the surface_tint
+    /// overlay — a subtree opt-out. Klaxon has no composition locals; the
+    /// Theme IS the ambient value, so hand a subtree a Theme copy with this
+    /// field false.
+    tonal_elevation_enabled: bool = true,
     type_scale: TypeScale = type_scale,
     shape: Shape = shape,
     /// Descriptive reference of the M3 levels — widgets raster shadows
@@ -390,6 +449,14 @@ pub const Theme = struct {
     /// tokens, so no widget reads this field.
     spacing: Spacing = spacing,
     platform: PlatformTokens = platform_mobile,
+
+    /// Upstream ColorScheme.applyTonalElevation (ColorScheme.kt:1566) with
+    /// the LocalTonalElevationEnabled flag supplied by this theme
+    /// (`tonal_elevation_enabled`). Widgets call this where their upstream
+    /// Surface() received a tonalElevation — see ColorScheme.applyTonalElevation.
+    pub fn applyTonalElevation(t: Theme, background: Color, elevation_dp: f32) Color {
+        return t.colors.applyTonalElevation(background, elevation_dp, t.tonal_elevation_enabled);
+    }
 
     /// Dynamic theme (Phase 2d): resolve every color role from a seed color
     /// through material-color-utilities (src/dynamic_color.zig → deps/mcu)
@@ -821,4 +888,70 @@ test "theme: fromImage — empty or fully transparent buffer uses the fallback s
     const transparent: [64]u8 = @splat(0); // 16 fully transparent pixels
     const t2 = Theme.fromImageScheme(&transparent, 4, 4, false, .tonal_spot, 0, 0x6750A4FF);
     try std.testing.expectEqual(reference, t2.colors);
+}
+
+// --- tonal elevation (ColorScheme.kt:1157-1161, 1566-1585) ---
+
+/// Independent recompute of tint@alpha over opaque surface: per channel
+/// (1-a)·surface + a·tint, alpha pinned opaque (the expected composite).
+fn expectTintedSurface(surface: Color, tint: Color, alpha: f32) Color {
+    const chan = struct {
+        fn f(s: u32, tt: u32, a: f32) u32 {
+            return @intFromFloat(std.math.clamp(@round(@as(f32, @floatFromInt(s)) * (1 - a) + @as(f32, @floatFromInt(tt)) * a), 0, 255));
+        }
+    }.f;
+    return (chan((surface >> 24) & 0xFF, (tint >> 24) & 0xFF, alpha) << 24) |
+        (chan((surface >> 16) & 0xFF, (tint >> 16) & 0xFF, alpha) << 16) |
+        (chan((surface >> 8) & 0xFF, (tint >> 8) & 0xFF, alpha) << 8) | 0xFF;
+}
+
+test "theme: surfaceColorAtElevation — the upstream alpha curve at levels 0-5" {
+    inline for (.{ light.colors, dark.colors }) |cs| {
+        // Level0 is surface, untouched (ColorScheme.kt:1158).
+        try std.testing.expectEqual(cs.surface, cs.surfaceColorAtElevation(0));
+        // Levels 1-5 (1/3/6/8/12dp) against the upstream formula
+        // alpha = (4.5·ln(e+1)+2)/100 (ColorScheme.kt:1159).
+        const levels = [5]f32{ 1, 3, 6, 8, 12 };
+        var prev_alpha: f32 = 0;
+        for (levels) |e| {
+            const alpha = (4.5 * @log(e + 1) + 2) / 100;
+            try std.testing.expect(alpha > prev_alpha); // strictly increasing
+            prev_alpha = alpha;
+            try std.testing.expect(alpha > 0 and alpha < 0.2);
+            const got = cs.surfaceColorAtElevation(e);
+            try std.testing.expectEqual(@as(u8, 0xFF), @as(u8, @truncate(got))); // opaque
+            const want = expectTintedSurface(cs.surface, cs.surface_tint, alpha);
+            // compositeOver rounds identically — ±1 LSB tolerance per channel.
+            inline for (.{ 24, 16, 8 }) |shift| {
+                const gc: i32 = @intCast((got >> shift) & 0xFF);
+                const wc: i32 = @intCast((want >> shift) & 0xFF);
+                try std.testing.expect(@abs(gc - wc) <= 1);
+            }
+        }
+    }
+    // dark scheme lifts the surface (tint is lighter than surface there).
+    try std.testing.expect(dark.colors.surfaceColorAtElevation(12) > dark.colors.surface);
+}
+
+test "theme: applyTonalElevation — the gate is surface-only and enabled-only" {
+    const cs = light.colors;
+    // surface + enabled + elev>0 → tinted (== surfaceColorAtElevation).
+    try std.testing.expectEqual(cs.surfaceColorAtElevation(3), cs.applyTonalElevation(cs.surface, 3, true));
+    try std.testing.expect(cs.applyTonalElevation(cs.surface, 3, true) != cs.surface);
+    // elevation 0 short-circuits to surface either way (identity).
+    try std.testing.expectEqual(cs.surface, cs.applyTonalElevation(cs.surface, 0, true));
+    // a surface_container_* background fails the gate, elevation be damned —
+    // THE reason M3E paints no tonal overlay by default.
+    try std.testing.expectEqual(cs.surface_container, cs.applyTonalElevation(cs.surface_container, 6, true));
+    try std.testing.expectEqual(cs.surface_container_low, cs.applyTonalElevation(cs.surface_container_low, 1, true));
+    try std.testing.expectEqual(cs.inverse_surface, cs.applyTonalElevation(cs.inverse_surface, 6, true));
+    // enabled=false (LocalTonalElevationEnabled off) → background unchanged.
+    try std.testing.expectEqual(cs.surface, cs.applyTonalElevation(cs.surface, 6, false));
+
+    // Theme.tonal_elevation_enabled supplies the flag (default true).
+    try std.testing.expect((Theme{}).tonal_elevation_enabled);
+    var t = light;
+    try std.testing.expectEqual(cs.applyTonalElevation(cs.surface, 3, true), t.applyTonalElevation(cs.surface, 3));
+    t.tonal_elevation_enabled = false;
+    try std.testing.expectEqual(cs.surface, t.applyTonalElevation(cs.surface, 3));
 }

@@ -54,6 +54,19 @@ See [`docs/DECISIONS.md`](file:///Users/btw/Documents/projects/Klaxon/docs/DECIS
 Each widget's header carries the same list; these are the tracked ones
 (file:line is approximate — headers move):
 
+- `theme.zig` — `surfaceColorAtElevation`/`applyTonalElevation` are ported
+  (ColorScheme.kt:1157/1566) with `Theme.tonal_elevation_enabled` standing
+  in for LocalTonalElevationEnabled. Two simplifications vs upstream: (1)
+  no `LocalAbsoluteTonalElevation` accumulation — Klaxon has no Surface
+  primitive or composition locals, so a widget's own elevation is the
+  whole term (a `surface` container inside an elevated parent won't
+  inherit the parent's tint); (2) the audit found **zero** baseline-theme
+  tint anywhere in the pinned M3E sources — every upstream `tonalElevation
+  > 0` call site resolves to a `surface_container_*` / `*Container` /
+  `inverse_*` container, and every `surface` container sits at Level0 — so
+  the gate is wired only where upstream passes a nonzero elevation
+  (`fab.zig`, `time_picker.zig`; both no-ops in the baselines, kept for
+  custom themes that collapse a container role onto `surface`).
 - `ui/interactions.zig` + `ui/state_layer.zig` + `ui/ripple.zig` — the
   Compose indication machinery has landed as shared modules
   (InteractionSource semantics, the animated StateLayer, and

@@ -7,6 +7,11 @@
 //
 // Tokens (TimePickerTokens):
 //   - container: SurfaceContainerHigh, CornerExtraLarge (28dp), 360dp wide
+//   - tonal elevation: upstream TimePickerDialog.kt passes
+//     tonalElevation = DialogTokens.ContainerElevation (Level3, 6dp) to its
+//     dialog Surface — the applyTonalElevation gate is wired on the panel.
+//     The panel is a surface_container* role (never `surface`), so the gate
+//     is a no-op in the baseline schemes — it stays for custom themes
 //   - header (a centered row): the hour plate + the ":" separator + the
 //     minute plate + the AM/PM period toggle (12h only)
 //     - plates: 96x80, CornerSmall (8dp); the ACTIVE plate (the dial's mode):
@@ -1302,7 +1307,12 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
     const tm = clampedTime(s.time.peek());
     // the container — vibrantColors().containerColor = SurfaceContainer
     // (the classic TimeInputTokens.ContainerColor is SurfaceContainerHigh)
-    const panel: Color = if (s.variant == .input and s.opts.vibrant) cs.surface_container else cs.surface_container_high;
+    // Upstream TimePickerDialog.kt:169-175 — the dialog Surface passes
+    // tonalElevation = DialogTokens.ContainerElevation (Level3, 6dp): the
+    // gate tints only a `surface` container, so it is a no-op for these
+    // surface_container* panels — kept for custom themes that collapse the
+    // container role onto surface.
+    const panel: Color = t.applyTonalElevation(if (s.variant == .input and s.opts.vibrant) cs.surface_container else cs.surface_container_high, 6);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, container_corner, panel);
     if (s.variant == .input) {
         // the input variant: two fields + the separator + the period

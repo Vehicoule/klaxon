@@ -27,6 +27,11 @@
 //   - elevation level3 (hover level4): the real ambient+spot shadow —
 //     6dp rest/pressed/focused, 8dp hovered (a press while hovered holds
 //     level 3 — upstream's last-interaction rule)
+//   - tonal elevation: upstream Surface(color = containerColor,
+//     tonalElevation = Level3) — FloatingActionButton.kt:177; the
+//     applyTonalElevation gate is wired at both container paints. The FAB
+//     containers are *Container roles (never `surface`), so the gate is a
+//     no-op in the baseline schemes — it stays for custom themes
 //   - toggle (ToggleFloatingActionButton): unchecked = the plain FAB;
 //     checked morphs to 56dp CornerFull, the family's solid/on-solid pair,
 //     icon 20 (FabMenuBaselineTokens.CloseButton*)
@@ -256,9 +261,15 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     if (s.opts.enabled) {
         ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius, if (s.hovered and !s.pressed) 8 else 6, t.colors.shadow);
     }
+    // Upstream FloatingActionButton.kt:177 — Surface(color = containerColor,
+    // tonalElevation = defaultElevation = Fab*ContainerTokens.ContainerElevation
+    // = Level3 6dp): the gate tints only a `surface` container, so it is a
+    // no-op for every M3E FAB family (*Container tokens, never `surface`) —
+    // kept for custom themes that collapse a container role onto surface.
+    const container = t.applyTonalElevation(cc.container, 6);
     // container
-    if (cc.container & 0xFF != 0) {
-        ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, cc.container);
+    if (container & 0xFF != 0) {
+        ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, container);
     }
     // state layer (enabled only): the content color blended over the
     // container — AT the state alpha over a transparent container.
@@ -272,10 +283,10 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
         else
             0;
         if (alpha > 0) {
-            const layer = if (cc.container & 0xFF == 0)
+            const layer = if (container & 0xFF == 0)
                 ui.paint.withAlphaScaled(cc.on, alpha)
             else
-                theme_mod.stateLayer(cc.container, cc.on, alpha);
+                theme_mod.stateLayer(container, cc.on, alpha);
             ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, layer);
         }
     }
@@ -566,8 +577,12 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
     if (s.opts.enabled) {
         ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius, if (s.hovered) 8 else 6, t.colors.shadow);
     }
-    if (cc.container & 0xFF != 0) {
-        ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, cc.container);
+    // Same gate as fabPaint (upstream FloatingActionButton.kt:177, shared by
+    // the extended FAB — Surface tonalElevation = Level3 6dp; no-op for the
+    // *Container family containers, kept for custom themes).
+    const container = t.applyTonalElevation(cc.container, 6);
+    if (container & 0xFF != 0) {
+        ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, container);
     }
     if (s.opts.enabled) {
         const alpha: f32 = if (s.pressed)
@@ -579,10 +594,10 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
         else
             0;
         if (alpha > 0) {
-            const layer = if (cc.container & 0xFF == 0)
+            const layer = if (container & 0xFF == 0)
                 ui.paint.withAlphaScaled(cc.on, alpha)
             else
-                theme_mod.stateLayer(cc.container, cc.on, alpha);
+                theme_mod.stateLayer(container, cc.on, alpha);
             ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, layer);
         }
     }
