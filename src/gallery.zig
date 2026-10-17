@@ -90,7 +90,7 @@ const Refs = struct {
     ib_heart: *Node, // the M3E filled icon toggle (Icon buttons M3E section)
     cb_m3e_btn: *Node, // the M3E checkbox (Selection controls section)
     chip_m3e_filter: *Node, // the M3E filter chip (Chips section)
-    tf_m3e: [5]*Node, // the M3E text fields (Text fields section)
+    tf_m3e: [6]*Node, // the M3E text fields (Text fields section)
     card_m3e: *Node, // the clickable M3E card (Cards section)
     li_m3e: *Node, // the clickable M3E list item (List items section)
     li_m3e_sel: *Node, // the selected M3E list item (List items section)
@@ -242,7 +242,7 @@ pub const Gallery = struct {
     saved_grid: f32 = 0,
     saved_carousel: f32 = 0, // the multi-browse carousel's scroll offset
     // the M3E text fields' entries (restored across theme switches)
-    saved_tf_m3e: [5]std.array_list.Managed(u8),
+    saved_tf_m3e: [6]std.array_list.Managed(u8),
     // the M3E search bar's entry (restored across theme switches)
     saved_sb: std.array_list.Managed(u8),
 
@@ -866,6 +866,7 @@ fn buildTextFieldsSection(g: *Gallery, theme: Theme) !*Node {
         .{ .variant = .filled, .label = "Notes", .supporting = "Helper text", .theme = theme },
         .{ .variant = .outlined, .@"error" = true, .label = "Username", .supporting = "Already taken", .theme = theme },
         .{ .variant = .filled, .enabled = false, .label = "Locked", .initial = "Read only", .theme = theme },
+        .{ .variant = .outlined, .label = "Bio", .multiline = true, .min_lines = 2, .max_lines = 4, .placeholder = "A few lines about you…", .theme = theme },
     };
     for (&specs, 0..) |*spec, i| {
         // the entry is restored across theme switches (disabled fields keep

@@ -1673,6 +1673,7 @@ fn buildInputIme(r: *SceneRunner) !void {
         .label = "Message",
         .placeholder = "こんにちは…",
         .supporting = "type CJK / emoji — the buffer follows the caret",
+        .multiline = true, // Compose runner: singleLine = false
         .theme = theme_mod.light,
     });
     r.text_field = tf;
