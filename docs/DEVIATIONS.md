@@ -147,7 +147,14 @@ Each widget's header carries the same list; these are the tracked ones
   menu, navigation rail, app bar, segmented/button groups, progress,
   loading indicator, data table, stepper, avatar and the color picker,
   and the calendar's painted weekday letters ride the CLDR
-  `weekday_letter` table.
+  `weekday_letter` table. The structural defaults too — nav bar, tabs,
+  bottom app bar, pull-to-refresh and carousel labels are nullable
+  (`null` = `tr()`), tree/expansion-panel expanded-state values
+  localize, the toolbar's defaulted FAB name and the search view's
+  region label re-dupe on a switch, the split button's trailing label
+  resolves "Expand", the snackbar dismiss button gets the upstream
+  "Dismiss" content description and the expansion panel's default title
+  localizes.
 - `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
   shipped: checkerboard + gradient bar feeding the Signal's alpha byte.
   The hex field rides the shared `text_edit.zig` core — real caret,
