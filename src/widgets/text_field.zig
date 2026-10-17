@@ -88,6 +88,7 @@ const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
+const text_edit = @import("text_edit.zig");
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -133,9 +134,6 @@ const corner: f32 = 4; // CornerExtraSmall (top corners for the filled)
 const outline_w: f32 = 1; // UnfocusedIndicator/BorderThickness
 const outline_w_focus: f32 = 2; // FocusedIndicator/BorderThickness
 const caret_w: f32 = 1;
-/// Upstream TextFieldDefaults caret cadence (Compose's cursor blink is a
-/// fixed 500ms half-period — the caret re-shows on any caret event).
-const blink_half_ms: u64 = 500;
 const cutout_pad: f32 = 4; // OutlinedTextFieldInnerPadding
 const supporting_top: f32 = 4; // SupportingTopPadding
 const min_w: f32 = 280; // TextFieldDefaults.MinWidth / OutlinedTextFieldDefaults.MinWidth
@@ -144,7 +142,9 @@ const min_label_line_h: f32 = 16; // MinFocusedLabelLineHeight
 const min_supporting_line_h: f32 = 16; // MinSupportingTextLineHeight
 
 const TextFieldState = struct {
-    buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
+    /// The shared editing core (text_edit.zig): the null-terminated buffer,
+    /// the IME composition, the caret/selection model and the blink ticker.
+    edit: text_edit.Edit,
     label: [:0]const u8, // owned
     placeholder: [:0]const u8, // owned
     supporting: [:0]const u8, // owned
@@ -170,35 +170,6 @@ const TextFieldState = struct {
     /// that prefix — appended mid-frame or unsafe to split — measures
     /// whole and merges into the last segment.
     segs: std.array_list.Managed(Seg) = undefined,
-    /// IME composition (preedit) — SDL_EVENT_TEXT_EDITING replaces it
-    /// wholesale; the next text_input commits into `buf` and clears it.
-    /// Never committed to `buf`, the signal, or semantics — platforms that
-    /// collapse composition to commits (Android) simply leave it empty.
-    comp: std.array_list.Managed(u8) = undefined,
-    /// SDL's cursor offset inside `comp` (bytes, text_editing comp_start);
-    /// the caret draws there while a composition is open.
-    comp_cursor: i32 = 0,
-    /// The caret: a byte offset into `buf` on a codepoint boundary. Every
-    /// committed edit applies at this position; a pointer-down maps to the
-    /// nearest grapheme boundary through the paragraph position lookup.
-    caret: usize = 0,
-    /// The selection anchor — the frozen end of the selection range; the
-    /// caret is the moving end. anchor == caret → collapsed (no highlight).
-    /// Click sets both; drag/shift-move move only the caret.
-    sel_anchor: usize = 0,
-    /// Primary-button drag in progress (a drag inside the field extends the
-    /// selection instead of scrolling away).
-    dragging: bool = false,
-    /// The blink clock (Compose's 500ms half-period). `caret_on` is the
-    /// painted phase; `blink_epoch` is the tick-time the ON phase started
-    /// — maxInt = "re-base at the next tick" (set by every caret event,
-    /// whose KeyEvent carries no timestamp).
-    caret_on: bool = true,
-    blink_epoch: u64 = std.math.maxInt(u64),
-    /// The blink ticker — registered lazily at the first paint (a field
-    /// built before the host installs its timeline retries), removed at
-    /// deinit. It only keeps the host awake while the field is focused.
-    ticker: ?ui.anim.Timeline.Ticker = null,
 
     const Seg = struct {
         text: [:0]u8, // owned
@@ -207,12 +178,11 @@ const TextFieldState = struct {
     };
 
     fn text(s: *TextFieldState) [:0]const u8 {
-        // Sentinel slice via the many-item pointer (see input.zig).
-        return s.buf.items.ptr[0..s.buf.items.len :0];
+        return s.edit.text();
     }
 
     fn composition(s: *TextFieldState) [:0]const u8 {
-        return s.comp.items.ptr[0..s.comp.items.len :0];
+        return s.edit.composition();
     }
 };
 
@@ -220,23 +190,8 @@ fn stateOf(n: *Node) *TextFieldState {
     return @ptrCast(@alignCast(n.state.?));
 }
 
-/// Write the null sentinel at items[len] (the P0 TextField helper).
-/// Grows if the buffer is exactly full — the sync/setText paths reserve
-/// only len bytes, and writing the sentinel past capacity was a heap OOB.
-fn setSentinel(buf: *std.array_list.Managed(u8)) void {
-    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
-    buf.items.len += 1;
-    buf.items[buf.items.len - 1] = 0;
-    buf.items.len -= 1;
-}
-
-/// An owned null-terminated copy of a string.
-fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
-    const buf = try allocator.alloc(u8, str.len + 1);
-    @memcpy(buf[0..str.len], str);
-    buf[str.len] = 0;
-    return buf[0..str.len :0];
-}
+const setSentinel = text_edit.setSentinel;
+const dupeZ = text_edit.dupeZ;
 
 fn hasLabel(s: *TextFieldState) bool {
     return s.label.len > 0;
@@ -250,7 +205,7 @@ const InputPhase = enum { focused, unfocused_empty, unfocused_not_empty };
 
 fn phaseOf(s: *TextFieldState, focused: bool) InputPhase {
     if (focused) return .focused;
-    return if (s.buf.items.len == 0) .unfocused_empty else .unfocused_not_empty;
+    return if (s.edit.buf.items.len == 0) .unfocused_empty else .unfocused_not_empty;
 }
 
 /// labelProgress target: Focused/UnfocusedNotEmpty → 1, UnfocusedEmpty → 0
@@ -568,49 +523,12 @@ fn runLeft(n: *Node, run_w: f32) f32 {
     return tr.x;
 }
 
-/// UTF-16 position → byte offset. The paragraph reports grapheme-cluster
-/// boundaries in UTF-16 code units (astral chars count 2 — the surrogate
-/// pair); a position mid-cluster clamps back to the codepoint's start.
-fn utf16ToByteIndex(str: []const u8, pos16: usize) usize {
-    var u16n: usize = 0;
-    var i: usize = 0;
-    while (i < str.len) {
-        const l = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
-        const units: usize = if (l == 4) 2 else 1; // astral = surrogate pair
-        if (u16n + units > pos16) break; // inside a codepoint → its start
-        u16n += units;
-        i += l;
-    }
-    return i;
-}
-
-/// Byte offset of the grapheme boundary nearest to the press — the
-/// paragraph's getGlyphPositionAtCoordinate (Compose's
-/// TextLayoutResult.getOffsetForPosition). One layout per click; the
-/// field's own segmented path is paint-only. Falls back to the run's
-/// near edge when the paragraph backend can't build.
+/// Byte offset of the grapheme boundary nearest to the press — the shared
+/// text_edit hit test; the field projects the parent-space point into the
+/// painted run's space first (the run's mirrored left + line-box top).
 fn caretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
-    const str = s.text();
-    if (str.len == 0) return 0;
     const m = fieldMetrics(s);
-    const tx = runLeft(n, m.width);
-    const tr = textRect(n);
-    const l = ui.paint.textLayoutBegin(0) orelse { // no wrap — the field clips
-        return if (px <= tx) 0 else str.len;
-    };
-    defer ui.paint.textLayoutDestroy(l);
-    // The paint path draws the segments in LOGICAL order (the text-run-LTR
-    // deviation). The hit test must agree with what's on screen, so the
-    // probe paragraph builds under LTR regardless of the locale's base
-    // direction — single-threaded UI; the global is restored right after.
-    const prev_rtl = ui.paint.textDirectionRtl();
-    ui.paint.setTextDirection(false);
-    defer ui.paint.setTextDirection(prev_rtl);
-    const style = bodyLarge(s.opts.theme);
-    ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(style.size, 400, 0, 0, 0xFF0000FF));
-    const pos = ui.paint.textLayoutPositionAt(l, px - tx, py - tr.y);
-    if (pos < 0) return if (px <= tx) 0 else str.len;
-    return utf16ToByteIndex(str, @intCast(pos));
+    return text_edit.caretFromPoint(s.text(), px - runLeft(n, m.width), py - textRect(n).y, bodyLarge(s.opts.theme).size);
 }
 
 /// The x of a byte offset inside the run (run-space): whole segments
@@ -633,78 +551,11 @@ fn runXAt(s: *TextFieldState, pos: usize) f32 {
     return x; // at/past the run end — no measure needed
 }
 
-/// The ordered selection range [lo, hi); empty when collapsed.
-fn selRange(s: *const TextFieldState) struct { lo: usize, hi: usize } {
-    return .{ .lo = @min(s.caret, s.sel_anchor), .hi = @max(s.caret, s.sel_anchor) };
-}
-
-/// Delete [lo, hi) from the buffer and collapse the caret onto `lo`.
-/// The caller decides whether this is an edit (applyEdit) or not.
-fn deleteRange(s: *TextFieldState, lo: usize, hi: usize) void {
-    std.mem.copyForwards(u8, s.buf.items.ptr[lo .. s.buf.items.len - (hi - lo)], s.buf.items[hi..]);
-    s.buf.items.len -= hi - lo;
-    s.caret = lo;
-    s.sel_anchor = lo;
-    setSentinel(&s.buf);
-}
-
-/// A caret event (move/edit/focus): the caret shows for the next half
-/// period. The epoch re-bases at the next tick (KeyEvent has no
-/// timestamp — the ticker's now_ms is the only SDL-epoch clock here).
-fn resetBlink(s: *TextFieldState) void {
-    s.caret_on = true;
-    s.blink_epoch = std.math.maxInt(u64);
-}
-
-fn caretTickCb(userdata: ?*anyopaque, now_ms: u64) void {
-    const n: *Node = @ptrCast(@alignCast(userdata.?));
-    const s = stateOf(n);
-    if (s.blink_epoch == std.math.maxInt(u64)) s.blink_epoch = now_ms;
-    const on = ((now_ms - s.blink_epoch) / blink_half_ms) % 2 == 0;
-    if (on != s.caret_on) {
-        s.caret_on = on;
-        n.markDirty();
-    }
-}
-
-/// The blink only needs the host awake while the caret is shown — an
-/// unfocused field paints no caret and lets the loop block.
-fn caretPendingCb(userdata: ?*anyopaque) bool {
-    const n: *Node = @ptrCast(@alignCast(userdata.?));
-    const s = stateOf(n);
-    return s.opts.enabled and input.isFocused(n);
-}
-
-/// Register the blink ticker once (the scrollbar's lazy pattern: built
-/// before the host installs its timeline → retries at the first paint).
-fn ensureTicker(n: *Node, s: *TextFieldState) void {
-    if (s.ticker != null) return;
-    const tl = ui.anim.timeline() orelse return;
-    const t = ui.anim.Timeline.Ticker{ .fn_ptr = caretTickCb, .userdata = n, .has_pending = caretPendingCb };
-    tl.addTicker(t);
-    s.ticker = t;
-}
-
-/// Move the caret to `pos` clamped onto a codepoint boundary. `extend`
-/// keeps the anchor (shift-arrow / drag selection); otherwise the anchor
-/// collapses onto the caret.
-fn moveCaret(n: *Node, s: *TextFieldState, pos: usize, extend: bool) void {
-    var p = @min(pos, s.buf.items.len);
-    // items[len] is the sentinel slot — outside the slice: only scan
-    // continuation bytes strictly inside the text.
-    while (p > 0 and p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p -= 1;
-    if (p == s.caret and (extend or p == s.sel_anchor)) return;
-    s.caret = p;
-    if (!extend) s.sel_anchor = p;
-    resetBlink(s);
-    n.markDirty();
-}
-
 fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
-    const str = if (s.buf.items.len > 0) s.text() else s.placeholder;
-    const m = if (s.buf.items.len > 0) fieldMetrics(s) else ui.paint.measureText(str, bodyLarge(t).size, false);
+    const str = if (s.edit.buf.items.len > 0) s.text() else s.placeholder;
+    const m = if (s.edit.buf.items.len > 0) fieldMetrics(s) else ui.paint.measureText(str, bodyLarge(t).size, false);
     const outlined = s.opts.variant == .outlined;
     // The measured label box: the text at the lerped size + the inner
     // padding the filled variant carries (the cutout label has none).
@@ -752,7 +603,7 @@ fn paintIcon(ctx: *kx.Ctx, name: ?icon_w.IconName, x: f32, y: f32, color: Color)
 fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     syncPhase(n, s); // the InputPhase transition drives the label spring
-    ensureTicker(n, s); // the caret blink (focused fields stay awake)
+    s.edit.ensureTicker(); // the caret blink (focused fields stay awake)
     const c = containerRect(n);
     const t = s.opts.theme;
     const focused = input.isFocused(n) and s.opts.enabled;
@@ -817,8 +668,8 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_x = c.x + @min(leftOffset(s), rightOffset(s));
     const clip_w = c.w - leftOffset(s) - rightOffset(s);
     ui.paint.clipRect(ctx, clip_x, c.y, clip_w, c.h);
-    const has_comp = s.comp.items.len > 0;
-    if (s.buf.items.len > 0 or has_comp) {
+    const has_comp = s.edit.comp.items.len > 0;
+    if (s.edit.buf.items.len > 0 or has_comp) {
         const style = bodyLarge(t);
         const m = fieldMetrics(s);
         const tx = mx(c.x, c.w, tr.x, m.width, rtl);
@@ -829,7 +680,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         // Selection highlight — behind the glyphs (upstream:
         // TextSelectionColors background, primary @ 0.4). The range is
         // contiguous in the painted logical order.
-        const sel = selRange(s);
+        const sel = s.edit.selRange();
         if (sel.hi > sel.lo) {
             const hx0 = tx + runXAt(s, sel.lo);
             const hx1 = tx + runXAt(s, sel.hi);
@@ -840,20 +691,20 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
             sx += seg.m.width;
         }
-        var caret_x = tx + runXAt(s, s.caret);
+        var caret_x = tx + runXAt(s, s.edit.caret);
         if (has_comp) {
             // Preedit: appended visually after the committed text with the
             // platform-conventional underline (Compose marks the composing
             // range; a 1px underline is the standard visual). SDL's
             // comp_start positions the IME cursor INSIDE the composition.
-            const comp = s.composition();
+            const comp = s.edit.composition();
             const comp_m = ui.paint.measureText(comp, style.size, false);
             ui.paint.text(ctx, comp, sx, baseline, style.size, false, fc.input);
             ui.paint.fillRect(ctx, sx, baseline + 1, comp_m.width, 1, fc.input);
-            const at: usize = @intCast(@min(@max(s.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
             caret_x = sx + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
         }
-        if (focused and s.caret_on) {
+        if (focused and s.edit.caret_on) {
             // the caret at its position (inside the composition when open)
             ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         }
@@ -868,7 +719,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.text(ctx, s.placeholder, tx, baselineIn(tr.y, tr.h, m), style.size, false, fc.placeholder);
             }
         }
-        if (focused and s.caret_on) {
+        if (focused and s.edit.caret_on) {
             // the caret at the start (empty text)
             const m = ui.paint.measureText(" ", bodyLarge(t).size, false);
             ui.paint.fillRect(ctx, mx(c.x, c.w, tr.x, caret_w, rtl), baselineIn(tr.y, tr.h, m) - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
@@ -903,21 +754,21 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // boundary (the pointer arrives in the node's parent space —
             // the same space containerRect/textRect build in). A down
             // collapses the selection onto the caret — the anchor.
-            s.dragging = true;
-            moveCaret(n, s, caretFromPoint(n, s, ev.x, ev.y), false);
-            resetBlink(s);
+            s.edit.dragging = true;
+            s.edit.moveCaret(caretFromPoint(n, s, ev.x, ev.y), false);
+            s.edit.resetBlink();
             n.markDirty(); // the label float / caret / colors follow focus
             return true;
         },
         .up => {
-            s.dragging = false;
+            s.edit.dragging = false;
             return true;
         },
         .move => {
             // A held primary button drags the caret — drag-select (the
             // pointer is captured, so moves keep arriving off-bounds).
-            if (!s.dragging) return false;
-            moveCaret(n, s, caretFromPoint(n, s, ev.x, ev.y), true);
+            if (!s.edit.dragging) return false;
+            s.edit.moveCaret(caretFromPoint(n, s, ev.x, ev.y), true);
             return true;
         },
         .enter, .leave => return true, // no hover styling — the state-based colors have no hover axis
@@ -938,229 +789,32 @@ fn applyEdit(n: *Node, s: *TextFieldState) void {
     if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
 }
 
+/// The widget's applyEdit adapted to text_edit's callback signature.
+fn applyEditNode(n: *Node) void {
+    applyEdit(n, stateOf(n));
+}
+
 fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
-    switch (ev.kind) {
-        .text_input => {
-            // A commit discharges the composition: SDL's sequence is
-            // text_input (commit) then text_editing("") (clear) on the
-            // platforms that report preedit at all.
-            s.comp.clearRetainingCapacity();
-            s.comp_cursor = 0;
-            setSentinel(&s.comp);
-            // Reject (never truncate) input that would grow the text past
-            // the documented cap — a paste/IME burst is applied whole or
-            // not at all.
-            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
-            // Insert AT the caret — an open selection is replaced first.
-            const sel = selRange(s);
-            if (sel.hi > sel.lo) deleteRange(s, sel.lo, sel.hi);
-            const at = s.caret;
-            s.buf.ensureUnusedCapacity(ev.text.len + 1) catch @panic("klaxon: out of memory");
-            const tail = s.buf.items.len - at;
-            std.mem.copyBackwards(u8, s.buf.items.ptr[at + ev.text.len ..][0..tail], s.buf.items[at..][0..tail]);
-            @memcpy(s.buf.items.ptr[at..][0..ev.text.len], ev.text);
-            s.buf.items.len += ev.text.len;
-            s.caret = at + ev.text.len;
-            s.sel_anchor = s.caret; // inserted text is not left selected
-            setSentinel(&s.buf);
-            resetBlink(s);
-            applyEdit(n, s);
+    // The shared editing core: text_input/text_editing, the Cmd/Ctrl
+    // clipboard chords, backspace/delete, arrows/home/end.
+    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (ev.kind == .key_down) switch (ev.key) {
+        .enter => {
+            if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .text_editing => {
-            // SDL delivers the full composing string — replace, don't
-            // append. Bounded by the same documented cap; an over-cap
-            // preedit is dropped whole (never truncated mid-codepoint).
-            s.comp.clearRetainingCapacity();
-            if (ev.text.len <= ui.state.TextSignal.max_len) {
-                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
-                // A fresh composition over an open selection commits the
-                // deletion (the IME owns the range; the text changed).
-                const sel = selRange(s);
-                if (s.comp.items.len > 0 and sel.hi > sel.lo) {
-                    deleteRange(s, sel.lo, sel.hi);
-                    applyEdit(n, s);
-                }
-            }
-            s.comp_cursor = ev.comp_start;
-            setSentinel(&s.comp);
-            n.markDirty(); // repaint only — comp is not a committed edit
+        .escape => {
+            s.edit.comp.clearRetainingCapacity();
+            s.edit.comp_cursor = 0;
+            setSentinel(&s.edit.comp);
+            input.requestFocus(null);
+            n.markDirty();
             return true;
         },
-        .key_down => {
-            // Clipboard + select-all chords (Cmd on Apple, Ctrl elsewhere —
-            // the platform's shortcut modifier arrives as `ev.command`).
-            if (ev.command) {
-                const sel = selRange(s);
-                switch (ev.chr) {
-                    'a' => { // select all: anchor start, caret end
-                        s.sel_anchor = 0;
-                        moveCaret(n, s, s.buf.items.len, true);
-                        return true;
-                    },
-                    'c' => { // copy the open range; collapsed = no-op
-                        if (sel.hi > sel.lo) ui.clipboard.set(s.buf.items[sel.lo..sel.hi]);
-                        return true;
-                    },
-                    'x' => { // cut = copy + delete the range
-                        if (sel.hi > sel.lo) {
-                            ui.clipboard.set(s.buf.items[sel.lo..sel.hi]);
-                            deleteRange(s, sel.lo, sel.hi);
-                            resetBlink(s);
-                            applyEdit(n, s);
-                        }
-                        return true;
-                    },
-                    'v' => { // paste: replaces the selection, inserts at caret
-                        const clip = ui.clipboard.get(n.allocator) orelse return true;
-                        defer n.allocator.free(clip);
-                        if (clip.len == 0) return true;
-                        // Single-line: line terminators don't paste (upstream
-                        // filters them through the IME pipeline).
-                        var scratch: ?[]u8 = null;
-                        defer if (scratch) |b| n.allocator.free(b);
-                        var ins: []const u8 = clip;
-                        if (std.mem.indexOfAny(u8, clip, "\r\n") != null) {
-                            const b = n.allocator.alloc(u8, clip.len) catch @panic("klaxon: out of memory");
-                            var w: usize = 0;
-                            for (clip) |ch| {
-                                if (ch == '\r' or ch == '\n') continue;
-                                b[w] = ch;
-                                w += 1;
-                            }
-                            scratch = b;
-                            ins = b[0..w];
-                        }
-                        if (ins.len == 0) return true;
-                        if (s.buf.items.len + ins.len - (sel.hi - sel.lo) > ui.state.TextSignal.max_len) return true;
-                        if (sel.hi > sel.lo) deleteRange(s, sel.lo, sel.hi);
-                        const at = s.caret;
-                        s.buf.ensureUnusedCapacity(ins.len + 1) catch @panic("klaxon: out of memory");
-                        const tl = s.buf.items.len - at;
-                        std.mem.copyBackwards(u8, s.buf.items.ptr[at + ins.len ..][0..tl], s.buf.items[at..][0..tl]);
-                        @memcpy(s.buf.items.ptr[at..][0..ins.len], ins);
-                        s.buf.items.len += ins.len;
-                        s.caret = at + ins.len;
-                        s.sel_anchor = s.caret;
-                        setSentinel(&s.buf);
-                        resetBlink(s);
-                        applyEdit(n, s);
-                        return true;
-                    },
-                    else => return true, // unknown chord — still consumed
-                }
-            }
-            switch (ev.key) {
-                .backspace => {
-                    if (s.comp.items.len > 0) {
-                        // An open composition eats the backspace (codepoint
-                        // first); the platform re-sends text_editing anyway.
-                        while (s.comp.items.len > 0) {
-                            const last = s.comp.items[s.comp.items.len - 1];
-                            s.comp.items.len -= 1;
-                            if ((last & 0xC0) != 0x80) break;
-                        }
-                        s.comp_cursor = @intCast(s.comp.items.len);
-                        setSentinel(&s.comp);
-                        n.markDirty();
-                        return true;
-                    }
-                    // An open selection eats the delete — upstream clears the
-                    // range, not the codepoint before the caret.
-                    const sel = selRange(s);
-                    if (sel.hi > sel.lo) {
-                        deleteRange(s, sel.lo, sel.hi);
-                        resetBlink(s);
-                        applyEdit(n, s);
-                        return true;
-                    }
-                    // Delete the codepoint ending AT the caret.
-                    if (s.caret == 0) return true;
-                    var start = s.caret;
-                    while (start > 0 and (s.buf.items[start - 1] & 0xC0) == 0x80) start -= 1;
-                    start -= 1;
-                    deleteRange(s, start, s.caret);
-                    resetBlink(s);
-                    applyEdit(n, s);
-                    return true;
-                },
-                .delete => {
-                    const sel = selRange(s);
-                    if (sel.hi > sel.lo) {
-                        deleteRange(s, sel.lo, sel.hi);
-                        resetBlink(s);
-                        applyEdit(n, s);
-                        return true;
-                    }
-                    // Forward delete: the codepoint STARTING at the caret.
-                    if (s.caret >= s.buf.items.len or s.comp.items.len > 0) return true;
-                    const l = std.unicode.utf8ByteSequenceLength(s.buf.items[s.caret]) catch 1;
-                    const end = @min(s.buf.items.len, s.caret + l);
-                    deleteRange(s, s.caret, end);
-                    resetBlink(s);
-                    applyEdit(n, s);
-                    return true;
-                },
-                // Logical caret motion — one codepoint per press (upstream
-                // moves by grapheme cluster; a cluster-aware step needs the
-                // paragraph's break iterator, tracked as a deviation). Under
-                // RTL this moves logically, not visually. Shift extends the
-                // selection; a plain arrow over an open selection collapses
-                // onto the range's edge (upstream caret-collapse semantics).
-                .left => {
-                    const sel = selRange(s);
-                    if (sel.hi > sel.lo and !ev.shift) {
-                        moveCaret(n, s, sel.lo, false); // collapse to the start
-                        return true;
-                    }
-                    var p = s.caret;
-                    while (p > 0) {
-                        p -= 1;
-                        if ((s.buf.items[p] & 0xC0) != 0x80) break;
-                    }
-                    moveCaret(n, s, p, ev.shift);
-                    return true;
-                },
-                .right => {
-                    const sel = selRange(s);
-                    if (sel.hi > sel.lo and !ev.shift) {
-                        moveCaret(n, s, sel.hi, false); // collapse to the end
-                        return true;
-                    }
-                    var p = s.caret;
-                    if (p < s.buf.items.len) {
-                        p += 1;
-                        while (p < s.buf.items.len and (s.buf.items[p] & 0xC0) == 0x80) p += 1;
-                    }
-                    moveCaret(n, s, p, ev.shift);
-                    return true;
-                },
-                .home => {
-                    moveCaret(n, s, 0, ev.shift); // single line: the run start
-                    return true;
-                },
-                .end => {
-                    moveCaret(n, s, s.buf.items.len, ev.shift); // the run end
-                    return true;
-                },
-                .enter => {
-                    if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
-                    return true;
-                },
-                .escape => {
-                    s.comp.clearRetainingCapacity();
-                    s.comp_cursor = 0;
-                    setSentinel(&s.comp);
-                    input.requestFocus(null);
-                    n.markDirty();
-                    return true;
-                },
-                else => {},
-            }
-        },
-    }
+        else => {},
+    };
     return false;
 }
 
@@ -1173,16 +827,13 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
     // The replaced text may be shorter — pull the caret back onto a
     // codepoint boundary (upstream clamps the selection into the new text).
-    s.caret = @min(s.caret, s.buf.items.len);
-    while (s.caret > 0 and s.caret < s.buf.items.len and (s.buf.items[s.caret] & 0xC0) == 0x80) s.caret -= 1;
-    s.sel_anchor = @min(s.sel_anchor, s.buf.items.len);
-    while (s.sel_anchor > 0 and s.sel_anchor < s.buf.items.len and (s.buf.items[s.sel_anchor] & 0xC0) == 0x80) s.sel_anchor -= 1;
+    s.edit.clampOffsets();
     n.markLayoutDirty(); // the measured width is content-driven
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
@@ -1190,17 +841,13 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
 
 fn textFieldDeinit(n: *Node) void {
     const s = stateOf(n);
-    if (s.ticker) |t| {
-        if (ui.anim.timeline()) |tl| tl.removeTicker(t); // the blink callback writes into state
-    }
+    s.edit.deinit(); // the blink ticker + both buffers
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.label_channel)); // the channel writes into state
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = textFieldSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.free(s.label);
     n.allocator.free(s.placeholder);
     n.allocator.free(s.supporting);
-    s.buf.deinit();
-    s.comp.deinit();
     segsReset(s);
     s.segs.deinit();
     n.allocator.destroy(s);
@@ -1238,8 +885,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     const supporting = try dupeZ(allocator, opts.supporting);
     errdefer allocator.free(supporting);
     s.* = .{
-        .buf = std.array_list.Managed(u8).init(allocator),
-        .comp = std.array_list.Managed(u8).init(allocator),
+        .edit = text_edit.Edit.init(allocator, node),
         .segs = std.array_list.Managed(TextFieldState.Seg).init(allocator),
         .label = label,
         .placeholder = placeholder,
@@ -1255,16 +901,16 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
         allocator.free(s.label);
         allocator.free(s.placeholder);
         allocator.free(s.supporting);
-        s.buf.deinit();
+        s.edit.deinit();
         s.segs.deinit();
     }
-    s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
-        s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
+        s.edit.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
     }
-    setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
-    s.caret = s.buf.items.len; // the caret starts at the end (Compose parity)
-    s.sel_anchor = s.caret; // collapsed — nothing selected at birth
+    setSentinel(&s.edit.buf); // null-terminates the (possibly empty) buffer
+    s.edit.caret = s.edit.buf.items.len; // the caret starts at the end (Compose parity)
+    s.edit.sel_anchor = s.edit.caret; // collapsed — nothing selected at birth
     node.state = s;
     ui.semantics.attach(node, .{
         .role = .text_field,
@@ -1291,13 +937,13 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
-    s.caret = s.buf.items.len; // programmatic replace → caret at the end
-    s.sel_anchor = s.caret;
-    resetBlink(s);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.caret = s.edit.buf.items.len; // programmatic replace → caret at the end
+    s.edit.sel_anchor = s.edit.caret;
+    s.edit.resetBlink();
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
@@ -1679,36 +1325,36 @@ test "text_field: click places the caret; arrows/home/end move it; edits apply a
     defer b.deinit();
     b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
     const s = stateOf(b);
-    try std.testing.expectEqual(@as(usize, 3), s.caret); // starts at the end
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret); // starts at the end
     // a press at the run's left edge → the nearest boundary (0 or 1)
     router.dispatchPointer(b, .{ .phase = .down, .x = 17, .y = 28 });
     try std.testing.expect(input.isFocused(b));
-    try std.testing.expect(s.caret <= 1);
+    try std.testing.expect(s.edit.caret <= 1);
     // a press far past the run end → the end
     router.dispatchPointer(b, .{ .phase = .down, .x = 250, .y = 28 });
-    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
     // arrows move by codepoint; home/end jump to the edges
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
-    try std.testing.expectEqual(@as(usize, 2), s.caret);
+    try std.testing.expectEqual(@as(usize, 2), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .home });
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
     // typing inserts AT the caret
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "X" });
     try std.testing.expectEqualStrings("Xabc", text(b));
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
     // backspace deletes the codepoint BEFORE the caret
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
     try std.testing.expectEqualStrings("abc", text(b));
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
     // backspace at 0 is a consumed no-op
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
     try std.testing.expectEqualStrings("abc", text(b));
     // delete removes the codepoint AT the caret
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .delete });
     try std.testing.expectEqualStrings("bc", text(b));
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
-    try std.testing.expectEqual(@as(usize, 2), s.caret);
+    try std.testing.expectEqual(@as(usize, 2), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "!" });
     try std.testing.expectEqualStrings("bc!", text(b));
 }
@@ -1722,18 +1368,18 @@ test "text_field: the caret steps by codepoint through multibyte text" {
     defer b.deinit();
     b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
     const s = stateOf(b);
-    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
     router.focus(b);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
-    try std.testing.expectEqual(@as(usize, 1), s.caret); // é's lead byte
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret); // é's lead byte
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right });
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right });
-    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // clamped
-    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
     // insert in the middle of a multibyte buffer lands on the boundary
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "i" });
@@ -1741,14 +1387,14 @@ test "text_field: the caret steps by codepoint through multibyte text" {
     // backspace deletes the whole codepoint before the caret
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
     try std.testing.expectEqualStrings("h\xC3\xA9", text(b));
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
     // an external set clamps the caret onto a boundary
     const sig_field = try textField(std.testing.allocator, null, null, null, .{ .initial = "long" });
     defer sig_field.deinit();
     const s2 = stateOf(sig_field);
-    s2.caret = 4;
+    s2.edit.caret = 4;
     setText(sig_field, "h\xC3\xA9");
-    try std.testing.expectEqual(@as(usize, 3), s2.caret); // clamped to len
+    try std.testing.expectEqual(@as(usize, 3), s2.edit.caret); // clamped to len
 }
 
 test "text_field: the caret blinks on the 500ms cadence and re-shows on edits" {
@@ -1764,25 +1410,26 @@ test "text_field: the caret blinks on the 500ms cadence and re-shows on edits" {
     b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
     const s = stateOf(b);
     router.focus(b);
-    ensureTicker(b, s); // paint would do it; tests paint nothing
-    try std.testing.expect(s.caret_on);
+    s.edit.ensureTicker(); // paint would do it; tests paint nothing
+    try std.testing.expect(s.edit.caret_on);
     tl.tick(0); // re-bases the epoch
     tl.tick(600); // one half-period past → off
-    try std.testing.expect(!s.caret_on);
+    try std.testing.expect(!s.edit.caret_on);
     tl.tick(1100); // second half-period → on
-    try std.testing.expect(s.caret_on);
+    try std.testing.expect(s.edit.caret_on);
     // an edit re-shows the caret immediately, re-based at the next tick
     tl.tick(1600);
-    try std.testing.expect(!s.caret_on);
+    try std.testing.expect(!s.edit.caret_on);
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "y" });
-    try std.testing.expect(s.caret_on); // reset on the edit event
+    try std.testing.expect(s.edit.caret_on); // reset on the edit event
     tl.tick(1700); // epoch re-based → still on within the half period
-    try std.testing.expect(s.caret_on);
+    try std.testing.expect(s.edit.caret_on);
     tl.tick(2300); // a half-period after the re-base → off
-    try std.testing.expect(!s.caret_on);
+    try std.testing.expect(!s.edit.caret_on);
     // unfocused: the ticker stops keeping the loop awake
     router.focus(null);
-    try std.testing.expect(!caretPendingCb(b));
+    const tk = s.edit.ticker.?;
+    try std.testing.expect(!tk.has_pending.?(tk.userdata));
     try std.testing.expect(!tl.hasTimedWork());
 }
 
@@ -1799,13 +1446,13 @@ test "golden: the caret paints at its position mid-text, not just the end" {
     // caret between the two glyphs (left arrow from the end)
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
     const s = stateOf(b);
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
     var r = try golden.Renderer.init(std.testing.allocator, 300, 80);
     defer r.deinit();
     r.paint(b, 0xFFFFFFFF); // caret ON (the blink's shown phase)
     var f_on = try r.readback(std.testing.allocator);
     defer f_on.deinit();
-    s.caret_on = false; // the blink's hidden phase
+    s.edit.caret_on = false; // the blink's hidden phase
     r.paint(b, 0xFFFFFFFF);
     var f_off = try r.readback(std.testing.allocator);
     defer f_off.deinit();
@@ -1848,42 +1495,42 @@ test "text_field: shift extends the selection; drag-selects; delete replaces the
     router.focus(b);
     // shift+left selects backwards; the anchor stays at 5
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left, .shift = true });
-    try std.testing.expectEqual(@as(usize, 4), s.caret);
-    try std.testing.expectEqual(@as(usize, 5), s.sel_anchor);
+    try std.testing.expectEqual(@as(usize, 4), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 5), s.edit.sel_anchor);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left, .shift = true });
-    try std.testing.expectEqual(@as(usize, 3), s.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
     // shift+home extends to the start
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .home, .shift = true });
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
-    try std.testing.expectEqual(@as(usize, 5), s.sel_anchor); // whole text selected
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 5), s.edit.sel_anchor); // whole text selected
     // typing replaces the selection (upstream: the range is deleted first)
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "yo" });
     try std.testing.expectEqualStrings("yo", text(b));
-    try std.testing.expectEqual(@as(usize, 2), s.caret);
-    try std.testing.expectEqual(@as(usize, 2), s.sel_anchor); // collapsed, not re-selected
+    try std.testing.expectEqual(@as(usize, 2), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 2), s.edit.sel_anchor); // collapsed, not re-selected
     // a plain arrow over an open selection collapses onto the edge
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .home });
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right, .shift = true });
-    try std.testing.expectEqual(@as(usize, 1), s.caret); // [0,1) selected
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret); // [0,1) selected
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // no shift → collapse to hi
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
-    try std.testing.expectEqual(@as(usize, 1), s.sel_anchor);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.sel_anchor);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right, .shift = true }); // [1,2)
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace }); // deletes the range
     try std.testing.expectEqualStrings("y", text(b));
-    try std.testing.expectEqual(@as(usize, 1), s.caret);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
     // drag-select: down at the end, move back over the text
     router.dispatchPointer(b, .{ .phase = .down, .x = 250, .y = 28 });
-    try std.testing.expectEqual(@as(usize, 1), s.caret); // end
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret); // end
     router.dispatchPointer(b, .{ .phase = .move, .x = 17, .y = 28 });
-    try std.testing.expect(s.caret <= 1);
-    try std.testing.expectEqual(@as(usize, 1), s.sel_anchor); // anchor froze at the press
+    try std.testing.expect(s.edit.caret <= 1);
+    try std.testing.expectEqual(@as(usize, 1), s.edit.sel_anchor); // anchor froze at the press
     router.dispatchPointer(b, .{ .phase = .up, .x = 17, .y = 28 });
-    try std.testing.expect(!s.dragging);
+    try std.testing.expect(!s.edit.dragging);
     // a plain click collapses
     router.dispatchPointer(b, .{ .phase = .down, .x = 250, .y = 28 });
     router.dispatchPointer(b, .{ .phase = .up, .x = 250, .y = 28 });
-    try std.testing.expectEqual(s.caret, s.sel_anchor);
+    try std.testing.expectEqual(s.edit.caret, s.edit.sel_anchor);
 }
 
 test "golden: the selection paints a primary@0.4 highlight over the range" {
@@ -1898,13 +1545,13 @@ test "golden: the selection paints a primary@0.4 highlight over the range" {
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .home });
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .right, .shift = true });
     const s = stateOf(b);
-    s.caret_on = false; // hold the caret off in both paints — the diff is pure highlight
+    s.edit.caret_on = false; // hold the caret off in both paints — the diff is pure highlight
     var r = try golden.Renderer.init(std.testing.allocator, 300, 80);
     defer r.deinit();
     r.paint(b, 0xFFFFFFFF); // selection painted
     var f_sel = try r.readback(std.testing.allocator);
     defer f_sel.deinit();
-    s.sel_anchor = s.caret; // collapse → same frame without the highlight
+    s.edit.sel_anchor = s.edit.caret; // collapse → same frame without the highlight
     r.paint(b, 0xFFFFFFFF);
     var f_plain = try r.readback(std.testing.allocator);
     defer f_plain.deinit();
@@ -1959,8 +1606,8 @@ test "text_field: Cmd/Ctrl chords — select-all, copy, cut, paste (single-line 
     router.focus(b);
     // Ctrl/Cmd+A selects all
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'a' });
-    try std.testing.expectEqual(@as(usize, 0), s.sel_anchor);
-    try std.testing.expectEqual(@as(usize, 5), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.sel_anchor);
+    try std.testing.expectEqual(@as(usize, 5), s.edit.caret);
     // copy — buffer unchanged
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'c' });
     try std.testing.expectEqualStrings("hello", Clip.slot[0..Clip.len]);
@@ -1969,14 +1616,14 @@ test "text_field: Cmd/Ctrl chords — select-all, copy, cut, paste (single-line 
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'x' });
     try std.testing.expectEqualStrings("hello", Clip.slot[0..Clip.len]);
     try std.testing.expectEqual(@as(usize, 0), text(b).len);
-    try std.testing.expectEqual(@as(usize, 0), s.caret);
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
     // paste with newlines — stripped (single-line)
     const nl = "he\nllo\r!";
     @memcpy(Clip.slot[0..nl.len], nl);
     Clip.len = nl.len;
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'v' });
     try std.testing.expectEqualStrings("hello!", text(b));
-    try std.testing.expectEqual(@as(usize, 6), s.caret);
+    try std.testing.expectEqual(@as(usize, 6), s.edit.caret);
     // paste over a selection replaces it
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'a' });
     Clip.len = 2;
