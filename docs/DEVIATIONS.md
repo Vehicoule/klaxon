@@ -115,9 +115,11 @@ Each widget's header carries the same list; these are the tracked ones
   paragraph ABI at the field width — one tr() sentence key each (upstream
   `TimePicker24HourError`/`HourError`/`MinuteError`). A field turning
   invalid announces its error politely (`semantics.announce`, upstream
-  liveRegion). Remaining: the
-  classic (non-vibrant)
-  `TimeInput` only — no 100x120 CornerFull style; the
+  liveRegion). The vibrant overload (`opts.vibrant`, upstream
+  `TimeInput(state, shapes, vibrantColors())`) lands the 100x120
+  CornerLarge fields, the 56x120 side period column with circle/squircle
+  pills, the compact panel and the invalid-only support box. Remaining:
+  the uncontained vibrant style (the side control column variant); the
   auto-advance always runs
   (upstream suppresses it while an a11y service is enabled — no
   equivalent query here); Tab reaches the focused node before the global
