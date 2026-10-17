@@ -127,7 +127,10 @@ Each widget's header carries the same list; these are the tracked ones
   upgrade path. (The paragraph bidi base direction follows the locale —
   fixed audit row above.)
 - `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
-  shipped: checkerboard + gradient bar feeding the Signal's alpha byte.)
+  shipped: checkerboard + gradient bar feeding the Signal's alpha byte.
+  The hex field rides the shared `text_edit.zig` core — real caret,
+  selection, clipboard and IME session via `wants_text_input` — and
+  commits on Enter, reverts on blur/Escape.)
 - `kx_skia_android.cpp` — font family/fallback hardcode Roboto/Droid Sans;
   the directory-scan manager covers devices without them.
 - `kx_skia_android_fontmgr_stub.cpp` — `GetSystemFontFamilies` clears the
