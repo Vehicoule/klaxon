@@ -143,7 +143,11 @@ Each widget's header carries the same list; these are the tracked ones
   widget callback to `locale_sig`; the modal chrome (dialog, bottom and
   side sheets, drawer) resolves its scrim/panel/close-button labels via
   `tr()` and re-attaches them on a switch — a caller-supplied `label`
-  stays verbatim.
+  stays verbatim. The same holds for every other framework-owned label —
+  menu, navigation rail, app bar, segmented/button groups, progress,
+  loading indicator, data table, stepper, avatar and the color picker,
+  and the calendar's painted weekday letters ride the CLDR
+  `weekday_letter` table.
 - `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
   shipped: checkerboard + gradient bar feeding the Signal's alpha byte.
   The hex field rides the shared `text_edit.zig` core — real caret,
