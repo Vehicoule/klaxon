@@ -20,7 +20,6 @@ check() { # label path
 echo "checking deps for tag: $TAG"
 check "skia build"        "deps/skia/out/$TAG/libskia.a"
 check "SDL3 build"        "deps/SDL/build-$TAG/libSDL3.a"
-check "wamr build"        "deps/wamr/build-$TAG/libiwasm.a"
 
 if [ "$missing" -eq 1 ]; then
   echo

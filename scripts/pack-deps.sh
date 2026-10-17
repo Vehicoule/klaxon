@@ -12,7 +12,6 @@
 #
 # Bundles (mirroring fetch-deps.sh components):
 #   native         → deps/skia/{include,out/$TAG} + deps/SDL/{include,build-$TAG}
-#                    + deps/wamr/{core/iwasm/include,build-$TAG}
 #   web-wasm       → deps/skia/out/web-wasm + deps/SDL/build-web-wasm
 #                    (emsdk itself is not packed — the toolchain install is
 #                    what activates emcc; only the Skia/SDL wasm objects are)
@@ -98,9 +97,7 @@ for b in "${BUNDLES[@]}"; do
         "skia/modules" \
         ${dawn_dirs[@]+"${dawn_dirs[@]}"} \
         "SDL/include" \
-        "SDL/build-$TAG" \
-        "wamr/core/iwasm/include" \
-        "wamr/build-$TAG" || rc=1
+        "SDL/build-$TAG" || rc=1
       ;;
     web-wasm)
       pack_bundle web-wasm \
