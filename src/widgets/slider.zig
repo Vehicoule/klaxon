@@ -9,8 +9,18 @@
 //     centered on the value position; focus/pressed → 2dp wide
 //   - disabled: active track OnSurface@0.38, inactive track OnSurface@0.12,
 //     thumb OnSurface@0.38
-//   - state layer: a 40dp circle centered on the thumb, Primary @ hover 0.08 /
-//     focus 0.10 / pressed 0.12
+//   - indication (Slider.kt:938-951 + ThumbContent :2760-2775): the default
+//     thumb carries NO press ripple and NO state-layer disc — upstream's
+//     only `.indication` is the focus-ring `ripple(focusRingShape =
+//     HandleShape, enablePressIndication = false, enableFocusIndication =
+//     true, enableDragIndication = false, enableHoverIndication = false)`
+//     and it applies only under the InsetRing focus configuration (not
+//     modeled). The press/hover/drag/focus bookkeeping still runs through
+//     the shared Tracker — ThumbContent's `interactions.isNotEmpty()`
+//     (Focus/Press/Drag, hover excluded upstream) IS the indication: the
+//     thumb squeezes 4 → 2dp (FocusHandleWidth / PressedHandleWidth), and
+//     the value-indicator bubble rides press+drag. Hover only feeds the
+//     tracker (upstream shows no hover overlay, just the hand cursor).
 //   - hit target: max(width,48) x max(44,48) (the a11y floor is the hit area)
 //   - input: a down/drag sets the value from the pointer x (the drag IS the
 //     interaction — no slop cancel); arrows adjust by ±1% (keyboard,
@@ -51,7 +61,6 @@ const thumb_w: f32 = 4; // HandleWidth
 const thumb_w_active: f32 = 2; // FocusHandleWidth / PressedHandleWidth
 const thumb_h: f32 = 44; // HandleHeight
 const inset: f32 = thumb_w / 2; // the track is inset by half the thumb width
-const state_layer_size: f32 = 40;
 /// Upstream slideOnKeyEvents: delta = range/actualSteps — 1% continuous.
 const keyboard_step: f32 = 0.01;
 /// The bubble's gap above the thumb (ValueIndicatorActiveBottomSpace).
@@ -88,11 +97,17 @@ const SliderState = struct {
     opts: SliderOptions,
     sig: *ui.state.Signal(f32),
     on_changed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The upstream interaction machinery (interactions.zig): the thumb's
+    /// `interactions.isNotEmpty()` list — press/drag/focus drive the
+    /// handle squeeze; hover is collected but unused upstream (the M3E
+    /// thumb carries no state-layer disc and no press ripple).
+    inter: ui.interactions.Tracker = .{},
+    /// The live press's interaction id (0 = none).
+    press_id: u32 = 0,
+    /// The live drag's interaction id (0 = none).
+    drag_id: u32 = 0,
     /// Gesture arbitration (raw coords): a horizontal drag edits the value,
     /// a vertical drag is a scroll and bubbles to the scrollable.
-    dragging: bool = false,
     scroll_won: bool = false,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
@@ -172,16 +187,22 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
     const tx = b.x + inset;
     const tw = @max(0, b.w - inset * 2);
     const cy = b.y + b.h / 2;
-    // The handle narrows pressed/focused — the morph is sprung (M3E). Focus
-    // has no widget callback, so the target is detected lazily here (paint
-    // runs on every dirty → a focus change re-arms it the next frame).
-    const want: f32 = if (s.pressed or input.isFocused(n)) thumb_w_active else thumb_w;
+    // Focus has no widget callback — poll the router so the tracker's
+    // interaction set stays honest (ThumbContent collects Focus/Press/
+    // Drag; a key/program focus entry squeezes the handle).
+    s.inter.setFocused(input.isFocused(n));
+    // The handle narrows while any of Focus/Press/Drag is active —
+    // ThumbContent's `interactions.isNotEmpty()` (upstream hover is
+    // collected but NOT part of that list → no squeeze on hover). The
+    // morph is sprung (M3E); the target is detected lazily in paint.
+    const interacting = s.inter.isPressed() or s.inter.isDragged() or s.inter.isFocused();
+    const want: f32 = if (interacting) thumb_w_active else thumb_w;
     if (want != s.handle_target) {
         s.handle_target = want;
         morphHandle(n, s, want);
     }
     // Same lazy retarget for the indicator appear (pressed/dragging).
-    const want_ind: f32 = if ((s.pressed or s.dragging) and s.opts.enabled) 1 else 0;
+    const want_ind: f32 = if ((s.inter.isPressed() or s.inter.isDragged()) and s.opts.enabled) 1 else 0;
     if (want_ind != s.indicator_target) {
         s.indicator_target = want_ind;
         morphIndicator(n, s, want_ind);
@@ -253,22 +274,10 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         }
     }
     // Handle: a 4x44 vertical bar (2dp while pressed/focused) centered on
-    // the value position, CornerFull.
+    // the value position, CornerFull. The M3E thumb's only indication is
+    // the squeeze itself (Slider.kt ThumbContent — no state-layer disc,
+    // no press ripple; the focus-ring ripple is InsetRing-config only).
     ui.paint.fillRRect(ctx, cx - thw / 2, b.y, thw, b.h, thw / 2, cc.thumb);
-    // state layer (enabled only): a 40dp circle centered on the handle
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.thumb, alpha));
-        }
-    }
 
     // --- value indicator (while pressed/dragging): the InverseSurface
     // pill + tail 12dp above the thumb's top (ValueIndicatorActiveBottom-
@@ -315,21 +324,22 @@ fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
-            s.dragging = false;
+            // sliderTapModifier's onPress: PressInteraction.Press at the
+            // down position (the press feeds the squeeze until it either
+            // releases or converts to a drag at the slop).
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
             s.scroll_won = false;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             const v = valueAt(s, n.bounds, ev.x);
             s.sig.set(v);
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
-            n.markDirty();
             return true;
         },
         .move => {
             // the router only delivers move while we are captured (drag)
             if (s.scroll_won) return false; // the scroll owns the gesture
-            if (!s.dragging) {
+            if (s.drag_id == 0 and s.press_id != 0) {
                 // gesture arbitration: past the touch slop, the dominant axis
                 // decides — horizontal = slider drag (claim), vertical =
                 // scroll (release: bubble to the scrollable)
@@ -337,39 +347,56 @@ fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
                     if (@abs(dy) > @abs(dx)) {
+                        // vertical scroll wins: upstream cancels the press
+                        // (Slider.kt:3136/3194 — "dismiss the ripple and
+                        // allow scrolling" — no drag interaction emitted)
+                        s.inter.cancel(s.press_id);
+                        s.press_id = 0;
                         s.scroll_won = true;
-                        s.pressed = false;
-                        n.markDirty();
                         return false;
                     }
-                    s.dragging = true;
+                    // the press converts to a drag: upstream cancels the
+                    // press then emits DragInteraction.Start (Slider.kt
+                    // :3135-3143) — the squeeze stays on through the drag
+                    s.inter.cancel(s.press_id);
+                    s.press_id = 0;
+                    s.drag_id = s.inter.dragStart();
                 }
             }
-            if (s.dragging) {
-                s.pressed = true; // kept for the whole drag (pressed feedback)
+            if (s.drag_id != 0) {
                 const v = valueAt(s, n.bounds, ev.x);
                 s.sig.set(v);
                 if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
-                n.markDirty();
             }
-            return s.dragging; // claim only the horizontal drag
+            return s.drag_id != 0; // claim only the horizontal drag
         },
         .up => {
             const was_scrolling = s.scroll_won;
-            s.pressed = false;
-            s.dragging = false;
+            // upstream: the drag finishes (DragInteraction.Stop) / the tap's
+            // press releases — either way the interaction set empties
+            s.inter.release(s.press_id);
+            s.inter.endDrag();
+            s.press_id = 0;
+            s.drag_id = 0;
             s.scroll_won = false;
-            n.markDirty();
             return !was_scrolling; // a scroll-owned gesture: the up bubbles
         },
+        .outside_down => {
+            s.inter.cancel(s.press_id);
+            s.inter.endDrag();
+            s.press_id = 0;
+            s.drag_id = 0;
+            s.scroll_won = false;
+            return true;
+        },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            // hoverable(interactionSource) — collected like upstream but
+            // the M3E thumb shows no hover overlay (no squeeze either)
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -498,30 +525,25 @@ fn sliderDeinit(n: *Node) void {
     n.allocator.destroy(s);
 }
 
-/// The region own-paint can touch: the bounds plus the 40dp state layer,
-/// centered on the thumb — its cx runs [b.x + inset, b.x + inset + tw] with
-/// tw = max(0, b.w - 2*inset) like the paint path, so the layer reaches
-/// (state_layer_size/2 - inset) past the horizontal edges, and past the
-/// vertical edges whenever the bounds are shorter than the layer (a
-/// constrained slider). Culling and damage both consult it.
+/// The region own-paint can touch: the bounds plus the value-indicator
+/// bubble — it floats above the thumb while pressed/dragging, its top edge
+/// gap + tail + pill above the bounds top, and its pill can overhang the
+/// track's ends horizontally. (The M3E thumb has no state-layer disc to
+/// account for — Slider.kt ThumbContent carries no overlay.) Culling and
+/// damage both consult it.
 fn sliderPaintBounds(n: *Node) Rect {
     const s = stateOf(n);
     const b = n.bounds;
-    const cy = b.y + b.h / 2;
-    var top = @min(b.y, cy - state_layer_size / 2);
-    // The value indicator floats above the bounds while pressed/dragging —
-    // its top edge is gap + tail + pill above the thumb's top.
     const ls = s.opts.theme.type_scale.label_large;
     const bubble_top = b.y - indicator_gap - indicator_tail_h - (ls.line_height + indicator_v_pad * 2);
-    top = @min(top, bubble_top);
-    const bottom = @max(b.y + b.h, cy + state_layer_size / 2);
+    const top = @min(b.y, bubble_top);
+    const bottom = b.y + b.h;
     // Horizontally the bubble can overhang the bounds at the track's ends.
     const bubble_half: f32 = 48 / 2 + 8; // widest "%" pill + tail margin
-    const over = @max(state_layer_size / 2, bubble_half);
     return .{
-        .x = b.x + inset - over,
+        .x = b.x + inset - bubble_half,
         .y = top,
-        .w = @max(0, b.w - inset * 2) + over * 2,
+        .w = @max(0, b.w - inset * 2) + bubble_half * 2,
         .h = bottom - top,
     };
 }
@@ -551,6 +573,9 @@ pub fn slider(allocator: std.mem.Allocator, sig: *ui.state.Signal(f32), on_chang
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_changed = on_changed };
     node.state = s;
+    // the interaction machinery — the tracker damages the node on every
+    // mutation (no per-phase markDirty in the handler)
+    s.inter.node = node;
     // the initial semantic value
     const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(sig.peek(), 0, 1) * 100}) catch "";
     s.value_len = str.len;
@@ -621,24 +646,29 @@ test "slider: gesture arbitration — a vertical drag is a scroll, not an edit" 
     defer b.deinit();
     b.layout(.{ .x = 0, .y = 0, .w = 160, .h = 44 });
     const on_pointer = b.vtable.on_pointer.?;
+    const s = stateOf(b);
     _ = on_pointer(b, .{ .phase = .down, .x = 80, .y = 22, .raw_x = 80, .raw_y = 22 });
+    try std.testing.expect(s.inter.isPressed()); // the tap's press is live
     const v0 = sig.peek();
     // a vertical drag past the slop: the scroll wins (the move bubbles, the
-    // value is frozen, the pressed feedback is dropped)
+    // value is frozen, the press is cancelled — Slider.kt:3194)
     try std.testing.expect(!on_pointer(b, .{ .phase = .move, .x = 80, .y = 45, .raw_x = 80, .raw_y = 45 }));
     try std.testing.expectEqual(v0, sig.peek());
-    try std.testing.expect(!stateOf(b).pressed);
+    try std.testing.expect(!s.inter.isPressed());
+    try std.testing.expect(!s.inter.isDragged());
     try std.testing.expect(!on_pointer(b, .{ .phase = .move, .x = 80, .y = 60, .raw_x = 80, .raw_y = 60 }));
     try std.testing.expectEqual(v0, sig.peek());
     try std.testing.expect(!on_pointer(b, .{ .phase = .up, .x = 80, .y = 60, .raw_x = 80, .raw_y = 60 })); // bubbles
-    // a horizontal drag edits the value and keeps the pressed feedback
+    // a horizontal drag converts press → drag (Slider.kt:3135-3143) and
+    // edits the value
     _ = on_pointer(b, .{ .phase = .down, .x = 80, .y = 22, .raw_x = 80, .raw_y = 22 });
     try std.testing.expect(on_pointer(b, .{ .phase = .move, .x = 100, .y = 22, .raw_x = 100, .raw_y = 22 }));
-    try std.testing.expect(stateOf(b).pressed);
-    try std.testing.expect(stateOf(b).dragging);
+    try std.testing.expect(!s.inter.isPressed()); // the press was cancelled
+    try std.testing.expect(s.inter.isDragged()); // the drag keeps the squeeze
     try std.testing.expect(sig.peek() > v0);
     try std.testing.expect(on_pointer(b, .{ .phase = .up, .x = 100, .y = 22, .raw_x = 100, .raw_y = 22 }));
-    try std.testing.expect(!stateOf(b).pressed);
+    try std.testing.expect(!s.inter.isDragged());
+    try std.testing.expectEqual(@as(u8, 0), s.inter.len);
 }
 
 test "slider: arrows adjust the value (keyboard)" {
@@ -831,7 +861,7 @@ test "slider: the value indicator morphs in/out on the timeline" {
     try std.testing.expectEqual(@as(f32, 0), s.indicator_a);
 }
 
-test "golden: slider hover paints the state layer over the inactive track" {
+test "golden: slider hover paints no overlay (M3E thumb has no state layer)" {
     const t = theme_mod.light;
     const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
     defer sig.deinit();
@@ -841,15 +871,13 @@ test "golden: slider hover paints the state layer over the inactive track" {
     defer r.deinit();
     b.layout(.{ .x = 0, .y = 2, .w = 160, .h = 44 });
     _ = b.vtable.on_pointer.?(b, .{ .phase = .enter, .x = 80, .y = 24 });
+    // upstream's hoverable collects the hover but ThumbContent ignores it —
+    // no overlay, no squeeze; the inactive track stays SecondaryContainer
+    try std.testing.expect(stateOf(b).inter.isHovered());
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the 40dp state layer circle centered on the thumb (80, 24): 15px right
-    // of the thumb center, over the inactive track → primary @ 0.08 blended
-    try std.testing.expectEqual(
-        theme_mod.stateLayer(t.colors.secondary_container, t.colors.primary, t.state.hover),
-        f.pixelAt(95, 24),
-    );
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(95, 24));
 }
 
 test "golden: disabled slider paints the OnSurface@0.38 active track" {
@@ -869,16 +897,16 @@ test "golden: disabled slider paints the OnSurface@0.38 active track" {
     try golden.expectPixelApprox(f, 40, 24, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), 0xFFFFFFFF));
 }
 
-test "slider: paintBounds covers the thumb state layer at the track ends" {
+test "slider: paintBounds covers the value-indicator bubble at the track ends" {
     const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
     defer sig.deinit();
     const b = try slider(std.testing.allocator, sig, null, .{});
     defer b.deinit();
     b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 44 });
-    // overhang: max(layer 40, bubble 64)/2 horizontally; the indicator's
-    // bubble also reaches 12+6+32 above the top edge → y = 0
+    // overhang: bubble_half 32dp horizontally; the indicator's bubble also
+    // reaches 12+6+32 above the top edge → y = 0; no state layer to cover
     try std.testing.expectEqual(ui.node.Rect{ .x = 70, .y = 0, .w = 260, .h = 94 }, b.paintRect());
-    // a constrained height still covers the layer (cy ± 20)
+    // a constrained height: the bubble's reach is unchanged below
     b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 16 });
-    try std.testing.expectEqual(ui.node.Rect{ .x = 70, .y = 0, .w = 260, .h = 78 }, b.paintRect());
+    try std.testing.expectEqual(ui.node.Rect{ .x = 70, .y = 0, .w = 260, .h = 66 }, b.paintRect());
 }

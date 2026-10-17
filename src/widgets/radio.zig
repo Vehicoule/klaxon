@@ -20,9 +20,17 @@
 //     Pressed}IconColor tokens (all OnSurface — the style system resolves
 //     them; the default colors are interaction-static) apply like the spec
 //     states table.
-//   - state layer: the unbounded ripple (radius 20dp → a 40dp circle
-//     centered on the ring) @ hover 0.08 / focus 0.10 / pressed 0.12 —
-//     the spec's state layer color is the effective icon color
+//   - indication (RadioButton.kt:163-166): the selectable carries
+//     `ripple(bounded = false, radius = RadioButtonTokens.StateLayerSize /
+//     2, focusRingShape = CircleShape)` — StateLayerSize = 40dp → an
+//     unbounded 20dp-radius ink disc centered on the ring (no color arg →
+//     the ripple theme's content color = the effective icon color here),
+//     drawn OVER the canvas like upstream's draw modifier. Interactions
+//     run through the shared machinery: Tracker (press/hover/focus
+//     ordering), StateLayer (the animated 40dp hover/focus layer —
+//     presses go to the ripple, never the layer), Ripples (75ms fade-in /
+//     225ms expand / 150ms fade-out). Enter/Space emits Press+Release → a
+//     centered unbounded ripple.
 //   - hit target: 48x48 centered on the ring
 //     (minimumInteractiveComponentSize — the a11y floor is the hit area,
 //     never the painted circle)
@@ -68,8 +76,18 @@ const RadioState = struct {
     opts: RadioOptions,
     sig: *ui.state.Signal(usize),
     index: u32,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The upstream interaction machinery (interactions.zig): ordered
+    /// press/hover/focus entries — the tracker damages the node on every
+    /// mutation (the manual markDirty on press/hover is gone).
+    inter: ui.interactions.Tracker = .{},
+    /// The animated interaction-state overlay (the 40dp disc's alpha —
+    /// hover/focus only; presses go to the ripple).
+    layer: ui.state_layer.StateLayer = .{},
+    /// The unbounded 20dp-radius ripple set (CommonRipple's ripples map).
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release.
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
@@ -95,14 +113,14 @@ fn isChecked(s: *RadioState) bool {
 /// resting interaction state) + the state layer's on-color.
 const RColors = struct { circle: Color, on: Color };
 
-fn currentColors(n: *Node, s: *RadioState) RColors {
+fn currentColors(s: *RadioState) RColors {
     const cs = s.opts.theme.colors;
     if (!s.opts.enabled) return .{ .circle = ui.paint.withAlphaScaled(cs.on_surface, 0.38), .on = ui.paint.withAlphaScaled(cs.on_surface, 0.38) };
     if (isChecked(s)) return .{ .circle = cs.primary, .on = cs.primary };
     // the Unselected{Hover,Focus,Pressed}IconColor tokens — all OnSurface
     // (the style system resolves them; defaultRadioButtonColors itself is
     // interaction-static)
-    const interacting = s.hovered or s.pressed or input.isFocused(n);
+    const interacting = s.inter.len > 0;
     const c = if (interacting) cs.on_surface else cs.on_surface_variant;
     return .{ .circle = c, .on = c };
 }
@@ -130,26 +148,11 @@ fn radioHitBounds(n: *Node) Rect {
 fn radioPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
-    const cc = currentColors(n, s);
+    const cc = currentColors(s);
     // the 20dp icon centers in the (24dp) node — wrapContentSize centers the
     // canvas in whatever space remains after the padding
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    // state layer (the unbounded ripple, radius 20dp → a 40dp circle
-    // centered on the ring): enabled only, the circle color @ the state alpha
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.on, alpha));
-        }
-    }
     // The signal-animated color carries the check-state transition; the
     // unselected icon's interaction variants (the *Hover/*Focus/*Pressed
     // tokens) resolve instantly like the other interaction-state painting
@@ -167,6 +170,20 @@ fn radioPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRRect(ctx, cx - dr, cy - dr, dr * 2, dr * 2, dr, circle);
         }
     }
+    // The indication draws over the canvas like upstream's draw modifier
+    // (the selectable wraps the Canvas). Focus has no widget callback —
+    // poll the router and let the tracker derive the layer target.
+    if (s.opts.enabled) {
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, cc.on);
+        // the animated state layer: the same 40dp disc centered on the ring
+        if (s.layer.paintColor()) |c| {
+            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, c);
+        }
+        // the unbounded ink (radius 20dp, centered on the ring)
+        s.ripples.color = cc.on;
+        s.ripples.paint(ctx, n, .none);
+    }
 }
 
 fn radioOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -174,16 +191,17 @@ fn radioOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            s.inter.release(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             // the click lands in the 48dp hit target, not necessarily in the
             // 20dp circle (the a11y floor is the interactive area)
             if (was_pressed and radioHitBounds(n).contains(ev.x, ev.y)) {
@@ -194,29 +212,29 @@ fn radioOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms);
+                    s.press_id = 0;
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            s.inter.cancel(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -225,12 +243,20 @@ fn radioOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space select the focused radio.
+/// Upstream's selectable emits Press → Release for a key activation, so
+/// the centered unbounded ripple spawns + releases (unbounded spawn is
+/// centered on the indication's bounds regardless of x/y).
 fn radioOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const pid = s.inter.pressDown(b.x + b.w / 2, b.y + b.h / 2);
+            s.ripples.spawn(pid, b.x + b.w / 2, b.y + b.h / 2, 0);
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             s.sig.set(s.index);
             return true;
         },
@@ -260,7 +286,7 @@ fn radioSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const checked = isChecked(s);
     if (n.semantics) |sem| sem.checked = checked;
-    const cc = currentColors(n, s);
+    const cc = currentColors(s);
     const dot_target: f32 = if (checked) dot_radius else 0;
     if (s.opts.enabled) {
         if (ui.anim.timeline()) |tl| {
@@ -296,6 +322,10 @@ fn radioSyncCb(userdata: ?*anyopaque) void {
 
 fn radioDeinit(n: *Node) void {
     const s = stateOf(n);
+    // the ripple ticker's userdata is `s.ripples` — unregister before the
+    // state is freed; the layer's tween channel likewise.
+    s.ripples.deinit();
+    s.layer.deinit();
     if (ui.anim.timeline()) |tl| {
         tl.cancelChannel(@ptrCast(&s.dot_channel));
         tl.cancelChannel(@ptrCast(&s.color_channel));
@@ -332,13 +362,18 @@ pub fn radio(allocator: std.mem.Allocator, sig: *ui.state.Signal(usize), index: 
     node.state = s;
     // seed the animated state at the current values (upstream's
     // animate*AsState starts at the target — no intro animation)
-    s.circle_color = currentColors(node, s).circle;
+    s.circle_color = currentColors(s).circle;
     s.dot_r = if (sig.peek() == index) dot_radius else 0;
-    // the 40dp state layer is centered on the circle's center (the bounds
-    // center) — paint (and damage) reaches 20dp from center; against a
-    // minimal 20dp bounds that's 10dp past each edge
-    const layer_overflow = state_layer_size / 2 - icon_size / 2;
-    node.damage_overflow = .{ .left = layer_overflow, .right = layer_overflow, .top = layer_overflow, .bottom = layer_overflow };
+    // the interaction machinery: the tracker + the tweened state layer
+    // (alphas from the theme state table) + the unbounded 20dp-radius ink
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples = .{ .bounded = false, .radius = state_layer_size / 2, .node = node, .pressed_alpha = opts.theme.state.pressed };
+    // the layer disc and the ripple ink reach radius 20dp past the
+    // circle's center (the bounds center) — against a minimal 20dp
+    // bounds that's 10dp past each edge, same as the static layer needed
+    node.damage_overflow = .{ .left = state_layer_size / 2 - icon_size / 2, .right = state_layer_size / 2 - icon_size / 2, .top = state_layer_size / 2 - icon_size / 2, .bottom = state_layer_size / 2 - icon_size / 2 };
     ui.semantics.attach(node, .{
         .role = .radio,
         .label = opts.a11y_label,

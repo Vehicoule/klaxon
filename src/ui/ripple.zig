@@ -315,9 +315,18 @@ pub const Ripples = struct {
     /// `clip` applies to bounded ripples only; unbounded ignores it (draw
     /// unclipped, like :151-153).
     pub fn paint(r: *const Ripples, ctx: *kx.Ctx, n: *Node, clip: Clip) void {
+        r.paintIn(ctx, n.bounds, clip);
+    }
+
+    /// paint() against an explicit rect — the indication's own layout
+    /// bounds when they aren't the node's: Switch's `.indication` sits on
+    /// the thumb's LayoutNode (Switch.kt:191-199 — the ripple anchors to
+    /// the animated thumb rect, not the track), and row widgets
+    /// (segmented button, tabs) carry one indication per cell rect.
+    /// `b` is in the node's parent space, same as n.bounds.
+    pub fn paintIn(r: *const Ripples, ctx: *kx.Ctx, b: Rect, clip: Clip) void {
         // `if (alpha != 0f)` (:96-97): pressedAlpha zero → nothing to draw.
         if (r.len == 0 or r.pressed_alpha <= 0) return;
-        const b = n.bounds;
         if (r.bounded) pushClip(ctx, b, clip);
         for (r.items[0..r.len]) |*rp| r.drawOne(rp, b, ctx);
         if (r.bounded) paint_mod.clipReset(ctx);

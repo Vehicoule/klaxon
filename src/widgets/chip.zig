@@ -34,8 +34,15 @@
 //     OnSecondaryContainer. Disabled: label/icons OnSurface@0.38; containers
 //     OnSurface@0.12 (elevated + selected); unselected outlines OnSurface
 //     @0.12 (Flat/DisabledUnselectedOutlineOpacity)
-//   - state layer: the Surface's bounded ripple — the content (label)
-//     color @ hover 0.08 / focus 0.10 / pressed 0.12 over the container
+//   - indication (Chip.kt's Surface: the clickable/toggleable carries
+//     `ripple()` — bounded, no explicit radius — clipped to the chip's
+//     animated shape by the Surface's `.clip(shape)`): the content (label)
+//     color is the ink — hover 0.08 / focus 0.10 / pressed 0.12 over the
+//     container. Interactions run through the shared machinery: Tracker
+//     (press/hover/focus ordering), StateLayer (the animated hover/focus
+//     alpha — presses go to the ripple, never the layer), Ripples (75ms
+//     fade-in / 225ms expand / 150ms fade-out). Enter/Space emits
+//     Press+Release → a centered bounded ripple.
 //   - hit target: the painted bounds grown to the 48dp a11y floor per axis
 //     (minimumInteractiveComponentSize)
 //   - RTL: the Row's reading order mirrors + start/end padding flips; the
@@ -115,8 +122,20 @@ const ChipState = struct {
     /// selected state (kept as a child: adding/removing would churn layout).
     lead_child: ?*Node = null,
     trail_child: ?*Node = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The upstream interaction machinery (interactions.zig): ordered
+    /// press/hover/focus entries — the tracker damages the node on every
+    /// mutation (the manual markDirty on press/hover is gone). The press
+    /// also feeds shapeByInteraction's CornerSmall morph.
+    inter: ui.interactions.Tracker = .{},
+    /// The animated interaction-state overlay (hover/focus — presses go
+    /// to the ripple).
+    layer: ui.state_layer.StateLayer = .{},
+    /// The bounded ripple set, clipped to the chip's shape (Surface's
+    /// `.clip(shape)` covers the indication).
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release.
+    press_id: u32 = 0,
     /// shapeByInteraction's animated corner radius (selectable chips only —
     /// action chips rest at CornerSmall=8).
     shape_radius: f32 = radius_rest,
@@ -286,7 +305,7 @@ fn chipChildClip(n: *Node) Rect {
 fn shapeTarget(s: *ChipState) f32 {
     switch (s.opts.variant) {
         .filter, .input => {
-            if (s.pressed) return radius_pressed;
+            if (s.inter.isPressed()) return radius_pressed;
             if (isSelected(s)) return radius_selected;
             return radius_unselected;
         },
@@ -325,29 +344,26 @@ fn chipPaint(n: *Node, ctx: *kx.Ctx) void {
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, cc.container);
     }
-    // state layer (enabled only): the label color blended over the container —
-    // AT the state alpha over a transparent container (the button fix pattern)
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const layer = if (cc.container & 0xFF == 0)
-                ui.paint.withAlphaScaled(cc.on, alpha)
-            else
-                theme_mod.stateLayer(cc.container, cc.on, alpha);
-            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
-        }
-    }
     // outline (flat variants): the BorderStroke draws INSIDE the chip edge —
-    // the ring's outer edge is flush with the bounds
+    // the ring's outer edge is flush with the bounds; it belongs to the
+    // container ink the indication paints over (upstream's drawContent)
     if (cc.outline & 0xFF != 0) {
         ui.paint.strokeRRect(ctx, b.x + outline_width / 2, b.y + outline_width / 2, b.w - outline_width, b.h - outline_width, @max(0, radius - outline_width / 2), outline_width, cc.outline);
+    }
+    // The indication draws over the container like upstream's draw modifier
+    // — label color at the animated layer alpha; the SAME color paints the
+    // transparent-container case (a straight src-over alpha fill, identical
+    // to the old stateLayer() pre-blend over a transparent container).
+    if (s.opts.enabled) {
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, cc.on);
+        if (s.layer.paintColor()) |c| {
+            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, c);
+        }
+        // the bounded ripple, clipped to the chip's (animated) shape —
+        // Surface's `.clip(shape)` covers the indication upstream
+        s.ripples.color = cc.on;
+        s.ripples.paint(ctx, n, .{ .rrect = radius });
     }
 }
 
@@ -356,18 +372,19 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms); // bounded: origin = the press point
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             retargetShape(n, s); // pressed → CornerSmall
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
+            const was_pressed = s.press_id != 0;
+            s.inter.release(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             retargetShape(n, s); // released → back to selected/unselected
-            n.markDirty();
             // the click lands in the 48dp hit target, not necessarily in the
             // 32-high chip (the a11y floor is the interactive area)
             if (was_pressed and chipHitBounds(n).contains(ev.x, ev.y)) {
@@ -379,31 +396,31 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms);
+                    s.press_id = 0;
                     retargetShape(n, s); // cancel → back to selected/unselected
-                    n.markDirty();
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
+            s.inter.cancel(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             retargetShape(n, s); // cancel → back to selected/unselected
-            n.markDirty();
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -412,12 +429,19 @@ fn chipOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space press the focused chip.
+/// Upstream's clickable emits Press → Release for a key activation, so the
+/// bounded ripple spawns + releases centered on the chip.
 fn chipOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const pid = s.inter.pressDown(b.x + b.w / 2, b.y + b.h / 2);
+            s.ripples.spawn(pid, b.x + b.w / 2, b.y + b.h / 2, 0);
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             if (s.sig) |sig| sig.set(!sig.peek());
             if (s.on_click) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -465,6 +489,10 @@ fn chipSyncCb(userdata: ?*anyopaque) void {
 
 fn chipDeinit(n: *Node) void {
     const s = stateOf(n);
+    // the ripple ticker's userdata is `s.ripples` — unregister before the
+    // state is freed; the layer's tween channel likewise.
+    s.ripples.deinit();
+    s.layer.deinit();
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.shape_channel));
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = chipSyncCb, .userdata = n } });
     input.releaseNode(n);
@@ -496,6 +524,13 @@ pub fn chip(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_click
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_click = on_click };
     node.state = s;
+    // the interaction machinery: the tracker + the tweened state layer
+    // (alphas from the theme state table) + the bounded ink clipped to the
+    // chip's shape
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples = .{ .bounded = true, .node = node, .pressed_alpha = opts.theme.state.pressed };
     const cc = currentColors(s);
     s.shape_radius = shapeTarget(s); // rememberAnimatedShape starts at rest
     const t = opts.theme;

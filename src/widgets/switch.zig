@@ -36,9 +36,19 @@
 //     iconColor — SelectedIconColor OnPrimaryContainer / UnselectedIconColor
 //     SurfaceContainerHighest (+ the disabled composites). show_icons draws
 //     check/close like the M3E spec asset
-//   - state layer: the unbounded ripple on the thumb (radius 20dp → a 40dp
-//     circle centered on the thumb) @ hover 0.08 / focus 0.10 / pressed
-//     0.12 — the spec's state layer color is the effective thumb color
+//   - indication (Switch.kt:156-199): the track-level toggleable carries
+//     `indication = null`; the THUMB's modifier chain attaches
+//     `.indication(interactionSource, ripple(bounded = false, radius =
+//     SwitchTokens.StateLayerSize / 2, enableFocusIndication = !useInsetRing))`
+//     — StateLayerSize = 40dp → an unbounded 20dp-radius ink disc anchored
+//     on the THUMB's own layout bounds (it follows the animated thumb
+//     position, not the track center), drawn over the thumb fill + icon
+//     like upstream's draw modifier. Interactions run through the shared
+//     machinery: Tracker (press/hover/focus ordering), StateLayer (the
+//     animated 40dp hover/focus disc on the thumb — presses go to the
+//     ripple, never the layer), Ripples (75ms fade-in / 225ms expand /
+//     150ms fade-out). The ink is the effective thumb color.
+//     Enter/Space emits Press+Release → a centered ripple at the thumb.
 //   - hit target: max(52,48) x max(32,48) centered on the track
 //     (minimumInteractiveComponentSize — the a11y floor is the hit area)
 //   - RTL: the CenterStart thumb + placeRelative(offset) mirror the track —
@@ -97,8 +107,18 @@ const SwitchState = struct {
     opts: SwitchOptions,
     sig: *ui.state.Signal(bool),
     on_changed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The upstream interaction machinery (interactions.zig): ordered
+    /// press/hover/focus entries — the tracker damages the node on every
+    /// mutation (the manual markDirty on press/hover is gone).
+    inter: ui.interactions.Tracker = .{},
+    /// The animated interaction-state overlay (the 40dp disc on the thumb —
+    /// hover/focus only; presses go to the ripple).
+    layer: ui.state_layer.StateLayer = .{},
+    /// The unbounded 20dp-radius ripple set, anchored to the thumb's rect.
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release.
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
@@ -145,7 +165,7 @@ fn overSurface(c: Color, k: f32, surface: Color) Color {
 /// come from the *Hover/*Focus/*Pressed tokens (the style system resolves
 /// them — the defaults are interaction-static); disabled colors are the
 /// upstream .copy(alpha).compositeOver(surface) results.
-fn currentColors(n: *Node, s: *SwitchState) SWColors {
+fn currentColors(s: *SwitchState) SWColors {
     const cs = s.opts.theme.colors;
     if (!s.opts.enabled) {
         if (isChecked(s)) {
@@ -168,7 +188,7 @@ fn currentColors(n: *Node, s: *SwitchState) SWColors {
     // the {Selected,Unselected}{Hover,Focus,Pressed}HandleColor tokens —
     // PrimaryContainer / OnSurfaceVariant, all equal per state (the style
     // system resolves them; the default colors are interaction-static)
-    const interacting = s.hovered or s.pressed or input.isFocused(n);
+    const interacting = s.inter.len > 0;
     if (isChecked(s)) {
         const h = if (interacting) cs.primary_container else cs.on_primary;
         return .{
@@ -196,8 +216,9 @@ fn thumbTargets(n: *Node, s: *SwitchState) struct { size: f32, off: f32 } {
     _ = n;
     const on = isChecked(s);
     const has_content = s.opts.show_icons;
-    const size: f32 = if (s.pressed) handle_pressed else if (has_content or on) handle_on else handle_off;
-    const off: f32 = if (s.pressed)
+    const pressed = s.inter.isPressed();
+    const size: f32 = if (pressed) handle_pressed else if (has_content or on) handle_on else handle_off;
+    const off: f32 = if (pressed)
         (if (on) max_bound - outline_width else outline_width) // maxBound - TrackOutlineWidth / TrackOutlineWidth
     else if (on)
         max_bound // thumbPathLength
@@ -234,7 +255,7 @@ fn switchHitBounds(n: *Node) Rect {
 fn switchPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
-    const cc = currentColors(n, s);
+    const cc = currentColors(s);
     // track (pill): background then the border ring — the border draws
     // INSIDE the track edge (Compose border() insets the ring), so its
     // outer edge is flush with the pill
@@ -252,23 +273,23 @@ fn switchPaint(n: *Node, ctx: *kx.Ctx) void {
         const icon_name: icon_w.IconName = if (isChecked(s)) .check else .close;
         icon_w.drawIcon(ctx, icon_name, h.x + (h.w - icon_size) / 2, h.y + (h.h - icon_size) / 2, icon_size / 24.0, cc.icon);
     }
-    // state layer (the thumb's unbounded ripple, radius 20dp → a 40dp
-    // circle centered on the thumb): enabled only, the thumb color @ the
-    // state alpha
+    // The indication draws over the thumb fill + icon like upstream's draw
+    // modifier (it sits inside the thumb's Box chain, Switch.kt:191-199).
+    // Focus has no widget callback — poll the router.
     if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const cx = h.x + h.w / 2;
-            const cy = h.y + h.h / 2;
-            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.on, alpha));
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, cc.on);
+        const cx = h.x + h.w / 2;
+        const cy = h.y + h.h / 2;
+        // the animated state layer: the 40dp disc centered on the thumb
+        if (s.layer.paintColor()) |c| {
+            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, c);
         }
+        // the unbounded ink: radius 20dp, anchored to the thumb's rect —
+        // it follows the animated thumb position (the indication's own
+        // bounds upstream are the thumb LayoutNode's)
+        s.ripples.color = cc.on;
+        s.ripples.paintIn(ctx, h, .none);
     }
 }
 
@@ -289,7 +310,7 @@ fn thumbOffCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
 fn retargetThumb(n: *Node, s: *SwitchState) void {
     const t = thumbTargets(n, s);
     if (ui.anim.timeline()) |tl| {
-        if (s.pressed) {
+        if (s.inter.isPressed()) {
             s.thumb_size = t.size;
             s.thumb_off = t.off;
             tl.cancelChannel(@ptrCast(&s.size_channel));
@@ -324,18 +345,19 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             retargetThumb(n, s); // pressed → snap to the pressed size/offset
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
+            const was_pressed = s.press_id != 0;
+            s.inter.release(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             retargetThumb(n, s); // release → spring back
-            n.markDirty();
             // the click lands in the hit target, not necessarily in the track
             if (was_pressed and switchHitBounds(n).contains(ev.x, ev.y)) {
                 s.sig.set(!s.sig.peek());
@@ -346,31 +368,31 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms);
+                    s.press_id = 0;
                     retargetThumb(n, s); // cancel → spring back
-                    n.markDirty();
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
+            s.inter.cancel(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             retargetThumb(n, s); // cancel → spring back
-            n.markDirty();
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -379,12 +401,22 @@ fn switchOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space toggle the focused switch.
+/// Upstream's toggleable emits Press → Release for a key activation, so the
+/// thumb-anchored unbounded ripple spawns + releases (unbounded spawn is
+/// centered on the thumb's rect regardless of x/y).
 fn switchOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const hr = handleRect(n, s);
+            const cx = n.bounds.x + hr.x + hr.w / 2;
+            const cy = n.bounds.y + hr.y + hr.h / 2;
+            const pid = s.inter.pressDown(cx, cy);
+            s.ripples.spawn(pid, cx, cy, 0);
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             s.sig.set(!s.sig.peek());
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -408,6 +440,10 @@ fn switchSyncCb(userdata: ?*anyopaque) void {
 
 fn switchDeinit(n: *Node) void {
     const s = stateOf(n);
+    // the ripple ticker's userdata is `s.ripples` — unregister before the
+    // state is freed; the layer's tween channel likewise.
+    s.ripples.deinit();
+    s.layer.deinit();
     if (ui.anim.timeline()) |tl| {
         tl.cancelChannel(@ptrCast(&s.size_channel));
         tl.cancelChannel(@ptrCast(&s.off_channel));
@@ -419,17 +455,18 @@ fn switchDeinit(n: *Node) void {
 
 /// The region own-paint can touch. handleRect works in a fixed 52x32 track
 /// space anchored at b.x — when bounds are narrower than 52 the checked
-/// handle (and its 40dp state layer) still paint past b's right edge, so a
-/// constant damage_overflow under-reports. Cover the union of both handle
-/// extremes plus the layer: track space [-4, 56] x [-4, 36], plus the bounds
+/// handle (and its 40dp layer / unbounded ripple ink) still paint past b's
+/// right edge, so a constant damage_overflow under-reports. Cover the union
+/// of both handle extremes plus the ink reach (thumb-center ± 21dp —
+/// radius 20 + ~1px AA): track space [-5, 57] x [-5, 37], plus the bounds
 /// themselves when wider/taller.
 fn switchPaintBounds(n: *Node) Rect {
     const b = n.bounds;
     return .{
-        .x = b.x - 4,
-        .y = b.y - 4,
-        .w = @max(b.w, track_w + 8), // layer reaches 56 in track space
-        .h = @max(b.h, track_h + 8), // layer reaches 36
+        .x = b.x - 5,
+        .y = b.y - 5,
+        .w = @max(b.w, track_w + 10), // ink reaches 57 in track space
+        .h = @max(b.h, track_h + 10), // ink reaches 37
     };
 }
 
@@ -463,6 +500,13 @@ pub fn @"switch"(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_c
     const t = thumbTargets(node, s);
     s.thumb_size = t.size;
     s.thumb_off = t.off;
+    // the interaction machinery: the tracker + the tweened state layer
+    // (alphas from the theme state table) + the unbounded 20dp-radius ink
+    // on the thumb
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples = .{ .bounded = false, .radius = state_layer_size / 2, .node = node, .pressed_alpha = opts.theme.state.pressed };
     ui.semantics.attach(node, .{
         .role = .toggle,
         .label = opts.a11y_label,
@@ -517,7 +561,7 @@ test "switch: the handle follows the state (off/on/pressed positions)" {
     try std.testing.expectEqual(handle_on, hr.w);
     // pressed on: 28x28 at (22, 2) — the press path (down → retargetThumb)
     // snaps to the pressed size/offset like upstream's SnapSpec
-    s.pressed = true;
+    _ = s.inter.pressDown(16, 16);
     retargetThumb(b, s);
     hr = handleRect(b, s);
     try std.testing.expectEqual(@as(f32, 22), hr.x);
@@ -622,16 +666,16 @@ test "golden: disabled checked switch paints the OnSurface@0.12 track" {
     try golden.expectPixelApprox(f, 10, 32, golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.12), t.colors.surface));
 }
 
-test "switch: paintRect covers the handle state layer extremes (culling/damage contract)" {
+test "switch: paintRect covers the thumb layer/ripple extremes (culling/damage contract)" {
     const sig = try ui.state.Signal(bool).init(std.testing.allocator, false);
     defer sig.deinit();
     const b = try @"switch"(std.testing.allocator, sig, null, .{});
     defer b.deinit();
     b.layout(.{ .x = 100, .y = 100, .w = 52, .h = 32 });
-    // 4dp overflow each side (handle cx ∈ [16, 36] → layer -4..56)
-    try std.testing.expectEqual(ui.node.Rect{ .x = 96, .y = 96, .w = 60, .h = 40 }, b.paintRect());
+    // thumb cx ∈ [16, 36] + the 21dp ink reach → track space [-5, 57]
+    try std.testing.expectEqual(ui.node.Rect{ .x = 95, .y = 95, .w = 62, .h = 42 }, b.paintRect());
     // constrained width: the handle still paints in track space 0..52 anchored
-    // at b.x — the checked handle + layer must NOT be clipped by narrow bounds
+    // at b.x — the checked handle + ink must NOT be clipped by narrow bounds
     b.layout(.{ .x = 100, .y = 100, .w = 20, .h = 32 });
-    try std.testing.expectEqual(ui.node.Rect{ .x = 96, .y = 96, .w = 60, .h = 40 }, b.paintRect());
+    try std.testing.expectEqual(ui.node.Rect{ .x = 95, .y = 95, .w = 62, .h = 42 }, b.paintRect());
 }

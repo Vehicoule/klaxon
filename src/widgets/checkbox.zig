@@ -24,13 +24,22 @@
 //   - box/border/checkmark colors animate with colorAnimationSpecForState
 //     (DefaultEffects entering, FastEffects leaving — both map to the theme
 //     effects spring); disabled colors snap (rememberUpdatedState).
-//   - state layer (the ripple, bounded=false radius 20dp): a 40dp circle
-//     centered on the box @ hover 0.08 / focus 0.10 / pressed 0.12. Checked:
-//     indicatorColor = the box color (Primary / Error). Unchecked: upstream's
-//     flag-on path passes uncheckedBoxColor (Transparent) — an upstream quirk
-//     that would drop the layer entirely; the spec table's unselected layer
-//     is On Surface, which is also what the flag-off Unspecified ripple
-//     resolves to (contentColor) — used here.
+//   - indication (Checkbox.kt:553-560): the triStateToggleable carries
+//     `ripple(bounded = false, radius = CheckboxTokens.StateLayerSize / 2,
+//     color = rippleColor, focusRingShape = RoundedCornerShape(25))` —
+//     StateLayerSize = 40dp → an unbounded 20dp-radius ink disc centered on
+//     the box (the indication's own bounds), drawn OVER the canvas like
+//     upstream's draw modifier. Interactions run through the shared
+//     machinery: Tracker (press/hover/focus ordering), StateLayer (the
+//     animated 40dp hover/focus layer — presses go to the ripple, never
+//     the layer), Ripples (75ms fade-in / 225ms expand / 150ms fade-out).
+//     The ink is rippleColor = colors.indicatorColor(state) (Checkbox.kt
+//     :510-512): checked → the box color (Primary / Error). Unchecked:
+//     upstream's flag-on path passes uncheckedBoxColor (Transparent) — an
+//     upstream quirk that would drop the layer entirely; the spec table's
+//     unselected layer is On Surface, which is also what the flag-off
+//     Unspecified ripple resolves to (contentColor) — used here.
+//     Enter/Space emits Press+Release → a centered unbounded ripple.
 //   - the unselected border uses the Unselected*{Hover,Focus,Pressed}
 //     OutlineColor tokens (all OnSurface — the style system resolves them;
 //     defaultCheckboxColors itself is interaction-static)
@@ -89,8 +98,18 @@ const CheckboxState = struct {
     opts: CheckboxOptions,
     sig: *ui.state.Signal(bool),
     on_changed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The upstream interaction machinery (interactions.zig): ordered
+    /// press/hover/focus entries — the tracker damages the node on every
+    /// mutation (the manual markDirty on press/hover is gone).
+    inter: ui.interactions.Tracker = .{},
+    /// The animated interaction-state overlay (the 40dp disc's alpha —
+    /// hover/focus only; presses go to the ripple).
+    layer: ui.state_layer.StateLayer = .{},
+    /// The unbounded 20dp-radius ripple set (CommonRipple's ripples map).
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release.
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
@@ -125,7 +144,7 @@ fn isChecked(s: *CheckboxState) bool {
 /// checkmark).
 const CBColors = struct { box: Color, outline: Color, check: Color, indicator: Color };
 
-fn currentColors(n: *Node, s: *CheckboxState) CBColors {
+fn currentColors(s: *CheckboxState) CBColors {
     const cs = s.opts.theme.colors;
     const err = s.opts.@"error";
     if (!s.opts.enabled) {
@@ -147,7 +166,7 @@ fn currentColors(n: *Node, s: *CheckboxState) CBColors {
     // the Unselected{Hover,Focus,Pressed}OutlineColor tokens — all OnSurface
     // (defaultCheckboxColors itself is interaction-static; the style system
     // resolves these)
-    const interacting = s.hovered or s.pressed or input.isFocused(n);
+    const interacting = s.inter.len > 0;
     if (isChecked(s)) {
         const c = if (err) cs.@"error" else cs.primary;
         return .{ .box = c, .outline = c, .check = if (err) cs.on_error else cs.on_primary, .indicator = c };
@@ -243,24 +262,9 @@ fn drawCheck(ctx: *kx.Ctx, x: f32, y: f32, size: f32, check_color: Color, check_
 fn checkboxPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
-    const cc = currentColors(n, s);
+    const cc = currentColors(s);
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    // state layer (the unbounded ripple, radius 20dp → a 40dp circle
-    // centered on the box): enabled only, indicator @ the state alpha
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.indicator, alpha));
-        }
-    }
     // The signal-animated colors apply to the check-state transition; the
     // unselected outline's interaction variants (the *Hover/*Focus/*Pressed
     // tokens) resolve instantly like the rest of the interaction-state
@@ -271,6 +275,21 @@ fn checkboxPaint(n: *Node, ctx: *kx.Ctx) void {
     drawBox(ctx, b.x, b.y, b.w, s.box_color, border);
     // the checkmark draws through checkDrawFraction (drawn on/off)
     drawCheck(ctx, b.x, b.y, b.w, s.check_color, s.check_frac, 0);
+    // The indication draws over the canvas like upstream's draw modifier
+    // (the triStateToggleable wraps the Canvas). Focus has no widget
+    // callback — poll the router and let the tracker derive the target.
+    if (s.opts.enabled) {
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, cc.indicator);
+        // the animated state layer: the same 40dp disc centered on the box
+        if (s.layer.paintColor()) |c| {
+            ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, c);
+        }
+        // the unbounded ink (radius 20dp, centered on the box — the
+        // indication's bounds are the canvas's)
+        s.ripples.color = cc.indicator;
+        s.ripples.paint(ctx, n, .none);
+    }
 }
 
 fn checkboxOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -278,16 +297,17 @@ fn checkboxOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            s.inter.release(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             // the click lands in the 48dp hit target, not necessarily in the
             // 18dp box (the a11y floor is the interactive area)
             if (was_pressed and checkboxHitBounds(n).contains(ev.x, ev.y)) {
@@ -299,29 +319,29 @@ fn checkboxOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms);
+                    s.press_id = 0;
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            s.inter.cancel(s.press_id);
+            s.ripples.release(s.press_id, ev.time_ms);
+            s.press_id = 0;
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -330,12 +350,20 @@ fn checkboxOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space toggle the focused checkbox.
+/// Upstream's toggleable emits Press → Release for a key activation, so the
+/// centered unbounded ripple spawns + releases (the indication's bounds are
+/// the box — unbounded spawn is centered regardless of x/y).
 fn checkboxOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const pid = s.inter.pressDown(b.x + b.w / 2, b.y + b.h / 2);
+            s.ripples.spawn(pid, b.x + b.w / 2, b.y + b.h / 2, 0);
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             s.sig.set(!s.sig.peek());
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -420,7 +448,7 @@ fn checkboxSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const checked = s.sig.peek();
     if (n.semantics) |sem| sem.checked = checked;
-    const cc = currentColors(n, s);
+    const cc = currentColors(s);
     if (s.opts.enabled) {
         s.box_color = animateColor(s, s.box_color, cc.box, @ptrCast(&s.box_channel), .{ .fn_ptr = boxColorCb, .userdata = n });
         s.border_color = animateColor(s, s.border_color, cc.outline, @ptrCast(&s.border_channel), .{ .fn_ptr = borderColorCb, .userdata = n });
@@ -444,6 +472,10 @@ fn checkboxSyncCb(userdata: ?*anyopaque) void {
 
 fn checkboxDeinit(n: *Node) void {
     const s = stateOf(n);
+    // the ripple ticker's userdata is `s.ripples` — unregister before the
+    // state is freed; the layer's tween channel likewise.
+    s.ripples.deinit();
+    s.layer.deinit();
     if (ui.anim.timeline()) |tl| {
         tl.cancelChannel(@ptrCast(&s.frac_channel));
         tl.cancelChannel(@ptrCast(&s.box_channel));
@@ -481,15 +513,20 @@ pub fn checkbox(allocator: std.mem.Allocator, sig: *ui.state.Signal(bool), on_ch
     node.state = s;
     // seed the animated state at the current values (upstream's
     // remember/animateColorAsState starts at the target — no intro animation)
-    const cc = currentColors(node, s);
+    const cc = currentColors(s);
     s.box_color = cc.box;
     s.border_color = cc.outline;
     s.check_color = cc.check;
     s.check_frac = if (sig.peek()) 1 else 0;
-    // the 40dp state layer is centered on the 18dp box — paint (and damage)
-    // reaches (state_layer_size - box_size)/2 past each edge
-    const layer_overflow = (state_layer_size - box_size) / 2;
-    node.damage_overflow = .{ .left = layer_overflow, .right = layer_overflow, .top = layer_overflow, .bottom = layer_overflow };
+    // the interaction machinery: the tracker + the tweened state layer
+    // (alphas from the theme state table) + the unbounded 20dp-radius ink
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples = .{ .bounded = false, .radius = state_layer_size / 2, .node = node, .pressed_alpha = opts.theme.state.pressed };
+    // the layer disc and the ripple ink reach radius+~1px past the box
+    // center on every side — the same 11dp the static layer needed
+    node.damage_overflow = ui.ripple.overflowFor(box_size, box_size, state_layer_size / 2);
     ui.semantics.attach(node, .{
         .role = .checkbox,
         .label = opts.a11y_label,

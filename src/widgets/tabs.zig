@@ -13,8 +13,12 @@
 //     primary, anchored at the selected cell's LEADING edge with the tab's
 //     CONTENT width (`TabPosition.left` + `contentWidth`, minimum 24dp),
 //     sitting on the divider,
-//   - state layer = a bounded ripple in the SELECTED content color (primary),
-//     on any tab (Tab.kt: `ripple(color = selectedContentColor)`).
+//   - indication = a bounded ripple in the SELECTED content color (primary),
+//     on any tab (Tab.kt:166 `ripple(bounded = true, color =
+//     selectedContentColor)` on the whole tab's selectable): each cell gets
+//     a per-item Tracker + animated StateLayer + Ripples set; presses spawn
+//     the ink at the press point (bounded → clipped to the cell rect),
+//     hover/focus ride the layer, Enter/Space presses at the cell's center.
 //
 // `TabPosition.contentWidth` upstream = intrinsic width minus the `Tab`
 // composable's own 16dp horizontal padding ×2. Klaxon tab children ARE the
@@ -61,6 +65,37 @@ pub const TabsOptions = struct {
     label: ?[]const u8 = null,
 };
 
+/// Per-cell indication state (the upstream per-tab MutableInteractionSource
+/// + the selectable's bounded ripple). Heap-allocated: the StateLayer's
+/// timeline channel takes `l`'s address, so the struct must never move
+/// once wired.
+const ItemFx = struct {
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0, // the live press's tracker id (0 = none)
+
+    fn create(allocator: std.mem.Allocator, n: *Node, t: Theme) !*ItemFx {
+        const fx = try allocator.create(ItemFx);
+        fx.* = .{};
+        fx.inter.node = n;
+        fx.layer.node = n;
+        fx.layer.alphas = .{ .hover = t.state.hover, .focus = t.state.focus, .pressed = t.state.pressed, .drag = t.state.drag };
+        fx.ripples = .{ .bounded = true, .node = n, .pressed_alpha = t.state.pressed };
+        // Tab.kt:166 — the ripple's explicit color is selectedContentColor
+        // (= the primary tab's Active*ContentColor = primary); the layer
+        // gets the same color per-paint.
+        fx.ripples.color = t.colors.primary;
+        return fx;
+    }
+
+    fn destroy(fx: *ItemFx, allocator: std.mem.Allocator) void {
+        fx.layer.deinit(); // in-flight tween userdata = `l`
+        fx.ripples.deinit(); // the live ticker userdata = `r`
+        allocator.destroy(fx);
+    }
+};
+
 const TabsState = struct {
     sig: *ui.state.Signal(usize),
     opts: TabsOptions,
@@ -70,6 +105,8 @@ const TabsState = struct {
     /// sizes (centering).
     cells: std.array_list.Managed(Rect),
     content_sizes: std.array_list.Managed(Size),
+    /// Per-cell indication (parallel to `cells` — same count/order).
+    fx: std.array_list.Managed(*ItemFx),
     semantics_attached: bool = false,
     // Animated indicator (x/w of the active tab's indicator).
     indicator_x: f32 = 0,
@@ -170,6 +207,19 @@ fn tabsMeasure(n: *Node, c: Constraints) Size {
 fn tabsLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     const count = n.children.items.len;
+    // The indication set tracks the child count: removed tabs' machinery
+    // dies with them (upstream's interaction set dies with the tab).
+    while (s.fx.items.len > count) {
+        const fx = s.fx.pop().?;
+        fx.destroy(n.allocator);
+    }
+    while (s.fx.items.len < count) {
+        s.fx.append(ItemFx.create(n.allocator, n, s.opts.theme) catch @panic("klaxon: out of memory")) catch @panic("klaxon: out of memory");
+    }
+    // The indices die with the shrunk tabs (the interactions inside the
+    // removed fx are already gone with it).
+    if (s.hovered != null and s.hovered.? >= count) s.hovered = null;
+    if (s.pressed != null and s.pressed.? >= count) s.pressed = null;
     if (count == 0) return;
     const tab_w = bounds.w / @as(f32, @floatFromInt(count));
     if (s.cells.items.len != count) {
@@ -228,15 +278,21 @@ fn tabsPaint(n: *Node, ctx: *kx.Ctx) void {
     const t = s.opts.theme;
     const b = n.bounds;
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, t.colors.surface);
+    // The indication (Tab.kt:166): the animated state layer + the bounded
+    // ink in the SELECTED content color (primary) — the layer is the same
+    // src-over result the old stateLayer() pre-blend produced. Painted in
+    // the row's own pass: under the tab content, like upstream's
+    // background-level indication modifier.
     for (s.cells.items, 0..) |cell, i| {
-        const hovered = s.hovered != null and s.hovered.? == i;
-        const pressed = s.pressed != null and s.pressed.? == i;
-        if (hovered or pressed) {
-            const alpha = if (pressed) t.state.pressed else t.state.hover;
-            // Tab.kt: `ripple(bounded = true, color = selectedContentColor)` —
-            // the state layer is the SELECTED content color on every tab.
-            ui.paint.fillRect(ctx, cell.x, cell.y, cell.w, cell.h, theme_mod.stateLayer(t.colors.surface, t.colors.primary, alpha));
+        const fx = s.fx.items[i];
+        // The tab's focus is its child node's (the .tab) — polled, there
+        // is no focus-gained hook.
+        fx.inter.setFocused(input.isFocused(n.children.items[i]));
+        fx.layer.sync(&fx.inter, t.colors.primary);
+        if (fx.layer.paintColor()) |lc| {
+            ui.paint.fillRect(ctx, cell.x, cell.y, cell.w, cell.h, lc);
         }
+        fx.ripples.paintIn(ctx, cell, .rect);
     }
     // HorizontalDivider: 1dp outline_variant, at the bottom of the row.
     const dh = s.opts.divider_height;
@@ -247,13 +303,35 @@ fn tabsPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRRect(ctx, s.indicator_x, b.y + b.h - dh - ih, s.indicator_w, ih, @min(indicator_radius, ih / 2), t.colors.primary);
 }
 
+/// End a cell's live press (release = up, cancel = pointer-off/outside) —
+/// the tracker entry and its ripple pair on `press_id`.
+fn tabsEndPress(s: *TabsState, i: usize, now_ms: u64, cancel: bool) void {
+    const fx = s.fx.items[i];
+    if (fx.press_id == 0) return;
+    if (cancel) fx.inter.cancel(fx.press_id) else fx.inter.release(fx.press_id);
+    fx.ripples.release(fx.press_id, now_ms);
+    fx.press_id = 0;
+}
+
+/// Move the hover interaction to a new cell (null = none).
+fn tabsSetHover(s: *TabsState, h: ?usize) void {
+    if (h == s.hovered) return;
+    if (s.hovered) |old| s.fx.items[old].inter.endHover();
+    s.hovered = h;
+    if (s.hovered) |new| _ = s.fx.items[new].inter.hoverEnter();
+}
+
 fn tabsOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     switch (ev.phase) {
         .down => {
-            s.pressed = tabAtPoint(n, s, ev.raw_x, ev.raw_y);
-            if (s.pressed != null) {
-                n.markDirty();
+            if (tabAtPoint(n, s, ev.raw_x, ev.raw_y)) |i| {
+                const fx = s.fx.items[i];
+                // a second pointer supersedes the live press
+                if (fx.press_id != 0) tabsEndPress(s, i, ev.time_ms, true);
+                fx.press_id = fx.inter.pressDown(ev.x, ev.y);
+                fx.ripples.spawn(fx.press_id, ev.x, ev.y, ev.time_ms);
+                s.pressed = i;
                 return true;
             }
             return false;
@@ -262,8 +340,8 @@ fn tabsOnPointer(n: *Node, ev: input.PointerEvent) bool {
             const up_tab = tabAtPoint(n, s, ev.raw_x, ev.raw_y);
             const was = s.pressed;
             s.pressed = null;
-            n.markDirty();
             if (was != null) {
+                tabsEndPress(s, was.?, ev.time_ms, false);
                 if (up_tab != null and up_tab.? == was.?) {
                     s.sig.set(up_tab.?);
                     n.markLayoutDirty(); // the indicator target moved
@@ -273,29 +351,39 @@ fn tabsOnPointer(n: *Node, ev: input.PointerEvent) bool {
             return false;
         },
         .enter => {
-            s.hovered = tabAtPoint(n, s, ev.raw_x, ev.raw_y);
-            n.markDirty();
+            tabsSetHover(s, tabAtPoint(n, s, ev.raw_x, ev.raw_y));
             return true;
         },
         .leave => {
-            if (s.hovered != null) {
-                s.hovered = null;
-                n.markDirty();
-            }
+            tabsSetHover(s, null);
             return true;
         },
-        .move => return s.pressed != null,
+        .move => {
+            // upstream selectable cancels the press when the pointer leaves
+            // the tab — the move stays claimed while pressed
+            if (s.pressed) |p| {
+                if (tabAtPoint(n, s, ev.raw_x, ev.raw_y) != p) {
+                    tabsEndPress(s, p, ev.time_ms, true);
+                    s.pressed = null;
+                }
+                return true;
+            }
+            return false;
+        },
+        .outside_down => {
+            if (s.pressed) |p| {
+                tabsEndPress(s, p, ev.time_ms, true);
+                s.pressed = null;
+                return true; // it owned the interaction
+            }
+            return false;
+        },
         // Uncaptured hover over an unchanged deepest node: track the hovered
         // cell (the enter/leave pair only fires when the node changes).
         .hover_move => {
-            const h = tabAtPoint(n, s, ev.raw_x, ev.raw_y);
-            if (h != s.hovered) {
-                s.hovered = h;
-                n.markDirty();
-            }
+            tabsSetHover(s, tabAtPoint(n, s, ev.raw_x, ev.raw_y));
             return true;
         },
-        else => return false,
     }
 }
 
@@ -305,6 +393,19 @@ fn tabsOnKey(n: *Node, ev: input.KeyEvent) bool {
     switch (ev.key) {
         .enter, .space => {
             if (focusedTab(n)) |i| {
+                // A key press lands at the cell's center (upstream's
+                // keyboard press position = the component center); the
+                // ripple releases immediately but still expands + fades.
+                if (i < s.fx.items.len and i < s.cells.items.len) {
+                    const fx = s.fx.items[i];
+                    const cell = s.cells.items[i];
+                    const cx = cell.x + cell.w / 2;
+                    const cy = cell.y + cell.h / 2;
+                    const pid = fx.inter.pressDown(cx, cy);
+                    fx.ripples.spawn(pid, cx, cy, 0);
+                    fx.inter.release(pid);
+                    fx.ripples.release(pid, 0);
+                }
                 s.sig.set(i);
                 n.markLayoutDirty();
                 return true;
@@ -346,6 +447,8 @@ fn tabsDeinit(n: *Node) void {
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = tabsSyncCb, .userdata = n } });
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tabsLocaleCb, .userdata = n });
     input.releaseNode(n);
+    for (s.fx.items) |fx| fx.destroy(n.allocator);
+    s.fx.deinit();
     s.cells.deinit();
     s.content_sizes.deinit();
     n.allocator.destroy(s);
@@ -379,7 +482,7 @@ pub fn tabs(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), opt
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(TabsState);
     errdefer allocator.destroy(s);
-    s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator) };
+    s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator), .fx = .init(allocator) };
     node.state = s;
     tabsLocaleCb(node); // Phase 2c — the same path resolves the label
     s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = tabsLocaleCb, .userdata = node });

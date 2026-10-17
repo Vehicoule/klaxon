@@ -29,10 +29,17 @@
 //     content; unselected = transparent fill + OnSurface content; disabled =
 //     OnSurface @ 0.38 content (the fill stays: a disabled+selected segment
 //     keeps SecondaryContainer)
-//   - state layer: the content color blended over the container at hover
-//     0.08 / focus 0.10 / pressed 0.12 (over the transparent unselected
-//     container the layer is the content color AT that alpha — lerping from
-//     transparent black would double-scale the RGB in the src-over blend)
+//   - indication (SegmentedButton.kt's Segment → Surface: the selectable/
+//     toggleable carries `ripple()` — bounded, no explicit radius — and the
+//     Surface's `.clip(itemShape)` covers it): every segment is its own
+//     interactive element → its own Tracker (press/hover/focus ordering),
+//     StateLayer (the animated hover/focus alpha — presses go to the
+//     ripple, never the layer) and Ripples set (75ms fade-in / 225ms
+//     expand / 150ms fade-out), clipped to the segment's per-corner shape
+//     (rounded row ends). The ink is the segment's content color —
+//     OnSecondaryContainer selected / OnSurface unselected — painted over
+//     the container, under the content. Keyboard activation on the multi
+//     cursor emits Press+Release → a centered bounded ripple.
 //   - input: a drag past the touch slop (ui/gestures.SLOP, raw coords) is a
 //     scroll, not a press; a click selects (sets the signal + on_change);
 //     left/right (up/down) arrows move the selection, skipping disabled
@@ -114,6 +121,18 @@ const ItemDef = struct {
     icon: ?icon_w.IconName,
     enabled: bool,
     anim: CheckAnim,
+    /// Per-segment upstream interaction machinery — each SegmentedButton is
+    /// its own selectable → its own interactionSource (SegmentedButton.kt).
+    /// The tracker/layer/ripples damage the row node on every mutation.
+    /// items.items never re-allocs after init (same guarantee the CheckAnim
+    /// channels + the a11y children rely on) — the ticker/channel userdata
+    /// pointers stay stable.
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release for this segment.
+    press_id: u32 = 0,
     /// Cached wrapped-label layout for a squeezed segment (built through
     /// the paragraph ABI — HarfBuzz shaping + ICU line breaking). Keyed
     /// on the laid-out width and the baked span color; null when the
@@ -479,7 +498,6 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     const cs = t.colors;
     const count = s.items.items.len;
     const def = &s.items.items[i]; // the wrap cache mutates through this
-    const idx: i32 = @intCast(i);
     const sh = segShape(b, i, count, w);
     const sr = sh.sr;
     const selected = isSel(s, i);
@@ -490,29 +508,28 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     if (selected) {
         ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, cs.secondary_container);
     }
-    // state layer (enabled only): the content color over the container.
-    // Upstream the focused segment carries the layer — the Klaxon row is
-    // one focused control whose virtual focus is the selected segment.
+    // The indication (enabled only — upstream's enabled=false drops the
+    // whole interaction set): the animated state layer + the bounded ink
+    // ripple. Presses never enter the layer (Ripple.kt:209-212 routes
+    // Press to addRipple, everything else to updateStateLayer); the ink
+    // is the segment's content color, clipped to the itemShape. Over a
+    // transparent container the alpha fill is identical to the old
+    // stateLayer() pre-blend; over the selected fill it's the same
+    // src-over result.
     if (def.enabled) {
+        const on = if (selected) cs.on_secondary_container else cs.on_surface;
         // The virtual focus: single = the selected segment, multi = the
-        // keyboard cursor (the next toggled segment).
-        const focused_here = focused and (if (s.multi) i == s.cursor else selected);
-        const alpha: f32 = if (s.pressed == idx)
-            t.state.pressed
-        else if (focused_here)
-            t.state.focus
-        else if (s.hovered == idx)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const on = if (selected) cs.on_secondary_container else cs.on_surface;
-            const layer = if (selected)
-                theme_mod.stateLayer(cs.secondary_container, on, alpha)
-            else
-                ui.paint.withAlphaScaled(on, alpha); // transparent container
-            ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, layer);
+        // keyboard cursor (the next toggled segment). Polled — there is
+        // no focus-gained hook.
+        def.inter.setFocused(focused and (if (s.multi) i == s.cursor else selected));
+        def.layer.sync(&def.inter, on);
+        if (def.layer.paintColor()) |lc| {
+            ui.paint.fillRRectCorners(ctx, sr.x, sr.y, sr.w, sr.h, sh.tl, sh.tr, sh.br, sh.bl, lc);
         }
+        var xs: [24]f32 = undefined;
+        var ys: [24]f32 = undefined;
+        def.ripples.color = on;
+        def.ripples.paintIn(ctx, sr, segClip(sh, &xs, &ys));
     }
     // content: [icon, gap, label] centered (the always-reserved icon slot
     // means an icon-less label centers in the segment — see segWidth)
@@ -586,22 +603,96 @@ fn segPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+/// The segment's itemShape as a clip polygon for the bounded ripple —
+/// upstream clips indication to the shape (`Surface.clip(itemShape)`);
+/// the ripple ABI's `.path` clip is a polygon, so each rounded row end
+/// becomes a 5-chord quarter-arc (an h/2 radius → ≈4dp chords — AA-fine
+/// at 40dp). Square corners emit their vertex once. The buffers are
+/// caller scratch — paint is synchronous, the slices only live for the
+/// call.
+fn segClip(sh: SegShape, xs: *[24]f32, ys: *[24]f32) ui.ripple.Clip {
+    const sr = sh.sr;
+    // (corner center, radius) in clockwise order — y-down screen space,
+    // where clockwise = the arc angle increasing.
+    const corners = [4]struct { cx: f32, cy: f32, r: f32 }{
+        .{ .cx = sr.x + sh.tl, .cy = sr.y + sh.tl, .r = sh.tl },
+        .{ .cx = sr.x + sr.w - sh.tr, .cy = sr.y + sh.tr, .r = sh.tr },
+        .{ .cx = sr.x + sr.w - sh.br, .cy = sr.y + sr.h - sh.br, .r = sh.br },
+        .{ .cx = sr.x + sh.bl, .cy = sr.y + sr.h - sh.bl, .r = sh.bl },
+    };
+    const pi = std.math.pi;
+    const arcs = [4][2]f32{
+        .{ pi, pi * 1.5 }, // tl: left-edge tangent → top-edge tangent
+        .{ pi * 1.5, pi * 2.0 }, // tr: top → right
+        .{ 0.0, pi / 2.0 }, // br: right → bottom
+        .{ pi / 2.0, pi }, // bl: bottom → left
+    };
+    var n: usize = 0;
+    for (corners, arcs) |c, a| {
+        if (c.r <= 0) {
+            xs[n] = c.cx;
+            ys[n] = c.cy;
+            n += 1;
+            continue;
+        }
+        for (0..6) |k| {
+            const ang = a[0] + (a[1] - a[0]) * (@as(f32, @floatFromInt(k)) / 5.0);
+            xs[n] = c.cx + c.r * @cos(ang);
+            ys[n] = c.cy + c.r * @sin(ang);
+            n += 1;
+        }
+    }
+    return .{ .path = .{ .xs = xs[0..n], .ys = ys[0..n] } };
+}
+
+/// End a segment's live press (release = up, cancel = drag-off/outside) —
+/// the tracker entry and its ripple pair on `press_id` (Ripple.kt:209-211:
+/// Release/Cancel both retire the ripple).
+fn segEndPress(s: *SegState, i: usize, now_ms: u64, cancel: bool) void {
+    const def = &s.items.items[i];
+    if (def.press_id == 0) return;
+    if (cancel) def.inter.cancel(def.press_id) else def.inter.release(def.press_id);
+    def.ripples.release(def.press_id, now_ms);
+    def.press_id = 0;
+}
+
+/// Move the hover interaction to a new segment (-1 = none). A disabled
+/// segment gets no tracker entry (upstream: enabled=false drops the whole
+/// interaction set); `hovered` still records the index — the paint gate
+/// and tests read the bookkeeping.
+fn segSetHover(s: *SegState, h: i32) void {
+    if (h == s.hovered) return;
+    if (s.hovered >= 0) s.items.items[@intCast(s.hovered)].inter.endHover();
+    s.hovered = h;
+    if (h >= 0 and s.items.items[@intCast(h)].enabled) {
+        _ = s.items.items[@intCast(h)].inter.hoverEnter();
+    }
+}
+
 fn segOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     const idx = segAt(s, s.opts.theme, n.bounds, ev.x, ev.y);
     switch (ev.phase) {
         .down => {
             if (idx < 0 or !s.items.items[@intCast(idx)].enabled) return false;
+            // a second pointer supersedes the live press (single-press
+            // bookkeeping — the tracker itself supports more)
+            if (s.pressed >= 0) {
+                segEndPress(s, @intCast(s.pressed), ev.time_ms, true);
+                s.pressed = -1;
+            }
+            const def = &s.items.items[@intCast(idx)];
+            def.press_id = def.inter.pressDown(ev.x, ev.y);
+            def.ripples.spawn(def.press_id, ev.x, ev.y, ev.time_ms);
             s.pressed = idx;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
             const was = s.pressed;
             s.pressed = -1;
-            n.markDirty();
+            if (was >= 0) segEndPress(s, @intCast(was), ev.time_ms, false);
             if (was >= 0 and idx == was) {
                 if (s.multi) segToggle(n, @intCast(was)) else segSelect(n, @intCast(was));
             }
@@ -609,42 +700,39 @@ fn segOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .move => {
             // A drag beyond the touch slop is a scroll, not a press: cancel
-            // the pressed state. The move is NOT claimed (return false) so
-            // it keeps bubbling to scrollable ancestors.
+            // the press (upstream's Cancel — the ripple still fades out).
+            // The move is NOT claimed (return false) so it keeps bubbling
+            // to scrollable ancestors.
             if (s.pressed >= 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    segEndPress(s, @intCast(s.pressed), ev.time_ms, true);
                     s.pressed = -1;
-                    n.markDirty();
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = -1;
-            n.markDirty();
+            if (s.pressed >= 0) {
+                segEndPress(s, @intCast(s.pressed), ev.time_ms, true);
+                s.pressed = -1;
+            }
             return true;
         },
         .enter => {
-            s.hovered = idx;
-            n.markDirty();
+            segSetHover(s, idx);
             return true;
         },
         // moving across segments within the leaf emits hover_move (not
         // enter/leave): re-resolve the segment under the pointer
         .hover_move => {
-            const h = segAt(s, s.opts.theme, n.bounds, ev.x, ev.y);
-            if (h != s.hovered) {
-                s.hovered = h;
-                n.markDirty();
-            }
+            segSetHover(s, segAt(s, s.opts.theme, n.bounds, ev.x, ev.y));
             return true;
         },
         .leave => {
-            s.hovered = -1;
-            n.markDirty();
+            segSetHover(s, -1);
             return true;
         },
     }
@@ -682,7 +770,22 @@ fn segOnKey(n: *Node, ev: input.KeyEvent) bool {
         },
         .space, .enter => {
             if (!s.multi) return false;
-            if (s.cursor < s.items.items.len) segToggle(n, s.cursor);
+            if (s.cursor < s.items.items.len) {
+                const def = &s.items.items[s.cursor];
+                if (def.enabled) {
+                    // upstream's keyPress emits Press+Release on the
+                    // interactionSource — a centered bounded ripple that
+                    // still runs its full expand + fade-out.
+                    const sh = segShape(n.bounds, s.cursor, s.items.items.len, segWidthFit(s, s.opts.theme, n.bounds));
+                    const cx = sh.sr.x + sh.sr.w / 2;
+                    const cy = sh.sr.y + sh.sr.h / 2;
+                    const pid = def.inter.pressDown(cx, cy);
+                    def.ripples.spawn(pid, cx, cy, 0);
+                    def.inter.release(pid);
+                    def.ripples.release(pid, 0);
+                }
+                segToggle(n, s.cursor);
+            }
             return true;
         },
         else => {},
@@ -698,6 +801,8 @@ fn segDeinit(n: *Node) void {
     input.releaseNode(n);
     for (s.items.items) |*def| {
         if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&def.anim.chan)); // the cb points into this item
+        def.layer.deinit(); // the in-flight tween's userdata is `l`
+        def.ripples.deinit(); // the live ticker's userdata is `r`
         if (def.wrap) |l| ui.paint.textLayoutDestroy(l);
         n.allocator.free(def.label);
     }
@@ -786,6 +891,16 @@ fn segBuild(allocator: std.mem.Allocator, items: []const SegmentedItem, opts: Se
         try s.items.append(.{ .label = label, .icon = item.icon, .enabled = item.enabled, .anim = .{ .n = node } });
     }
     node.state = s;
+    // The per-segment indication set (each SegmentedButton is its own
+    // selectable upstream): mutations + ticks damage the row node; the
+    // layer alphas + the pressed ink come from the theme state table; the
+    // ripple's color is set per-paint (it flips with the selection).
+    for (s.items.items) |*def| {
+        def.inter.node = node;
+        def.layer.node = node;
+        def.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+        def.ripples = .{ .bounded = true, .node = node, .pressed_alpha = opts.theme.state.pressed };
+    }
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
     snapChecks(s); // the initial check state is settled — no enter anim
     // Per-segment virtual a11y children — VoiceOver reads/selects each
