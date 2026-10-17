@@ -12,6 +12,7 @@ const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 const golden = @import("../golden.zig");
 const text_w = @import("text.zig");
+const text_edit = @import("text_edit.zig");
 const layout_w = @import("layout.zig");
 
 const Node = ui.node.Node;
@@ -511,33 +512,17 @@ pub const TextFieldOptions = struct {
     initial: []const u8 = "",
 };
 
-/// Write the null sentinel at items[len] (requires capacity > len — callers
-/// ensureTotalCapacity first). The slice length stays at the text length, so
-/// items[0..len :0] is valid.
-fn setSentinel(buf: *std.array_list.Managed(u8)) void {
-    buf.items.len += 1;
-    buf.items[buf.items.len - 1] = 0;
-    buf.items.len -= 1;
-}
-
 const TextFieldState = struct {
-    buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
+    edit: text_edit.Edit,
     placeholder: [:0]const u8, // owned
     opts: TextFieldOptions,
     on_changed: ?Callback = null,
     on_submitted: ?Callback = null,
-
-    fn text(s: *TextFieldState) [:0]const u8 {
-        // Sentinel slice via the many-item pointer: the null terminator sits at
-        // items[len] in the spare capacity (a plain items[0..len :0] slice would
-        // require the sentinel to be inside the slice bounds).
-        return s.buf.items.ptr[0..s.buf.items.len :0];
-    }
 };
 
 fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(TextFieldState, n);
-    const str = if (s.buf.items.len > 0) s.text() else s.placeholder;
+    const str = if (s.edit.buf.items.len > 0) s.edit.text() else s.placeholder;
     const m = ui.paint.measureText(str, s.opts.size, false);
     return c.constrain(.{ .w = m.width + s.opts.padding.hSum() + 2, .h = m.height + s.opts.padding.vSum() });
 }
@@ -549,84 +534,112 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(TextFieldState, n);
     const b = n.bounds;
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, s.opts.radius, s.opts.bg);
-    const empty = s.buf.items.len == 0;
-    const str = if (empty) s.placeholder else s.text();
+    const empty = s.edit.buf.items.len == 0;
+    const str = if (empty) s.placeholder else s.edit.text();
     const m = ui.paint.measureText(str, s.opts.size, false);
     const text_x = b.x + s.opts.padding.left;
-    const text_y = b.y + (b.h - m.height) / 2 + m.ascent;
+    const text_y = b.y + (b.h - m.height) / 2 + m.ascent; // baseline
+    if (!empty) {
+        const sel = s.edit.selRange();
+        if (sel.hi > sel.lo) {
+            // The selection highlight sits behind the glyphs.
+            const hx0 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.lo], s.opts.size, false).width;
+            const hx1 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.hi], s.opts.size, false).width;
+            ui.paint.fillRect(ctx, hx0, text_y - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(s.opts.color, 0.3));
+        }
+    }
     if (str.len > 0) ui.paint.text(ctx, str, text_x, text_y, s.opts.size, false, if (empty) s.opts.hint else s.opts.color);
-    if (input.isFocused(n)) {
-        // Cursor bar at the end of the text (P0: cursor always at the end).
-        const cursor_x = text_x + (if (empty) @as(f32, 0) else m.width + 1);
-        ui.paint.fillRect(ctx, cursor_x, b.y + s.opts.padding.top, 2, m.height, s.opts.color);
+    const focused = input.isFocused(n);
+    if (focused) s.edit.ensureTicker(); // the caret blink
+    const has_comp = s.edit.comp.items.len > 0;
+    if (!empty or has_comp) {
+        var caret_x = text_x + ui.paint.measureTextLen(s.edit.text()[0..s.edit.caret], s.opts.size, false).width;
+        if (has_comp) {
+            // The live preedit paints underlined after the committed text;
+            // comp_start positions the IME cursor inside it.
+            const comp = s.edit.composition();
+            const comp_m = ui.paint.measureText(comp, s.opts.size, false);
+            const cx = text_x + (if (empty) @as(f32, 0) else m.width);
+            ui.paint.text(ctx, comp, cx, text_y, s.opts.size, false, s.opts.color);
+            ui.paint.fillRect(ctx, cx, text_y + 1, comp_m.width, 1, s.opts.color);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_x = cx + ui.paint.measureTextLen(comp[0..at], s.opts.size, false).width;
+        }
+        if (focused and s.edit.caret_on) {
+            ui.paint.fillRect(ctx, caret_x, text_y - m.ascent, 2, m.ascent + m.descent, s.opts.color);
+        }
+    } else if (focused and s.edit.caret_on) {
+        // Empty field: the caret at the text start.
+        ui.paint.fillRect(ctx, text_x, b.y + s.opts.padding.top, 2, m.height, s.opts.color);
     }
 }
+
+/// Byte offset of the grapheme boundary nearest to the press — the point
+/// is projected into the painted run's space (text starts at padding.left,
+/// the line box tops at baseline - ascent).
+fn inputCaretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
+    const str = s.edit.text();
+    const m = ui.paint.measureText(str, s.opts.size, false);
+    const text_top = n.bounds.y + (n.bounds.h - m.height) / 2;
+    return text_edit.caretFromPoint(str, px - (n.bounds.x + s.opts.padding.left), py - text_top, s.opts.size);
+}
+
 fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const s = stateOf(TextFieldState, n);
     switch (ev.phase) {
         .down => {
             input.requestFocus(n);
+            // Press-to-caret; tap() handles placement vs double-click
+            // word select.
+            s.edit.tap(inputCaretFromPoint(n, s, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
             n.markDirty();
             return true;
         },
-        .up => return true,
+        .up => {
+            s.edit.dragging = false;
+            s.edit.drag_word = false;
+            return true;
+        },
+        .move => {
+            if (!s.edit.dragging) return false;
+            s.edit.dragExtend(inputCaretFromPoint(n, s, ev.x, ev.y));
+            return true;
+        },
         else => {},
     }
     return false;
 }
+
+/// An edit happened: repaint, sync the a11y value, fire the callback.
+fn inputApplyEdit(n: *Node) void {
+    const s = stateOf(TextFieldState, n);
+    n.markDirty();
+    if (n.semantics) |sem| sem.value = s.edit.text(); // a11y: the value follows edits
+    if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
+}
+
 fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(TextFieldState, n);
-    switch (ev.kind) {
-        .text_editing => {
-            // Legacy widget: IME preedit is consumed but not rendered —
-            // the M3E fields render the composing span underlined.
+    if (s.edit.handleKey(ev, inputApplyEdit)) return true;
+    if (ev.kind == .key_down) switch (ev.key) {
+        .enter => {
+            if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .text_input => {
-            // Reject (never truncate) input that would grow the text past
-            // the documented cap — a paste/IME burst is applied whole or
-            // not at all.
-            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
-            s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
-            s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
-            setSentinel(&s.buf);
+        .escape => {
+            input.requestFocus(null);
             n.markDirty();
-            if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
-            if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .key_down => switch (ev.key) {
-            .backspace => {
-                // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (s.buf.items.len > 0) {
-                    const last = s.buf.items[s.buf.items.len - 1];
-                    s.buf.items.len -= 1;
-                    if ((last & 0xC0) != 0x80) break;
-                }
-                setSentinel(&s.buf);
-                n.markDirty();
-                if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
-                if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
-                return true;
-            },
-            .enter => {
-                if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
-                return true;
-            },
-            .escape => {
-                input.requestFocus(null);
-                n.markDirty();
-                return true;
-            },
-            else => {},
-        },
-    }
+        else => {},
+    };
     return false;
 }
 fn textFieldDeinit(n: *Node) void {
     input.releaseNode(n);
     const s = stateOf(TextFieldState, n);
     n.allocator.free(s.placeholder);
-    s.buf.deinit();
+    s.edit.deinit();
     n.allocator.destroy(s);
 }
 const text_field_vtable = ui.node.VTable{
@@ -652,7 +665,7 @@ pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_change
     @memcpy(placeholder[0..opts.placeholder.len], opts.placeholder);
     placeholder[opts.placeholder.len] = 0;
     s.* = .{
-        .buf = std.array_list.Managed(u8).init(allocator),
+        .edit = text_edit.Edit.init(allocator, node),
         .placeholder = placeholder[0..opts.placeholder.len :0],
         .opts = opts,
         .on_changed = on_changed,
@@ -660,18 +673,16 @@ pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_change
     };
     errdefer {
         allocator.free(s.placeholder);
-        s.buf.deinit();
+        s.edit.deinit();
     }
-    s.buf.ensureTotalCapacity(opts.initial.len + 1) catch @panic("klaxon: out of memory");
     if (opts.initial.len > 0) {
-        s.buf.appendSlice(opts.initial) catch @panic("klaxon: out of memory");
+        _ = s.edit.insert(opts.initial); // len ≤ cap was checked above
     }
-    setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
     node.state = s;
     // value = the initial text too — a pre-filled field must announce its
     // content; without it, screen readers see an empty value until the first
-    // edit re-syncs it (lines "a11y: the value follows edits" below).
-    ui.semantics.attach(node, .{ .role = .text_field, .focusable = true, .hint = s.placeholder, .value = s.text() }); // Phase 2c
+    // edit re-syncs it (the "a11y: the value follows edits" line above).
+    ui.semantics.attach(node, .{ .role = .text_field, .focusable = true, .hint = s.placeholder, .value = s.edit.text() }); // Phase 2c
     return node;
 }
 
@@ -679,7 +690,7 @@ pub fn textField(allocator: std.mem.Allocator, opts: TextFieldOptions, on_change
 /// the next edit or deinit). Apps read it from on_changed/on_submitted.
 pub fn textFieldText(n: *Node) [:0]const u8 {
     const s = stateOf(TextFieldState, n);
-    return s.text();
+    return s.edit.text();
 }
 
 // --- Dropdown (popup menu) ---
@@ -1141,11 +1152,11 @@ test "text field edits the buffer (type, backspace, submit, escape)" {
     // type "ab"
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "a" });
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "b" });
-    try std.testing.expectEqualStrings("ab", s.text());
+    try std.testing.expectEqualStrings("ab", s.edit.text());
     try std.testing.expectEqual(@as(u32, 2), changed.fired);
     // backspace deletes the last codepoint (multi-byte safe)
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
-    try std.testing.expectEqualStrings("a", s.text());
+    try std.testing.expectEqualStrings("a", s.edit.text());
     // enter submits, escape unfocuses
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
     try std.testing.expectEqual(@as(u32, 1), submitted.fired);
@@ -1161,12 +1172,38 @@ test "text field deletes multi-byte codepoints correctly" {
     defer root.deinit();
     root.layout(.{ .x = 0, .y = 0, .w = 160, .h = 32 });
     const s = stateOf(TextFieldState, root);
-    try std.testing.expectEqualStrings("a\u{25CF}b", s.text());
+    try std.testing.expectEqualStrings("a\u{25CF}b", s.edit.text());
     router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 16 });
+    // The click also places the caret (click-to-caret) — park it at the
+    // text end so the backspaces below eat the trailing codepoints.
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace }); // deletes b
-    try std.testing.expectEqualStrings("a\u{25CF}", s.text());
+    try std.testing.expectEqualStrings("a\u{25CF}", s.edit.text());
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace }); // deletes ● (3 bytes at once)
-    try std.testing.expectEqualStrings("a", s.text());
+    try std.testing.expectEqualStrings("a", s.edit.text());
+}
+
+test "text field: the caret is a real position (mid-text edits, selection)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const root = try textField(std.testing.allocator, .{ .initial = "ac" }, null, null);
+    defer root.deinit();
+    root.layout(.{ .x = 0, .y = 0, .w = 160, .h = 32 });
+    const s = stateOf(TextFieldState, root);
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 16 });
+    // Home/Left/End move the caret; a mid-text insert lands between the
+    // glyphs — the old end-caret model couldn't express this.
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "b" });
+    try std.testing.expectEqualStrings("abc", s.edit.text());
+    // End, then Shift+Left selects the 'c'; backspace deletes the
+    // selection.
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left, .shift = true });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("ab", s.edit.text());
 }
 
 test "dropdown: initial_selected picks the starting item (clamped)" {

@@ -68,8 +68,10 @@ Each widget's header carries the same list; these are the tracked ones
   core: real caret (click-to-position hit test, 500ms blink), selection
   (shift/drag + highlight + range edits), grapheme-cluster arrows and
   double-click word select via ICU UBRK (ABI 0.23.0), Cmd/Ctrl+A/C/X/V
-  on the platform clipboard.
-  The legacy `input.zig` textField (conformance-only) still end-caret.
+  on the platform clipboard. The legacy `input.zig` textField
+  (conformance-only) rides the same `text_edit.zig` core — caret,
+  selection, grapheme arrows, word select, clipboard, underlined IME
+  preedit.
 - `time_picker.zig` — the text-input variant (`opts.mode = .input`,
   upstream `TimeInput`) landed on the shared `text_edit.zig` core: the
   selected field is a real editable box (caret/selection/clipboard,
@@ -113,9 +115,11 @@ Each widget's header carries the same list; these are the tracked ones
 - `drawer.zig` — no predictive back, window-inset padding, or content
   scale-down during overshoot; `confirm_state_change` gates only
   drawer-initiated transitions (the app owns the signal).
-- `gestures.zig` — long-press without a timeline fires on the first event
-  after the deadline. (Slop is pointer-type aware — fixed audit row; the
-  tap now holds for the double-tap window when on_double_tap exists.)
+- `gestures.zig` — the long-press fires at its deadline without a pointer
+  event (the arena registers a timeline ticker on pointer-down;
+  `hasPendingTimeWork` wakes the host); in headless no-timeline tests it
+  fires on the next event. (Slop is pointer-type aware; a tap holds for
+  the double-tap window when `on_double_tap` exists.)
 - `i18n.zig` — number/date tables cover en/fr/ja/ar/es; ar renders CLDR
   Arabic-Indic digits/separators (other native digit sets need the ICU
   upgrade path). (The paragraph bidi base direction follows the locale —

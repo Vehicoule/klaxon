@@ -73,10 +73,14 @@ pub const Edit = struct {
 
     /// The committed text (borrowed, null-terminated).
     pub fn text(e: *const Edit) [:0]const u8 {
+        // A fresh list's items.ptr is undefined — the sentinel slice would
+        // dereference it; an empty text needs no sentinel storage.
+        if (e.buf.items.len == 0) return "";
         return e.buf.items.ptr[0..e.buf.items.len :0];
     }
     /// The live preedit (borrowed, null-terminated).
     pub fn composition(e: *const Edit) [:0]const u8 {
+        if (e.comp.items.len == 0) return "";
         return e.comp.items.ptr[0..e.comp.items.len :0];
     }
 
