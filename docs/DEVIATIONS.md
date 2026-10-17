@@ -53,8 +53,9 @@ Each widget's header carries the same list; these are the tracked ones
   the timeline — AnimatedShape parity.)
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
-- `slider.zig` — the value indicator doesn't morph its shape (upstream's
-  label animates in on drag start). Steps/ticks, the pressed value
+- `slider.zig` — the value indicator now morphs on the timeline (150ms
+  emphasized fade + pop from the tail tip, like upstream's label
+  animation) instead of popping. Steps/ticks, the pressed value
   bubble, the corner-inset thumb mapping and PageUp/PageDown
   (actualSteps/10 clamped to [1,10] ticks) match upstream.
 - `split_button.zig` — filled only; no checked trailing morph; trailing

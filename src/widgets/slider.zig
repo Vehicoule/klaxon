@@ -103,6 +103,11 @@ const SliderState = struct {
     handle_w: f32 = thumb_w,
     handle_target: f32 = thumb_w,
     anim_channel: u8 = 0, // channel marker (stable address)
+    /// The value indicator's appear progress — 0 hidden, 1 fully shown;
+    /// upstream fades the label in on drag start rather than popping it.
+    indicator_a: f32 = 0,
+    indicator_target: f32 = 0,
+    ind_channel: u8 = 0, // channel marker (stable address)
     /// The semantic value string ("42%") — borrowed by the semantics.
     value_buf: [16]u8 = std.mem.zeroes([16]u8),
     value_len: usize = 0,
@@ -174,6 +179,12 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
     if (want != s.handle_target) {
         s.handle_target = want;
         morphHandle(n, s, want);
+    }
+    // Same lazy retarget for the indicator appear (pressed/dragging).
+    const want_ind: f32 = if ((s.pressed or s.dragging) and s.opts.enabled) 1 else 0;
+    if (want_ind != s.indicator_target) {
+        s.indicator_target = want_ind;
+        morphIndicator(n, s, want_ind);
     }
     const thw = s.handle_w;
     // Compose drawTrack: the track splits into an ACTIVE segment
@@ -261,21 +272,31 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
 
     // --- value indicator (while pressed/dragging): the InverseSurface
     // pill + tail 12dp above the thumb's top (ValueIndicatorActiveBottom-
-    // Space), LabelLarge InverseOnSurface value text ---
-    if ((s.pressed or s.dragging) and s.opts.enabled) {
+    // Space), LabelLarge InverseOnSurface value text. `indicator_a` morphs
+    // the appear: alpha + a pop from the tail tip (upstream fades/scales
+    // the label in on drag start instead of popping it).
+    const ia = s.indicator_a;
+    if (ia > 0.001 and s.opts.enabled) {
+        const bubble = ui.paint.withAlphaScaled(cs.inverse_surface, ia);
+        const ink = ui.paint.withAlphaScaled(cs.inverse_on_surface, ia);
         const ls = s.opts.theme.type_scale.label_large;
         const txt = s.value_buf[0..s.value_len :0];
         const lm = ui.paint.measureText(txt, ls.size, false);
-        const pw = @max(lm.width + indicator_h_pad * 2, 24);
-        const ph = ls.line_height + indicator_v_pad * 2;
-        const by = b.y - indicator_gap; // bubble bottom edge
+        const scale = 0.6 + 0.4 * ia;
+        const pw = @max(lm.width + indicator_h_pad * 2, 24) * scale;
+        const ph = (ls.line_height + indicator_v_pad * 2) * scale;
+        const by = b.y - indicator_gap * ia; // rises to its resting gap
         const bx = cx - pw / 2; // centered on the handle
-        ui.paint.fillRRect(ctx, bx, by - ph, pw, ph, ph / 2, cs.inverse_surface);
+        ui.paint.fillRRect(ctx, bx, by - ph, pw, ph, ph / 2, bubble);
         // the tail: a small downward point centered on the handle
-        const pts = [6]f32{ cx - indicator_tail_w / 2, by, cx + indicator_tail_w / 2, by, cx, by + indicator_tail_h };
+        const tw2 = indicator_tail_w * scale;
+        const th2 = indicator_tail_h * scale;
+        const pts = [6]f32{ cx - tw2 / 2, by, cx + tw2 / 2, by, cx, by + th2 };
         const verbs = [4]i32{ @backingInt(ui.paint.PathVerb.move), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.close) };
-        ui.paint.fillPath(ctx, &pts, &verbs, cs.inverse_surface, false);
-        ui.paint.text(ctx, txt, cx - lm.width / 2, by - ph + (ph - (lm.ascent + lm.descent)) / 2 + lm.ascent, ls.size, false, cs.inverse_on_surface);
+        ui.paint.fillPath(ctx, &pts, &verbs, bubble, false);
+        if (ia > 0.5) { // the label rides the tail of the fade
+            ui.paint.text(ctx, txt, cx - lm.width / 2, by - ph + (ph - (lm.ascent + lm.descent)) / 2 + lm.ascent, ls.size, false, ink);
+        }
     }
 }
 
@@ -405,6 +426,30 @@ fn sliderOnKey(n: *Node, ev: input.KeyEvent) bool {
 /// The handle-width morph: 4dp resting ↔ 2dp pressed/focused, sprung with
 /// the theme spatial spring (M3E fast-spatial handle morph). No timeline →
 /// snap (headless tests render the target state).
+/// The appear/disappear tween for the value indicator — 150ms emphasized
+/// (a fast-effects fade + pop like upstream's label animation).
+fn morphIndicator(n: *Node, s: *SliderState, target: f32) void {
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ s.indicator_a, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, 150, .{ .ease = .emphasized }),
+            .from = from,
+            .channel = @ptrCast(&s.ind_channel),
+            .on_update = .{ .fn_ptr = indicatorCb, .userdata = n },
+        });
+    } else {
+        s.indicator_a = target;
+        n.markDirty();
+    }
+}
+
+fn indicatorCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.indicator_a = v[0];
+    n.markDirty();
+}
+
 fn morphHandle(n: *Node, s: *SliderState, target: f32) void {
     if (ui.anim.timeline()) |tl| {
         const from: ui.anim.Vec4 = .{ s.handle_w, 0, 0, 0 };
@@ -444,7 +489,10 @@ fn sliderSyncCb(userdata: ?*anyopaque) void {
 
 fn sliderDeinit(n: *Node) void {
     const s = stateOf(n);
-    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
+        tl.cancelChannel(@ptrCast(&s.ind_channel));
+    }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = sliderSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -751,6 +799,36 @@ test "golden: pressed slider paints the value indicator bubble above the track" 
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), f2.pixelAt(80, 30));
+}
+
+test "slider: the value indicator morphs in/out on the timeline" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{});
+    defer b.deinit();
+    // The lazy retarget arms at the next paint — a real ctx is needed.
+    var r = try golden.Renderer.init(std.testing.allocator, 160, 130);
+    defer r.deinit();
+    b.layout(.{ .x = 0, .y = 60, .w = 160, .h = 44 });
+    const s = stateOf(b);
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    r.paint(b, 0xFFFFFFFF);
+    try std.testing.expectEqual(@as(f32, 1), s.indicator_target);
+    tl.tick(0); // lazy start
+    tl.tick(75); // mid-fade
+    try std.testing.expect(s.indicator_a > 0 and s.indicator_a < 1);
+    tl.tick(200); // settled
+    try std.testing.expectEqual(@as(f32, 1), s.indicator_a);
+    // Release: fades back out.
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .up, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    r.paint(b, 0xFFFFFFFF);
+    tl.tick(400);
+    tl.tick(600);
+    try std.testing.expectEqual(@as(f32, 0), s.indicator_a);
 }
 
 test "golden: slider hover paints the state layer over the inactive track" {
