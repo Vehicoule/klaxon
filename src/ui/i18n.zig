@@ -56,6 +56,11 @@ pub const Locale = struct {
     // Number formatting.
     decimal_sep: []const u8 = ".",
     group_sep: []const u8 = ",",
+    percent_sign: []const u8 = "%",
+    /// Native digits (CLDR numbering system): when set, ASCII 0-9 in the
+    /// formatted output map to these UTF-8 strings — ar uses Arabic-Indic
+    /// ٠–٩ (its CLDR default); latn locales leave null.
+    digits: ?[10][:0]const u8 = null,
     // Date formatting (pattern tokens: y, M, d — repeats set the width;
     // ICU quoting: '...' is literal text, '' is a literal quote).
     date_short: []const u8 = "M/d/yy",
@@ -177,8 +182,8 @@ pub const Locale = struct {
             try buf.appendSlice(loc.decimal_sep);
             try buf.appendSlice(frac_part);
         }
-        if (opts.percent) try buf.append('%');
-        return buf.toOwnedSlice();
+        if (opts.percent) try buf.appendSlice(loc.percent_sign);
+        return shapeDigits(loc, allocator, try buf.toOwnedSlice());
     }
 
     /// Format a date per the locale and kind (pattern tokens y/M/d).
@@ -252,9 +257,28 @@ pub const Locale = struct {
             }
             i = j;
         }
-        return buf.toOwnedSlice();
+        return shapeDigits(loc, allocator, try buf.toOwnedSlice());
     }
 };
+
+/// Map ASCII digits to the locale's native digit set (CLDR numbering
+/// system — ar/ar-EG render ١٢٣٤٥). Owns `ascii` (frees it on remap;
+/// returns it unchanged for latn locales).
+fn shapeDigits(loc: *const Locale, allocator: std.mem.Allocator, ascii: []u8) ![]u8 {
+    const digits = loc.digits orelse return ascii;
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.ensureTotalCapacity(ascii.len); // native digits are 2-byte
+    for (ascii) |ch| {
+        if (ch >= '0' and ch <= '9') {
+            try out.appendSlice(digits[ch - '0']);
+        } else {
+            try out.append(ch);
+        }
+    }
+    allocator.free(ascii);
+    return out.toOwnedSlice();
+}
 
 // --- Per-locale format data (en/fr/ja/ar/es built in; ICU is the upgrade path) ---
 
@@ -339,6 +363,11 @@ fn applyFormatData0(loc: *Locale) void {
         loc.weekday_short = .{ "日", "月", "火", "水", "木", "金", "土" };
         loc.weekday_letter = .{ "日", "月", "火", "水", "木", "金", "土" };
     } else if (std.mem.eql(u8, base, "ar")) {
+        // CLDR ar numbers: Arabic-Indic digits, ٫ decimal, ٬ group, ٪ percent.
+        loc.decimal_sep = "٫";
+        loc.group_sep = "٬";
+        loc.percent_sign = "٪";
+        loc.digits = .{ "٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩" };
         loc.date_short = "d/M/y";
         loc.date_medium = "d MMM y";
         loc.date_long = "d MMMM y";
@@ -1165,11 +1194,28 @@ test "formatDate: patterns per locale and kind" {
     try expectDate(en, date, .short, "10/7/26");
     try expectDate(fr, date, .short, "07/10/2026");
     try expectDate(ja, date, .short, "2026/10/07");
-    try expectDate(ar, date, .short, "7/10/2026");
+    try expectDate(ar, date, .short, "٧/١٠/٢٠٢٦"); // Arabic-Indic digits
     // medium/long with month names
     try expectDate(en, date, .long, "October 7, 2026");
     try expectDate(fr, date, .medium, "7 oct. 2026");
     try expectDate(ja, date, .long, "2026年10月7日");
+}
+
+test "formatNumber: ar renders Arabic-Indic digits and separators" {
+    const i18n = try testI18n();
+    defer i18n.deinit();
+    try i18n.addArb("ar", "{\"x\": \"y\"}", .rtl);
+    const ar = i18n.locales.get("ar").?;
+    {
+        const s = try ar.formatNumber(std.testing.allocator, 1234567.891, .{});
+        defer std.testing.allocator.free(s);
+        try std.testing.expectEqualStrings("١٬٢٣٤٬٥٦٧٫٨٩١", s);
+    }
+    {
+        const s = try ar.formatNumber(std.testing.allocator, 0.42, .{ .decimals = 1, .percent = true });
+        defer std.testing.allocator.free(s);
+        try std.testing.expectEqualStrings("٤٢٫٠٪", s);
+    }
 }
 
 test "direction: locale direction + process-global + setLocale flips it" {

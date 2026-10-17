@@ -85,9 +85,10 @@ Each widget's header carries the same list; these are the tracked ones
 - `gestures.zig` — long-press without a timeline fires on the first event
   after the deadline. (Slop is pointer-type aware — fixed audit row; the
   tap now holds for the double-tap window when on_double_tap exists.)
-- `i18n.zig` — number/date tables cover en/fr/ja/ar/es; no native digits
-  (ar renders Latin digits); ICU/CLDR is the upgrade path. (The paragraph
-  bidi base direction follows the locale — fixed audit row above.)
+- `i18n.zig` — number/date tables cover en/fr/ja/ar/es; ar renders CLDR
+  Arabic-Indic digits/separators (other native digit sets need the ICU
+  upgrade path). (The paragraph bidi base direction follows the locale —
+  fixed audit row above.)
 - `color_picker.zig` — no alpha slider (forced 0xFF), no RGB/HSL inputs,
   no eyedropper.
 - `kx_skia_android.cpp` — font family/fallback hardcode Roboto/Droid Sans;
