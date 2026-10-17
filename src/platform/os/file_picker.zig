@@ -22,8 +22,14 @@ pub const SaveOptions = struct {
     filters: []const FileFilter = &.{},
 };
 
-/// Invoked with selected paths (empty slice on cancel).
-pub const Callback = *const fn (userdata: ?*anyopaque, paths: []const []const u8) void;
+/// Why the callback fired: `.ok` — `paths` holds the user's picks;
+/// `.cancelled` — the user dismissed the dialog (paths empty);
+/// `.unavailable` — no backend installed / platform cannot show dialogs;
+/// `.err` — the backend failed (paths empty).
+pub const Status = enum { ok, cancelled, unavailable, err };
+
+/// Invoked with the outcome. `paths` slices are only valid for the call.
+pub const Callback = *const fn (userdata: ?*anyopaque, status: Status, paths: []const []const u8) void;
 
 pub const Impl = struct {
     open_file: ?*const fn (opts: OpenOptions, cb: Callback, userdata: ?*anyopaque) void = null,
@@ -40,7 +46,7 @@ pub fn openFile(opts: OpenOptions, cb: Callback, userdata: ?*anyopaque) void {
     if (impl.open_file) |f| {
         f(opts, cb, userdata);
     } else {
-        cb(userdata, &.{});
+        cb(userdata, .unavailable, &.{});
     }
 }
 
@@ -48,25 +54,25 @@ pub fn saveFile(opts: SaveOptions, cb: Callback, userdata: ?*anyopaque) void {
     if (impl.save_file) |f| {
         f(opts, cb, userdata);
     } else {
-        cb(userdata, &.{});
+        cb(userdata, .unavailable, &.{});
     }
 }
 
-test "file_picker: uninstalled invokes callback with empty selection" {
+test "file_picker: uninstalled reports unavailable, not a cancelled pick" {
     install(.{});
     var called = false;
-    var count: usize = 99;
+    var st: Status = .ok;
     const Ctx = struct {
         called: *bool,
-        count: *usize,
-        fn cb(ud: ?*anyopaque, paths: []const []const u8) void {
+        st: *Status,
+        fn cb(ud: ?*anyopaque, status: Status, paths: []const []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ud.?));
             self.called.* = true;
-            self.count.* = paths.len;
+            self.st.* = status;
         }
     };
-    var ctx: Ctx = .{ .called = &called, .count = &count };
+    var ctx: Ctx = .{ .called = &called, .st = &st };
     openFile(.{}, Ctx.cb, &ctx);
     try std.testing.expect(called);
-    try std.testing.expectEqual(@as(usize, 0), count);
+    try std.testing.expectEqual(Status.unavailable, st);
 }

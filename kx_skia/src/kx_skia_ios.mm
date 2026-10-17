@@ -305,4 +305,33 @@ extern "C" bool kx_ios_window_mapped(void* uiwindow) {
     return (v && v.window == w);
 }
 
+// UIKit's safeAreaInsets deliberately excludes the on-screen keyboard, and
+// SDL keeps the frame it tracks in a private view-controller property — so
+// we observe UIKeyboardWillChangeFrame ourselves and cache the occluded
+// strip height. A keyboard docked to the bottom edge reports its height;
+// a floating/undocked keyboard (end frame above the bottom edge) reports
+// 0 since it doesn't push content.
+static float g_kx_kb_height = 0;
+
+__attribute__((constructor)) static void kx_ios_watch_keyboard(void) {
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIKeyboardWillChangeFrameNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification* n) {
+        const CGRect end =
+            [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+        const CGFloat screen_h = UIScreen.mainScreen.bounds.size.height;
+        g_kx_kb_height =
+            (end.origin.y + end.size.height >= screen_h - 1)
+                ? (float)MAX(0, screen_h - end.origin.y)
+                : 0;
+    }];
+}
+
+// Screen-points height of the bottom strip the on-screen keyboard covers.
+extern "C" float kx_ios_keyboard_height(void) {
+    return g_kx_kb_height;
+}
+
 } // namespace kx

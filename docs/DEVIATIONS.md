@@ -14,6 +14,7 @@ See [`docs/DECISIONS.md`](file:///Users/btw/Documents/projects/Klaxon/docs/DECIS
 - **Platform layer & C ABI**: added `src/platform/` (`storage/kv.zig`, `storage/paths.zig`, `net/http.zig`, `os/window_insets.zig`, `os/url.zig`, `os/haptics.zig`, `os/file_picker.zig`, `os/share.zig`, `os/notifications.zig`, `media/video.zig`, `runtime/plugin.zig`), `include/klaxon.h` + `src/c_abi.zig` with compile-time layout assertions, and `gates/thresholds.json`.
 - **GPU backends & HiDPI**: persisted `skgpu::graphite::Recorder` at context lifetime across Linux Vulkan, Windows Dawn/D3D12, and WebGPU (eliminating the per-frame `offscreen_pools`/`images`/`atlas` wipe in `kx_begin_frame`), unified root HiDPI scaling after `kx_begin_frame` across all platforms (fixing iOS 1× scale), scaled `kx_offscreen_acquire` by `display_scale`, shared a single `MTLCommandQueue` on iOS, fixed MRC `+1` leaks on macOS/iOS, fixed RTL sub-run ordering in `shape_line_runs`, fixed Linux `platform_font_mgr`/`platform_font_family`, and fixed the `kx_atlas_alloc` free-slot leak.
 - **6-platform accessibility & modal trapping**: fixed `kx_a11y_dump_tree`/`kx_a11y_free_string` capacity mismatch via `toOwnedSliceSentinel(0)`, trapped focus/semantics to open modals (`Dialog`, `Drawer`, `BottomSheet`, `SideSheet`), and overhauled all 6 native accessibility bridges (macOS, iOS, Android, Windows, Linux, Web).
+- **Backend-request honesty & Layer-4 services**: `gpu_init` on Android/macOS/wasm now rejects backend requests it cannot honor instead of silently labelling a different renderer (e.g. a Ganesh-GLES context reported as Graphite-Vulkan), and the Android raster path presents through SDL like the desktop instead of a dead surface. `host.zig` installs real SDL backends for the Layer-4 contracts: `openUrl` → `SDL_OpenURL`, the file picker → `SDL_ShowFileDialogWithProperties` (title/location/filters/many, results marshalled to the main thread, `Status` distinguishing `ok`/`cancelled`/`unavailable`/`err`), and `paths.resolve` → `SDL_GetPrefPath`/`SDL_GetBasePath` — with env-convention fallbacks (`XDG_*`/`$HOME`/`%APPDATA%`) replacing the bogus `/etc`, `/var/lib`, system `/Library` and `C:\Users\Default` placeholders. Haptics stays uninstalled: SDL has no UI-haptic API (it is an honest no-op, not a fake). Safe-area/keyboard wiring detailed in the drawer entry below.
 - **UI engine, M3E widgets, registry & build/CLI**: fixed `i18n.zig` cross-allocator free, `carousel.zig` `cancelChannel` UAF and keyline stack OOB, `list_view.zig`/`image.zig` `ctxSerialAlive` checks, `registry.zig` `BuildCtx.rollback` UAF + registered all 16 missing widgets, `text_field.zig`/`search_bar.zig` horizontal scroll + IME preedit reset + duplicate `errdefer`, `color_picker.zig` `#RRGGBB` alpha preservation, `anim.zig` scale guards, `node.zig` `.measure_pure = true` + `impure_descendant` recomputation + negative scale culling, `navigator.zig` query-string navigation + Hero transforms, `devtools.zig` `dt_ms` recording, and `build.zig` cross-target `mcu_sources` / `-Dapp-root`.
 
 ## Fixed in the 2026-10-16 audit
@@ -211,9 +212,16 @@ Each widget's header carries the same list; these are the tracked ones
   transitions (the app owns the signal). The sheet `content` slot is
   padded by `platform.window_insets.safeArea()` (Vertical + Start,
   matching `DrawerDefaults.windowInsets`; the surface still paints
-  edge-to-edge) — the host diffs the display usable-bounds on window/
-  display events and marks the tree layout-dirty when an inset changes,
-  so content re-lays out on the next frame.
+  edge-to-edge) — the host reads `SDL_GetWindowSafeArea` (per-window
+  status/nav-bar + cutout insets on Android, UIKit `safeAreaInsets` on
+  iOS, the display notch on macOS) on safe-area/keyboard/geometry events
+  and marks the tree layout-dirty when an inset changes, so content
+  re-lays out on the next frame. `window_insets.keyboardHeight()` is real
+  too: Android unions `WindowInsets.Type.ime()` into the reported bottom
+  edge (the host splits it back out via `SDL_ScreenKeyboardShown` + the
+  nav baseline), iOS reads the observed `UIKeyboardWillChangeFrame` end
+  height (`kx_ios_keyboard_height`), and `SDL_EVENT_SCREEN_KEYBOARD_*`
+  trigger the resync.
 - `gestures.zig` — the long-press fires at its deadline without a pointer
   event (the arena registers a timeline ticker on pointer-down;
   `hasPendingTimeWork` wakes the host); in headless no-timeline tests it

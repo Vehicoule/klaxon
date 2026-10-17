@@ -958,6 +958,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                     imm.hideSoftInputFromWindow(mTextEdit.getWindowToken(), 0);
 
                     mScreenKeyboardShown = false;
+                    onNativeScreenKeyboardHidden();
 
                     mSurface.requestFocus();
                 }
@@ -1084,6 +1085,8 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native void nativeSetNaturalOrientation(int orientation);
     public static native void onNativeRotationChanged(int rotation);
     public static native void onNativeInsetsChanged(int left, int right, int top, int bottom);
+    public static native void onNativeScreenKeyboardShown();
+    public static native void onNativeScreenKeyboardHidden();
     public static native void nativeAddTouch(int touchId, String name);
     public static native void nativePermissionResult(int requestCode, boolean result);
     public static native void onNativeLocaleChanged();
@@ -1439,6 +1442,9 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
             imm.showSoftInput(mTextEdit, 0);
 
             mScreenKeyboardShown = true;
+            if (imm.isAcceptingText()) {
+                onNativeScreenKeyboardShown();
+            }
         }
     }
 

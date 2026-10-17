@@ -25,6 +25,10 @@ pub fn install(i: Impl) void {
 }
 
 /// Resolve a platform directory path for `(org, app)`. Caller owns the returned slice.
+/// The fallback chain (no backend installed — tests, headless) reads the
+/// platform's own conventions: XDG dirs / $HOME on Linux, ~/Library on
+/// Apple, %APPDATA%/%LOCALAPPDATA% on Windows, $TMPDIR for temp — never a
+/// system directory an app could not write to.
 pub fn resolveDir(
     allocator: std.mem.Allocator,
     kind: DirKind,
@@ -36,26 +40,82 @@ pub fn resolveDir(
     }
     const clean_org = if (org.len == 0) "klaxon" else org;
     const clean_app = if (app.len == 0) "app" else app;
+    const unavailable = error.DirectoryUnavailable;
 
     return switch (kind) {
-        .temp => allocator.dupe(u8, if (builtin.os.tag == .windows) "C:\\Temp" else "/tmp"),
+        .temp => tempFallback(allocator),
         .app_data => switch (builtin.os.tag) {
-            .macos, .ios => std.fmt.allocPrint(allocator, "/Library/Application Support/{s}/{s}", .{ clean_org, clean_app }),
-            .windows => std.fmt.allocPrint(allocator, "C:\\Users\\Default\\AppData\\Roaming\\{s}\\{s}", .{ clean_org, clean_app }),
-            else => std.fmt.allocPrint(allocator, "/var/lib/{s}/{s}", .{ clean_org, clean_app }),
+            .windows => if (env("APPDATA")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ b, clean_org, clean_app })
+            else if (env("USERPROFILE")) |up|
+                std.fmt.allocPrint(allocator, "{s}/AppData/Roaming/{s}/{s}", .{ up, clean_org, clean_app })
+            else
+                unavailable,
+            .macos, .ios => if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/Library/Application Support/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
+            else => if (env("XDG_DATA_HOME")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ b, clean_org, clean_app })
+            else if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/.local/share/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
         },
         .cache => switch (builtin.os.tag) {
-            .macos, .ios => std.fmt.allocPrint(allocator, "/Library/Caches/{s}/{s}", .{ clean_org, clean_app }),
-            .windows => std.fmt.allocPrint(allocator, "C:\\Users\\Default\\AppData\\Local\\{s}\\{s}\\Cache", .{ clean_org, clean_app }),
-            else => std.fmt.allocPrint(allocator, "/var/cache/{s}/{s}", .{ clean_org, clean_app }),
+            .windows => if (env("LOCALAPPDATA")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}/Cache", .{ b, clean_org, clean_app })
+            else if (env("USERPROFILE")) |up|
+                std.fmt.allocPrint(allocator, "{s}/AppData/Local/{s}/{s}/Cache", .{ up, clean_org, clean_app })
+            else
+                unavailable,
+            .macos, .ios => if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/Library/Caches/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
+            else => if (env("XDG_CACHE_HOME")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ b, clean_org, clean_app })
+            else if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/.cache/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
         },
         .config => switch (builtin.os.tag) {
-            .macos, .ios => std.fmt.allocPrint(allocator, "/Library/Preferences/{s}/{s}", .{ clean_org, clean_app }),
-            .windows => std.fmt.allocPrint(allocator, "C:\\Users\\Default\\AppData\\Roaming\\{s}\\{s}\\Config", .{ clean_org, clean_app }),
-            else => std.fmt.allocPrint(allocator, "/etc/{s}/{s}", .{ clean_org, clean_app }),
+            .windows => if (env("APPDATA")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}/Config", .{ b, clean_org, clean_app })
+            else if (env("USERPROFILE")) |up|
+                std.fmt.allocPrint(allocator, "{s}/AppData/Roaming/{s}/{s}/Config", .{ up, clean_org, clean_app })
+            else
+                unavailable,
+            .macos, .ios => if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/Library/Preferences/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
+            else => if (env("XDG_CONFIG_HOME")) |b|
+                std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ b, clean_org, clean_app })
+            else if (env("HOME")) |h|
+                std.fmt.allocPrint(allocator, "{s}/.config/{s}/{s}", .{ h, clean_org, clean_app })
+            else
+                unavailable,
         },
         .executable => allocator.dupe(u8, "."),
     };
+}
+
+fn env(name: [*:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    const s = std.mem.span(v);
+    return if (s.len == 0) null else s;
+}
+
+fn tempFallback(allocator: std.mem.Allocator) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        if (env("TEMP") orelse env("TMP")) |t| return allocator.dupe(u8, t);
+        if (env("LOCALAPPDATA")) |la| return std.fmt.allocPrint(allocator, "{s}/Temp", .{la});
+        return allocator.dupe(u8, ".");
+    }
+    // $TMPDIR may carry a trailing slash — trim for a canonical form.
+    return allocator.dupe(u8, std.mem.trimRight(u8, env("TMPDIR") orelse "/tmp", "/"));
 }
 
 pub fn appDataDir(allocator: std.mem.Allocator, org: []const u8, app: []const u8) ![]u8 {

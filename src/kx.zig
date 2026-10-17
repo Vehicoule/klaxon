@@ -17,6 +17,9 @@ pub const c_extern = struct {
     /// iOS: true when the UIWindow's root view is attached (presents before
     /// mapping are silently lost — see klaxon-spikes kx_metal.mm).
     extern fn kx_ios_window_mapped(uiwindow: ?*anyopaque) bool;
+    /// iOS (kx_skia_ios.mm): screen-points height of the strip the on-screen
+    /// keyboard covers at the bottom edge (0 when hidden or floating).
+    extern fn kx_ios_keyboard_height() f32;
 };
 
 pub fn a11yInit(root: *anyopaque) void {
@@ -37,6 +40,12 @@ pub fn a11yActionEventType() u32 {
 /// mapping are silently lost).
 pub fn iosWindowMapped(uiwindow: ?*anyopaque) bool {
     return c_extern.kx_ios_window_mapped(uiwindow);
+}
+
+/// iOS: screen-points height of the strip the on-screen keyboard covers at
+/// the bottom edge (0 when hidden or floating — see kx_skia_ios.mm).
+pub fn iosKeyboardHeight() f32 {
+    return c_extern.kx_ios_keyboard_height();
 }
 
 pub fn create(window: ?*anyopaque, width: c_int, height: c_int, backend: c.kx_backend) ?*Ctx {

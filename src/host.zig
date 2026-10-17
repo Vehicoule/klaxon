@@ -189,6 +189,11 @@ pub const Host = struct {
     /// iOS: timestamp (ns) when the UIWindow's root view was first mapped.
     /// -1 = not yet mapped. Presents before mapping are silently lost.
     ios_mapped_ns: i128 = -1,
+    /// The bottom safe-area inset last seen while the screen keyboard was
+    /// hidden — the nav/gesture bar height. While the keyboard is up the
+    /// reported bottom inset is the IME (it occludes the nav region), so
+    /// this baseline keeps safe_area.bottom honest during input.
+    nav_baseline_bottom: f32 = 0,
     /// Mobile benchmark aid (Phase 4c): ns timestamp of the last periodic
     /// fps log (windowed over 600 frames).
     fps_log_ns: i128 = 0,
@@ -227,6 +232,12 @@ pub const Host = struct {
         // stay SDL-free). The allocator feeds SDL_SetClipboardText copies.
         clipboard_allocator = allocator;
         ui.clipboard.install(.{ .get = clipboardGetImpl, .set = clipboardSetImpl });
+        // Layer-4 services ride SDL the same way (installed once; the
+        // service modules stay SDL-free). Haptics has no SDL-level API —
+        // the contract stays uninstalled = documented no-op.
+        ui.platform.url.install(.{ .open = sdlOpenUrl });
+        ui.platform.picker.install(.{ .open_file = sdlOpenFileDialog, .save_file = sdlSaveFileDialog });
+        ui.platform.paths.install(.{ .resolve = sdlResolveDir });
         const t_sdl = sdl.c.SDL_GetTicksNS();
 
         // PPM dumps go through kx_readback_rgba — raster surfaces only.
@@ -398,6 +409,7 @@ pub const Host = struct {
         if (!is_android or android_owns_window) {
             errdefer sdl.c.SDL_DestroyWindow(window);
         }
+        dialog_window = window; // file dialogs parent to this window
         const t_win = sdl.c.SDL_GetTicksNS();
 
         // Emscripten (wasm) + Android + Linux-GL: create the GL context and
@@ -661,6 +673,158 @@ pub const Host = struct {
         const str = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
         if (str.len == 0) return null;
         return alloc.dupe(u8, str) catch null;
+    }
+
+    // ---- Layer-4 platform services, SDL-backed (installed in init) ----
+    // url/file-picker/paths are install contracts in ui.platform; these
+    // impls wire them to real SDL calls on every platform SDL covers.
+
+    /// The window file dialogs are modal to (set after window creation;
+    /// null is legal — dialogs just aren't parented).
+    var dialog_window: ?*sdl.c.SDL_Window = null;
+
+    fn sdlOpenUrl(url: []const u8) bool {
+        const alloc = clipboard_allocator orelse return false;
+        const z = alloc.allocSentinel(u8, url.len, 0) catch return false;
+        defer alloc.free(z);
+        @memcpy(z, url);
+        return sdl.c.SDL_OpenURL(z.ptr);
+    }
+
+    const Picker = ui.platform.file_picker;
+
+    /// One pending dialog's lifetime: the picker strings (title, location,
+    /// filter name/patterns) must stay valid until SDL's callback fires,
+    /// and the delivered path list needs somewhere to live — one arena
+    /// covers both, freed after the app callback runs on the main thread.
+    const DialogCtx = struct {
+        cb: Picker.Callback,
+        userdata: ?*anyopaque,
+        arena: std.heap.ArenaAllocator,
+        status: Picker.Status = .err,
+        paths: []const []const u8 = &.{},
+    };
+
+    fn dialogDeliverMain(ud: ?*anyopaque) callconv(.c) void {
+        const ctx: *DialogCtx = @ptrCast(@alignCast(ud orelse return));
+        ctx.cb(ctx.userdata, ctx.status, ctx.paths);
+        const alloc = ctx.arena.child_allocator;
+        ctx.arena.deinit();
+        alloc.destroy(ctx);
+    }
+
+    fn sdlDialogCb(ud: ?*anyopaque, filelist: [*c]const [*c]const u8, filter: c_int) callconv(.c) void {
+        _ = filter;
+        const ctx: *DialogCtx = @ptrCast(@alignCast(ud orelse return));
+        const list = filelist orelse {
+            ctx.status = .err;
+            if (!sdl.c.SDL_RunOnMainThread(dialogDeliverMain, ctx, false)) dialogDeliverMain(ctx);
+            return;
+        };
+        var n: usize = 0;
+        while (list[n] != null) n += 1;
+        if (n == 0) {
+            ctx.status = .cancelled;
+        } else ok: {
+            const a = ctx.arena.allocator();
+            const items = a.alloc([]const u8, n) catch break :ok;
+            for (items, 0..) |*item, i| {
+                item.* = a.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(list[i])))) catch break :ok;
+            }
+            ctx.paths = items;
+            ctx.status = .ok;
+        }
+        // SDL may invoke this on a worker thread (Android result dispatch);
+        // the widget-facing contract is main-thread only.
+        if (!sdl.c.SDL_RunOnMainThread(dialogDeliverMain, ctx, false)) dialogDeliverMain(ctx);
+    }
+
+    fn sdlShowDialog(
+        save: bool,
+        title: ?[]const u8,
+        default_path: ?[]const u8,
+        filters: []const Picker.FileFilter,
+        allow_many: bool,
+        cb: Picker.Callback,
+        userdata: ?*anyopaque,
+    ) void {
+        const alloc = clipboard_allocator orelse return cb(userdata, .unavailable, &.{});
+        const ctx = alloc.create(DialogCtx) catch return cb(userdata, .err, &.{});
+        ctx.* = .{ .cb = cb, .userdata = userdata, .arena = std.heap.ArenaAllocator.init(alloc) };
+        var shown = false;
+        // Any setup failure delivers .err through the same path SDL uses.
+        defer if (!shown) dialogDeliverMain(ctx);
+
+        const a = ctx.arena.allocator();
+        const props = sdl.c.SDL_CreateProperties();
+        if (props == 0) return;
+        defer sdl.c.SDL_DestroyProperties(props);
+
+        if (title) |t| {
+            const z = a.dupeZ(u8, t) catch return;
+            _ = sdl.c.SDL_SetStringProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_TITLE_STRING, z.ptr);
+        }
+        if (default_path) |d| {
+            const z = a.dupeZ(u8, d) catch return;
+            _ = sdl.c.SDL_SetStringProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_LOCATION_STRING, z.ptr);
+        }
+        if (filters.len > 0) {
+            const sf = a.alloc(sdl.c.SDL_DialogFileFilter, filters.len) catch return;
+            for (filters, sf) |f, *dst| {
+                dst.name = (a.dupeZ(u8, f.name) catch return).ptr;
+                dst.pattern = (a.dupeZ(u8, f.pattern) catch return).ptr;
+            }
+            _ = sdl.c.SDL_SetPointerProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_FILTERS_POINTER, sf.ptr);
+            _ = sdl.c.SDL_SetNumberProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, @intCast(filters.len));
+        }
+        if (dialog_window) |w| {
+            _ = sdl.c.SDL_SetPointerProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_WINDOW_POINTER, w);
+        }
+        if (!save and allow_many) {
+            _ = sdl.c.SDL_SetBooleanProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_MANY_BOOLEAN, true);
+        }
+        sdl.c.SDL_ShowFileDialogWithProperties(
+            if (save) sdl.c.SDL_FILEDIALOG_SAVEFILE else sdl.c.SDL_FILEDIALOG_OPENFILE,
+            sdlDialogCb,
+            ctx,
+            props,
+        );
+        shown = true;
+    }
+
+    fn sdlOpenFileDialog(opts: Picker.OpenOptions, cb: Picker.Callback, userdata: ?*anyopaque) void {
+        sdlShowDialog(false, opts.title, opts.default_path, opts.filters, opts.allow_multiple, cb, userdata);
+    }
+    fn sdlSaveFileDialog(opts: Picker.SaveOptions, cb: Picker.Callback, userdata: ?*anyopaque) void {
+        sdlShowDialog(true, opts.title, opts.default_path, opts.filters, false, cb, userdata);
+    }
+
+    /// SDL_GetPrefPath is the app's private writable dir on every target
+    /// (incl. Android files/ and the iOS sandbox); cache/config hang under
+    /// it. temp stays on the env fallback — SDL has no temp-dir API.
+    fn sdlResolveDir(allocator: std.mem.Allocator, kind: ui.platform.paths.DirKind, org: []const u8, app: []const u8) ?[]u8 {
+        return switch (kind) {
+            .executable => blk: {
+                const p = sdl.c.SDL_GetBasePath() orelse break :blk null;
+                break :blk allocator.dupe(u8, std.mem.span(p)) catch null;
+            },
+            .app_data => prefPathJoin(allocator, org, app, null),
+            .cache => prefPathJoin(allocator, org, app, "cache"),
+            .config => prefPathJoin(allocator, org, app, "config"),
+            .temp => null,
+        };
+    }
+
+    fn prefPathJoin(alloc: std.mem.Allocator, org: []const u8, app: []const u8, leaf: ?[]const u8) ?[]u8 {
+        const zorg = alloc.dupeZ(u8, if (org.len == 0) "klaxon" else org) catch return null;
+        defer alloc.free(zorg);
+        const zapp = alloc.dupeZ(u8, if (app.len == 0) "app" else app) catch return null;
+        defer alloc.free(zapp);
+        const raw = sdl.c.SDL_GetPrefPath(zorg.ptr, zapp.ptr) orelse return null;
+        defer sdl.c.SDL_free(raw);
+        const base = std.mem.trimRight(u8, std.mem.span(raw), "/\\");
+        if (leaf) |l| return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, l }) catch null;
+        return alloc.dupe(u8, base) catch null;
     }
 
     /// Pointer cursors (Phase 2d-0.5, desktop): map the hovered node to a
@@ -1227,13 +1391,16 @@ pub const Host = struct {
         // Moving the window between displays at different DPR fires these
         // without RESIZED — the backing pixel size and display_scale change,
         // so the canvas + buffers must be rebuilt (same work as a resize).
-        // Window/display geometry changes can move the usable-bounds
-        // margins — resync the safe-area insets (fullscreen toggles,
-        // display moves, dock/menu-bar changes all arrive here).
+        // Window/display geometry changes can move the safe-area margins —
+        // resync the insets (fullscreen toggles, display moves, safe-area
+        // and screen-keyboard changes all arrive here).
         if (event.type == sdl.c.SDL_EVENT_WINDOW_MOVED or
             event.type == sdl.c.SDL_EVENT_WINDOW_DISPLAY_CHANGED or
             event.type == sdl.c.SDL_EVENT_WINDOW_ENTER_FULLSCREEN or
-            event.type == sdl.c.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
+            event.type == sdl.c.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN or
+            event.type == sdl.c.SDL_EVENT_WINDOW_SAFE_AREA_CHANGED or
+            event.type == sdl.c.SDL_EVENT_SCREEN_KEYBOARD_SHOWN or
+            event.type == sdl.c.SDL_EVENT_SCREEN_KEYBOARD_HIDDEN)
         {
             host.syncWindowInsets(root);
         }
@@ -1515,42 +1682,42 @@ pub const Host = struct {
         }
     }
 
-    /// Push the window's safe-area insets into `ui.platform.window_insets`:
-    /// the display's usable bounds exclude status/nav bars, notches and
-    /// dock/taskbar margins — the window rect minus the usable rect gives
-    /// the per-edge margin in window (logical) points. Re-queried at
-    /// startup and on moves/resizes/fullscreen/display changes; a changed
-    /// inset marks the tree layout-dirty since widgets read the global
-    /// during layout (the module has no change signal yet).
-    /// Keyboard height has no SDL query — hosts on mobile set it via the
-    /// platform layer directly.
+    /// Push the window's safe-area insets + soft-keyboard height into
+    /// `ui.platform.window_insets`. `SDL_GetWindowSafeArea` reports the
+    /// per-window interactive rect — the macOS notch, the iOS/Android
+    /// status/nav bars + display cutout, TV overscan — in window (layout)
+    /// units, so insets are the margin between the window edge and the
+    /// safe rect. Re-queried at startup and on
+    /// SDL_EVENT_WINDOW_SAFE_AREA_CHANGED / screen-keyboard / geometry
+    /// events; a changed inset marks the tree layout-dirty since widgets
+    /// read the global during layout.
+    /// The Android insets listener unions the IME into the reported
+    /// bottom edge: while the screen keyboard is up, the bottom inset IS
+    /// the keyboard height, and the nav/gesture baseline is the last
+    /// bottom seen while it was hidden. iOS excludes the keyboard from
+    /// safeAreaInsets entirely — its height comes from our UIKit frame
+    /// observer (kx_ios_keyboard_height).
     fn syncWindowInsets(host: *Host, root: *Node) void {
-        const disp = sdl.c.SDL_GetDisplayForWindow(host.window);
-        if (disp == 0) return;
-        var ub: sdl.c.SDL_Rect = undefined;
-        if (!sdl.c.SDL_GetDisplayUsableBounds(disp, &ub)) return;
-        var wx: c_int = 0;
-        var wy: c_int = 0;
-        _ = sdl.c.SDL_GetWindowPosition(host.window, &wx, &wy);
-        // Window rect in global screen space — logical points, the same
-        // space usable bounds report (insets are layout-space units).
-        const wl: f32 = @floatFromInt(wx);
-        const wt: f32 = @floatFromInt(wy);
-        const wr = wl + @as(f32, @floatFromInt(host.width));
-        const wb = wt + @as(f32, @floatFromInt(host.height));
-        const ul: f32 = @floatFromInt(ub.x);
-        const ut: f32 = @floatFromInt(ub.y);
-        const ur = ul + @as(f32, @floatFromInt(ub.w));
-        const ubt = ut + @as(f32, @floatFromInt(ub.h));
-        const sa: ui.platform.window_insets.SafeArea = .{
-            .top = @max(0, ut - wt),
-            .bottom = @max(0, wb - ubt),
-            .left = @max(0, ul - wl),
-            .right = @max(0, wr - ur),
+        var r: sdl.c.SDL_Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        if (!sdl.c.SDL_GetWindowSafeArea(host.window, &r)) return;
+        var sa: ui.platform.window_insets.SafeArea = .{
+            .top = @max(0, @as(f32, @floatFromInt(r.y))),
+            .left = @max(0, @as(f32, @floatFromInt(r.x))),
+            .right = @max(0, @as(f32, @floatFromInt(host.width - (r.x + r.w)))),
+            .bottom = @max(0, @as(f32, @floatFromInt(host.height - (r.y + r.h)))),
         };
-        const prev = ui.platform.window_insets.safeArea();
-        if (prev.top != sa.top or prev.bottom != sa.bottom or prev.left != sa.left or prev.right != sa.right) {
-            ui.platform.window_insets.setSafeArea(sa);
+        var kb: f32 = 0;
+        if (is_ios) {
+            kb = kx.iosKeyboardHeight();
+        } else if (sdl.c.SDL_ScreenKeyboardShown(host.window)) {
+            kb = sa.bottom;
+            sa.bottom = host.nav_baseline_bottom;
+        } else {
+            host.nav_baseline_bottom = sa.bottom;
+        }
+        const prev = ui.platform.window_insets.get();
+        if (!prev.safe_area.eql(sa) or prev.keyboard_height != kb) {
+            ui.platform.window_insets.set(.{ .safe_area = sa, .keyboard_height = kb });
             root.markLayoutDirty();
         }
     }
