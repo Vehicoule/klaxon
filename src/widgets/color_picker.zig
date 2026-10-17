@@ -35,10 +35,9 @@
 // edits commit on Enter, revert on blur/Escape.
 //
 // Remaining deviations (documented):
-//   - No RGB/HSL numeric inputs (hex only).
+//   - No HSL numeric inputs (RGB + hex only).
 //   - No preset swatches, no eyedropper.
 //   - Instant cursor movement (animated spring = Phase 3).
-//   - en strings only.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -221,7 +220,17 @@ fn hueStops() [7]Color {
 // --- State ---
 
 const DragTarget = enum { none, sv, hue, alpha };
-const FocusTarget = enum { none, sv, hue, alpha, hex };
+const FocusTarget = enum { none, sv, hue, alpha, hex, r, g, b };
+
+/// The RGB numeric field's channel index (null for non-field targets).
+fn chanIndex(f: FocusTarget) ?usize {
+    return switch (f) {
+        .r => 0,
+        .g => 1,
+        .b => 2,
+        else => null,
+    };
+}
 
 pub const CPState = struct {
     opts: ColorPickerOptions,
@@ -237,6 +246,10 @@ pub const CPState = struct {
     /// The hex text field — the shared editing core (caret, selection,
     /// grapheme arrows, clipboard, IME preedit). Holds "#RRGGBB".
     hex_edit: text_edit.Edit,
+    /// The RGB numeric fields — the same edit core, one per channel,
+    /// holding the decimal byte ("0".."255"). Enter writes the channel
+    /// back through the HSV model; blur/Escape reverts to the live byte.
+    chan_edits: [3]text_edit.Edit = undefined,
     /// The down position in raw coords (drag past slop = scroll cancel).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
@@ -246,6 +259,7 @@ pub const CPState = struct {
     alpha_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     swatch_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     hex_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    chan_rects: [3]Rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
     i18n: ?*i18n_mod.I18n = null,
 };
 
@@ -278,12 +292,44 @@ fn resetHex(s: *CPState, c: Color) void {
     _ = e.insert(hex); // caret lands past the text
 }
 
+/// The channel byte of `c` for RGB field `i` (0=R, 1=G, 2=B — the color
+/// packs 0xRRGGBBAA).
+fn chanByte(c: Color, i: usize) u8 {
+    const shift: u5 = @intCast((3 - i) * 8);
+    return @intCast((c >> shift) & 0xFF);
+}
+
+/// Rewrite RGB field `i` with the channel's live byte — the same
+/// revert-to-canonical contract as the hex field (focused fields keep
+/// the in-progress text; callers leave them alone).
+fn resetChan(s: *CPState, c: Color, i: usize) void {
+    var buf: [4]u8 = undefined;
+    const digits = std.fmt.bufPrint(&buf, "{d}", .{chanByte(c, i)}) catch "0";
+    const e = &s.chan_edits[i];
+    e.buf.clearRetainingCapacity();
+    e.caret = 0;
+    e.sel_anchor = 0;
+    _ = e.insert(digits);
+}
+
+fn resetChans(s: *CPState, c: Color) void {
+    for (0..3) |i| {
+        const f: FocusTarget = switch (i) {
+            0 => .r,
+            1 => .g,
+            else => .b,
+        };
+        if (s.focus != f) resetChan(s, c, i);
+    }
+}
+
 /// Push the current HSV+A to the signal + fire on_change + update hex + a11y.
 fn pushColor(s: *CPState, n: *Node) void {
     const c = hsvToColorAlpha(s.h, s.s, s.v, s.a);
     if (s.sig) |sig| sig.set(c);
-    // Update hex text (unless the user is actively editing it).
+    // Update hex + RGB text (unless the user is actively editing it).
     if (s.focus != .hex) resetHex(s, c);
+    resetChans(s, c);
     // Update a11y value.
     if (n.semantics) |sem| {
         sem.value = s.hex_edit.text();
@@ -300,6 +346,7 @@ fn applyExternalColor(s: *CPState, n: *Node, c: Color) void {
     s.v = hsv.v;
     s.a = @as(f32, @floatFromInt(c & 0xFF)) / 255;
     if (s.focus != .hex) resetHex(s, c);
+    resetChans(s, c);
     if (n.semantics) |sem| {
         sem.value = s.hex_edit.text();
     }
@@ -328,8 +375,12 @@ fn previewY() f32 {
     return alphaY() + hue_h + section_gap;
 }
 
+fn chanY() f32 {
+    return previewY() + swatch_size + section_gap;
+}
+
 fn totalHeight(opts: ColorPickerOptions) f32 {
-    return panel_pad + sv_height + section_gap + hue_h + section_gap + hue_h + section_gap + hexH(opts.theme) + panel_pad;
+    return panel_pad + sv_height + section_gap + hue_h + section_gap + hue_h + section_gap + @max(swatch_size, hexH(opts.theme)) + section_gap + hexH(opts.theme) + panel_pad;
 }
 
 // --- Measure ---
@@ -360,6 +411,16 @@ fn cpLayout(n: *Node, bounds: Rect) void {
         .w = inner_w - swatch_size - hex_gap,
         .h = hexH(s.opts.theme),
     };
+    // The RGB row: three equal fields under the preview row.
+    const chan_w = (inner_w - 2 * hex_gap) / 3;
+    for (0..3) |i| {
+        s.chan_rects[i] = .{
+            .x = inner_x + @as(f32, @floatFromInt(i)) * (chan_w + hex_gap),
+            .y = bounds.y + chanY(),
+            .w = chan_w,
+            .h = hexH(s.opts.theme),
+        };
+    }
 }
 
 // --- Paint ---
@@ -471,6 +532,38 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
         const caret_x = text_x + ui.paint.measureTextLen(hex_z[0..s.hex_edit.caret], ts.size, bold).width;
         ui.paint.fillRect(ctx, caret_x, text_y - hm.ascent, 1, hm.ascent + hm.descent, t.colors.primary);
     }
+
+    // --- RGB numeric fields ---
+    const chan_labels = [_][]const u8{ "R", "G", "B" };
+    for (0..3) |i| {
+        const fr = s.chan_rects[i];
+        const focused = chanIndex(s.focus) == i;
+        const e = &s.chan_edits[i];
+        ui.paint.fillRRect(ctx, fr.x, fr.y, fr.w, fr.h, field_corner, t.colors.surface_container_highest);
+        const ind_c = if (focused) t.colors.primary else t.colors.on_surface_variant;
+        const ind_h: f32 = if (focused) 2 else 1;
+        ui.paint.fillRect(ctx, fr.x, fr.y + fr.h - ind_h, fr.w, ind_h, ind_c);
+        const lw = ui.paint.measureTextLen(chan_labels[i], ts.size, bold).width;
+        const ly = fr.y + (fr.h - ts.line_height) / 2 + ts.line_height * 0.8;
+        ui.paint.textSlice(ctx, chan_labels[i], fr.x + 10, ly, ts.size, bold, t.colors.on_surface_variant);
+        const digits = e.text();
+        const dx = fr.x + 10 + lw + 4;
+        const dm = ui.paint.measureText(digits, ts.size, bold);
+        if (focused) {
+            const sel = e.selRange();
+            if (sel.hi > sel.lo) {
+                const sx0 = dx + ui.paint.measureTextLen(digits[0..sel.lo], ts.size, bold).width;
+                const sx1 = dx + ui.paint.measureTextLen(digits[0..sel.hi], ts.size, bold).width;
+                ui.paint.fillRect(ctx, sx0, ly - dm.ascent, sx1 - sx0, dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+            }
+            e.ensureTicker();
+        }
+        ui.paint.text(ctx, digits, dx, ly, ts.size, bold, t.colors.on_surface);
+        if (focused and e.caret_on) {
+            const caret_dx = dx + ui.paint.measureTextLen(digits[0..e.caret], ts.size, bold).width;
+            ui.paint.fillRect(ctx, caret_dx, ly - dm.ascent, 1, dm.ascent + dm.descent, t.colors.primary);
+        }
+    }
 }
 
 /// Byte offset in the hex text nearest to the press — the point projects
@@ -484,6 +577,23 @@ fn hexCaretFromPoint(s: *CPState, px: f32, py: f32) usize {
     return text_edit.caretFromPoint(s.hex_edit.text(), px - (hx.x + 16), py - top, ts.size);
 }
 
+/// The digit text's x offset inside RGB field `i` (past "R  " prefix).
+fn chanTextX(s: *CPState, i: usize) f32 {
+    const t = s.opts.theme;
+    const ts = t.type_scale.body_large;
+    const chan_labels = [_][]const u8{ "R", "G", "B" };
+    return s.chan_rects[i].x + 10 + ui.paint.measureTextLen(chan_labels[i], ts.size, ts.weight >= 500).width + 4;
+}
+
+/// Byte offset in RGB field `i`'s digits nearest to the press.
+fn chanCaretFromPoint(s: *CPState, i: usize, px: f32, py: f32) usize {
+    const t = s.opts.theme;
+    const ts = t.type_scale.body_large;
+    const fr = s.chan_rects[i];
+    const top = fr.y + (fr.h - ts.line_height) / 2;
+    return text_edit.caretFromPoint(s.chan_edits[i].text(), px - chanTextX(s, i), py - top, ts.size);
+}
+
 // --- Hit test ---
 
 fn zoneAt(s: *CPState, x: f32, y: f32) DragTarget {
@@ -495,11 +605,12 @@ fn zoneAt(s: *CPState, x: f32, y: f32) DragTarget {
 
 fn cpHit(n: *Node, x: f32, y: f32) bool {
     const s = stateOf(n);
-    // SV square, hue/alpha sliders, or hex field.
+    // SV square, hue/alpha sliders, hex + RGB fields.
     if (s.sv_rect.contains(x, y)) return true;
     if (s.hue_rect.contains(x, y)) return true;
     if (s.alpha_rect.contains(x, y)) return true;
     if (s.hex_rect.contains(x, y)) return true;
+    for (s.chan_rects) |fr| if (fr.contains(x, y)) return true;
     return n.bounds.contains(x, y);
 }
 
@@ -522,6 +633,20 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 n.markDirty();
                 return true;
             }
+            // RGB fields: focus + place the caret in the digit run.
+            for (0..3) |i| {
+                if (s.chan_rects[i].contains(ev.x, ev.y)) {
+                    s.focus = switch (i) {
+                        0 => .r,
+                        1 => .g,
+                        else => .b,
+                    };
+                    s.chan_edits[i].tap(chanCaretFromPoint(s, i, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
+                    input.requestFocus(n);
+                    n.markDirty();
+                    return true;
+                }
+            }
             // SV or hue.
             const zone = zoneAt(s, ev.x, ev.y);
             if (zone != .none) {
@@ -537,21 +662,34 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 n.markDirty();
                 return true;
             }
-            // Click on panel background: blur hex (revert uncommitted edits).
+            // Click on panel background: blur the edit field (revert
+            // uncommitted text to the live color).
             if (s.focus == .hex) {
                 s.focus = .none;
                 s.hex_edit.dragging = false;
                 s.hex_edit.drag_word = false;
                 resetHex(s, hsvToColor(s.h, s.s, s.v));
                 n.markDirty();
+            } else if (chanIndex(s.focus)) |ci| {
+                s.focus = .none;
+                s.chan_edits[ci].dragging = false;
+                s.chan_edits[ci].drag_word = false;
+                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
+                n.markDirty();
             }
             return false;
         },
         .move => {
-            // A held press inside the hex text drags the selection.
+            // A held press inside a field's text drags the selection.
             if (s.focus == .hex and s.hex_edit.dragging) {
                 s.hex_edit.dragExtend(hexCaretFromPoint(s, ev.x, ev.y));
                 return true;
+            }
+            if (chanIndex(s.focus)) |ci| {
+                if (s.chan_edits[ci].dragging) {
+                    s.chan_edits[ci].dragExtend(chanCaretFromPoint(s, ci, ev.x, ev.y));
+                    return true;
+                }
             }
             if (s.dragging != .none) {
                 // Drag past slop = cancel (scroll).
@@ -573,6 +711,10 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
         .up => {
             s.hex_edit.dragging = false;
             s.hex_edit.drag_word = false;
+            for (&s.chan_edits) |*e| {
+                e.dragging = false;
+                e.drag_word = false;
+            }
             if (s.dragging != .none) {
                 s.dragging = .none;
                 n.markDirty();
@@ -591,6 +733,14 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.hex_edit.dragging = false;
                 s.hex_edit.drag_word = false;
                 resetHex(s, hsvToColor(s.h, s.s, s.v));
+                n.markDirty();
+                return true;
+            }
+            if (chanIndex(s.focus)) |ci| {
+                s.focus = .none;
+                s.chan_edits[ci].dragging = false;
+                s.chan_edits[ci].drag_word = false;
+                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
                 n.markDirty();
                 return true;
             }
@@ -630,12 +780,67 @@ fn hexApplyEdit(n: *Node) void {
     if (n.semantics) |sem| sem.value = s.hex_edit.text();
 }
 
+/// RGB field edits repaint only — the byte commits on Enter (the a11y
+/// value already carries the canonical hex).
+fn chanApplyEdit(n: *Node) void {
+    n.markDirty();
+}
+
+/// Commit RGB field `i`: parse the decimal byte, write that channel into
+/// the live color and run it back through the HSV model. Out-of-range or
+/// unparsable text reverts to the live byte (the Enter contract).
+fn commitChan(n: *Node, i: usize) void {
+    const s = stateOf(n);
+    const e = &s.chan_edits[i];
+    const live = hsvToColorAlpha(s.h, s.s, s.v, s.a);
+    const parsed = std.fmt.parseInt(u16, e.text(), 10) catch {
+        resetChan(s, live, i);
+        return;
+    };
+    if (parsed > 255) {
+        resetChan(s, live, i);
+        return;
+    }
+    const shift: u5 = @intCast((3 - i) * 8);
+    const c = (live & ~(@as(Color, 0xFF) << shift)) | (@as(Color, parsed) << shift);
+    applyExternalColor(s, n, c);
+    if (s.sig) |sig| sig.set(c);
+    if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
+}
+
 fn cpKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
 
     // Hex field: the shared editing core consumes text_input, the IME
     // preedit, clipboard chords, backspace/delete and caret motion.
     if (s.focus == .hex and s.hex_edit.handleKey(ev, hexApplyEdit)) return true;
+
+    // RGB fields: the same core, digit-filtered (a decimal byte).
+    if (chanIndex(s.focus)) |ci| {
+        const e = &s.chan_edits[ci];
+        if (ev.kind == .text_input) {
+            for (ev.text) |ch| {
+                if (ch < '0' or ch > '9') return true; // swallow non-digits
+            }
+        }
+        if (e.handleKey(ev, chanApplyEdit)) return true;
+        if (ev.kind != .key_down) return true;
+        switch (ev.key) {
+            .enter => {
+                commitChan(n, ci);
+                s.focus = .none;
+                n.markDirty();
+                return true;
+            },
+            .escape, .back => {
+                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
+                s.focus = .none;
+                n.markDirty();
+                return true;
+            },
+            else => return true, // the focused field owns the key stream
+        }
+    }
 
     if (ev.kind != .key_down) return false;
 
@@ -720,6 +925,7 @@ fn cpDeinit(n: *Node) void {
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = cpLocaleCb, .userdata = n });
     input.releaseNode(n);
     s.hex_edit.deinit();
+    for (&s.chan_edits) |*e| e.deinit();
     n.allocator.destroy(s);
 }
 
@@ -753,7 +959,7 @@ const cp_vtable = ui.node.VTable{
     .on_pointer = cpPointer,
     .on_key = cpKey,
     .deinit = cpDeinit,
-    .wants_text_input = true, // the hex field hosts an IME session
+    .wants_text_input = true, // the hex + RGB fields host IME sessions
 };
 
 /// Create an M3E color picker panel.
@@ -786,7 +992,9 @@ pub fn colorPicker(
         .a = @as(f32, @floatFromInt(initial & 0xFF)) / 255,
         .hex_edit = text_edit.Edit.init(allocator, node),
     };
+    for (&s.chan_edits) |*e| e.* = text_edit.Edit.init(allocator, node);
     resetHex(s, initial);
+    resetChans(s, initial);
 
     node.state = @ptrCast(s);
 
@@ -893,13 +1101,14 @@ test "color helpers: colorToHsv / hsvToColor round-trip" {
     try std.testing.expectEqual(@as(Color, 0xFF), c2 & 0xFF);
 }
 
-test "color_picker: measure returns 320×384" {
+test "color_picker: measure returns 320×448" {
     const a = std.testing.allocator;
     const n = try colorPicker(a, null, null, .{});
     defer n.deinit();
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectApproxEqAbs(@as(f32, 320), sz.w, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 384), sz.h, 0.001);
+    // 384 (SV + sliders + preview/hex row) + 16 gap + 48 RGB row.
+    try std.testing.expectApproxEqAbs(@as(f32, 448), sz.h, 0.001);
 }
 
 test "color_picker: SV drag updates the color (signal + on_change)" {
@@ -1055,6 +1264,89 @@ test "color_picker: the hex field is a real editor (caret, commit, revert)" {
     _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .escape });
     try std.testing.expectEqualStrings("#FF00FF", s.hex_edit.text());
     try std.testing.expect(s.focus == .none);
+}
+
+test "color_picker: the RGB fields sync + commit through the HSV model" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const sig = try ui.state.Signal(Color).init(std.testing.allocator, 0x3F51B5FF); // indigo
+    defer sig.deinit();
+    const a = std.testing.allocator;
+    const n = try colorPicker(a, sig, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 448 });
+    const s = stateOf(n);
+
+    // Initial bytes mirror the color (0x3F, 0x51, 0xB5).
+    try std.testing.expectEqualStrings("63", s.chan_edits[0].text());
+    try std.testing.expectEqualStrings("81", s.chan_edits[1].text());
+    try std.testing.expectEqualStrings("181", s.chan_edits[2].text());
+
+    // Focus the G field via a click, select all, type "200", Enter.
+    const gr = s.chan_rects[1];
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = gr.x + 30, .y = gr.y + gr.h / 2, .raw_x = gr.x + 30, .raw_y = gr.y + gr.h / 2 });
+    try std.testing.expect(s.focus == .g);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .command = true, .chr = 'a' });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "200" });
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
+    try std.testing.expect(s.focus == .none);
+    // G channel is now 0xC8; R and B bytes survive.
+    const c = sig.peek();
+    try std.testing.expectEqual(@as(Color, 0x3F), (c >> 24) & 0xFF);
+    try std.testing.expectEqual(@as(Color, 0xC8), (c >> 16) & 0xFF);
+    try std.testing.expectEqual(@as(Color, 0xB5), (c >> 8) & 0xFF);
+    // The fields + hex resynced to the committed color.
+    try std.testing.expectEqualStrings("200", s.chan_edits[1].text());
+    try std.testing.expectEqualStrings("#3FC8B5", s.hex_edit.text());
+}
+
+test "color_picker: RGB fields — out-of-range reverts, non-digits swallowed, signal syncs" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const sig = try ui.state.Signal(Color).init(std.testing.allocator, 0xFF0000FF);
+    defer sig.deinit();
+    const a = std.testing.allocator;
+    const n = try colorPicker(a, sig, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 448 });
+    const s = stateOf(n);
+    try std.testing.expectEqualStrings("255", s.chan_edits[0].text());
+    try std.testing.expectEqualStrings("0", s.chan_edits[1].text());
+
+    const rr = s.chan_rects[0];
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = rr.x + 30, .y = rr.y + rr.h / 2, .raw_x = rr.x + 30, .raw_y = rr.y + rr.h / 2 });
+    try std.testing.expect(s.focus == .r);
+    // Non-digit input is swallowed.
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "x" });
+    try std.testing.expectEqualStrings("255", s.chan_edits[0].text());
+    // "999" parses but exceeds the byte — Enter reverts to the live byte.
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .command = true, .chr = 'a' });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "999" });
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqualStrings("255", s.chan_edits[0].text());
+    try std.testing.expect(s.focus == .none);
+
+    // An external signal set resyncs all three fields.
+    sig.set(0x102030FF);
+    try std.testing.expectEqualStrings("16", s.chan_edits[0].text());
+    try std.testing.expectEqualStrings("32", s.chan_edits[1].text());
+    try std.testing.expectEqualStrings("48", s.chan_edits[2].text());
+
+    // A focused field keeps its in-progress text across a sync.
+    const br = s.chan_rects[2];
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = br.x + 30, .y = br.y + br.h / 2, .raw_x = br.x + 30, .raw_y = br.y + br.h / 2 });
+    try std.testing.expect(s.focus == .b);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .command = true, .chr = 'a' });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "77" });
+    sig.set(0xAABBCCFF);
+    try std.testing.expectEqualStrings("77", s.chan_edits[2].text()); // untouched
+    try std.testing.expectEqualStrings("170", s.chan_edits[0].text());
+    // Blur (click outside the field) reverts to the live byte.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .outside_down, .x = 0, .y = 0, .raw_x = 0, .raw_y = 0 });
+    try std.testing.expect(s.focus == .none);
+    try std.testing.expectEqualStrings("204", s.chan_edits[2].text());
 }
 
 test "color_picker: semantics — role group, focusable, value = hex" {
