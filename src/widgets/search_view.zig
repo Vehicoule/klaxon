@@ -1185,17 +1185,17 @@ test "search_view: the back arrow and Escape close; on_close fires" {
     // query field takes the focus
     open.set(true);
     try std.testing.expectEqual(@as(usize, 1), router.back_stack_len);
-    try std.testing.expect(router.focused == v);
+    try std.testing.expect(router.focusedNode() == v);
     // a click on the back arrow (the 48dp start box of the 64dp header)
     router.dispatchPointer(v, .{ .phase = .down, .x = 24, .y = 32 });
     router.dispatchPointer(v, .{ .phase = .up, .x = 24, .y = 32 });
     try std.testing.expect(!open.peek());
     try std.testing.expectEqual(@as(u32, 1), closed);
     try std.testing.expectEqual(@as(usize, 0), router.back_stack_len);
-    try std.testing.expect(router.focused == null); // the close released the focus
+    try std.testing.expect(router.focusedNode() == null); // the close released the focus
     // reopen: Escape (the focused key path) closes it too
     open.set(true);
-    try std.testing.expect(router.focused == v);
+    try std.testing.expect(router.focusedNode() == v);
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .escape }));
     try std.testing.expect(!open.peek());
     try std.testing.expectEqual(@as(u32, 2), closed);
@@ -1264,7 +1264,7 @@ test "search_view: typing edits the query; the signal mirrors; clear empties it"
     defer input.setCurrent(null);
     // open with the router live → the query field takes the focus
     open.set(true);
-    try std.testing.expect(router.focused == v);
+    try std.testing.expect(router.focusedNode() == v);
     _ = router.dispatchKey(.{ .kind = .text_input, .text = "ap" });
     try std.testing.expectEqualStrings("ap", text(v));
     try std.testing.expectEqualStrings("ap", query.peek());

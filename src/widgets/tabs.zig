@@ -114,7 +114,7 @@ fn syncTabSemantics(n: *Node, s: *TabsState) void {
 /// The child index containing the focused node (keyboard activation).
 fn focusedTab(n: *Node) ?usize {
     const router = input.current() orelse return null;
-    const f = router.focused orelse return null;
+    const f = router.focusedNode() orelse return null;
     var cur: ?*Node = f;
     while (cur) |c| : (cur = c.parent) {
         if (c == n) return null;
@@ -506,7 +506,7 @@ test "tabs: arrows move the selection AND the focus; hover tracks across cells" 
     input.requestFocus(a);
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .right }));
     try std.testing.expectEqual(@as(usize, 1), sel.peek());
-    try std.testing.expect(router.focused == b);
+    try std.testing.expect(router.focusedNode() == b);
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .enter }));
     try std.testing.expectEqual(@as(usize, 1), sel.peek());
     // hover_move: y=4 is inside the row but above the centered content —

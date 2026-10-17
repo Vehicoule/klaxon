@@ -189,21 +189,21 @@ test "demo: focus order, keyboard activation, announcements" {
     try std.testing.expectEqual(@as(usize, 4), order.len);
 
     fm.focusNext(); // → TextField
-    const field = router.focused.?;
+    const field = router.focusedNode().?;
     try std.testing.expectEqual(ui.semantics.Role.text_field, field.semantics.?.role);
     fm.focusNext(); // → Submit
-    const submit = router.focused.?;
+    const submit = router.focusedNode().?;
     try std.testing.expectEqual(ui.semantics.Role.button, submit.semantics.?.role);
     try std.testing.expect(fm.handleKey(.{ .kind = .key_down, .key = .enter }));
     try std.testing.expectEqual(@as(u32, 1), app.submitted);
     fm.focusNext(); // → Toggle
-    const toggle = router.focused.?;
+    const toggle = router.focusedNode().?;
     try std.testing.expectEqual(ui.semantics.Role.toggle, toggle.semantics.?.role);
     try std.testing.expect(fm.handleKey(.{ .kind = .key_down, .key = .space }));
     try std.testing.expect(app.toggle_sig.peek());
     try std.testing.expectEqual(@as(?bool, true), toggle.semantics.?.checked); // synced
     fm.focusNext(); // → Slider
-    const slider = router.focused.?;
+    const slider = router.focusedNode().?;
     try std.testing.expectEqual(ui.semantics.Role.slider, slider.semantics.?.role);
     // Arrow key → the slider's on_key (routed to the focused node).
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .left }));

@@ -547,8 +547,11 @@ fn ringRect(n: *Node, margin: f32) Rect {
 
 pub const FocusManager = struct {
     allocator: std.mem.Allocator,
-    root: ?*Node = null,
-    focused: ?*Node = null,
+    /// Weak node ids: both outlive the traversal that set them — a
+    /// destroyed node resolves null instead of dangling (resolve through
+    /// rootNode()/focusedNode()).
+    root: ?u64 = null,
+    focused: ?u64 = null,
     focused_sig: *state_mod.Signal(?*Node),
     ring_color: Color = 0x1C7ED6FF,
     ring_width: f32 = 2, // theme.platform.focus_ring_width
@@ -569,13 +572,24 @@ pub const FocusManager = struct {
     }
 
     pub fn setRoot(fm: *FocusManager, root: *Node) void {
-        fm.root = root;
+        fm.root = root.ref();
+    }
+
+    /// The focus tree root (setRoot), if it is still alive.
+    pub fn rootNode(fm: *FocusManager) ?*Node {
+        return if (fm.root) |id| node_mod.resolve(id) else null;
+    }
+
+    /// The focused node, if it is still alive — a destroyed focus target
+    /// resolves null (no stale pointer, no notification needed).
+    pub fn focusedNode(fm: *FocusManager) ?*Node {
+        return if (fm.focused) |id| node_mod.resolve(id) else null;
     }
 
     /// The focusable nodes in semantic-tree order (freshly computed — the
     /// tree is retained, but subtrees come and go).
     pub fn focusOrder(fm: *FocusManager, allocator: std.mem.Allocator) ![]*Node {
-        const root = fm.root orelse return &.{};
+        const root = fm.rootNode() orelse return &.{};
         var tree = try buildSemanticTree(allocator, root);
         defer tree.deinit(allocator);
         var list = std.array_list.Managed(*Node).init(allocator);
@@ -602,20 +616,21 @@ pub const FocusManager = struct {
     }
 
     fn setFocused(fm: *FocusManager, node: ?*Node) void {
-        if (fm.focused == node) return;
+        const new_id: ?u64 = if (node) |n| n.ref() else null;
+        if (fm.focused == new_id) return;
         // Damage the old + new ring regions (mapped to window space) so the
         // host repaints exactly what the ring vacated/occupies. The old node
         // is also marked dirty (wakeup): its focus styling must repaint, and
         // its damage_overflow covers paint beyond its bounds (a text field's
         // cutout label) that the ring rect (ring_offset) would miss.
-        if (fm.root) |r| {
-            if (fm.focused) |old| {
+        if (fm.rootNode()) |r| {
+            if (fm.focusedNode()) |old| {
                 old.markDirty();
                 r.markDirtyRect(ringRect(old, fm.ring_offset));
             }
             if (node) |new| r.markDirtyRect(ringRect(new, fm.ring_offset));
         }
-        fm.focused = node;
+        fm.focused = new_id;
         fm.focused_sig.set(node);
         if (node) |n| n.markDirty();
         notifyBridge(.{ .kind = .focus_changed, .node = node });
@@ -638,9 +653,9 @@ pub const FocusManager = struct {
         fm.focusNode(order[(idx + order.len - 1) % order.len]);
     }
 
-    fn indexOf(order: []const *Node, node: ?*Node) ?usize {
+    fn indexOf(order: []const *Node, id: ?u64) ?usize {
         for (order, 0..) |n, i| {
-            if (n == node) return i;
+            if (n.id == id) return i;
         }
         return null;
     }
@@ -661,7 +676,7 @@ pub const FocusManager = struct {
                 return true;
             },
             .enter, .space => {
-                const n = fm.focused orelse return false;
+                const n = fm.focusedNode() orelse return false;
                 // Only nodes advertising the activate action are activated:
                 // a slider has increment/decrement — a center click would
                 // reset its value to 50%.
@@ -685,7 +700,7 @@ pub const FocusManager = struct {
         // does the same): each phase re-hit-tests, so a .down handler that
         // tears down its own subtree can't make the .up dereference freed
         // nodes — the direct down+up-on-the-same-node loop did.
-        if (fm.root) |root| {
+        if (fm.rootNode()) |root| {
             if (input_mod.current()) |router| {
                 const r = node.mapRectToRoot(node.bounds);
                 router.dispatchPointer(root, .{ .phase = .down, .x = r.x + r.w / 2, .y = r.y + r.h / 2 });
@@ -716,7 +731,7 @@ pub const FocusManager = struct {
     /// Paint the focus ring around the focused node (the host calls this
     /// after painting the tree). 4 fillRects — no stroke primitive needed.
     pub fn paintRing(fm: *FocusManager, ctx: *kx.Ctx) void {
-        const n = fm.focused orelse return;
+        const n = fm.focusedNode() orelse return;
         const r = ringRect(n, fm.ring_offset);
         const w = fm.ring_width;
         const c = fm.ring_color;
@@ -737,14 +752,6 @@ pub fn setCurrentFocus(fm: ?*FocusManager) void {
 
 pub fn currentFocus() ?*FocusManager {
     return current_focus;
-}
-
-/// A node is being destroyed (virtualization, navigation) — drop it from the
-/// focus if it was focused (the pointer would dangle).
-pub fn focusNodeDestroyed(node: *Node) void {
-    if (current_focus) |fm| {
-        if (fm.focused == node) fm.focusNode(null);
-    }
 }
 
 /// The router's focus moved (pointer) — sync the process-global focus manager.
@@ -774,13 +781,15 @@ fn nodeContains(root: *Node, target: *Node) bool {
 }
 
 /// Move keyboard focus into `panel` when a modal opens (saving the prior
-/// focus), and restore the prior focus when the modal closes.
-pub fn syncModalFocus(panel: *Node, is_open: bool, saved_focus: *?*Node, focus_saved: *bool) void {
+/// focus), and restore the prior focus when the modal closes. `saved_focus`
+/// holds a weak node id — the saved node may be destroyed while the modal
+/// is open, and a dead id simply resolves to no restore.
+pub fn syncModalFocus(panel: *Node, is_open: bool, saved_focus: *?u64, focus_saved: *bool) void {
     if (is_open) {
         if (!focus_saved.*) {
             const fm_opt = currentFocus();
-            const cur = if (fm_opt) |fm| fm.focused else if (input_mod.current()) |r| r.focused else null;
-            saved_focus.* = cur;
+            const cur = if (fm_opt) |fm| fm.focusedNode() else if (input_mod.current()) |r| r.focusedNode() else null;
+            saved_focus.* = if (cur) |c| c.ref() else null;
             focus_saved.* = true;
             const target = firstFocusableIn(panel);
             if (target != null or (cur != null and !nodeContains(panel, cur.?))) {
@@ -797,10 +806,13 @@ pub fn syncModalFocus(panel: *Node, is_open: bool, saved_focus: *?*Node, focus_s
             focus_saved.* = false;
             const prev = saved_focus.*;
             saved_focus.* = null;
-            const valid_prev: ?*Node = if (prev) |p| blk: {
-                if (p.zombie) break :blk null;
+            // A destroyed saved focus resolves null — the zombie check it
+            // replaces. A survivor detached from the tree (a replaced page)
+            // is dropped too.
+            const valid_prev: ?*Node = if (prev) |pid| blk: {
+                const p = node_mod.resolve(pid) orelse break :blk null;
                 if (currentFocus()) |fm| {
-                    if (fm.root) |r| {
+                    if (fm.rootNode()) |r| {
                         if (!nodeContains(r, p)) break :blk null;
                     }
                 }
@@ -933,13 +945,13 @@ test "focus order: next/prev wrap around the semantic tree" {
     try std.testing.expect(order[0] == first and order[1] == second);
 
     fm.focusNext();
-    try std.testing.expect(fm.focused == first);
+    try std.testing.expect(fm.focusedNode() == first);
     fm.focusNext();
-    try std.testing.expect(fm.focused == second);
+    try std.testing.expect(fm.focusedNode() == second);
     fm.focusNext(); // wraps
-    try std.testing.expect(fm.focused == first);
+    try std.testing.expect(fm.focusedNode() == first);
     fm.focusPrev(); // wraps back
-    try std.testing.expect(fm.focused == second);
+    try std.testing.expect(fm.focusedNode() == second);
 }
 
 test "focusNode: signal fires, router focuses, bridge notified" {
@@ -966,7 +978,7 @@ test "focusNode: signal fires, router focuses, bridge notified" {
 
     fm.focusNode(node);
     try std.testing.expectEqual(@as(u32, 1), sig_fired);
-    try std.testing.expect(router.focused == node);
+    try std.testing.expect(router.focusedNode() == node);
     try std.testing.expectEqual(@as(usize, 1), lb.events.items.len);
     try std.testing.expectEqual(BridgeEvent.Kind.focus_changed, lb.events.items[0].kind);
     try std.testing.expectEqual(@intFromPtr(node), lb.events.items[0].node_id);
@@ -998,9 +1010,9 @@ test "handleKey: tab moves focus, enter/space activate (synthesized click)" {
 
     // Tab with a single focusable wraps onto itself.
     try std.testing.expect(fm.handleKey(.{ .kind = .key_down, .key = .tab }));
-    try std.testing.expect(fm.focused == root);
+    try std.testing.expect(fm.focusedNode() == root);
     try std.testing.expect(fm.handleKey(.{ .kind = .key_down, .key = .tab, .shift = true }));
-    try std.testing.expect(fm.focused == root);
+    try std.testing.expect(fm.focusedNode() == root);
 
     // Enter/Space activate: a synthesized click at the visual center.
     try std.testing.expect(fm.handleKey(.{ .kind = .key_down, .key = .enter }));
@@ -1029,7 +1041,7 @@ test "announce + LogBridge records live-region events" {
     try std.testing.expectEqual(BridgeEvent.Kind.tree_dirty, lb.events.items[1].kind);
 }
 
-test "focusNodeDestroyed: a destroyed focused node is dropped" {
+test "a destroyed focused node resolves to no focus" {
     const a = std.testing.allocator;
     var router = input_mod.InputRouter{};
     input_mod.setCurrent(&router);
@@ -1045,11 +1057,14 @@ test "focusNodeDestroyed: a destroyed focused node is dropped" {
     defer setCurrentFocus(null);
     fm.setRoot(root);
     fm.focusNode(node);
-    try std.testing.expect(fm.focused == node);
+    try std.testing.expect(fm.focusedNode() == node);
     _ = root.remove(node);
-    node.deinit(); // → focusNodeDestroyed → focus dropped
-    try std.testing.expect(fm.focused == null);
-    try std.testing.expect(router.focused == null);
+    node.deinit(); // the weak id dies with the node — no notification needed
+    try std.testing.expect(fm.focusedNode() == null);
+    try std.testing.expect(router.focusedNode() == null);
+    // And the focus still moves normally afterwards.
+    fm.focusNode(root);
+    try std.testing.expect(fm.focusedNode() == root);
 }
 
 test "routerFocusChanged: pointer focus syncs the focus manager" {
@@ -1068,10 +1083,10 @@ test "routerFocusChanged: pointer focus syncs the focus manager" {
     defer setCurrentFocus(null);
     fm.setRoot(root);
     input_mod.requestFocus(node); // pointer path (TextField click)
-    try std.testing.expect(fm.focused == node);
-    try std.testing.expect(router.focused == node);
+    try std.testing.expect(fm.focusedNode() == node);
+    try std.testing.expect(router.focusedNode() == node);
     input_mod.requestFocus(null); // Escape blur
-    try std.testing.expect(fm.focused == null);
+    try std.testing.expect(fm.focusedNode() == null);
 }
 
 test "handleKey: enter/space activate only nodes advertising .activate" {
@@ -1246,13 +1261,13 @@ test "modal semantics: active modal scopes semantic tree + focusOrder and restor
     root.add(modal_panel);
 
     fm.focusNode(bg_btn);
-    try std.testing.expect(fm.focused == bg_btn);
+    try std.testing.expect(fm.focusedNode() == bg_btn);
 
-    var saved: ?*Node = null;
+    var saved: ?u64 = null;
     var is_saved: bool = false;
     modal_panel.visible = true;
     syncModalFocus(modal_panel, true, &saved, &is_saved);
-    try std.testing.expect(fm.focused == modal_btn);
+    try std.testing.expect(fm.focusedNode() == modal_btn);
 
     const order = try fm.focusOrder(a);
     defer a.free(order);
@@ -1261,5 +1276,5 @@ test "modal semantics: active modal scopes semantic tree + focusOrder and restor
 
     modal_panel.visible = false;
     syncModalFocus(modal_panel, false, &saved, &is_saved);
-    try std.testing.expect(fm.focused == bg_btn);
+    try std.testing.expect(fm.focusedNode() == bg_btn);
 }

@@ -30,13 +30,16 @@ pub const Callback = struct {
 
 pub const Subscriber = union(enum) {
     effect: *Effect,
-    node: *Node,
+    /// Weak node binding (bindNode): the node's id — a dead node resolves
+    /// null at notify time instead of dangling (deinitBody's unbindAll is
+    /// the eager cleanup; this is the safety net).
+    node: u64,
     callback: Callback,
 
     pub fn notify(sub: Subscriber) void {
         switch (sub) {
             .effect => |e| e.run(),
-            .node => |n| n.markDirty(),
+            .node => |id| if (node_mod.resolve(id)) |n| n.markDirty(),
             .callback => |cb| cb.fn_ptr(cb.userdata),
         }
     }
@@ -45,7 +48,7 @@ pub const Subscriber = union(enum) {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
             .effect => |e| e == b.effect,
-            .node => |n| n == b.node,
+            .node => |id| id == b.node,
             .callback => |cb| cb.fn_ptr == b.callback.fn_ptr and cb.userdata == b.callback.userdata,
         };
     }
@@ -165,7 +168,9 @@ pub const SignalBase = struct {
     fn detachBoundNodes(base: *SignalBase) void {
         for (base.subscribers.items) |*entry| {
             const n = switch (entry.sub) {
-                .node => |nd| nd,
+                // A dead node's bound_signals died with it — nothing to
+                // detach.
+                .node => |id| node_mod.resolve(id) orelse continue,
                 else => continue,
             };
             var i: usize = 0;
@@ -569,13 +574,13 @@ pub fn Store(comptime T: type) type {
 /// bound node OR be freed inside that node's own deinit (widget-owned
 /// signals are: unbindAll runs first).
 pub fn bindNode(node: *Node, signal: anytype) void {
-    signal.subscribe(.{ .node = node });
+    signal.subscribe(.{ .node = node.ref() });
     node.bound_signals.append(node.allocator, &signal.base) catch @panic("klaxon: out of memory");
 }
 
 /// Detach a binding made by bindNode before the node's deinit.
 pub fn unbindNode(node: *Node, signal: anytype) void {
-    signal.unsubscribe(.{ .node = node });
+    signal.unsubscribe(.{ .node = node.ref() });
     const base: *SignalBase = &signal.base;
     for (node.bound_signals.items, 0..) |b, i| {
         if (b == @as(*anyopaque, base)) {
@@ -589,7 +594,7 @@ pub fn unbindNode(node: *Node, signal: anytype) void {
 pub fn unbindAll(node: *Node) void {
     for (node.bound_signals.items) |b| {
         const base: *SignalBase = @ptrCast(@alignCast(b));
-        base.unsubscribe(.{ .node = node });
+        base.unsubscribe(.{ .node = node.ref() });
     }
     node.bound_signals.deinit(node.allocator);
     node.bound_signals = .empty;

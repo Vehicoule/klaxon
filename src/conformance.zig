@@ -1173,7 +1173,7 @@ fn expectDamage(h: *Harness, c: *Check, v: Value) void {
 }
 
 fn expectFocused(h: *Harness, c: *Check, v: Value, router_side: bool) void {
-    const n = if (router_side) h.router.focused else if (h.fm) |fm| fm.focused else null;
+    const n = if (router_side) h.router.focusedNode() else if (h.fm) |fm| fm.focusedNode() else null;
     if (v == .null) {
         if (n) |nn| c.fail("{s}: expected null, got \"{s}\"", .{ if (router_side) "router_focused" else "focused", idFor(h, nn) });
         return;
