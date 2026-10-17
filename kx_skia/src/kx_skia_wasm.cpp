@@ -324,12 +324,13 @@ void gpu_end_frame(GpuState* state) {
 
 SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
     // Warmup (Phase 4e.1): a render-target surface on the active context —
-    // same draw ops, same programs as the onscreen frames.
+    // same draw ops, target format, and sRGB color space as onscreen frames.
     if (!state || width <= 0 || height <= 0) return nullptr;
     if (state->is_graphite()) {
         state->warmup_surface = SkSurfaces::RenderTarget(
             state->recorder.get(),
-            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+            SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+                              SkColorSpace::MakeSRGB()));
     } else if (state->dctx) {
         // Signature at the pinned Skia (include/gpu/ganesh/SkSurfaceGanesh.h):
         // RenderTarget(GrRecordingContext*, skgpu::Budgeted, const SkImageInfo&)
@@ -337,7 +338,8 @@ SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
         // include/gpu/GpuTypes.h via ganesh/GrTypes.h.
         state->warmup_surface = SkSurfaces::RenderTarget(
             state->dctx.get(), skgpu::Budgeted::kYes,
-            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+            SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType,
+                              SkColorSpace::MakeSRGB()));
     }
     return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }

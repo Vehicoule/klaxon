@@ -36,9 +36,11 @@
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkData.h"
 #include "include/core/SkFontMgr.h"
+#include "include/core/SkFontStyle.h"
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSize.h"
 #include "include/core/SkSurface.h"
+#include "include/core/SkTypeface.h"
 #include "include/gpu/GpuTypes.h"                  // skgpu::Mipmapped, GrRenderable
 #include "include/gpu/ganesh/GrBackendSurface.h"    // GrBackendRenderTarget
 #include "include/gpu/ganesh/GrDirectContext.h"
@@ -781,9 +783,13 @@ static void vulkan_end_frame(GpuState* st) {
 
 static SkCanvas* vulkan_begin_offscreen(GpuState* st, int width, int height) {
     if (!st || !st->grecorder || width <= 0 || height <= 0) return nullptr;
+    const SkColorType ct = (st->swapchain.format == VK_FORMAT_R8G8B8A8_UNORM ||
+                            st->swapchain.format == VK_FORMAT_R8G8B8A8_SRGB)
+                               ? kRGBA_8888_SkColorType
+                               : kBGRA_8888_SkColorType;
     st->warmup_surface = SkSurfaces::RenderTarget(
         st->grecorder.get(),
-        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+        SkImageInfo::Make(width, height, ct, kPremul_SkAlphaType, SkColorSpace::MakeSRGB()));
     return st->warmup_surface ? st->warmup_surface->getCanvas() : nullptr;
 }
 
@@ -793,6 +799,7 @@ static bool vulkan_end_offscreen(GpuState* st) {
     if (recording) {
         skgpu::graphite::InsertRecordingInfo info{};
         info.fRecording = recording.get();
+        info.fTargetSurface = st->warmup_surface.get();
         st->gcontext->insertRecording(info);
     }
     st->gcontext->submit(skgpu::graphite::SyncToCpu::kYes);
@@ -861,11 +868,12 @@ void gpu_end_frame(GpuState* state) {
 SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
     if (state && state->gcontext) return vulkan_begin_offscreen(state, width, height);
     // Warmup (Phase 4e.1): a render-target surface on the Ganesh context —
-    // same draw ops, same programs as the onscreen frames.
+    // same draw ops, same programs + sRGB color space as the onscreen frames.
     if (!state || !state->dctx || width <= 0 || height <= 0) return nullptr;
     state->warmup_surface = SkSurfaces::RenderTarget(
         state->dctx.get(), skgpu::Budgeted::kYes,
-        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+        SkImageInfo::Make(width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType,
+                          SkColorSpace::MakeSRGB()));
     return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }
 
@@ -919,15 +927,58 @@ sk_sp<SkImage> gpu_stream_image(GpuState* state, const void* rgba, int w, int h)
     return SkImages::TextureFromImage(state->dctx.get(), img.get());
 }
 
+static const char* g_linux_font_family = nullptr;
+
+static const char* pick_latin_family(SkFontMgr* mgr) {
+    if (!mgr) return nullptr;
+    static constexpr const char* kPreferred[] = {
+        "DejaVu Sans", "Liberation Sans", "Noto Sans", "Ubuntu", "Cantarell", "FreeSans",
+    };
+    for (const char* fam : kPreferred) {
+        if (sk_sp<SkTypeface> tf = mgr->matchFamilyStyle(fam, SkFontStyle::Normal())) {
+            if (tf->unicharToGlyph('A') != 0) return fam;
+        }
+    }
+    return nullptr;
+}
+
+static bool mgr_has_latin_face(SkFontMgr* mgr) {
+    if (!mgr) return false;
+    if (pick_latin_family(mgr)) return true;
+    const int n = mgr->countFamilies();
+    for (int i = 0; i < n; ++i) {
+        if (sk_sp<SkFontStyleSet> set = mgr->createStyleSet(i)) {
+            if (sk_sp<SkTypeface> tf = set->matchStyle(SkFontStyle::Normal())) {
+                if (tf->unicharToGlyph('A') != 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
 sk_sp<SkFontMgr> platform_font_mgr() {
-    // System font directories (DejaVu et al. on CI runners).
-    for (const char* dir : {"/usr/share/fonts", "/usr/local/share/fonts"}) {
-        if (auto mgr = SkFontMgr_New_Custom_Directory(dir)) return mgr;
+    // System and workspace font directories — verify the directory actually
+    // yields at least one Latin-covering face (SkFontMgr_New_Custom_Directory
+    // returns a non-null manager with SkTypeface_Empty when a directory is
+    // missing or empty).
+    for (const char* dir : {
+             "/usr/share/fonts",
+             "/usr/local/share/fonts",
+             "assets/fonts",
+             "deps/fonts",
+             "deps/skia/resources/fonts",
+         }) {
+        if (auto mgr = SkFontMgr_New_Custom_Directory(dir)) {
+            if (mgr_has_latin_face(mgr.get())) {
+                g_linux_font_family = pick_latin_family(mgr.get());
+                return mgr;
+            }
+        }
     }
     return SkFontMgr_New_Custom_Empty();
 }
 
-const char* platform_font_family() { return nullptr; }
+const char* platform_font_family() { return g_linux_font_family; }
 
 const char* platform_fallback_font_family() { return nullptr; }
 

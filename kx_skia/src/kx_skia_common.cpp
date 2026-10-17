@@ -1466,7 +1466,7 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
 // driver, never silently switches APIs).
 static const kx_backend* kx_platform_chain(size_t* count) {
 #if defined(__EMSCRIPTEN__)
-    static const kx_backend chain[] = { KX_BACKEND_GANESH_WEBGL2 };
+    static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_WEBGPU, KX_BACKEND_GANESH_WEBGL2 };
 #elif defined(__ANDROID__)
     static const kx_backend chain[] = { KX_BACKEND_GRAPHITE_VULKAN, KX_BACKEND_GANESH_GLES };
 #elif defined(__APPLE__)
@@ -1601,44 +1601,13 @@ void kx_resize(kx_ctx* ctx, int width, int height) {
     }
 }
 
-// A Graphite surface's Device is snapped into the recording at frame
-// flush — pooled offscreen surfaces must not outlive the frame that drew
-// them (the device is dead next frame — measured: crash in drawPaint on
-// reuse). The pool resets here; passes within the frame still share one
-// surface, which is the win that matters (a scene rasterizing N retained
-// subtrees pays ONE surface alloc per frame, not N).
 void kx_begin_frame(kx_ctx* ctx) {
     if (!ctx) return;
-    // Only Graphite surfaces die at frame flush — Ganesh render targets and
-    // raster surfaces are persistent, so they keep the pool across frames
-    // (releasing it per frame measured ~0.8ms of FBO/texture churn on the
-    // GLES emulator — the dominant scroll_10k regression there).
-    // Graphite recorders now persist across frames (snap() leaves them
-    // reusable) — surfaces made on them stay valid, so the pool keeps its
-    // texture like the raster/Ganesh paths instead of reallocating a
-    // RenderTarget every frame.
-    const bool rec = ctx->backend == KX_BACKEND_GRAPHITE_VULKAN ||
-                     ctx->backend == KX_BACKEND_GRAPHITE_DAWN ||
-                     ctx->backend == KX_BACKEND_GRAPHITE_WEBGPU;
-    if (rec) {
-        ctx->offscreen_pools.clear();  // stale: those platforms still reset
-                                        //        the recorder per frame
-        ctx->pixels_surf = nullptr;
-        ctx->pixels_view = nullptr;
-        ctx->pixels_surf_w = 0;
-        ctx->pixels_surf_h = 0;
-        // The atlas is the same surface kind — its device dies at flush
-        // too. Reset it fully and bump gen so Zig-side slots re-rasterize.
-        if (ctx->atlas_image_id) {
-            ctx->images.erase(ctx->atlas_image_id);
-            ctx->atlas_image_id = 0;
-        }
-        ctx->atlas.reset();
-        ctx->atlas_view.reset();
-        ctx->atlas_shelves.clear();
-        ctx->atlas_next_y = 0;
-        ctx->atlas_gen++;
-    }
+    // Graphite recorders persist across frames on all backends (Metal,
+    // Vulkan, Dawn, WebGPU) — snap() drains the task list and leaves the
+    // recorder reusable, so surfaces created on it (offscreen_pools,
+    // pixels_surf, and the row atlas) stay valid across frames just like on
+    // Ganesh and raster.
     // Unbalanced layer records from a previous frame die with it — and so
     // does any leaked batch/pass state (a stray sprite_target pointing at
     // a dead pooled canvas would misroute a whole frame of blits).
@@ -2172,8 +2141,13 @@ static bool kx_atlas_alloc(kx_ctx* ctx, int w, int h, int* sx, int* sy) {
             for (size_t fi = 0; fi < sh.free_x.size(); ++fi) {
                 if (w <= sh.free_w[fi]) {
                     *sx = sh.free_x[fi]; *sy = sh.y;
-                    sh.free_x.erase(sh.free_x.begin() + fi);
-                    sh.free_w.erase(sh.free_w.begin() + fi);
+                    if (w < sh.free_w[fi]) {
+                        sh.free_x[fi] += w;
+                        sh.free_w[fi] -= w;
+                    } else {
+                        sh.free_x.erase(sh.free_x.begin() + fi);
+                        sh.free_w.erase(sh.free_w.begin() + fi);
+                    }
                     return true;
                 }
             }

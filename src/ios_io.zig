@@ -123,12 +123,12 @@ fn noCrashHandler(userdata: ?*anyopaque) void {
     _ = userdata; // pas de handler SIGSEGV: le panic imprime via SDL_Log puis abort()
 }
 
-var cancel_protection: u1 = @intFromEnum(Io.CancelProtection.unblocked);
+var cancel_protection: u1 = @backingInt(Io.CancelProtection.unblocked);
 
 fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
     _ = userdata;
-    const old: u1 = @atomicRmw(u1, &cancel_protection, .Xchg, @intFromEnum(new), .seq_cst);
-    return @enumFromInt(old);
+    const old: u1 = @atomicRmw(u1, &cancel_protection, .Xchg, @backingInt(new), .seq_cst);
+    return @fromBackingInt(@intCast(old));
 }
 
 fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {

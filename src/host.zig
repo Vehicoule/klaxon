@@ -73,15 +73,6 @@ fn displayScaleOf(window: *sdl.c.SDL_Window, layout_w: c_int, pixel_w: c_int) f3
     return sdl.c.SDL_GetWindowDisplayScale(window);
 }
 
-/// iOS: the Graphite-Metal shim scales the frame canvas itself in
-/// gpu_begin_frame (Ganesh-Metal and Graphite-Dawn share that path). Raster
-/// and Ganesh GLES do not — they rely on the host-side DPR scale in
-/// renderFrame.
-fn iosShimScalesCanvas(ctx: *kx.Ctx) bool {
-    const b = kx.c.kx_backend_of(ctx);
-    return b == kx.c.KX_BACKEND_GRAPHITE_METAL;
-}
-
 /// Frame budget: 8.33 ms → 120 fps target (the metrics gate). The whole loop
 /// iteration is paced to the budget (slow iterations run unthrottled and flag
 /// the timeline's frame_overrun — low-priority animations pause).
@@ -549,6 +540,33 @@ pub const Host = struct {
                 // syncIme re-arms text input on the new window
             }
         }
+        // Emscripten AUTO tries Graphite WebGPU first (without an OpenGL
+        // context on the canvas). If WebGPU is unavailable and the chain fell
+        // through to raster, retry Ganesh WebGL2 on an OPENGL window with a
+        // current GLES 3.0 context before settling on raster.
+        if (is_emscripten and backend == kx.c.KX_BACKEND_AUTO and resolved_backend == kx.c.KX_BACKEND_RASTER) {
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MAJOR_VERSION), 3);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_MINOR_VERSION), 0);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_CONTEXT_PROFILE_MASK), sdl.c.SDL_GL_CONTEXT_PROFILE_ES);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DOUBLEBUFFER), 1);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_DEPTH_SIZE), 0);
+            _ = sdl.c.SDL_GL_SetAttribute(@intCast(sdl.c.SDL_GL_STENCIL_SIZE), 8);
+            sdl.c.SDL_DestroyWindow(window);
+            window = sdl.c.SDL_CreateWindow("klaxon hello", width, height, sdl.c.SDL_WINDOW_OPENGL) orelse
+                sdl.c.SDL_CreateWindow("klaxon hello", width, height, 0) orelse return error.SdlWindow;
+            if (sdl.c.SDL_GL_CreateContext(window)) |new_gl| {
+                _ = sdl.c.SDL_GL_MakeCurrent(window, new_gl);
+                _ = sdl.c.SDL_GL_SetSwapInterval(0);
+                if (kx.create(@ptrCast(window), pixel_w, pixel_h, kx.c.KX_BACKEND_GANESH_WEBGL2)) |gl_kx| {
+                    kx.c.kx_destroy(ctx);
+                    ctx = gl_kx;
+                    gl_ctx = new_gl;
+                    resolved_backend = kx.c.kx_backend_of(ctx);
+                } else {
+                    _ = sdl.c.SDL_GL_DestroyContext(new_gl);
+                }
+            }
+        }
         const t_kx = sdl.c.SDL_GetTicksNS();
         log("init stages: sdl {d:.1} ms, window {d:.1} ms, gl-ctx {d:.1} ms, kx-create {d:.1} ms", .{
             @as(f32, @floatFromInt(t_sdl - t_init)) / 1e6,
@@ -912,11 +930,9 @@ pub const Host = struct {
         // HiDPI: the canvas is pixel-sized (kx_create got
         // pixel_width/pixel_height) while the tree lays out in points —
         // scale the point-space paint onto the pixel canvas (crisp on
-        // Retina/HiDPI). Skipped only for the iOS Metal shim, which scales
-        // the canvas itself in gpu_begin_frame.
-        if (host.display_scale != 1.0 and
-            !(is_ios and iosShimScalesCanvas(host.ctx)))
-        {
+        // Retina/HiDPI) on all platforms after kx_begin_frame resets the
+        // canvas matrix.
+        if (host.display_scale != 1.0) {
             kx.c.kx_save(host.ctx);
             kx.c.kx_scale(host.ctx, host.display_scale, host.display_scale);
         }
@@ -1015,8 +1031,7 @@ pub const Host = struct {
             host.devtools.recordFrame(host.stats.frame_time_ms);
             host.devtools.paint(host.ctx, host.width, host.height, &host.stats);
         }
-        if (host.display_scale != 1.0 and
-            !(is_ios and iosShimScalesCanvas(host.ctx)))
+        if (host.display_scale != 1.0)
             kx.c.kx_restore(host.ctx);
         kx.c.kx_end_frame(host.ctx);
         const t_paint = sdl.c.SDL_GetTicksNS();
@@ -1155,7 +1170,7 @@ pub const Host = struct {
         // carry the root and target node pointers). Dispatch here on the
         // render thread. The getter returns 0 when the bridge is down — no
         // real event has type 0.
-        if (is_linux and event.type == kx.a11yActionEventType()) {
+        if ((is_linux or is_android) and event.type == kx.a11yActionEventType()) {
             const ptr: u64 = if (event.user.data2) |p| @intFromPtr(p) else 0;
             a11y_bridge.dispatchAtAction(event.user.code, event.user.data1, ptr);
             return false;

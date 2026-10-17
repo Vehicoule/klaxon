@@ -39,7 +39,6 @@ namespace kx {
 struct GpuState {
     std::unique_ptr<skgpu::graphite::Context> context;
     std::unique_ptr<skgpu::graphite::Recorder> recorder;
-    std::unique_ptr<skgpu::graphite::Recorder> warmup_recorder;
     sk_sp<SkSurface> warmup_surface;
     CAMetalLayer* layer = nil;
     SDL_MetalView metal_view = nullptr;
@@ -100,17 +99,36 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
     state->layer.device = device;
     state->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     state->layer.framebufferOnly = YES;
-    state->command_queue = [device newCommandQueue]; // retained for presentDrawable
+    // Share a single MTLCommandQueue between Graphite and presentDrawable so
+    // GPU rendering and presentation execute in order on the same queue.
+    state->command_queue = [device newCommandQueue];
+    if (!state->command_queue) { [device release]; SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
     sync_layer(state);
-
-    id<MTLCommandQueue> queue = [device newCommandQueue];
 
     skgpu::graphite::MtlBackendContext mtl_ctx;
     // No ARC: CFRetain produces the +1 reference that sk_cfp adopts (and releases).
+    // Release the local +1 device reference; state->command_queue retains its +1
+    // until gpu_shutdown.
     mtl_ctx.fDevice = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)device));
-    mtl_ctx.fQueue = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)queue));
+    mtl_ctx.fQueue = sk_cfp<CFTypeRef>((CFTypeRef)CFRetain((__bridge CFTypeRef)state->command_queue));
+    [device release];
     state->context = skgpu::graphite::ContextFactory::MakeMetal(mtl_ctx, skgpu::graphite::ContextOptions{});
-    if (!state->context) { SDL_Metal_DestroyView(state->metal_view); delete state; return false; }
+    if (!state->context) {
+        [state->command_queue release];
+        state->command_queue = nil;
+        SDL_Metal_DestroyView(state->metal_view);
+        delete state;
+        return false;
+    }
+    state->recorder = state->context->makeRecorder();
+    if (!state->recorder) {
+        state->context.reset();
+        [state->command_queue release];
+        state->command_queue = nil;
+        SDL_Metal_DestroyView(state->metal_view);
+        delete state;
+        return false;
+    }
     *out = state;
     return true;
 }
@@ -118,13 +136,17 @@ bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backen
 void gpu_shutdown(GpuState* state) {
     if (!state) return;
     state->frame_surface = nullptr;
+    state->warmup_surface = nullptr;
     state->drawable_texture = nil;
     state->drawable = nil;
-    state->command_queue = nil;
     state->recorder.reset();
     if (state->context) {
         state->context->submit(skgpu::graphite::SyncToCpu::kYes);
         state->context.reset();
+    }
+    if (state->command_queue) {
+        [state->command_queue release];
+        state->command_queue = nil;
     }
     if (state->metal_view) SDL_Metal_DestroyView(state->metal_view);
     delete state;
@@ -160,13 +182,10 @@ SkCanvas* gpu_begin_frame(GpuState* state) {
         state->recorder.get(), backend_tex, kBGRA_8888_SkColorType,
         SkColorSpace::MakeSRGB(), nullptr);
     if (!state->frame_surface) return nullptr;
-    // Layout is in points, the drawable is in pixels: scale the canvas so
-    // point-space drawing lands 1:1 on the pixel grid. Recomputed per frame
-    // from the live view bounds (tracks rotation / display changes).
+    // Update layer scale for contentsScale tracking; Host.renderFrame applies
+    // the uniform DPR canvas scale after kx_begin_frame resets the base matrix.
     state->scale = layer_scale(state);
-    SkCanvas* canvas = state->frame_surface->getCanvas();
-    canvas->scale(state->scale, state->scale);
-    return canvas;
+    return state->frame_surface->getCanvas();
 }
 
 void gpu_end_frame(GpuState* state) {
@@ -200,8 +219,8 @@ void gpu_end_frame(GpuState* state) {
     state->frame_surface = nullptr;
     state->drawable_texture = nil; // release our texture reference
     if (state->drawable) {
-        // Present via command buffer (not [drawable present]) — the simulator
-        // requires presentDrawable to go through the command queue.
+        // Present via command buffer on the shared command queue — guaranteed
+        // ordered after the Graphite submit above.
         if (state->command_queue) {
             id<MTLCommandBuffer> cb = [state->command_queue commandBuffer];
             [cb presentDrawable:state->drawable];
@@ -220,31 +239,30 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     return SkFontMgr_New_CoreText(nullptr);
 }
 
-// Warmup: offscreen graphite surface on its own recorder — same draw ops,
-// so the same pipelines onscreen frames use (Metal compiles lazily on
-// first use). Identical to the macOS implementation.
+// Warmup: offscreen graphite surface on the shared recorder — same draw ops
+// and target format/colorSpace as onscreen frames.
 SkCanvas* gpu_begin_offscreen(GpuState* state, int width, int height) {
     if (!state || !state->context || width <= 0 || height <= 0) return nullptr;
-    state->warmup_recorder = state->context->makeRecorder();
-    if (!state->warmup_recorder) return nullptr;
-    // BGRA like the wrapped CAMetalLayer drawable — pipelines are
+    if (!state->recorder) state->recorder = state->context->makeRecorder();
+    if (!state->recorder) return nullptr;
+    // BGRA + sRGB like the wrapped CAMetalLayer drawable — pipelines are
     // per-target-format, an RGBA warmup would not prime onscreen draws.
     state->warmup_surface = SkSurfaces::RenderTarget(
-        state->warmup_recorder.get(),
-        SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType, nullptr));
+        state->recorder.get(),
+        SkImageInfo::Make(width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType,
+                          SkColorSpace::MakeSRGB()));
     return state->warmup_surface ? state->warmup_surface->getCanvas() : nullptr;
 }
 bool gpu_end_offscreen(GpuState* state) {
     if (!state || !state->context) return false;
-    if (state->warmup_recorder) {
-        std::unique_ptr<skgpu::graphite::Recording> recording = state->warmup_recorder->snap();
+    if (state->recorder) {
+        std::unique_ptr<skgpu::graphite::Recording> recording = state->recorder->snap();
         if (recording) {
             skgpu::graphite::InsertRecordingInfo info;
             info.fRecording = recording.get();
             info.fTargetSurface = state->warmup_surface.get();
             state->context->insertRecording(info);
         }
-        state->warmup_recorder.reset();
     }
     // Synchronous: the pipeline compile must complete inside the warmup
     // call, not leak into the next real frame.
