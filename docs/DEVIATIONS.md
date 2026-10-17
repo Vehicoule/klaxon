@@ -54,6 +54,26 @@ See [`docs/DECISIONS.md`](file:///Users/btw/Documents/projects/Klaxon/docs/DECIS
 Each widget's header carries the same list; these are the tracked ones
 (file:line is approximate — headers move):
 
+- `ui/interactions.zig` + `ui/state_layer.zig` + `ui/ripple.zig` — the
+  Compose indication machinery has landed as shared modules
+  (InteractionSource semantics, the animated StateLayer, and
+  RippleAnimation/CommonRipple), but **no widget consumes them yet**:
+  widgets still paint fixed-alpha interaction overlays (checkbox's 40dp
+  circle, button's hand-rolled pressed/focused/hovered precedence,
+  nav_bar's index tracking) and draw no expanding ink ripple. Widget
+  migration is deliberately deferred to follow-up batches; the integration
+  contract lives in each module's header. Deliberate port deltas inside
+  the machinery itself: concurrent ripples capped at 4 (upstream's
+  scatter map is unbounded, though every `addRipple` finishes all live
+  ripples anyway — overflow retires the oldest instantly); active
+  interactions capped at 8 = InputRouter's pointer slots (upstream's list
+  is unbounded; `MutableSharedFlow`'s DROP_OLDEST policy applies on
+  overflow); the bounded clip supports `.rrect`/`.path` beyond upstream's
+  `clipRect` (material3 clips indication to the component shape; the
+  vendored material-ripple predates that); pointer-provenance focus
+  (`focus_via`) is explicit so the focus state layer can be gated
+  focus-visible — upstream gets this for free since `clickable` never
+  requests focus on press.
 - `input.zig` — legacy P0 controls co-exported alongside the M3E ports.
 - `segmented_button.zig` — the check icon is upstream's
   AnimatedVisibility (fade + scale-in from bottom-left, instant exit,

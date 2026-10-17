@@ -65,4 +65,17 @@ No upstream counterpart (Klaxon-native, M3-styled): avatar, calendar,
 color_picker, expansion_panel, stepper, table, tree.
 
 Framework primitives (not widgets): anim, container, gestures, grid_view,
-i18n, image, input, layout, list_view, navigator, scroll_*, scrollbar, text.
+i18n, image, input, interactions, layout, list_view, navigator, ripple,
+scroll_*, scrollbar, state_layer, text.
+
+Indication machinery (ports `material-ripple/` + `foundation-interaction/`):
+`ui.interactions` (ordered active-interaction set — upstream
+InteractionSource/PressInteraction/HoverInteraction/FocusInteraction/
+DragInteraction semantics, id-paired ends, last-wins + focus-visible
+gating), `ui.state_layer` (Ripple.kt:412-529's private StateLayer — one
+animated alpha, the incoming/outgoing spec table, RippleAlpha targets),
+`ui.ripple` (RippleAnimation.kt + CommonRipple.kt — 30%-of-max-dim start
+radius, half-diagonal +10dp bounded end, 75/225/150ms fade-in/expand/out,
+shape clipping, a live-only timeline ticker). Landed but not yet consumed
+by any widget — the migration contract is in each module header; see
+docs/DEVIATIONS.md.
