@@ -113,7 +113,15 @@
 //   - The AM/PM column is pointer-only (as in the dial variant); Tab
 //     reaches the focused node before the host's global traversal, so it
 //     walks the fields directionally and bubbles off the edge.
-//   - No per-label hover on the dial; no keyboard navigation on the dial.
+//   - No per-label hover on the dial. Keyboard nav on the dial: the node
+//     is focusable, arrows step a focused numeral (composition order —
+//     outer ring then the 24h inner ring), Enter/Space commits it without
+//     the pointer path's auto-advance to minute, Tab bubbles. Upstream
+//     gates numeral focus on `inputMode != Touch` and Shift+Tab raises
+//     `isDialFocusable = false`; with no input-modality query the dial
+//     is a permanent stop and touch only clears the focused numeral.
+//     Per-numeral virtual a11y children are not synthesized — screen
+//     readers see the group value.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -335,6 +343,49 @@ fn valueAtAngle(cx: f32, cy: f32, x: f32, y: f32, mode: DialMode, is_24h: bool) 
         return hour_values[i];
     }
     return @mod(@as(i32, @intFromFloat(@round(deg / 6))), 60);
+}
+
+/// The dial's keyboard-focusable numerals — upstream's per-ClockText
+/// focus order is composition order: the outer ring first, then the
+/// 24h dial's inner ring (minute/12h-hour dials have just the one).
+fn dialNumeralCount(s: *const TpState) usize {
+    return if (s.mode == .hour and s.opts.is_24h) 24 else 12;
+}
+
+/// Numeral `idx`'s dial value (traversal order — see dialNumeralCount).
+fn dialNumeralValue(s: *const TpState, idx: usize) i32 {
+    if (s.mode == .hour) {
+        if (s.opts.is_24h) return @intCast(idx); // 0..11 outer, 12..23 inner
+        return hour_values[idx];
+    }
+    return @intCast(idx * 5);
+}
+
+/// `value`'s index in the traversal order (seeds the keyboard focus at
+/// the current value; an off-numeral minute snaps to the nearest one).
+fn dialNumeralIdx(s: *const TpState, value: i32) usize {
+    if (s.mode == .hour) {
+        if (s.opts.is_24h) return @intCast(@mod(value, 24));
+        const v12: i32 = if (value == 0) 12 else value;
+        for (hour_values, 0..) |hv, i| if (hv == v12) return i;
+        return 0;
+    }
+    return @intCast(@mod(@divTrunc(value + 2, 5), 12));
+}
+
+/// Upstream's numeral focus move: ±1 in the traversal order, seeding at
+/// the current value when no numeral is focused yet.
+fn dialStepFocus(s: *TpState, dir: i32) void {
+    const count = dialNumeralCount(s);
+    var idx = dialNumeralIdx(s, dialValue(clampedTime(s.time.peek()), s.mode, s.opts.is_24h));
+    if (s.dial_focus >= 0) {
+        // the focused numeral may not match the mode's set after a swap —
+        // fall back to the current value in that case
+        const fi = dialNumeralIdx(s, s.dial_focus);
+        if (fi < count and dialNumeralValue(s, fi) == s.dial_focus) idx = fi;
+    }
+    const next = @mod(@as(i32, @intCast(idx)) + dir, @as(i32, @intCast(count)));
+    s.dial_focus = dialNumeralValue(s, @intCast(next));
 }
 
 /// Apply a dial selection to the time signal (mode-dependent).
@@ -663,6 +714,10 @@ const TpState = struct {
     /// LaunchedEffect on state.hour/state.minute).
     last_hour: i32 = -1,
     last_minute: i32 = -1,
+    /// The keyboard-focused dial numeral's value (-1 = none — upstream's
+    /// per-ClockText focus, flattened onto the single focusable node;
+    /// arrows step it in composition order, Enter/Space commits).
+    dial_focus: i32 = -1,
     /// The field the routed key event went to (applyEditNode's target) +
     /// its pre-edit snapshot (revertAllChanges restores it wholesale).
     editing: DialMode = .hour,
@@ -1347,6 +1402,17 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
         const m = ui.paint.measureText(vstr, bl.size, bl_bold);
         ui.paint.text(ctx, vstr, sel_x - m.width / 2, sel_y - m.height / 2 + m.ascent, bl.size, bl_bold, cs.on_primary);
     }
+    // the keyboard-focused numeral's indication (upstream's focusable
+    // ClockText ripple — a ring at the numeral's bounds while the node
+    // holds focus)
+    if (s.dial_focus >= 0 and input.isFocused(n)) {
+        const fa = valueAngle(s.dial_focus, s.mode, s.opts.is_24h) * std.math.pi / 180;
+        const fr = selectorRing(s.dial_focus, s.mode, s.opts.is_24h);
+        const fx = cx + @cos(fa) * fr;
+        const fy = cy + @sin(fa) * fr;
+        const fd: f32 = 48; // MinimumInteractiveSize — upstream's ring d
+        ui.paint.strokeRRect(ctx, fx - fd / 2, fy - fd / 2, fd, fd, fd / 2, t.platform.focus_ring_width, cs.primary);
+    }
     // the footer
     paintFooter(n, ctx);
 }
@@ -1375,8 +1441,11 @@ fn tpOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.down_x = ev.raw_x;
             s.down_y = ev.raw_y;
             if (std.meta.activeTag(z) == .dial) {
-                // the dial owns the drag: select by angle immediately
+                // the dial owns the drag: select by angle immediately;
+                // a touch clears the keyboard focus (upstream's
+                // inputMode gate)
                 s.dragging = true;
+                s.dial_focus = -1;
                 const c = dialCenter(n);
                 applyDialValue(s, valueAtAngle(c[0], c[1], ev.x, ev.y, s.mode, s.opts.is_24h));
                 n.markDirty();
@@ -1483,8 +1552,27 @@ fn tpOnPointer(n: *Node, ev: input.PointerEvent) bool {
 
 fn tpOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
-    // Only the input variant edits — and only while a field holds focus.
-    if (s.variant != .input or !input.isFocused(n)) return false;
+    if (!input.isFocused(n)) return false;
+    if (s.variant != .input) {
+        // The dial's keyboard nav (upstream ClockText.onKeyEvent): arrows
+        // step the focused numeral, Enter/Space commits it (the keyboard
+        // commit passes autoSwitchToMinute = false — no advance), Tab and
+        // Escape bubble to the host's focus traversal (upstream's escape
+        // path).
+        if (ev.kind != .key_down) return false;
+        switch (ev.key) {
+            .right, .down => dialStepFocus(s, 1),
+            .left, .up => dialStepFocus(s, -1),
+            .enter, .space => {
+                if (s.dial_focus >= 0) applyDialValue(s, s.dial_focus);
+                n.markDirty();
+                return true;
+            },
+            else => return false,
+        }
+        n.markDirty();
+        return true;
+    }
     // Upstream shouldSwitchFocusToMinute: a digit at the end of a complete
     // valid hour hops to the minute field and lands there.
     var target: DialMode = s.mode;
@@ -1593,8 +1681,14 @@ fn flipVariant(n: *Node, s: *TpState) void {
 fn activate(n: *Node, s: *TpState, z: Zone) void {
     switch (z) {
         .none, .dial => {},
-        .hour_plate => s.mode = .hour,
-        .minute_plate => s.mode = .minute,
+        .hour_plate => {
+            s.mode = .hour;
+            s.dial_focus = -1; // the numeral set changed
+        },
+        .minute_plate => {
+            s.mode = .minute;
+            s.dial_focus = -1;
+        },
         .hour_field => selectField(n, s, .hour),
         .minute_field => selectField(n, s, .minute),
         .mode_toggle => flipVariant(n, s),
@@ -1712,7 +1806,10 @@ fn attachSemantics(n: *Node) void {
             .role = .group,
             .label = i18n_mod.tr("Time picker"),
             .value = s.value_buf[0..s.value_len],
-        }); // the dial's original descriptor — unchanged
+            // upstream's numerals are focusable in keyboard input mode;
+            // without an input-modality query the dial is always a stop
+            .focusable = true,
+        });
     }
 }
 
@@ -2751,4 +2848,68 @@ test "golden: the vibrant input variant (CornerLarge plates, the circle/squircle
     // field is the bare panel (upstream `shapes == null || !isValid`)
     const sup = supportRect(n.bounds, .minute, s, 0, t);
     try std.testing.expectEqual(t.colors.surface_container, f2.pixelAt(@intFromFloat(sup.x + sup.w / 2), @intFromFloat(sup.y + 4)));
+}
+
+test "time_picker: the dial's keyboard nav — arrows step the focused numeral, Enter commits (no auto-advance)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(i32).init(a, 630); // 10:30 AM
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{});
+    defer n.deinit();
+    const s = stateOf(n);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = 520 });
+    input.requestFocus(n);
+    // unfocused → keys ignored
+    input.requestFocus(null);
+    try std.testing.expect(!n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .right }));
+    input.requestFocus(n);
+    // Right seeds the focus at the current hour (10 → idx 10) and steps
+    // to 11; Enter commits it WITHOUT the pointer path's minute advance
+    try std.testing.expect(n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .right }));
+    try std.testing.expectEqual(@as(i32, 11), s.dial_focus);
+    try std.testing.expect(n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter }));
+    try std.testing.expectEqual(@as(i32, 11 * 60 + 30), sig.peek());
+    try std.testing.expectEqual(DialMode.hour, s.mode); // no auto-advance
+    // wrap-around: Up/Left from idx 0 (12 o'clock) → idx 11
+    s.dial_focus = 12;
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(i32, 11), s.dial_focus);
+    // a pointer tap clears the keyboard focus (inputModality)
+    const c = dialCenter(n);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = c[0], .y = c[1] - label_ring, .raw_x = c[0], .raw_y = c[1] - label_ring, .pointer = 0, .time_ms = 0 });
+    try std.testing.expectEqual(@as(i32, -1), s.dial_focus);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = c[0], .y = c[1] - label_ring, .raw_x = c[0], .raw_y = c[1] - label_ring, .pointer = 0, .time_ms = 0 });
+    // the minute mode's numerals step 5 at a time
+    activate(n, s, .minute_plate);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .right }); // 30 → 35
+    try std.testing.expectEqual(@as(i32, 35), s.dial_focus);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqual(@as(i32, 35), sig.peek()); // the tap set 12 AM = 0h
+    // Tab bubbles to the host's traversal
+    try std.testing.expect(!n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .tab }));
+}
+
+test "time_picker: the 24h dial traverses both rings (outer 0..11, inner 12..23)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(i32).init(a, 14 * 60); // 14:00
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .is_24h = true });
+    defer n.deinit();
+    const s = stateOf(n);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = 520 });
+    input.requestFocus(n);
+    // the seed: 14 → inner-ring idx 14; Left → 13, Right wraps the ring end
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(i32, 13), s.dial_focus);
+    s.dial_focus = 23;
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .right });
+    try std.testing.expectEqual(@as(i32, 0), s.dial_focus);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqual(@as(i32, 0), sig.peek()); // 00:00
 }

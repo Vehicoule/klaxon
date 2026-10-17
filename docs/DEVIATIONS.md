@@ -125,7 +125,14 @@ Each widget's header carries the same list; these are the tracked ones
   equivalent query here); Tab reaches the focused node before the global
   focus traversal — the picker consumes it to walk hour⇄minute
   directionally and bubbles it off the edge — and the AM/PM column is
-  pointer-only (as in the dial variant).
+  pointer-only (as in the dial variant). The dial itself is now a focus
+  stop: arrows step a focused numeral in composition order (outer ring,
+  then the 24h dial's inner ring), Enter/Space commits it without the
+  pointer path's auto-advance, Tab bubbles. Upstream gates numeral focus
+  on `inputMode != Touch`; with no input-modality query ours is always a
+  stop — a pointer tap just clears the focused numeral — and the
+  per-numeral virtual a11y children upstream synthesizes are not ported
+  (screen readers get the group value).
 - `table.zig` — sorting (a `sortable` column's header toggles a real
   stable asc/desc sort + the arrow icon), selection (the checkbox column +
   select-all with the tristate dash), and a wheel/drag body scroll under a
