@@ -1786,9 +1786,23 @@ kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bo
 // True when every 4-byte pixel's alpha byte (offset 3 for all our 8888
 // formats — N32 BGRA and RGBA alike) is 0xFF. Scanned once at register time
 // because SkImage::isOpaque only reflects the DECLARED alpha type.
+// 8 pixels per block: AND u64 pairs together, then test the two alpha lanes
+// once — a lone non-FF alpha in the block clears a bit and fails the block.
 static bool kx_pixels_opaque(const uint8_t* p, size_t bytes) {
-    for (size_t i = 3; i < bytes; i += 4)
-        if (p[i] != 0xFF) return false;
+    const uint64_t ALPHA_LANES = 0xFF000000FF000000ULL;
+    const size_t n = bytes / 4;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t acc = ~0ULL;
+        for (int k = 0; k < 4; ++k) {
+            uint64_t w;
+            memcpy(&w, p + (i + k * 2) * 4, 8);
+            acc &= w;
+        }
+        if ((acc & ALPHA_LANES) != ALPHA_LANES) return false;
+    }
+    for (; i < n; ++i)
+        if (p[i * 4 + 3] != 0xFF) return false;
     return true;
 }
 
@@ -3066,11 +3080,21 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
         it->second.tick = tick;
     }
     const kx_ctx::KxShadowEntry& e = it->second;
-    // Device-res image → logical dst rect (the canvas's own scale maps it
-    // back to pixels 1:1; linear sampling absorbs the sub-pixel fringe).
+    // Ordering: sprites queued on this canvas must draw BEFORE the shadow —
+    // the batch defers its mesh, so an unflushed batch would draw over it.
+    kx_sprite_flush(ctx);
+    // Device-res image → logical dst rect. The canvas's own scale maps it
+    // back to pixels 1:1 whenever ds == e.scale (ds is folded into the cache
+    // key, so a hit always matches — the 0.25 clamp is the only mismatch).
+    // 1:1 device mapping needs no sampler: the unsampled path is a straight
+    // SrcOver blit; linear only earns its keep on the sub-pixel fringe when
+    // the scale was clamped.
     ctx->canvas->drawImageRect(e.img, SkRect::MakeXYWH(x - e.pad, y - e.pad,
                                e.img->width() / e.scale, e.img->height() / e.scale),
-                               SkSamplingOptions(SkFilterMode::kLinear), nullptr);
+                               fabsf(ds - e.scale) < 0.001f
+                                   ? SkSamplingOptions()
+                                   : SkSamplingOptions(SkFilterMode::kLinear),
+                               nullptr);
 }
 
 // Points consumed by a verb stream — 0 move(2f), 1 line(2f), 2 quad(4f),
