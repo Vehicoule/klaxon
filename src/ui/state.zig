@@ -139,20 +139,22 @@ pub const SignalBase = struct {
         }
         base.notify_gen += 1;
         const gen = base.notify_gen;
-        // Rescan from the top after every callback: (un)subscribes inside a
-        // subscriber may reorder the list, and an element moved to an
-        // earlier index must still fire. The fired_gen stamp prevents
-        // double-firing; the loop ends on a full pass with nothing left.
-        while (true) {
-            var fired = false;
-            for (base.subscribers.items) |*entry| {
-                if (entry.fired_gen == gen) continue;
-                entry.fired_gen = gen;
-                entry.sub.notify();
-                fired = true;
-                break; // items may have moved — restart the scan
+        // (Un)subscribes inside a callback may reorder the list, but only
+        // ever move the unfired frontier to a LOWER index (unsubscribe is
+        // an orderedRemove — left shift — and subscribe appends). So
+        // re-examining the current slot after each callback catches whatever
+        // shifted in, the fired_gen stamp prevents double-firing, and the
+        // walk stays O(k) instead of rescanning per callback.
+        var i: usize = 0;
+        while (i < base.subscribers.items.len) {
+            const entry = &base.subscribers.items[i];
+            if (entry.fired_gen == gen) {
+                i += 1;
+                continue;
             }
-            if (!fired) break;
+            entry.fired_gen = gen;
+            const sub = entry.sub; // the callback may reorder — copy out
+            sub.notify();
         }
     }
 
