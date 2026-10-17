@@ -91,8 +91,19 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
+    // -Dsanitize: instrument the kx_skia C/C++ shim with clang
+    // -fsanitize=address,undefined. Declared after the wasm/android/ios
+    // early returns — those graphs reject the flag (emscripten's
+    // compiler_rt lacks the symbols; the wasm shim set carries its own
+    // -fno-sanitize). Zig ships no ASan runtime (compiler-rt has ubsan_rt
+    // + libtsan only), so sanitizerRuntime() locates an external
+    // libclang_rt/libasan to link into every artifact; zig's bundled
+    // ubsan_rt covers -fsanitize=undefined automatically.
+    const sanitize = b.option(bool, "sanitize", "Instrument the kx_skia C/C++ shim with -fsanitize=address,undefined (native linux/macOS only)") orelse false;
+    const san_rt: ?SanitizerRuntime = if (sanitize) sanitizerRuntime(b, target) else null;
+
     // --- kx_skia shim (C++ / ObjC++ static lib) ---
-    const kx_skia = addKxSkia(b, target, optimize, "kx_skia", is_macos);
+    const kx_skia = addKxSkia(b, target, optimize, "kx_skia", is_macos, sanitize);
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c
     // (Zig 0.17 removed @cImport — b.addTranslateC is the replacement).
@@ -118,12 +129,12 @@ pub fn build(b: *std.Build) void {
     }
 
     if (app_root_opt) |app_root| {
-        addExternalApp(b, target, optimize, translate_sdl, translate_kx, kx_skia, is_macos, tag, app_root);
+        addExternalApp(b, target, optimize, translate_sdl, translate_kx, kx_skia, is_macos, tag, app_root, san_rt);
         return;
     }
 
     // --- hello app ---
-    const exe = addApp(b, target, optimize, "hello", "src/main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const exe = addApp(b, target, optimize, "hello", "src/main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -132,7 +143,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run.step);
 
     // --- gallery app (Phase 1g) ---
-    const gallery_exe = addApp(b, target, optimize, "gallery", "src/gallery_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const gallery_exe = addApp(b, target, optimize, "gallery", "src/gallery_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(gallery_exe);
 
     const run_gallery = b.addRunArtifact(gallery_exe);
@@ -141,7 +152,7 @@ pub fn build(b: *std.Build) void {
     gallery_step.dependOn(&run_gallery.step);
 
     // --- navigator demo app (Phase 2a) ---
-    const nav_exe = addApp(b, target, optimize, "navigator", "src/navigator_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const nav_exe = addApp(b, target, optimize, "navigator", "src/navigator_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(nav_exe);
 
     const run_nav = b.addRunArtifact(nav_exe);
@@ -150,7 +161,7 @@ pub fn build(b: *std.Build) void {
     nav_step.dependOn(&run_nav.step);
 
     // --- i18n demo app (Phase 2b) ---
-    const i18n_exe = addApp(b, target, optimize, "i18n", "src/i18n_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const i18n_exe = addApp(b, target, optimize, "i18n", "src/i18n_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(i18n_exe);
 
     const run_i18n = b.addRunArtifact(i18n_exe);
@@ -159,7 +170,7 @@ pub fn build(b: *std.Build) void {
     i18n_step.dependOn(&run_i18n.step);
 
     // --- a11y demo app (Phase 2c) ---
-    const a11y_exe = addApp(b, target, optimize, "a11y", "src/a11y_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const a11y_exe = addApp(b, target, optimize, "a11y", "src/a11y_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(a11y_exe);
 
     const run_a11y = b.addRunArtifact(a11y_exe);
@@ -186,9 +197,11 @@ pub fn build(b: *std.Build) void {
     // so the file is in place before the runner executes.
     bench_options.addOption([]const u8, "bench_exe_path", "zig-out/bin/bench");
 
-    const kx_skia_bench = addKxSkia(b, target, .ReleaseSmall, "kx_skia_bench", is_macos);
+    const kx_skia_bench = addKxSkia(b, target, .ReleaseSmall, "kx_skia_bench", is_macos, false);
     const bench_opt = b.option(std.builtin.OptimizeMode, "bench-optimize", "bench executable optimize mode (default ReleaseSmall)") orelse .small;
-    const bench_exe = addApp(b, target, bench_opt, "bench", "src/bench_main.zig", translate_sdl, translate_kx, kx_skia_bench, is_macos, tag);
+    // The bench shim is never sanitized (false above — instrumentation
+    // would skew metrics), so the exe doesn't need the sanitizer runtime.
+    const bench_exe = addApp(b, target, bench_opt, "bench", "src/bench_main.zig", translate_sdl, translate_kx, kx_skia_bench, is_macos, tag, null);
     bench_exe.root_module.addOptions("build_options", bench_options);
     b.installArtifact(bench_exe);
 
@@ -200,7 +213,7 @@ pub fn build(b: *std.Build) void {
     // --- conformance suite (Phase 4c.7) ---
     // Runs conformance/tests/*.json against the real widget tree headlessly
     // (raster backend), writes conformance/results-<ts>.json + a summary.
-    const conf_exe = addApp(b, target, optimize, "conformance", "src/conformance_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag);
+    const conf_exe = addApp(b, target, optimize, "conformance", "src/conformance_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
     b.installArtifact(conf_exe);
 
     const run_conf = b.addRunArtifact(conf_exe);
@@ -220,7 +233,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("sdl_c", translate_sdl.createModule());
     tests.root_module.addImport("kx_c", translate_kx.createModule());
     // Golden tests render through the shim: the test exe links the same runtime.
-    linkRuntime(b, tests.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
@@ -241,7 +254,7 @@ pub fn build(b: *std.Build) void {
     });
     golden_tests.root_module.addImport("sdl_c", translate_sdl.createModule());
     golden_tests.root_module.addImport("kx_c", translate_kx.createModule());
-    linkRuntime(b, golden_tests.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, golden_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     const run_golden = b.addRunArtifact(golden_tests);
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
@@ -261,7 +274,7 @@ pub fn build(b: *std.Build) void {
             .link_libcpp = !is_windows_local(target),
         }),
     });
-    linkRuntime(b, dc_tests.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, dc_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     const run_dc_tests = b.addRunArtifact(dc_tests);
     const dc_test_step = b.step("test-dynamic-color", "Run dynamic-color (material-color-utilities) tests");
     dc_test_step.dependOn(&run_dc_tests.step);
@@ -320,6 +333,7 @@ fn addExternalApp(
     is_macos: bool,
     tag: []const u8,
     app_root: []const u8,
+    san_rt: ?SanitizerRuntime,
 ) void {
     const klaxon_mod = b.createModule(.{
         .root_source_file = b.path("src/klaxon.zig"),
@@ -343,7 +357,7 @@ fn addExternalApp(
         }),
     });
     app.root_module.addImport("klaxon", klaxon_mod);
-    linkRuntime(b, app.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, app.root_module, kx_skia, target, is_macos, tag, san_rt);
     b.installArtifact(app);
 
     const app_tests = b.addTest(.{
@@ -357,7 +371,7 @@ fn addExternalApp(
         }),
     });
     app_tests.root_module.addImport("klaxon", klaxon_mod);
-    linkRuntime(b, app_tests.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, app_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     b.installArtifact(app_tests);
     const run_tests = b.addRunArtifact(app_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -375,7 +389,7 @@ fn addExternalApp(
         .test_runner = .{ .path = b.path("src/test_runner_golden.zig"), .mode = .simple },
     });
     app_golden.root_module.addImport("klaxon", klaxon_mod);
-    linkRuntime(b, app_golden.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, app_golden.root_module, kx_skia, target, is_macos, tag, san_rt);
     b.installArtifact(app_golden);
     const run_golden = b.addRunArtifact(app_golden);
     const golden_step = b.step("test-golden", "Run golden tests only");
@@ -429,6 +443,7 @@ fn addKxSkia(
     optimize: std.builtin.OptimizeMode,
     name: []const u8,
     is_macos: bool,
+    sanitize: bool,
 ) *std.Build.Step.Compile {
     const kx_skia = b.addLibrary(.{
         .name = name,
@@ -440,13 +455,20 @@ fn addKxSkia(
             .link_libcpp = !is_windows_local(target),
         }),
     });
-    const shim_flags = &[_][]const u8{
+    const shim_flags_base = &[_][]const u8{
         "-std=c++20",             "-fno-exceptions", "-fno-rtti",
         "-DSK_GANESH",            "-DSK_GRAPHITE",   "-DNDEBUG",
         // Match the vendored libicu.a: Skia builds ICU with symbol
         // renaming off, so ubrk_* links unsuffixed.
         "-DU_DISABLE_RENAMING=1",
     };
+    // -Dsanitize: clang ASan + UBSan on the shim TUs. UBSan links out of
+    // the box (zig bundles ubsan_rt); ASan objects get their runtime from
+    // sanitizerRuntime(), attached in linkRuntime.
+    const shim_flags: []const []const u8 = if (sanitize)
+        shim_flags_base ++ &[_][]const u8{"-fsanitize=address,undefined"}
+    else
+        shim_flags_base;
     // On Windows, kx_skia_common.cpp goes through compileMsvcShims instead
     // (MSVC STL ABI — see the .windows case below).
     if (target.result.os.tag != .windows) {
@@ -468,6 +490,22 @@ fn addKxSkia(
                 .flags = shim_flags,
                 .language = .objective_cpp,
             });
+            if (sanitize) {
+                // Upstream clang emits __asan_version_mismatch_check_v8
+                // into each instrumented TU; Apple's asan dylib exports a
+                // differently-versioned name instead — satisfy it with a
+                // no-op (the check only compares instrumenter/runtime
+                // versions, and both are clang 21-era ABI v8).
+                const stub = b.addWriteFiles().add("kx_asan_abi_stub.cpp",
+                    \\extern "C" void __asan_version_mismatch_check_v8(void) {}
+                    \\
+                );
+                kx_skia.root_module.addCSourceFile(.{
+                    .file = stub,
+                    .flags = &.{"-std=c++20"},
+                    .language = .cpp,
+                });
+            }
         },
         .linux => {
             kx_skia.root_module.addCSourceFiles(.{
@@ -546,6 +584,7 @@ fn addApp(
     kx_skia: *std.Build.Step.Compile,
     is_macos: bool,
     tag: []const u8,
+    san_rt: ?SanitizerRuntime,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = name,
@@ -559,7 +598,7 @@ fn addApp(
     });
     exe.root_module.addImport("sdl_c", translate_sdl.createModule());
     exe.root_module.addImport("kx_c", translate_kx.createModule());
-    linkRuntime(b, exe.root_module, kx_skia, target, is_macos, tag);
+    linkRuntime(b, exe.root_module, kx_skia, target, is_macos, tag, san_rt);
     return exe;
 }
 
@@ -572,6 +611,7 @@ fn linkRuntime(
     target: std.Build.ResolvedTarget,
     is_macos: bool,
     tag: []const u8,
+    san_rt: ?SanitizerRuntime,
 ) void {
     const is_windows = std.mem.startsWith(u8, tag, "windows-");
     // SDL3 (static lib).
@@ -588,6 +628,14 @@ fn linkRuntime(
         }) |framework| {
             module.linkFramework(framework, .{});
         }
+    }
+
+    // Sanitized shim: every artifact linking libkx_skia.a also links the
+    // ASan runtime sanitizerRuntime() located (zig has none of its own),
+    // plus -rpath so dyld finds the real toolchain dylib on macOS.
+    if (san_rt) |rt| {
+        for (rt.objects) |obj| module.addObjectFile(obj);
+        for (rt.rpaths) |rp| module.addRPath(rp);
     }
 
     // kx_skia shim + Skia static libs. The .a/.lib lists are deterministic
@@ -671,6 +719,94 @@ fn linkRuntime(
             module.linkFramework(fw, .{});
         }
     }
+}
+
+/// What an artifact must link when the shim is built with
+/// -fsanitize=address (-Dsanitize). Zig 0.17's compiler-rt covers ubsan +
+/// tsan but ships no ASan runtime, so it comes from the host toolchain.
+const SanitizerRuntime = struct {
+    /// Extra link inputs (.so on linux; the stripped toolchain dylib on macOS).
+    objects: []const std.Build.LazyPath = &.{},
+    /// Extra -rpath dirs (macOS only: the clang runtime dir, so dyld
+    /// resolves @rpath/libclang_rt.asan_osx_dynamic.dylib to the original).
+    rpaths: []const std.Build.LazyPath = &.{},
+};
+
+fn sanitizerRuntime(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime {
+    return switch (target.result.os.tag) {
+        .macos => macOsAsanRt(b),
+        .linux => linuxAsanRt(b, target),
+        else => @panic("-Dsanitize supports native linux and macOS targets only"),
+    };
+}
+
+/// Apple ships libclang_rt.asan_osx_dynamic.dylib as a "zippered" binary:
+/// its arm64 slice carries both macOS and MacCatalyst LC_BUILD_VERSIONs,
+/// and zig's dylib parser rejects the maccatalyst one. Produce a
+/// macOS-only copy via lipo+vtool for the static link — the install name
+/// still points at @rpath/libclang_rt.asan_osx_dynamic.dylib, so dyld
+/// loads the original (properly signed) dylib at runtime.
+fn macOsAsanRt(b: *std.Build) SanitizerRuntime {
+    const res_dir = std.mem.trim(u8, b.run(&.{ "xcrun", "clang", "-print-resource-dir" }), &std.ascii.whitespace);
+    const darwin_lib = b.fmt("{s}/lib/darwin", .{res_dir});
+    const strip = b.addSystemCommand(&.{ "sh", "-c",
+        // vtool warns "code signature will be invalid" — expected, the
+        // stripped copy is link-only (dyld loads the original). stderr is
+        // silenced so zig doesn't echo it as a failed-command annotation.
+        \\xcrun lipo "$1" -thin arm64 -output "$2.tmp" &&
+        \\xcrun vtool -remove-build-version maccatalyst -output "$2" "$2.tmp" 2>/dev/null &&
+        \\rm "$2.tmp"
+        , "kx-asan-strip" });
+    strip.addFileArg(.{ .cwd_relative = b.fmt("{s}/libclang_rt.asan_osx_dynamic.dylib", .{darwin_lib}) });
+    const dylib = strip.addOutputFileArg("libclang_rt.asan_osx_dynamic.dylib");
+    const objects = b.allocator.alloc(std.Build.LazyPath, 1) catch @panic("OOM");
+    objects[0] = dylib;
+    const rpaths = b.allocator.alloc(std.Build.LazyPath, 1) catch @panic("OOM");
+    rpaths[0] = .{ .cwd_relative = darwin_lib };
+    return .{ .objects = objects, .rpaths = rpaths };
+}
+
+/// zig cc instruments the shim for ASan but has no runtime to link; find
+/// the host's. clang's own libclang_rt.asan-*.so is preferred (same vintage
+/// as the instrumenter); gcc's libasan.so.8 is ABI-compatible (upstream
+/// ASan v8) and is a plain `apt install libasan8` away.
+fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime {
+    const arch: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => @panic("-Dsanitize: no ASan runtime lookup for this linux arch"),
+    };
+    var objects: std.ArrayList(std.Build.LazyPath) = .empty;
+    // `clang -print-file-name` resolves inside clang's resource dir and
+    // echoes the bare name back when the file isn't there. asan_cxx adds
+    // the operator new/delete interceptors.
+    for ([_][]const u8{ "asan", "asan_cxx" }) |rt| {
+        const name = b.fmt("libclang_rt.{s}-{s}.so", .{ rt, arch });
+        switch (b.runFallible(&.{ "clang", b.fmt("-print-file-name={s}", .{name}) }, .{ .stderr_behavior = .ignore })) {
+            .success => |out| {
+                const p = std.mem.trim(u8, out, &std.ascii.whitespace);
+                if (std.mem.endsWith(u8, p, ".so"))
+                    objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
+            },
+            else => {},
+        }
+    }
+    if (objects.items.len == 0) {
+        const triplet: []const u8 = if (target.result.cpu.arch == .x86_64) "x86_64-linux-gnu" else "aarch64-linux-gnu";
+        const gcc_candidates = [_][]const u8{
+            b.fmt("/usr/lib/{s}/libasan.so.8", .{triplet}),
+            "/usr/lib64/libasan.so.8",
+        };
+        for (gcc_candidates) |p| {
+            if (std.Io.Dir.accessAbsolute(b.graph.io, p, .{})) |_| {
+                objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
+                break;
+            } else |_| {}
+        }
+    }
+    if (objects.items.len == 0)
+        @panic("-Dsanitize needs an ASan runtime on linux: apt install libclang-rt-dev (preferred) or libasan8");
+    return .{ .objects = objects.items };
 }
 
 /// Phase 3f web target (wasm32-emscripten). Zig cannot link an executable for
