@@ -13,12 +13,22 @@
 //     focus 0.10 / pressed 0.12
 //   - hit target: max(width,48) x max(44,48) (the a11y floor is the hit area)
 //   - input: a down/drag sets the value from the pointer x (the drag IS the
-//     interaction — no slop cancel); arrows adjust by ±0.05 (keyboard)
+//     interaction — no slop cancel); arrows adjust by ±1% (keyboard,
+//     upstream's rangeLength/100 — `steps+1` in discrete mode)
 //
-// v1 deviations (documented, fixed later):
-//   - Continuous only (no steps/ticks — the stop indicators land with the
-//     discrete slider); no value indicator (the bubble above the thumb);
-//     vertical sliders and range sliders are separate widgets later.
+// Discrete mode (upstream `steps`): N>0 quantizes the value to the N+2
+// tick fractions (snapValueToTick during drag, keyboard delta =
+// range/(steps+1)), draws the stop-indicator ticks inside the corner-inset
+// range (the endpoints' ticks: index 0 draws on the active track's corner
+// center, the last is covered by the end stop dot), and maps the thumb
+// through the inset range between the corner centers while it isn't on an
+// endpoint. While pressed/dragging the value indicator bubble floats 12dp
+// above the thumb (ValueIndicatorActiveBottomSpace) — InverseSurface pill
+// with a tail, LabelLarge InverseOnSurface "{d}%" text.
+//
+// Remaining deviations (documented, fixed later):
+//   - vertical sliders and range sliders are separate widgets; the bubble
+//     doesn't morph its shape (upstream's label animates in on drag start).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -42,7 +52,15 @@ const thumb_w_active: f32 = 2; // FocusHandleWidth / PressedHandleWidth
 const thumb_h: f32 = 44; // HandleHeight
 const inset: f32 = thumb_w / 2; // the track is inset by half the thumb width
 const state_layer_size: f32 = 40;
-const keyboard_step: f32 = 0.05;
+/// Upstream slideOnKeyEvents: delta = range/actualSteps — 1% continuous.
+const keyboard_step: f32 = 0.01;
+/// The bubble's gap above the thumb (ValueIndicatorActiveBottomSpace).
+const indicator_gap: f32 = 12;
+/// The bubble tail — a small downward point under the pill.
+const indicator_tail_w: f32 = 10;
+const indicator_tail_h: f32 = 6;
+const indicator_h_pad: f32 = 12;
+const indicator_v_pad: f32 = 6;
 // Compose minimumInteractiveComponentSize (the a11y hit-target floor) =
 // theme.platform.hit_target_min — read from s.opts.theme where used.
 /// TrackCornerSize — CornerFull on a 16dp track.
@@ -58,6 +76,9 @@ pub const SliderOptions = struct {
     enabled: bool = true,
     /// The natural width when the parent does not constrain it.
     default_width: f32 = 160,
+    /// Discrete stops BETWEEN the endpoints (upstream `steps`): 0 = the
+    /// continuous slider; N>0 quantizes to i/(N+1) and draws the ticks.
+    steps: u16 = 0,
     /// The accessible name.
     a11y_label: []const u8 = "",
     theme: Theme = theme_mod.light,
@@ -95,6 +116,15 @@ fn clampedValue(s: *SliderState) f32 {
     return std.math.clamp(s.sig.peek(), 0, 1);
 }
 
+/// Upstream snapValueToTick: with steps>0 the value quantizes to the
+/// nearest tick fraction i/(steps+1); 0 keeps the continuous range.
+fn snap(s: *SliderState, v: f32) f32 {
+    const c = std.math.clamp(v, 0, 1);
+    if (s.opts.steps == 0) return c;
+    const n: f32 = @floatFromInt(s.opts.steps + 1);
+    return @round(c * n) / n;
+}
+
 /// The active/inactive track colors + the thumb color for the current state.
 const SLColors = struct { active: Color, inactive: Color, thumb: Color };
 
@@ -129,6 +159,7 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const b = n.bounds;
     const cc = currentColors(s);
+    const cs = s.opts.theme.colors;
     const v = clampedValue(s);
     const rtl = ui.i18n.direction() == .rtl;
     // track: 16dp high, vertically centered, inset by half the thumb width
@@ -148,7 +179,14 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
     // Compose drawTrack: the track splits into an ACTIVE segment
     // (value-start → handle) and an INACTIVE segment (handle → value-end)
     // separated by a gap = handleW/2 + 6dp measured from the handle center.
-    const value_x = tw * v; // handle center in the track's value space
+    // Upstream drawTrack with steps: the value maps into the corner-inset
+    // range [corner, tw - corner] so the endpoint ticks sit at the corner
+    // centers — except while the value sits ON an endpoint (full range).
+    const on_endpoint = v <= 0 or v >= 1;
+    const value_x = if (s.opts.steps > 0 and !on_endpoint)
+        track_corner + (tw - track_corner * 2) * v
+    else
+        tw * v; // handle center in the track's value space
     const gap = thw / 2 + track_gap;
     // Map a value-space x to a screen x (RTL mirrors the value direction).
     const vx = struct {
@@ -183,6 +221,26 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         const stop_x = vx(tx, tw, tw - track_corner, rtl);
         ui.paint.fillRRect(ctx, stop_x - stop_d / 2, cy - stop_d / 2, stop_d, stop_d, stop_d / 2, cc.active);
     }
+    // Ticks (upstream tickFractions = i/(steps+1), i = 0..steps+1): a 4dp
+    // dot at each stop inside the corner-inset range — active-segment ticks
+    // punch in the inactive color and vice versa (the contrast inversion);
+    // the last endpoint sits under the stop indicator (skipped), and a tick
+    // covered by the handle gap is skipped.
+    if (s.opts.steps > 0) {
+        const n_frac: usize = @as(usize, s.opts.steps) + 2;
+        for (0..n_frac) |i| {
+            if (i == n_frac - 1) continue; // the end stop indicator's spot
+            const f = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_frac - 1));
+            const t = track_corner + (tw - track_corner * 2) * f; // value-space x
+            if (t >= value_x - gap and t <= value_x + gap) continue; // under the handle
+            // activeTrack = [0, value_x - gap] — the painted segment minus
+            // its gap, matching upstream's `centerTick in activeTrack`.
+            const col = if (!s.opts.enabled)
+                (if (t <= value_x - gap) ui.paint.withAlphaScaled(cs.on_surface, 0.12) else ui.paint.withAlphaScaled(cs.on_surface, 0.38))
+            else if (t <= value_x - gap) cc.inactive else cc.active;
+            ui.paint.fillRRect(ctx, vx(tx, tw, t, rtl) - stop_d / 2, cy - stop_d / 2, stop_d, stop_d, stop_d / 2, col);
+        }
+    }
     // Handle: a 4x44 vertical bar (2dp while pressed/focused) centered on
     // the value position, CornerFull.
     ui.paint.fillRRect(ctx, cx - thw / 2, b.y, thw, b.h, thw / 2, cc.thumb);
@@ -200,16 +258,35 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRRect(ctx, cx - state_layer_size / 2, cy - state_layer_size / 2, state_layer_size, state_layer_size, state_layer_size / 2, ui.paint.withAlphaScaled(cc.thumb, alpha));
         }
     }
+
+    // --- value indicator (while pressed/dragging): the InverseSurface
+    // pill + tail 12dp above the thumb's top (ValueIndicatorActiveBottom-
+    // Space), LabelLarge InverseOnSurface value text ---
+    if ((s.pressed or s.dragging) and s.opts.enabled) {
+        const ls = s.opts.theme.type_scale.label_large;
+        const txt = s.value_buf[0..s.value_len :0];
+        const lm = ui.paint.measureText(txt, ls.size, false);
+        const pw = @max(lm.width + indicator_h_pad * 2, 24);
+        const ph = ls.line_height + indicator_v_pad * 2;
+        const by = b.y - indicator_gap; // bubble bottom edge
+        const bx = cx - pw / 2; // centered on the handle
+        ui.paint.fillRRect(ctx, bx, by - ph, pw, ph, ph / 2, cs.inverse_surface);
+        // the tail: a small downward point centered on the handle
+        const pts = [6]f32{ cx - indicator_tail_w / 2, by, cx + indicator_tail_w / 2, by, cx, by + indicator_tail_h };
+        const verbs = [4]i32{ @backingInt(ui.paint.PathVerb.move), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.close) };
+        ui.paint.fillPath(ctx, &pts, &verbs, cs.inverse_surface, false);
+        ui.paint.text(ctx, txt, cx - lm.width / 2, by - ph + (ph - (lm.ascent + lm.descent)) / 2 + lm.ascent, ls.size, false, cs.inverse_on_surface);
+    }
 }
 
 /// The value for a pointer x (window coords): the track spans
 /// [b.x + inset, b.x + w - inset]. RTL mirrors the value direction.
 fn valueAt(s: *SliderState, b: Rect, x: f32) f32 {
-    _ = s;
     const tw = @max(0, b.w - inset * 2);
     if (tw <= 0) return 0;
     const f = std.math.clamp((x - b.x - inset) / tw, 0, 1);
-    return if (ui.i18n.direction() == .rtl) 1 - f else f;
+    const raw = if (ui.i18n.direction() == .rtl) 1 - f else f;
+    return snap(s, raw); // discrete: the nearest tick's value
 }
 
 fn sliderOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -286,16 +363,29 @@ fn sliderOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     const rtl = ui.i18n.direction() == .rtl;
+    // Upstream slideOnKeyEvents: delta = range/(steps+1) discrete, 1% when
+    // continuous; home/end jump to the range edges.
+    const step: f32 = if (s.opts.steps > 0) 1.0 / @as(f32, @floatFromInt(s.opts.steps + 1)) else keyboard_step;
     switch (ev.key) {
         .left, .down => {
-            const d: f32 = if (ev.key == .left and rtl) keyboard_step else -keyboard_step;
+            const d: f32 = if (ev.key == .left and rtl) step else -step;
             s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
         .right, .up => {
-            const d: f32 = if (ev.key == .right and rtl) -keyboard_step else keyboard_step;
+            const d: f32 = if (ev.key == .right and rtl) -step else step;
             s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
+            if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
+            return true;
+        },
+        .home => {
+            s.sig.set(0);
+            if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
+            return true;
+        },
+        .end => {
+            s.sig.set(1);
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -335,6 +425,7 @@ fn sliderSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{clampedValue(s) * 100}) catch return;
     s.value_len = str.len;
+    s.value_buf[s.value_len] = 0; // sentinel for measureText/text (16-slot buffer)
     if (n.semantics) |sem| {
         sem.value = s.value_buf[0..s.value_len];
         // The numeric range is in percent units, matching the "{d}%"
@@ -360,14 +451,23 @@ fn sliderDeinit(n: *Node) void {
 /// vertical edges whenever the bounds are shorter than the layer (a
 /// constrained slider). Culling and damage both consult it.
 fn sliderPaintBounds(n: *Node) Rect {
+    const s = stateOf(n);
     const b = n.bounds;
     const cy = b.y + b.h / 2;
-    const top = @min(b.y, cy - state_layer_size / 2);
+    var top = @min(b.y, cy - state_layer_size / 2);
+    // The value indicator floats above the bounds while pressed/dragging —
+    // its top edge is gap + tail + pill above the thumb's top.
+    const ls = s.opts.theme.type_scale.label_large;
+    const bubble_top = b.y - indicator_gap - indicator_tail_h - (ls.line_height + indicator_v_pad * 2);
+    top = @min(top, bubble_top);
     const bottom = @max(b.y + b.h, cy + state_layer_size / 2);
+    // Horizontally the bubble can overhang the bounds at the track's ends.
+    const bubble_half: f32 = 48 / 2 + 8; // widest "%" pill + tail margin
+    const over = @max(state_layer_size / 2, bubble_half);
     return .{
-        .x = b.x + inset - state_layer_size / 2,
+        .x = b.x + inset - over,
         .y = top,
-        .w = @max(0, b.w - inset * 2) + state_layer_size,
+        .w = @max(0, b.w - inset * 2) + over * 2,
         .h = bottom - top,
     };
 }
@@ -400,6 +500,7 @@ pub fn slider(allocator: std.mem.Allocator, sig: *ui.state.Signal(f32), on_chang
     // the initial semantic value
     const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(sig.peek(), 0, 1) * 100}) catch "";
     s.value_len = str.len;
+    s.value_buf[s.value_len] = 0; // sentinel for the indicator's text
     ui.semantics.attach(node, .{
         .role = .slider,
         .label = opts.a11y_label,
@@ -493,10 +594,10 @@ test "slider: arrows adjust the value (keyboard)" {
     defer b.deinit();
     const on_key = b.vtable.on_key.?;
     try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .right }));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.55), sig.peek(), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.51), sig.peek(), 0.001); // upstream: range/100 continuous
     try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .left }));
     try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .left }));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.45), sig.peek(), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.49), sig.peek(), 0.001);
     try std.testing.expect(!on_key(b, .{ .kind = .key_down, .key = .enter }));
 }
 
@@ -537,6 +638,89 @@ test "golden: slider paints the active/inactive track + the thumb at the value" 
     // the thumb (4x44 at x = 2 + 78 - 2 = 78): primary, above the track
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(80, 4));
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(80, 42));
+}
+
+test "slider: steps snap the pointer value to the nearest tick" {
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x", .steps = 3 });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 200, .h = 44 });
+    const on_pointer = b.vtable.on_pointer.?;
+    // x=60 on the track [2, 198] → fraction ~0.296 → snaps to the 0.25 tick
+    _ = on_pointer(b, .{ .phase = .down, .x = 60, .y = 22, .raw_x = 60, .raw_y = 22 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), sig.peek(), 0.001);
+    _ = on_pointer(b, .{ .phase = .up, .x = 60, .y = 22, .raw_x = 60, .raw_y = 22 });
+    // continuous mode (steps = 0) keeps the pointer fraction
+    const sig2 = try ui.state.Signal(f32).init(std.testing.allocator, 0);
+    defer sig2.deinit();
+    const b2 = try slider(std.testing.allocator, sig2, null, .{ .a11y_label = "x" });
+    defer b2.deinit();
+    b2.layout(.{ .x = 0, .y = 0, .w = 200, .h = 44 });
+    _ = b2.vtable.on_pointer.?(b2, .{ .phase = .down, .x = 60, .y = 22, .raw_x = 60, .raw_y = 22 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.296), sig2.peek(), 0.001);
+}
+
+test "slider: arrows step by 1/(steps+1) in discrete mode" {
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x", .steps = 3 });
+    defer b.deinit();
+    const on_key = b.vtable.on_key.?;
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .right }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), sig.peek(), 0.001);
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .right }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sig.peek(), 0.001);
+}
+
+test "golden: slider steps paint the stop ticks with the contrast inversion" {
+    const t = theme_mod.light;
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x", .steps = 3, .theme = t });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 160, 48);
+    defer r.deinit();
+    b.layout(.{ .x = 0, .y = 2, .w = 160, .h = 44 });
+    r.paint(b, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // steps=3 → ticks at f ∈ {0, .25, .5, .75, 1} minus the end stop. With
+    // v=.5 the handle sits on the mid tick; the corner-inset mapping puts
+    // the remaining ticks at x = 2 + 8 + 140·f → screen x 10 / 45 / 115.
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(10, 24)); // on the active track → inactive color
+    try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(45, 24));
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(115, 24)); // on the inactive track → active color
+}
+
+test "golden: pressed slider paints the value indicator bubble above the track" {
+    const t = theme_mod.light;
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x", .theme = t });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 160, 130);
+    defer r.deinit();
+    b.layout(.{ .x = 0, .y = 60, .w = 160, .h = 44 });
+    // not pressed → no bubble (white above the bounds)
+    r.paint(b, 0xFFFFFFFF);
+    var f0 = try r.readback(std.testing.allocator);
+    defer f0.deinit();
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), f0.pixelAt(80, 30));
+    // pressed → the InverseSurface pill 12dp above the bounds
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    r.paint(b, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // inside the pill's left padding — (80, 30) lands on the label glyphs
+    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(60, 30));
+    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(80, 50)); // tail tip
+    // released → gone again
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .up, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    r.paint(b, 0xFFFFFFFF);
+    var f2 = try r.readback(std.testing.allocator);
+    defer f2.deinit();
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), f2.pixelAt(80, 30));
 }
 
 test "golden: slider hover paints the state layer over the inactive track" {
@@ -583,9 +767,10 @@ test "slider: paintBounds covers the thumb state layer at the track ends" {
     const b = try slider(std.testing.allocator, sig, null, .{});
     defer b.deinit();
     b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 44 });
-    // layer 40 on cx ∈ [102, 298] → x = 82, w = 236; vertically inside
-    try std.testing.expectEqual(ui.node.Rect{ .x = 82, .y = 50, .w = 236, .h = 44 }, b.paintRect());
+    // overhang: max(layer 40, bubble 64)/2 horizontally; the indicator's
+    // bubble also reaches 12+6+32 above the top edge → y = 0
+    try std.testing.expectEqual(ui.node.Rect{ .x = 70, .y = 0, .w = 260, .h = 94 }, b.paintRect());
     // a constrained height still covers the layer (cy ± 20)
     b.layout(.{ .x = 100, .y = 50, .w = 200, .h = 16 });
-    try std.testing.expectEqual(ui.node.Rect{ .x = 82, .y = 38, .w = 236, .h = 40 }, b.paintRect());
+    try std.testing.expectEqual(ui.node.Rect{ .x = 70, .y = 0, .w = 260, .h = 78 }, b.paintRect());
 }

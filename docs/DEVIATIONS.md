@@ -49,7 +49,10 @@ Each widget's header carries the same list; these are the tracked ones
   (upstream weight(1f) distributes the mean); no checked-icon crossfade.
 - `icon_button.zig` — no elevation shadows; instant shape morphs.
 - `switch.zig` — mid-flight re-press restarts the spring from 0 velocity.
-- `slider.zig` — continuous only: no steps/ticks, no value indicator.
+- `slider.zig` — the value indicator doesn't morph its shape (upstream's
+  label animates in on drag start); no PageUp/PageDown keys (input.Key
+  lacks them). Steps/ticks, the pressed value bubble and the
+  corner-inset thumb mapping match upstream.
 - `split_button.zig` — trailing half is pointer-only (a11y activation pending).
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
   only; arrows move by codepoint, not grapheme cluster; no double-click
