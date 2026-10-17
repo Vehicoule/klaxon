@@ -96,8 +96,15 @@ Each widget's header carries the same list; these are the tracked ones
 - `tree.zig` — no drag-and-drop reordering. (Keyboard nav with
   selection-follows-focus, synchronous lazy children providers, per-node
   icons and per-row virtual a11y children landed.)
-- `carousel.zig` — no contentPadding, no hero/center-aligned strategy, no
-  parallax.
+- `carousel.zig` — the hero/center-aligned strategy landed (upstream's
+  `HorizontalCenteredHeroCarousel`: even small count flanking a centered
+  focal run, start-aligned fallback under 3 items) and
+  `padding_before`/`padding_after` is upstream's main-axis
+  `contentPadding` (the resting edge steps shrink keylines by
+  padding/count). The parallax is the ported `Modifier.carouselItem`
+  mask+translation — item content stays full-size inside a moving clip
+  band, upstream's mechanism verbatim. No end-aligned variant (upstream
+  exposes only the centered hero).
 - `progress.zig` — static `progress` snaps on rebuild (the spring runs on
   `progress_sig` writes). The wavy amplitude runs the upstream
   `updateAmplitudeAnimation` spec: a 500ms tween (standard easing up,
