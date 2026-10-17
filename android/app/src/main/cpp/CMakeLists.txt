@@ -36,17 +36,51 @@ foreach(lib IN LISTS KX_SKIA_LIBS)
         IMPORTED_LOCATION "${KLAXON_ROOT}/deps/skia/out/android-arm64/lib${lib}.a")
 endforeach()
 
+# --- material-color-utilities (deps/mcu) -----------------------------------
+# Same list as mcu_sources in build.zig — update both together.
+set(KX_MCU_SOURCES
+    "${KLAXON_ROOT}/deps/mcu/kx_mcu.cpp"
+    "${KLAXON_ROOT}/deps/mcu/cpp/blend/blend.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/cam/cam.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/cam/hct.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/cam/hct_solver.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/cam/viewing_conditions.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/contrast/contrast.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/dislike/dislike.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/dynamiccolor/dynamic_color.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/dynamiccolor/dynamic_scheme.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/dynamiccolor/material_dynamic_colors.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/palettes/tones.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/quantize/celebi.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/quantize/lab.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/quantize/wsmeans.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/quantize/wu.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_content.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_expressive.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_fidelity.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_fruit_salad.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_monochrome.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_neutral.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_rainbow.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_tonal_spot.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/scheme/scheme_vibrant.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/score/score.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/temperature/temperature_cache.cc"
+    "${KLAXON_ROOT}/deps/mcu/cpp/utils/utils.cc")
+
 # --- libmain.so: shim + app ------------------------------------------------
 # OUTPUT_NAME main -> libmain.so (loaded by SDLActivity as "main").
 add_library(main SHARED
     "${KLAXON_ROOT}/kx_skia/src/kx_skia_common.cpp"
     "${KLAXON_ROOT}/kx_skia/src/kx_skia_android.cpp"
     "${KLAXON_ROOT}/kx_skia/src/kx_a11y_android.cpp"
-    "${KLAXON_ROOT}/kx_skia/src/kx_skia_android_fontmgr_stub.cpp")
+    "${KLAXON_ROOT}/kx_skia/src/kx_skia_android_fontmgr_stub.cpp"
+    ${KX_MCU_SOURCES})
 set_target_properties(main PROPERTIES OUTPUT_NAME "main")
 
 target_include_directories(main PRIVATE
     "${KLAXON_ROOT}/kx_skia/include"
+    "${KLAXON_ROOT}/deps/mcu"
     "${KLAXON_ROOT}/deps/skia"
     "${KLAXON_ROOT}/deps/skia/include"
     # Vendored ICU headers (ubrk.h — grapheme-cluster boundaries) BEFORE

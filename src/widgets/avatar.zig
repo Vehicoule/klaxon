@@ -154,8 +154,7 @@ fn avPaint(n: *Node, ctx: *kx.Ctx) void {
         .icon => {
             if (s.opts.icon) |ic| {
                 const icon_size = b.w * 0.5;
-                icon_w.drawIcon(ctx, ic, b.x + (b.w - icon_size) / 2,
-                    b.y + (b.h - icon_size) / 2, icon_size / 24.0, t.colors.on_primary_container);
+                icon_w.drawIcon(ctx, ic, b.x + (b.w - icon_size) / 2, b.y + (b.h - icon_size) / 2, icon_size / 24.0, t.colors.on_primary_container);
             }
         },
         .image => {

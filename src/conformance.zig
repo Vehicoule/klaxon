@@ -174,7 +174,7 @@ fn parseTextAlign(s: []const u8) ui.layout.TextAlign {
 fn parseRole(s: []const u8) ?sem.Role {
     const info = @typeInfo(sem.Role).@"enum";
     inline for (info.field_names, info.field_values) |name, value| {
-        if (std.mem.eql(u8, s, name)) return @enumFromInt(value);
+        if (std.mem.eql(u8, s, name)) return @fromBackingInt(@intCast(value));
     }
     return null;
 }
@@ -193,7 +193,7 @@ fn parseKey(s: []const u8) input_mod.Key {
     if (std.mem.eql(u8, s, "back")) return .back;
     // Single chars map to their codepoint (Key is a non-exhaustive enum(u32);
     // e.g. "a" → @enumFromInt('a') like the host's keymap path).
-    if (s.len == 1) return @enumFromInt(s[0]);
+    if (s.len == 1) return @fromBackingInt(@intCast(s[0]));
     return .unknown;
 }
 
@@ -551,7 +551,7 @@ fn attachPropSemantics(node: *Node, props: Value) void {
                 const name = str(av) orelse continue;
                 const info = @typeInfo(sem.Action).@"enum";
                 inline for (info.field_names, info.field_values) |fname, fval| {
-                    if (std.mem.eql(u8, name, fname)) s.actions.insert(@enumFromInt(fval));
+                    if (std.mem.eql(u8, name, fname)) s.actions.insert(@fromBackingInt(@intCast(fval)));
                 }
             }
         }

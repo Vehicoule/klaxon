@@ -1235,19 +1235,19 @@ pub fn emitPathInto(cubics: []const Cubic, pts: []f32, verbs: []i32) EmittedPath
     std.debug.assert(cubics.len > 0);
     const counts = pathCounts(cubics.len);
     std.debug.assert(pts.len >= counts.pts and verbs.len >= counts.verbs);
-    verbs[0] = @intFromEnum(PathVerb.move);
+    verbs[0] = @backingInt(PathVerb.move);
     pts[0] = cubics[0].a0[0];
     pts[1] = cubics[0].a0[1];
     var w: usize = 2;
     for (cubics, 1..) |c, i| {
-        verbs[i] = @intFromEnum(PathVerb.cubic);
+        verbs[i] = @backingInt(PathVerb.cubic);
         inline for (.{ c.c0, c.c1, c.a1 }) |v| {
             pts[w] = v[0];
             pts[w + 1] = v[1];
             w += 2;
         }
     }
-    verbs[cubics.len + 1] = @intFromEnum(PathVerb.close);
+    verbs[cubics.len + 1] = @backingInt(PathVerb.close);
     return .{ .pts = pts[0..counts.pts], .verbs = verbs[0..counts.verbs] };
 }
 
@@ -1721,10 +1721,10 @@ fn expectValidPath(cubics: []const Cubic, e: EmittedPath, bmin: Point, bmax: Poi
     try testing.expectEqual(counts.pts, e.pts.len);
     try testing.expectEqual(counts.verbs, e.verbs.len);
     // verb stream: move, then one cubic per outline cubic, then close
-    try testing.expectEqual(@as(i32, @intFromEnum(PathVerb.move)), e.verbs[0]);
+    try testing.expectEqual(@as(i32, @backingInt(PathVerb.move)), e.verbs[0]);
     for (e.verbs[1 .. e.verbs.len - 1]) |v|
-        try testing.expectEqual(@as(i32, @intFromEnum(PathVerb.cubic)), v);
-    try testing.expectEqual(@as(i32, @intFromEnum(PathVerb.close)), e.verbs[e.verbs.len - 1]);
+        try testing.expectEqual(@as(i32, @backingInt(PathVerb.cubic)), v);
+    try testing.expectEqual(@as(i32, @backingInt(PathVerb.close)), e.verbs[e.verbs.len - 1]);
     // point stream: a0 then c0,c1,a1 per cubic, in order
     try expectApprox(.{ e.pts[0], e.pts[1] }, cubics[0].a0, 0);
     var w: usize = 2;

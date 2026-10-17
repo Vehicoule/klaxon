@@ -64,6 +64,15 @@ const snackbar_w = @import("widgets/snackbar.zig");
 const fab_w = @import("widgets/fab.zig");
 const carousel_w = @import("widgets/carousel.zig");
 const bottom_app_bar_w = @import("widgets/bottom_app_bar.zig");
+const container_w = @import("widgets/container.zig");
+const image_w = @import("widgets/image.zig");
+const scroll_view_w = @import("widgets/scroll_view.zig");
+const anim_w = @import("widgets/anim.zig");
+const navigator_w = @import("widgets/navigator.zig");
+const fab_menu_w = @import("widgets/fab_menu.zig");
+const button_group_w = @import("widgets/button_group.zig");
+const toolbar_w = @import("widgets/toolbar.zig");
+const search_view_w = @import("widgets/search_view.zig");
 const golden = @import("golden.zig"); // tests
 
 /// Options type for widgets without options.
@@ -176,6 +185,22 @@ pub const widgets = [_]WidgetEntry{
     .{ .name = "extended_fab", .category = "input", .build = buildExtendedFab, .schema = schemaExtendedFab },
     .{ .name = "carousel", .category = "display", .build = buildCarousel, .schema = schemaCarousel },
     .{ .name = "bottom_app_bar", .category = "navigation", .build = buildBottomAppBar, .schema = schemaBottomAppBar },
+    .{ .name = "stack", .category = "layout", .build = buildStack, .schema = schemaStack },
+    .{ .name = "grid", .category = "layout", .build = buildGrid, .schema = schemaGrid },
+    .{ .name = "align", .category = "layout", .build = buildAlign, .schema = schemaAlign },
+    .{ .name = "padding_dir", .category = "layout", .build = buildPaddingDir, .schema = schemaPaddingDir },
+    .{ .name = "container", .category = "layout", .build = buildContainer, .schema = schemaContainer },
+    .{ .name = "rich_text", .category = "display", .build = buildRichText, .schema = schemaRichText },
+    .{ .name = "image", .category = "display", .build = buildImage, .schema = schemaImage },
+    .{ .name = "scroll_view", .category = "layout", .build = buildScrollView, .schema = schemaScrollView },
+    .{ .name = "animated_container", .category = "layout", .build = buildAnimatedContainer, .schema = schemaAnimatedContainer },
+    .{ .name = "animated_offset", .category = "layout", .build = buildAnimatedOffset, .schema = schemaAnimatedOffset },
+    .{ .name = "animated_scale", .category = "layout", .build = buildAnimatedScale, .schema = schemaAnimatedScale },
+    .{ .name = "hero", .category = "navigation", .build = buildHero, .schema = schemaHero },
+    .{ .name = "fab_menu", .category = "input", .build = buildFabMenu, .schema = schemaFabMenu },
+    .{ .name = "button_group", .category = "input", .build = buildButtonGroup, .schema = schemaButtonGroup },
+    .{ .name = "toolbar", .category = "navigation", .build = buildToolbar, .schema = schemaToolbar },
+    .{ .name = "search_view", .category = "input", .build = buildSearchView, .schema = schemaSearchView },
 };
 
 pub fn byName(name: []const u8) ?WidgetEntry {
@@ -207,6 +232,7 @@ pub const BuildCtx = struct {
     const JournalEntry = union(enum) {
         record: *Node,
         signal: Tracked,
+        radio_group: []const u8,
     };
 
     pub fn init(allocator: std.mem.Allocator) BuildCtx {
@@ -263,6 +289,9 @@ pub const BuildCtx = struct {
                     }
                     t.deinit_fn(t.ptr);
                 },
+                .radio_group => |key| {
+                    if (ctx.radio_groups.fetchRemove(key)) |kv| ctx.allocator.free(kv.key);
+                },
             }
         }
     }
@@ -270,9 +299,10 @@ pub const BuildCtx = struct {
     fn track(ctx: *BuildCtx, ptr: *anyopaque, deinit_fn: *const fn (*anyopaque) void) !void {
         const t = Tracked{ .ptr = ptr, .deinit_fn = deinit_fn };
         try ctx.tracked.append(t);
-        ctx.journal.append(.{ .signal = t }) catch {
+        ctx.journal.append(.{ .signal = t }) catch |e| {
             deinit_fn(ptr);
             _ = ctx.tracked.pop();
+            return e;
         };
     }
 
@@ -300,7 +330,7 @@ pub fn treeFromValue(ctx: *BuildCtx, v: Value) !*Node {
 }
 
 fn treeFromValueInner(ctx: *BuildCtx, v: Value) !*Node {
-    const name_v = v.get("name") orelse return error.MissingName;
+    const name_v = v.get("name") orelse v.get("type") orelse return error.MissingName;
     const name = switch (name_v) {
         .string => |s| s,
         else => return error.ExpectedString,
@@ -511,9 +541,12 @@ fn buildRadio(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerro
     } else "default";
     const sig = blk: {
         if (ctx.radio_groups.get(group)) |s| break :blk s; // shared group signal
-        const s = try buildUsizeSignal(allocator, opts, ctx); // "selected"
-        ctx.radio_groups.put(try allocator.dupe(u8, group), s) catch |e| {
-            s.deinit();
+        const s = try buildUsizeSignal(allocator, opts, ctx); // "selected" (tracked in ctx.journal)
+        const key = try ctx.allocator.dupe(u8, group);
+        errdefer ctx.allocator.free(key);
+        try ctx.radio_groups.put(key, s);
+        ctx.journal.append(.{ .radio_group = key }) catch |e| {
+            _ = ctx.radio_groups.remove(key);
             return e;
         };
         break :blk s;
@@ -1343,6 +1376,354 @@ fn buildBottomAppBar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) 
     return .{ .node = try bottom_app_bar_w.bottomAppBar(allocator, bopts), .skip_children = true };
 }
 
+fn buildStack(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try layout_w.stack(allocator, try value_mod.optionsFromValue(layout_w.StackOptions, opts, null, null)) };
+}
+
+fn buildGrid(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try layout_w.grid(allocator, try value_mod.optionsFromValue(layout_w.GridOptions, opts, null, null)) };
+}
+
+fn buildAlign(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try layout_w.alignTo(allocator, try value_mod.optionsFromValue(layout_w.AlignOptions, opts, null, null)) };
+}
+
+fn buildPaddingDir(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try layout_w.paddingDir(allocator, try value_mod.optionsFromValue(ui.layout.EdgeInsetsDirectional, opts, null, null)) };
+}
+
+fn buildContainer(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try container_w.container(allocator, try value_mod.optionsFromValue(container_w.ContainerOptions, opts, null, null)) };
+}
+
+const RichSpanRegistryOptions = struct {
+    text: []const u8 = "",
+    size: f32 = 16,
+    color: ui.paint.Color = 0x000000FF,
+    bold: bool = false,
+    weight: u16 = 0,
+    italic: bool = false,
+    letter_spacing: f32 = 0,
+    family: ?[]const u8 = null,
+};
+
+fn buildRichText(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    var spans: std.array_list.Managed(text_w.TextSpan) = .init(allocator);
+    defer spans.deinit();
+    if (opts.get("spans")) |sv| switch (sv) {
+        .null => {},
+        .array => |arr| {
+            try spans.ensureTotalCapacity(arr.len);
+            for (arr) |item| {
+                const parsed = try value_mod.optionsFromValue(RichSpanRegistryOptions, item, null, null);
+                spans.appendAssumeCapacity(.{
+                    .text = parsed.text,
+                    .size = parsed.size,
+                    .color = parsed.color,
+                    .bold = parsed.bold,
+                    .weight = parsed.weight,
+                    .italic = parsed.italic,
+                    .letter_spacing = parsed.letter_spacing,
+                    .family = parsed.family,
+                });
+            }
+        },
+        else => return error.ExpectedArray,
+    };
+    return .{ .node = try text_w.richText(allocator, spans.items), .skip_children = true };
+}
+
+const ImageRegistryOptions = struct {
+    width: i32 = 16,
+    height: i32 = 16,
+    color: ui.paint.Color = 0xCCCCCCFF,
+};
+
+fn buildImage(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    const iopts = try value_mod.optionsFromValue(ImageRegistryOptions, opts, null, null);
+    if (iopts.width <= 0 or iopts.height <= 0) return error.InvalidImage;
+    const w: usize = @intCast(iopts.width);
+    const h: usize = @intCast(iopts.height);
+    const count = std.math.mul(usize, w, h) catch return error.InvalidImage;
+    const byte_len = std.math.mul(usize, count, 4) catch return error.InvalidImage;
+    const rgba = try allocator.alloc(u8, byte_len);
+    defer allocator.free(rgba);
+    const r: u8 = @intCast((iopts.color >> 24) & 0xFF);
+    const g: u8 = @intCast((iopts.color >> 16) & 0xFF);
+    const b: u8 = @intCast((iopts.color >> 8) & 0xFF);
+    const a: u8 = @intCast(iopts.color & 0xFF);
+    var i: usize = 0;
+    while (i < byte_len) : (i += 4) {
+        rgba[i] = r;
+        rgba[i + 1] = g;
+        rgba[i + 2] = b;
+        rgba[i + 3] = a;
+    }
+    return .{ .node = try image_w.image(allocator, iopts.width, iopts.height, rgba), .skip_children = true };
+}
+
+fn buildScrollView(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try scroll_view_w.scrollView(allocator, try value_mod.optionsFromValue(scroll_view_w.ScrollViewOptions, opts, null, null)) };
+}
+
+const AnimContainerRegistryOptions = struct {
+    width: ?f32 = null,
+    height: ?f32 = null,
+    color: ?ui.paint.Color = null,
+    radius: f32 = 0,
+    padding: ui.layout.EdgeInsets = .{},
+};
+
+fn buildAnimatedContainer(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const aopts = try value_mod.optionsFromValue(AnimContainerRegistryOptions, opts, null, null);
+    var w_sig: ?*state.Signal(f32) = null;
+    if (aopts.width) |w| {
+        const s = try state.Signal(f32).init(allocator, w);
+        try ctx.track(s, deinitF32Signal);
+        w_sig = s;
+    }
+    var h_sig: ?*state.Signal(f32) = null;
+    if (aopts.height) |h| {
+        const s = try state.Signal(f32).init(allocator, h);
+        try ctx.track(s, deinitF32Signal);
+        h_sig = s;
+    }
+    var c_sig: ?*state.Signal(ui.paint.Color) = null;
+    if (aopts.color) |col| {
+        const s = try state.Signal(ui.paint.Color).init(allocator, col);
+        try ctx.track(s, deinitColorSignal);
+        c_sig = s;
+    }
+    const n = try anim_w.animatedContainer(allocator, .{
+        .width = w_sig,
+        .height = h_sig,
+        .color = c_sig,
+        .radius = aopts.radius,
+        .padding = aopts.padding,
+    });
+    return .{ .node = n };
+}
+
+const AnimOffsetRegistryOptions = struct {
+    dx: f32 = 0,
+    dy: f32 = 0,
+};
+
+fn deinitOffsetSignal(p: *anyopaque) void {
+    const s: *state.Signal(anim_w.Offset) = @ptrCast(@alignCast(p));
+    s.deinit();
+}
+
+fn buildAnimatedOffset(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const aopts = try value_mod.optionsFromValue(AnimOffsetRegistryOptions, opts, null, null);
+    const sig = try state.Signal(anim_w.Offset).init(allocator, .{ .x = aopts.dx, .y = aopts.dy });
+    try ctx.track(sig, deinitOffsetSignal);
+    return .{ .node = try anim_w.animatedOffset(allocator, .{ .offset = sig }) };
+}
+
+const AnimScaleRegistryOptions = struct {
+    scale: f32 = 1,
+};
+
+fn buildAnimatedScale(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const aopts = try value_mod.optionsFromValue(AnimScaleRegistryOptions, opts, null, null);
+    const sig = try state.Signal(f32).init(allocator, aopts.scale);
+    try ctx.track(sig, deinitF32Signal);
+    return .{ .node = try anim_w.animatedScale(allocator, .{ .scale = sig }) };
+}
+
+fn buildHero(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    return .{ .node = try navigator_w.hero(allocator, try value_mod.optionsFromValue(navigator_w.HeroOptions, opts, null, null)) };
+}
+
+fn optionsWithoutKey(comptime T: type, allocator: std.mem.Allocator, opts: Value, skip_key: []const u8) !T {
+    if (opts != .object) return error.ExpectedObject;
+    var fields = try allocator.alloc(value_mod.Field, opts.object.len);
+    defer allocator.free(fields);
+    var n: usize = 0;
+    for (opts.object) |f| {
+        if (!std.mem.eql(u8, f.name, skip_key)) {
+            fields[n] = f;
+            n += 1;
+        }
+    }
+    return value_mod.optionsFromValue(T, .{ .object = fields[0..n] }, null, null);
+}
+
+fn parseFabMenuItems(allocator: std.mem.Allocator, v: Value) ![]fab_menu_w.FabMenuItem {
+    switch (v) {
+        .null => return allocator.alloc(fab_menu_w.FabMenuItem, 0),
+        .array => |arr| {
+            const items = try allocator.alloc(fab_menu_w.FabMenuItem, arr.len);
+            errdefer allocator.free(items);
+            for (arr, 0..) |iv, i| {
+                if (iv != .object) return error.ExpectedObject;
+                const label: []const u8 = if (iv.get("label")) |lv| switch (lv) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const icon: icon_w.IconName = if (iv.get("icon")) |lv| switch (lv) {
+                    .string => |s| std.meta.stringToEnum(icon_w.IconName, s) orelse return error.UnknownIcon,
+                    else => .star,
+                } else .star;
+                const enabled: bool = if (iv.get("enabled")) |ev| switch (ev) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+                items[i] = .{ .icon = icon, .label = label, .enabled = enabled };
+            }
+            return items;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
+fn buildFabMenu(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    var fopts = try optionsWithoutKey(fab_menu_w.FabMenuOptions, allocator, opts, "open");
+    const items = try parseFabMenuItems(allocator, opts.get("items") orelse Value.null);
+    defer allocator.free(items);
+    const sig = try buildBoolSignal(allocator, opts, ctx, "open");
+    fopts.open = sig;
+    const n = try fab_menu_w.fabMenu(allocator, items, fopts);
+    return .{ .node = n, .live = .{ .signal = sig, .field = "open", .read = readBoolSignal }, .skip_children = true };
+}
+
+fn parseButtonGroupItems(allocator: std.mem.Allocator, v: Value) ![]button_group_w.ButtonGroupItem {
+    switch (v) {
+        .null => return allocator.alloc(button_group_w.ButtonGroupItem, 0),
+        .array => |arr| {
+            const items = try allocator.alloc(button_group_w.ButtonGroupItem, arr.len);
+            errdefer allocator.free(items);
+            for (arr, 0..) |iv, i| {
+                if (iv != .object) return error.ExpectedObject;
+                const label: []const u8 = if (iv.get("label")) |lv| switch (lv) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const icon: ?icon_w.IconName = if (iv.get("icon")) |lv| switch (lv) {
+                    .null => null,
+                    .string => |s| std.meta.stringToEnum(icon_w.IconName, s) orelse return error.UnknownIcon,
+                    else => null,
+                } else null;
+                const enabled: bool = if (iv.get("enabled")) |ev| switch (ev) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+                items[i] = .{ .label = label, .icon = icon, .enabled = enabled };
+            }
+            return items;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
+fn buildButtonGroup(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    _ = ctx;
+    const bopts = try value_mod.optionsFromValue(button_group_w.ButtonGroupOptions, opts, null, null);
+    const items = try parseButtonGroupItems(allocator, opts.get("items") orelse Value.null);
+    defer allocator.free(items);
+    const n = try button_group_w.buttonGroup(allocator, items, bopts);
+    return .{ .node = n, .skip_children = true };
+}
+
+fn parseToolbarItems(allocator: std.mem.Allocator, v: Value) ![]toolbar_w.ToolbarItem {
+    switch (v) {
+        .null => return allocator.alloc(toolbar_w.ToolbarItem, 0),
+        .array => |arr| {
+            const items = try allocator.alloc(toolbar_w.ToolbarItem, arr.len);
+            errdefer allocator.free(items);
+            for (arr, 0..) |iv, i| {
+                if (iv != .object) return error.ExpectedObject;
+                const icon: icon_w.IconName = if (iv.get("icon")) |lv| switch (lv) {
+                    .string => |s| std.meta.stringToEnum(icon_w.IconName, s) orelse return error.UnknownIcon,
+                    else => .star,
+                } else .star;
+                const enabled: bool = if (iv.get("enabled")) |ev| switch (ev) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+                const a11y_label: ?[]const u8 = if (iv.get("a11y_label")) |av| switch (av) {
+                    .string => |s| s,
+                    else => null,
+                } else null;
+                const divider: bool = if (iv.get("divider")) |dv| switch (dv) {
+                    .bool => |b| b,
+                    else => false,
+                } else false;
+                items[i] = .{ .icon = icon, .enabled = enabled, .a11y_label = a11y_label, .divider = divider };
+            }
+            return items;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
+fn buildToolbar(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    var topts = try optionsWithoutKey(toolbar_w.ToolbarOptions, allocator, opts, "expanded");
+    const items = try parseToolbarItems(allocator, opts.get("items") orelse Value.null);
+    defer allocator.free(items);
+    const has_expanded = if (opts.get("expanded")) |ev| ev != .null else false;
+    if (has_expanded) {
+        const sig = try buildBoolSignal(allocator, opts, ctx, "expanded");
+        topts.expanded = sig;
+        const n = try toolbar_w.toolbar(allocator, items, topts);
+        return .{ .node = n, .live = .{ .signal = sig, .field = "expanded", .read = readBoolSignal }, .skip_children = true };
+    }
+    const n = try toolbar_w.toolbar(allocator, items, topts);
+    return .{ .node = n, .skip_children = true };
+}
+
+fn parseSearchViewItems(allocator: std.mem.Allocator, v: Value) ![]search_view_w.SuggestionItem {
+    switch (v) {
+        .null => return allocator.alloc(search_view_w.SuggestionItem, 0),
+        .array => |arr| {
+            const items = try allocator.alloc(search_view_w.SuggestionItem, arr.len);
+            errdefer allocator.free(items);
+            for (arr, 0..) |iv, i| {
+                if (iv != .object) return error.ExpectedObject;
+                const label: []const u8 = if (iv.get("label")) |lv| switch (lv) {
+                    .string => |s| s,
+                    else => "",
+                } else "";
+                const icon: icon_w.IconName = if (iv.get("icon")) |lv| switch (lv) {
+                    .string => |s| std.meta.stringToEnum(icon_w.IconName, s) orelse return error.UnknownIcon,
+                    else => .search,
+                } else .search;
+                const trailing_icon: ?icon_w.IconName = if (iv.get("trailing_icon")) |tv| switch (tv) {
+                    .null => null,
+                    .string => |s| std.meta.stringToEnum(icon_w.IconName, s) orelse return error.UnknownIcon,
+                    else => null,
+                } else null;
+                const enabled: bool = if (iv.get("enabled")) |ev| switch (ev) {
+                    .bool => |b| b,
+                    else => true,
+                } else true;
+                items[i] = .{ .label = label, .icon = icon, .trailing_icon = trailing_icon, .enabled = enabled };
+            }
+            return items;
+        },
+        else => return error.ExpectedArray,
+    }
+}
+
+fn buildSearchView(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerror!BuildResult {
+    const sopts = try value_mod.optionsFromValue(search_view_w.SearchViewOptions, opts, null, null);
+    const items = try parseSearchViewItems(allocator, opts.get("items") orelse Value.null);
+    defer allocator.free(items);
+    const open_sig = try buildBoolSignal(allocator, opts, ctx, "open");
+    const n = try search_view_w.searchView(allocator, items, open_sig, null, null, null, null, null, sopts);
+    return .{ .node = n, .live = .{ .signal = open_sig, .field = "open", .read = readBoolSignal }, .skip_children = true };
+}
+
 // --- per-widget inspector schemas (comptime-generated from options types) ---
 
 fn schemaColumn(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
@@ -1614,6 +1995,78 @@ fn schemaBottomAppBar(allocator: std.mem.Allocator) anyerror![]value_mod.PropSch
     return value_mod.schemaOf(bottom_app_bar_w.BottomAppBarOptions, allocator);
 }
 
+fn schemaStack(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(layout_w.StackOptions, allocator);
+}
+
+fn schemaGrid(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(layout_w.GridOptions, allocator);
+}
+
+fn schemaAlign(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(layout_w.AlignOptions, allocator);
+}
+
+fn schemaPaddingDir(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(ui.layout.EdgeInsetsDirectional, allocator);
+}
+
+fn schemaContainer(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(container_w.ContainerOptions, allocator);
+}
+
+fn schemaRichText(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    const base = try value_mod.schemaOf(NoOptions, allocator);
+    return value_mod.appendSchemaProp(base, allocator, "spans", .unsupported, &.{}, .null);
+}
+
+fn schemaImage(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(ImageRegistryOptions, allocator);
+}
+
+fn schemaScrollView(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(scroll_view_w.ScrollViewOptions, allocator);
+}
+
+fn schemaAnimatedContainer(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(AnimContainerRegistryOptions, allocator);
+}
+
+fn schemaAnimatedOffset(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(AnimOffsetRegistryOptions, allocator);
+}
+
+fn schemaAnimatedScale(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(AnimScaleRegistryOptions, allocator);
+}
+
+fn schemaHero(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    return value_mod.schemaOf(navigator_w.HeroOptions, allocator);
+}
+
+fn schemaFabMenu(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    var base = try value_mod.schemaOf(fab_menu_w.FabMenuOptions, allocator);
+    base = try value_mod.appendSchemaProp(base, allocator, "items", .unsupported, &.{}, .null);
+    return value_mod.appendSchemaProp(base, allocator, "open", .toggle, &.{}, .{ .bool = false });
+}
+
+fn schemaButtonGroup(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    const base = try value_mod.schemaOf(button_group_w.ButtonGroupOptions, allocator);
+    return value_mod.appendSchemaProp(base, allocator, "items", .unsupported, &.{}, .null);
+}
+
+fn schemaToolbar(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    var base = try value_mod.schemaOf(toolbar_w.ToolbarOptions, allocator);
+    base = try value_mod.appendSchemaProp(base, allocator, "items", .unsupported, &.{}, .null);
+    return value_mod.appendSchemaProp(base, allocator, "expanded", .toggle, &.{}, .{ .bool = true });
+}
+
+fn schemaSearchView(allocator: std.mem.Allocator) anyerror![]value_mod.PropSchema {
+    var base = try value_mod.schemaOf(search_view_w.SearchViewOptions, allocator);
+    base = try value_mod.appendSchemaProp(base, allocator, "items", .unsupported, &.{}, .null);
+    return value_mod.appendSchemaProp(base, allocator, "open", .toggle, &.{}, .{ .bool = false });
+}
+
 // --- tests ---
 
 fn slotBuilder(userdata: ?*anyopaque, v: Value) anyerror!*Node {
@@ -1626,8 +2079,12 @@ test "registry: byName finds entries, rejects unknown" {
     try std.testing.expect(byName("column") != null);
     try std.testing.expect(byName("slider") != null);
     try std.testing.expect(byName("snackbar") != null);
+    try std.testing.expect(byName("fab_menu") != null);
+    try std.testing.expect(byName("button_group") != null);
+    try std.testing.expect(byName("toolbar") != null);
+    try std.testing.expect(byName("search_view") != null);
     try std.testing.expect(byName("nope") == null);
-    try std.testing.expectEqual(@as(usize, 50), widgets.len);
+    try std.testing.expectEqual(@as(usize, 66), widgets.len);
 }
 
 test "registry: builds a node with defaults from a minimal value" {
@@ -2614,4 +3071,72 @@ test "registry: slot options build subtrees via the slot builder" {
     opts.leading.?.deinit();
     // without a builder: unsupported
     try std.testing.expectError(error.UnsupportedFieldType, value_mod.optionsFromValue(SlotOpts, v, null, null));
+}
+
+test "registry: radio_groups cleaned up on partial tree rollback without double-free" {
+    var ctx = BuildCtx.init(std.testing.allocator);
+    defer ctx.deinit();
+    // A row whose first child creates a radio_group ("g_fail") and second child fails to build.
+    try std.testing.expectError(
+        error.UnknownWidget,
+        treeFromJson(
+            &ctx,
+            std.testing.allocator,
+            "{\"name\":\"row\",\"children\":[{\"name\":\"radio\",\"options\":{\"group\":\"g_fail\",\"index\":0}},{\"name\":\"nonexistent_widget\"}]}",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ctx.radio_groups.count());
+    try std.testing.expectEqual(@as(usize, 0), ctx.tracked.items.len);
+    // Subsequent valid build using the same group name works cleanly without dangling pointer.
+    const node = try treeFromJson(
+        &ctx,
+        std.testing.allocator,
+        "{\"name\":\"radio\",\"options\":{\"group\":\"g_fail\",\"index\":0,\"selected\":0}}",
+    );
+    try std.testing.expectEqual(true, node.semantics.?.checked.?);
+    node.deinit();
+    ctx.reset();
+    try std.testing.expectEqual(@as(usize, 0), ctx.radio_groups.count());
+}
+
+test "registry: 16 newly registered widgets build from JSON and expose schemas" {
+    try std.testing.expectEqual(@as(usize, 66), widgets.len);
+    const a = std.testing.allocator;
+    for (widgets) |w| {
+        const s = try w.schema(a);
+        defer {
+            for (s) |*p| p.deinit(a);
+            a.free(s);
+        }
+        try std.testing.expect(w.name.len > 0);
+    }
+    var ctx = BuildCtx.init(a);
+    defer ctx.deinit();
+
+    const specs = [_][]const u8{
+        "{\"name\":\"stack\",\"options\":{\"fit\":\"loose\",\"alignment\":{\"x\":0,\"y\":0}},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"a\"}}]}",
+        "{\"name\":\"grid\",\"options\":{\"columns\":2,\"gap\":4},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"1\"}},{\"name\":\"text\",\"options\":{\"text\":\"2\"}}]}",
+        "{\"name\":\"align\",\"options\":{\"alignment\":{\"x\":1,\"y\":1}},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"x\"}}]}",
+        "{\"name\":\"padding_dir\",\"options\":{\"start\":8,\"end\":8,\"top\":4,\"bottom\":4},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"p\"}}]}",
+        "{\"name\":\"container\",\"options\":{\"color\":255,\"radius\":8,\"border_width\":2},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"c\"}}]}",
+        "{\"name\":\"rich_text\",\"options\":{\"spans\":[{\"text\":\"hello \"},{\"text\":\"world\",\"bold\":true}]}}",
+        "{\"name\":\"image\",\"options\":{\"width\":32,\"height\":32,\"color\":4278190335}}",
+        "{\"name\":\"scroll_view\",\"options\":{\"max_height\":120},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"s\"}}]}",
+        "{\"name\":\"animated_container\",\"options\":{\"width\":80,\"height\":40,\"radius\":6},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"ac\"}}]}",
+        "{\"name\":\"animated_offset\",\"options\":{\"dx\":4,\"dy\":8},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"ao\"}}]}",
+        "{\"name\":\"animated_scale\",\"options\":{\"scale\":0.9},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"as\"}}]}",
+        "{\"name\":\"hero\",\"options\":{\"tag\":\"avatar\"},\"children\":[{\"name\":\"text\",\"options\":{\"text\":\"h\"}}]}",
+        "{\"name\":\"fab_menu\",\"options\":{\"open\":true,\"items\":[{\"icon\":\"plus\",\"label\":\"Add\"}]}}",
+        "{\"name\":\"button_group\",\"options\":{\"items\":[{\"label\":\"One\"},{\"label\":\"Two\"}]}}",
+        "{\"name\":\"toolbar\",\"options\":{\"expanded\":true,\"items\":[{\"icon\":\"star\",\"a11y_label\":\"Bold\"}]}}",
+        "{\"name\":\"search_view\",\"options\":{\"open\":true,\"initial\":\"zig\",\"placeholder\":\"Search...\",\"items\":[{\"label\":\"zig\"},{\"label\":\"zls\"}]}}",
+    };
+    for (specs) |spec| {
+        const node = try treeFromJson(&ctx, a, spec);
+        const out = try treeToJson(&ctx, node, a);
+        defer a.free(out);
+        try std.testing.expectEqualStrings(spec, out);
+        node.deinit();
+        ctx.reset();
+    }
 }

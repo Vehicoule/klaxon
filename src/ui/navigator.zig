@@ -188,11 +188,28 @@ pub const Navigator = struct {
             const eq = std.mem.indexOf(u8, pair, "=") orelse return error.InvalidUri;
             if (!params.add(pair[0..eq], pair[eq + 1 ..])) return error.TooManyParams;
         }
-        // No-op when the top page is the same concrete path.
+        // No-op when the top page is the same concrete path AND query params;
+        // if the path matches and query params changed, replace in-place.
+        const param_slice = params.items[0..params.len];
         if (nav.current()) |top| {
-            if (std.mem.eql(u8, top.route.path, parsed.path)) return;
+            if (std.mem.eql(u8, top.route.path, parsed.path)) {
+                if (paramsEqual(top.route.params.items[0..top.route.params.len], param_slice)) return;
+                const new_page = try nav.buildPageFromSlice(def, parsed.path, param_slice);
+                freePage(nav.allocator, top);
+                top.* = new_page;
+                nav.notify(.replace);
+                return;
+            }
         }
-        try nav.pushDef(def, parsed.path, params.items[0..params.len]);
+        try nav.pushDef(def, parsed.path, param_slice);
+    }
+
+    fn paramsEqual(a: []const Param, b: []const Param) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |pa, pb| {
+            if (!std.mem.eql(u8, pa.key, pb.key) or !std.mem.eql(u8, pa.value, pb.value)) return false;
+        }
+        return true;
     }
 
     /// Back (Android hardware button / Escape): pop while deeper than the

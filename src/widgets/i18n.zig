@@ -132,8 +132,9 @@ pub fn L10nText(comptime Args: type) type {
         fn resolveCb(userdata: ?*anyopaque) void {
             const s: *State = @ptrCast(@alignCast(userdata.?));
             _ = s.base.i18n.locale_sig.get(); // track: re-run on locale switch
-            const new_text = resolveText(Args, s.base.i18n.allocator, s.base.key, s.base.i18n, s.args) catch @panic("klaxon: out of memory");
-            resolveBase(s.base.i18n.allocator, &s.base, new_text);
+            const alloc = s.base.node.allocator;
+            const new_text = resolveText(Args, alloc, s.base.key, s.base.i18n, s.args) catch @panic("klaxon: out of memory");
+            resolveBase(alloc, &s.base, new_text);
         }
 
         fn deinit(n: *Node) void {
@@ -141,7 +142,7 @@ pub fn L10nText(comptime Args: type) type {
             l10nDeinitBase(&s.base);
             n.allocator.destroy(s);
         }
-        const vtable = ui.node.VTable{ .measure = l10nMeasure, .layout = l10nLayout, .paint = l10nPaint, .deinit = deinit };
+        const vtable = ui.node.VTable{ .measure = l10nMeasure, .measure_pure = true, .layout = l10nLayout, .paint = l10nPaint, .deinit = deinit };
 
         pub fn text(allocator: std.mem.Allocator, i18n: *i18n_mod.I18n, key: []const u8, args: Args, opts: L10nTextOptions) !*Node {
             const node = try Node.create(allocator, &vtable);
@@ -183,8 +184,9 @@ const PluralState = struct {
 fn pluralResolveCb(userdata: ?*anyopaque) void {
     const s: *PluralState = @ptrCast(@alignCast(userdata.?));
     _ = s.base.i18n.locale_sig.get(); // track: re-run on locale switch
-    const new_text = resolvePlural(s.base.i18n.allocator, s.base.i18n, s.base.key, s.count) catch @panic("klaxon: out of memory");
-    resolveBase(s.base.i18n.allocator, &s.base, new_text);
+    const alloc = s.base.node.allocator;
+    const new_text = resolvePlural(alloc, s.base.i18n, s.base.key, s.count) catch @panic("klaxon: out of memory");
+    resolveBase(alloc, &s.base, new_text);
 }
 
 fn pluralDeinit(n: *Node) void {
@@ -192,7 +194,7 @@ fn pluralDeinit(n: *Node) void {
     l10nDeinitBase(&s.base);
     n.allocator.destroy(s);
 }
-const plural_vtable = ui.node.VTable{ .measure = l10nMeasure, .layout = l10nLayout, .paint = l10nPaint, .deinit = pluralDeinit };
+const plural_vtable = ui.node.VTable{ .measure = l10nMeasure, .measure_pure = true, .layout = l10nLayout, .paint = l10nPaint, .deinit = pluralDeinit };
 
 /// Localized plural text (fixed count).
 pub fn l10nPlural(allocator: std.mem.Allocator, i18n: *i18n_mod.I18n, key: []const u8, count: i64, opts: L10nTextOptions) !*Node {
@@ -228,19 +230,18 @@ const PluralSigState = struct {
 fn pluralSigResolveCb(userdata: ?*anyopaque) void {
     const s: *PluralSigState = @ptrCast(@alignCast(userdata.?));
     _ = s.base.i18n.locale_sig.get(); // track: re-run on locale switch
-    const new_text = resolvePlural(s.base.i18n.allocator, s.base.i18n, s.base.key, s.count_sig.peek()) catch @panic("klaxon: out of memory");
-    resolveBase(s.base.i18n.allocator, &s.base, new_text);
+    const alloc = s.base.node.allocator;
+    const new_text = resolvePlural(alloc, s.base.i18n, s.base.key, s.count_sig.peek()) catch @panic("klaxon: out of memory");
+    resolveBase(alloc, &s.base, new_text);
 }
 
 fn pluralSigDeinit(n: *Node) void {
     const s: *PluralSigState = @ptrCast(@alignCast(n.state.?));
     s.count_sig.unsubscribe(.{ .callback = .{ .fn_ptr = pluralSigResolveCb, .userdata = s } });
-    s.base.effect.deinit();
-    n.allocator.free(s.base.key);
-    n.allocator.free(s.base.text);
+    l10nDeinitBase(&s.base);
     n.allocator.destroy(s);
 }
-const plural_sig_vtable = ui.node.VTable{ .measure = l10nMeasure, .layout = l10nLayout, .paint = l10nPaint, .deinit = pluralSigDeinit };
+const plural_sig_vtable = ui.node.VTable{ .measure = l10nMeasure, .measure_pure = true, .layout = l10nLayout, .paint = l10nPaint, .deinit = pluralSigDeinit };
 
 /// Localized plural text bound to a count signal: both the count and the
 /// locale re-resolve the text.

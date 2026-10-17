@@ -939,23 +939,28 @@ fn computeStrategy(n: *Node, s: *CarouselState) void {
     tn += 1;
     if (centered) {
         for (0..arr.small_count / 2) |_| {
+            if (tn >= max_keylines - 1) break;
             tmp[tn] = .{ .size = arr.small_size };
             tn += 1;
         }
         for (0..arr.medium_count / 2) |_| {
+            if (tn >= max_keylines - 1) break;
             tmp[tn] = .{ .size = arr.medium_size };
             tn += 1;
         }
     }
     for (0..arr.large_count) |_| {
+        if (tn >= max_keylines - 1) break;
         tmp[tn] = .{ .size = arr.large_size };
         tn += 1;
     }
     for (0..arr.medium_count - if (centered) arr.medium_count / 2 else 0) |_| {
+        if (tn >= max_keylines - 1) break;
         tmp[tn] = .{ .size = arr.medium_size };
         tn += 1;
     }
     for (0..arr.small_count - if (centered) arr.small_count / 2 else 0) |_| {
+        if (tn >= max_keylines - 1) break;
         tmp[tn] = .{ .size = arr.small_size };
         tn += 1;
     }
@@ -1057,6 +1062,7 @@ const mask_vtable = ui.node.VTable{
             return n.children.items[0].measure(c);
         }
     }.m,
+    .measure_pure = true,
     .layout = struct {
         fn l(n: *Node, b: Rect) void {
             _ = n;
@@ -1255,6 +1261,7 @@ fn carouselSetOffset(n: *Node, offset: f32) void {
 
 fn carouselDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel));
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = carouselLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -1276,6 +1283,7 @@ fn carouselLocaleCb(userdata: ?*anyopaque) void {
 
 const carousel_vtable = ui.node.VTable{
     .measure = carouselMeasure,
+    .measure_pure = true,
     .layout = carouselLayout,
     .paint = carouselPaint,
     .deinit = carouselDeinit,

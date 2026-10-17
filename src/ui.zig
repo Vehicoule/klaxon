@@ -13,3 +13,4 @@ pub const i18n = @import("ui/i18n.zig");
 pub const semantics = @import("ui/semantics.zig");
 pub const clipboard = @import("ui/clipboard.zig");
 pub const value = @import("ui/value.zig");
+pub const platform = @import("platform/mod.zig");

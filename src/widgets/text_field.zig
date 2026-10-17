@@ -650,6 +650,17 @@ fn segsReset(s: *TextFieldState) void {
     while (s.segs.pop()) |seg| freeSeg(s, seg);
 }
 
+/// The single-line caret/selection x measure — Edit.measure_prefix hook.
+/// Walks the seg rope (reconciled, each seg's width memoized): O(#segs to
+/// the cut) + one within-seg measure — what pre-paragraph caret geometry
+/// paid. The paragraph path still serves RTL/mixed content and multiline.
+fn segPrefixMeasure(e: *text_edit.Edit, off: usize, size: f32) f32 {
+    const s: *TextFieldState = @fieldParentPtr("edit", e);
+    _ = size; // runXAt measures at the live paint size — same source
+    _ = fieldMetrics(s); // the hook can fire outside paint — reconcile first
+    return runXAt(s, off);
+}
+
 // --- the caret ---
 
 /// The run's visual left edge in node-parent space (the `mx` mirror,
@@ -1334,6 +1345,7 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     s.edit.hit_weight = @intCast(hit_style.weight);
     s.edit.hit_spacing = hit_style.letter_spacing;
     s.edit.hit_ink = opts.theme.colors.on_surface; // input ink in every enabled state
+    s.edit.measure_prefix = segPrefixMeasure; // single-line caret x rides the seg rope
     node.state = s;
     ui.semantics.attach(node, .{
         .role = .text_field,

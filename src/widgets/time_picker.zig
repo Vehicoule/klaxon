@@ -53,7 +53,34 @@
 // Tokens (TimeInputTokens): fields 96x72 CornerSmall, DisplayMedium text,
 // the separator 24x72 DisplayMedium OnSurface (-4dp nudge), the period toggle 52x72,
 // supporting text BodySmall OnSurfaceVariant / Error, 7dp top pad, a 2-line
-// box (upstream minLines=2). The editing core is text_edit.Edit (real
+// box (upstream minLines=2).
+//
+//   opts.vibrant ports upstream's vibrant overload — `TimeInput(state,
+//   shapes, colors = TimeInputDefaults.vibrantColors())` where shapes !=
+//   null resolves the vibrant fallbacks via orVibrant() and the palette
+//   comes from ColorScheme.defaultVibrantTimeInputColors:
+//     - the fields grow to 100x120 (VibrantTimeFieldWidth/Height)
+//       CornerLarge plates (defaultTimePickerShapes.timeFieldShape =
+//       ShapeKeyTokens.CornerLarge = 16dp) at DisplayLarge text; the
+//       editable box is SurfaceContainerLowest with NO border unless
+//       focused (then a 2dp Primary border — focusedBorderColor=Primary,
+//       unfocusedBorderColor=Transparent) and Primary text; the plate is
+//       SurfaceContainerLowest + OnSurface, still borderless.
+//     - the separator narrows to 16x120 (VibrantSeparatorWidth), still
+//       DisplayLarge-ish (upstream's LocalTextStyle override) OnSurface.
+//     - the AM/PM column is a 56x120 VerticalPeriodToggle of two 56x56
+//       items with an 8dp gap (VibrantPeriodTogglePadding) — upstream's
+//       updated-toggle ToggleButtons: unchecked = a CornerFull circle
+//       (SurfaceContainerLowest + OnSurfaceVariant), checked = a 12dp
+//       squircle (PrimaryContainer + OnPrimaryContainer, BOLD TitleMedium
+//       — periodSelectorSelectedContainerColor/ContentColor). No Outline
+//       border or divider (upstream drops them under useUpdatedToggle).
+//     - the panel paints SurfaceContainer (vibrantColors().containerColor
+//       = SurfaceContainer vs the classic SurfaceContainerHigh token);
+//       supporting text paints only while a field is invalid (upstream
+//       `shapes == null || !isValid`), so the panel reserves the label
+//       box only then.
+//   The editing core is text_edit.Edit (real
 // caret/selection/clipboard) — the fields cap at 2 digits and reject
 // non-digit input wholesale (upstream's transformInput), a valid typed
 // value updates `time` immediately, an out-of-range value paints the error
@@ -73,9 +100,10 @@
 // Default: shown in input mode only.
 //
 // Remaining deviations (documented, fixed later):
-//   - The input variant ports the CLASSIC TimeInput (shapes == null): the
-//     vibrant/uncontained styles (100x120 CornerFull fields, the side
-//     control column) are not.
+//   - The uncontained vibrant style (the TimeInput(state, shapes, toggle)
+//     overload — the SideControlColumn with the mode switch INSIDE the
+//     side column, UncontainedTimeFieldHeight 136 / UncontainedToggleHeight
+//     140) is not ported; opts.mode_toggle keeps the footer affordance.
 //   - The supporting texts wrap through the paragraph ABI at the field
 //     width (upstream minLines = 2 reserves the box); a field turning
 //     invalid announces its error text politely (upstream liveRegion).
@@ -124,6 +152,11 @@ pub const TimePickerOptions = struct {
     /// upstream's caller-supplied `toggle` slot. null = shown in input
     /// mode only (an explicit bool pins it on/off for both variants).
     mode_toggle: ?bool = null,
+    /// The M3E vibrant style — upstream's `TimeInput(state, shapes, …)`
+    /// overload: shapes != null resolves the vibrant geometry/shapes via
+    /// orVibrant() and the palette is vibrantColors(). Affects the INPUT
+    /// variant only — the dial paints the same chrome either way.
+    vibrant: bool = false,
 };
 
 pub const DialMode = enum { hour, minute };
@@ -169,6 +202,26 @@ const toggle_box: f32 = 40; // the icon button's visual box
 const toggle_icon: f32 = 24; // the glyph size inside it
 const max_field_chars: usize = 2; // upstream's maxTextLength = 2
 
+/// Vibrant input-variant tokens (the `TimeInput(state, shapes, …)`
+/// overload — the Vibrant* private vals in TimePicker.kt +
+/// Shapes.defaultTimePickerShapes): the fields are 100x120
+/// (VibrantTimeFieldWidth/Height) CornerLarge plates
+/// (defaultTimePickerShapes.timeFieldShape = ShapeKeyTokens.CornerLarge),
+/// the separator narrows to 16dp (VibrantSeparatorWidth), and the AM/PM
+/// column is a 56x120 VerticalPeriodToggle (VibrantPeriodToggleWidth/
+/// Height) of two 56x56 items with an 8dp gap + an 8dp leading pad
+/// (VibrantPeriodTogglePadding; defaultTimePickerShapes.periodSelectorShape
+/// = ShapeKeyTokens.CornerFull resolves the unchecked item's circle, the
+/// checked item paints upstream's RoundedCornerShape(12dp) squircle).
+const vfield_w: f32 = 100; // VibrantTimeFieldWidth
+const vfield_h: f32 = 120; // VibrantTimeFieldHeight
+const vfield_corner: f32 = 16; // timeFieldShape = CornerLarge (16dp)
+const vsep_w: f32 = 16; // VibrantSeparatorWidth
+const vperiod_w: f32 = 56; // VibrantPeriodToggleWidth
+const vperiod_h: f32 = 120; // VibrantPeriodToggleHeight
+const vperiod_gap: f32 = 8; // VibrantPeriodTogglePadding (leading pad + item gap)
+const vperiod_item_corner: f32 = 12; // the checked item's RoundedCornerShape(12dp)
+
 /// Derived layout metrics.
 const dial_y_off: f32 = header_top + header_h + display_gap; // 132
 const footer_y_off: f32 = dial_y_off + dial_size + face_gap; // 412
@@ -182,13 +235,33 @@ fn supportH(t: Theme) f32 {
     return 2 * t.type_scale.body_small.line_height;
 }
 
-/// The input variant's footer row offset + total height.
+/// The input variant's footer row offset + total height (classic).
 fn inputFooterYOff(t: Theme) f32 {
     return header_top + field_h + support_top_pad + supportH(t) + face_gap;
 }
 
 fn inputTotalH(t: Theme) f32 {
     return inputFooterYOff(t) + footer_h + footer_pad_bottom;
+}
+
+/// The supporting-text block the input variant reserves under the
+/// fields: classic always (upstream minLines = 2); vibrant only while a
+/// field is invalid — upstream's `shapes == null || !isValid` drops the
+/// label under a valid vibrant field.
+fn inputSupportH(s: *const TpState) f32 {
+    if (s.opts.vibrant and !fieldInvalid(s, .hour) and !fieldInvalid(s, .minute)) return 0;
+    return support_top_pad + supportH(s.opts.theme);
+}
+
+/// The input variant's footer offset + total height for the CURRENT
+/// style (vibrant fields are 120dp and skip the support box while valid).
+fn inputFooterYOffOf(s: *const TpState) f32 {
+    if (!s.opts.vibrant) return inputFooterYOff(s.opts.theme);
+    return header_top + vfield_h + inputSupportH(s) + face_gap;
+}
+
+fn inputTotalHOf(s: *const TpState) f32 {
+    return inputFooterYOffOf(s) + footer_h + footer_pad_bottom;
 }
 
 /// The hour screen values (12 at the top, then 1..11 clockwise).
@@ -288,32 +361,32 @@ fn editOf(s: *TpState, which: DialMode) *text_edit.Edit {
 }
 
 /// Upstream state.isPm — the COMMITTED hour's period (always valid).
-fn committedPm(s: *TpState) bool {
+fn committedPm(s: *const TpState) bool {
     return isPm(clampedTime(s.time.peek()));
 }
 
 /// Upstream TimePickerState.isValidHour — on the hour-24 scale against
 /// `pm` (12h inputs are only valid inside the committed period's half).
-fn isValidHourIn(s: *TpState, target: i32, pm: bool) bool {
+fn isValidHourIn(s: *const TpState, target: i32, pm: bool) bool {
     if (s.opts.is_24h) return target >= 0 and target <= 23;
     return if (pm) (target >= 12 and target <= 23) else (target >= 0 and target <= 11);
 }
 
-fn isValidHour(s: *TpState, target: i32) bool {
+fn isValidHour(s: *const TpState, target: i32) bool {
     return isValidHourIn(s, target, committedPm(s));
 }
 
 /// Upstream isHourInputValid / isMinuteInputValid.
-fn isHourInputValid(s: *TpState) bool {
+fn isHourInputValid(s: *const TpState) bool {
     return isValidHour(s, s.hour_input);
 }
-fn isMinuteInputValid(s: *TpState) bool {
+fn isMinuteInputValid(s: *const TpState) bool {
     return s.minute_input >= 0 and s.minute_input <= 59;
 }
 
 /// The field's error flag — upstream `!isValidInput` (drives the error
 /// container/border/text + the supporting-text swap).
-fn fieldInvalid(s: *TpState, which: DialMode) bool {
+fn fieldInvalid(s: *const TpState, which: DialMode) bool {
     return if (which == .hour) !isHourInputValid(s) else !isMinuteInputValid(s);
 }
 
@@ -500,6 +573,9 @@ fn transformAfterEdit(n: *Node, which: DialMode) void {
     if (!was_invalid and fieldInvalid(s, which)) {
         ui.semantics.announce(supportText(s, which), .polite);
     }
+    // The vibrant panel reserves the support box only while a field is
+    // invalid — a validity flip re-measures it.
+    if (s.opts.vibrant and was_invalid != fieldInvalid(s, which)) n.markLayoutDirty();
     n.markDirty();
 }
 
@@ -658,31 +734,84 @@ fn dialRect(b: Rect) Rect {
 
 // --- input-variant geometry ---
 
-/// An input-variant field's box (96x72, at the header row's y) — the
-/// hour field is the row's first slot, the minute field its third (the
-/// separator is the second).
-fn inputFieldRect(b: Rect, which: DialMode, is_24h: bool) Rect {
-    const row_x = headerRowX(b, is_24h);
-    const x = if (which == .hour) row_x else row_x + field_w + sep_w;
-    return .{ .x = x, .y = b.y + header_top, .w = field_w, .h = field_h };
+/// The per-style input-variant metrics — orVibrant() with the classic
+/// tokens as the default and the Vibrant* vals as the fallback.
+fn fieldW(s: *const TpState) f32 {
+    return if (s.opts.vibrant) vfield_w else field_w;
 }
 
-fn inputSeparatorRect(b: Rect, is_24h: bool) Rect {
-    const row_x = headerRowX(b, is_24h);
-    return .{ .x = row_x + field_w, .y = b.y + header_top, .w = sep_w, .h = field_h };
+fn fieldH(s: *const TpState) f32 {
+    return if (s.opts.vibrant) vfield_h else field_h;
 }
 
-/// The input variant's period toggle: 52x72 (PeriodSelectorContainer) at
-/// the row's end — narrower vertically than the dial's 80dp toggle.
-fn inputPeriodRect(b: Rect) Rect {
-    const row_x = headerRowX(b, false);
-    return .{ .x = row_x + 2 * field_w + sep_w + period_gap, .y = b.y + header_top, .w = period_w, .h = input_period_h };
+fn fieldCorner(s: *const TpState) f32 {
+    return if (s.opts.vibrant) vfield_corner else plate_corner;
 }
 
-/// A field's supporting-text line box (under its 96dp field, 16dp tall
-/// each of the two upstream minLines).
-fn supportRect(b: Rect, which: DialMode, is_24h: bool, line: usize, t: Theme) Rect {
-    const f = inputFieldRect(b, which, is_24h);
+fn sepW(s: *const TpState) f32 {
+    return if (s.opts.vibrant) vsep_w else sep_w;
+}
+
+/// The field text's type style — upstream's orVibrant(TimeFieldLabelTextFont
+/// = DisplayMedium, TypographyKeyTokens.DisplayLarge) override rides
+/// LocalTextStyle, so the separator glyphs share it too.
+fn fieldFont(s: *const TpState) theme_mod.TypeStyle {
+    return if (s.opts.vibrant) s.opts.theme.type_scale.display_large else s.opts.theme.type_scale.display_medium;
+}
+
+/// The input row's width — classic: 96+24+96 (+4+52); vibrant:
+/// 100+16+100 (+8+56). Classic values equal the dial header's, so the
+/// classic row centers identically to headerRowX.
+fn inputRowW(s: *const TpState) f32 {
+    const fw = fieldW(s);
+    var w = fw + sepW(s) + fw;
+    if (!s.opts.is_24h) {
+        w += (if (s.opts.vibrant) vperiod_gap else period_gap) +
+            (if (s.opts.vibrant) vperiod_w else period_w);
+    }
+    return w;
+}
+
+fn inputRowX(b: Rect, s: *const TpState) f32 {
+    return b.x + (b.w - inputRowW(s)) / 2;
+}
+
+/// An input-variant field's box (96x72 classic / 100x120 vibrant, at the
+/// header row's y) — the hour field is the row's first slot, the minute
+/// field its third (the separator is the second).
+fn inputFieldRect(b: Rect, which: DialMode, s: *const TpState) Rect {
+    const row_x = inputRowX(b, s);
+    const x = if (which == .hour) row_x else row_x + fieldW(s) + sepW(s);
+    return .{ .x = x, .y = b.y + header_top, .w = fieldW(s), .h = fieldH(s) };
+}
+
+fn inputSeparatorRect(b: Rect, s: *const TpState) Rect {
+    const row_x = inputRowX(b, s);
+    return .{ .x = row_x + fieldW(s), .y = b.y + header_top, .w = sepW(s), .h = fieldH(s) };
+}
+
+/// The input variant's period toggle at the row's end: classic is the
+/// 52x72 (PeriodSelectorContainer) column 4dp past the minute field;
+/// vibrant is the 56x120 (VibrantPeriodToggle) column 8dp past it.
+fn inputPeriodRect(b: Rect, s: *const TpState) Rect {
+    const row_x = inputRowX(b, s);
+    const gap: f32 = if (s.opts.vibrant) vperiod_gap else period_gap;
+    return .{ .x = row_x + 2 * fieldW(s) + sepW(s) + gap, .y = b.y + header_top, .w = if (s.opts.vibrant) vperiod_w else period_w, .h = if (s.opts.vibrant) vperiod_h else input_period_h };
+}
+
+/// A vibrant period item's box inside the 56x120 column — AM at the top,
+/// PM below the 8dp gap (upstream's updated-toggle MeasurePolicy: each
+/// item maxHeight = (maxHeight - gap) / 2, placed at y = 0 and
+/// y = items[0].height + gap).
+fn periodItemRect(pr: Rect, which: Zone) Rect {
+    const item_h = (pr.h - vperiod_gap) / 2;
+    return .{ .x = pr.x, .y = if (which == .pm) pr.y + item_h + vperiod_gap else pr.y, .w = pr.w, .h = item_h };
+}
+
+/// A field's supporting-text line box (under its field, 16dp tall each
+/// of the two upstream minLines).
+fn supportRect(b: Rect, which: DialMode, s: *const TpState, line: usize, t: Theme) Rect {
+    const f = inputFieldRect(b, which, s);
     return .{ .x = f.x, .y = f.y + f.h + support_top_pad + @as(f32, @floatFromInt(line)) * t.type_scale.body_small.line_height, .w = f.w, .h = t.type_scale.body_small.line_height };
 }
 
@@ -690,7 +819,7 @@ fn supportRect(b: Rect, which: DialMode, is_24h: bool, line: usize, t: Theme) Re
 /// the input variant sits it right under the fields + supporting text.
 fn footerYOff(n: *Node) f32 {
     const s = stateOf(n);
-    return if (s.variant == .input) inputFooterYOff(s.opts.theme) else footer_y_off;
+    return if (s.variant == .input) inputFooterYOffOf(s) else footer_y_off;
 }
 
 /// The mode toggle's tap target at the footer's leading edge (48dp,
@@ -733,11 +862,18 @@ fn zoneAt(n: *Node, x: f32, y: f32) Zone {
     if (fr.ok.contains(x, y)) return .ok;
     if (showModeToggle(s) and modeToggleRect(n).contains(x, y)) return .mode_toggle;
     if (s.variant == .input) {
-        if (inputFieldRect(b, .hour, s.opts.is_24h).contains(x, y)) return .hour_field;
-        if (inputFieldRect(b, .minute, s.opts.is_24h).contains(x, y)) return .minute_field;
+        if (inputFieldRect(b, .hour, s).contains(x, y)) return .hour_field;
+        if (inputFieldRect(b, .minute, s).contains(x, y)) return .minute_field;
         if (!s.opts.is_24h) {
-            const pr = inputPeriodRect(b);
-            if (pr.contains(x, y)) return if (y < pr.y + pr.h / 2) .am else .pm;
+            const pr = inputPeriodRect(b, s);
+            if (s.opts.vibrant) {
+                // the vibrant items are two separate pills — the 8dp gap
+                // between them is dead space (upstream's MeasurePolicy)
+                if (periodItemRect(pr, .am).contains(x, y)) return .am;
+                if (periodItemRect(pr, .pm).contains(x, y)) return .pm;
+            } else if (pr.contains(x, y)) {
+                return if (y < pr.y + pr.h / 2) .am else .pm;
+            }
         }
         return .none;
     }
@@ -762,7 +898,7 @@ fn zoneAt(n: *Node, x: f32, y: f32) Zone {
 
 fn tpMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
-    const h = if (s.variant == .input) inputTotalH(s.opts.theme) else total_h;
+    const h = if (s.variant == .input) inputTotalHOf(s) else total_h;
     return c.constrain(.{ .w = s.opts.width, .h = h });
 }
 
@@ -883,27 +1019,38 @@ fn supportText(s: *TpState, which: DialMode) []const u8 {
     };
 }
 
-/// An input-variant field (96x72, upstream TimeInputImpl's row): only the
-/// SELECTED field is an editable box — PrimaryContainer + a 2dp Outline
-/// border while focused, SurfaceContainerHighest + a 1dp Outline border
-/// when the node isn't focused (upstream's TimePickerTextFieldContainer
-/// border); the other field paints the borderless TimeSelector plate —
-/// SurfaceContainerHighest + the FORMATTED value. An invalid input swaps
-/// the container/text/border + the supporting text for the error tokens.
+/// An input-variant field (96x72 classic / 100x120 vibrant, upstream
+/// TimeInputImpl's row): only the SELECTED field is an editable box —
+/// classic: PrimaryContainer + a 2dp Outline border while focused,
+/// SurfaceContainerHighest + a 1dp Outline border when the node isn't
+/// focused (upstream's TimePickerTextFieldContainer border); vibrant
+/// (defaultVibrantTimeInputColors): a SurfaceContainerLowest box with a
+/// 2dp Primary border only while focused (unfocusedBorderColor is
+/// Transparent), Primary text. The other field paints the borderless
+/// TimeSelector plate — SurfaceContainerHighest (classic) /
+/// SurfaceContainerLowest (vibrant) + the FORMATTED value. An invalid
+/// input swaps the container/text/border + the supporting text for the
+/// error tokens.
 fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cs = t.colors;
-    const r = inputFieldRect(n.bounds, which, s.opts.is_24h);
+    const vibrant = s.opts.vibrant;
+    const r = inputFieldRect(n.bounds, which, s);
+    const corner = fieldCorner(s);
     const e = editOf(s, which);
     const selected = s.mode == which;
     const focused = input.isFocused(n);
     const invalid = fieldInvalid(s, which);
     const zone: Zone = if (which == .hour) .hour_field else .minute_field;
     // The upstream container/content colors (timeTextFieldColors /
-    // timeSelectorColors + the error slots).
+    // timeSelectorColors + the error slots). Vibrant: focused AND
+    // unfocused containers are SurfaceContainerLowest; the selected
+    // field's valid text is focusedTextColor = Primary.
     const fill: Color = if (invalid)
         cs.error_container
+    else if (vibrant)
+        cs.surface_container_lowest
     else if (selected and focused)
         cs.primary_container
     else
@@ -912,28 +1059,36 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
         // timeTextFieldColors: focusedTextColor → Error, the
         // TimeSelector's → OnErrorContainer.
         (if (selected) cs.@"error" else cs.on_error_container)
+    else if (vibrant)
+        (if (selected) cs.primary else cs.on_surface)
     else if (selected and focused)
         cs.on_primary_container
     else
         cs.on_surface;
-    ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, plate_corner, fill);
+    ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, corner, fill);
     const hover = std.meta.eql(s.hover, zone);
     const pressed = std.meta.eql(s.pressed, zone);
     if (hover or pressed) {
         const alpha = if (pressed) t.state.pressed else t.state.hover;
-        ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, plate_corner, theme_mod.stateLayer(fill, fg, alpha));
+        ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, corner, theme_mod.stateLayer(fill, fg, alpha));
     }
-    const dm = t.type_scale.display_medium;
+    const dm = fieldFont(s);
     const dm_bold = dm.weight >= 500;
     var tx: f32 = 0;
     var baseline: f32 = 0;
     var m: ui.paint.TextMetrics = undefined;
     var str: [:0]const u8 = "";
     if (selected) {
-        // The editable box: the 2dp focused / 1dp unfocused Outline border
-        // (Error while invalid), then the LIVE buffer text centered.
-        const bw: f32 = if (focused) plate_border else 1;
-        ui.paint.strokeRRect(ctx, r.x, r.y, r.w, r.h, plate_corner, bw, if (invalid) cs.@"error" else cs.outline);
+        // The editable box's border: classic = 2dp focused / 1dp
+        // unfocused Outline (Error while invalid); vibrant =
+        // focusedBorderColor Primary 2dp while focused, Error while
+        // invalid (1dp unfocused / 2dp focused) — and NOTHING otherwise
+        // (unfocusedBorderColor = Transparent).
+        if (!vibrant or focused or invalid) {
+            const bw: f32 = if (focused) plate_border else 1;
+            const bc: Color = if (invalid) cs.@"error" else if (vibrant) cs.primary else cs.outline;
+            ui.paint.strokeRRect(ctx, r.x, r.y, r.w, r.h, corner, bw, bc);
+        }
         str = e.text();
         m = ui.paint.measureText(str, dm.size, dm_bold);
         tx = r.x + (r.w - m.width) / 2;
@@ -984,10 +1139,13 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
     }
     // The supporting text: "Hour"/"Minute" (or the error text), BodySmall
     // in the field's x band — laid out through the paragraph ABI at the
-    // 96dp field width so long translations wrap (upstream minLines = 2).
+    // field width so long translations wrap (upstream minLines = 2).
+    // Upstream `shapes == null || !isValid`: vibrant fields show it ONLY
+    // while invalid.
+    if (vibrant and !invalid) return;
     const bs = t.type_scale.body_small;
     const ink: Color = if (invalid) cs.@"error" else cs.on_surface_variant;
-    const sup = supportRect(n.bounds, which, s.opts.is_24h, 0, t);
+    const sup = supportRect(n.bounds, which, s, 0, t);
     var buf: [256]u8 = undefined;
     const msg = supportText(s, which);
     if (msg.len < buf.len) blk: {
@@ -1001,8 +1159,8 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
     }
 }
 
-/// The AM/PM period toggle (both variants): a 1dp Outline border +
-/// divider, the selected half TertiaryContainer.
+/// The AM/PM period toggle (the dial + the classic input variant): a 1dp
+/// Outline border + divider, the selected half TertiaryContainer.
 fn paintPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
     const s = stateOf(n);
     const t = s.opts.theme;
@@ -1042,26 +1200,70 @@ fn paintPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
     ui.paint.fillRect(ctx, pr.x, pr.y + half_h - 0.5, pr.w, 1, cs.outline);
 }
 
+/// The vibrant AM/PM column — upstream VerticalPeriodToggle under
+/// useUpdatedToggle: two 56x56 ToggleButtons stacked with an 8dp gap (the
+/// updated-toggle MeasurePolicy), NO container border or divider. The
+/// unchecked item is a CornerFull circle (periodSelectorContainerColor =
+/// SurfaceContainerLowest + OnSurfaceVariant); the checked item is a
+/// RoundedCornerShape(12dp) squircle (periodSelectorSelectedContainerColor
+/// = PrimaryContainer + OnPrimaryContainer) with a BOLD TitleMedium label
+/// (upstream `style.copy(fontWeight = FontWeight.Bold)`).
+fn paintVibrantPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
+    const s = stateOf(n);
+    const t = s.opts.theme;
+    const cs = t.colors;
+    const pm = isPm(tm);
+    const ampm = i18n_mod.amPm();
+    const halves = [_]struct { zone: Zone, label: []const u8, checked: bool }{
+        .{ .zone = .am, .label = ampm.am, .checked = !pm },
+        .{ .zone = .pm, .label = ampm.pm, .checked = pm },
+    };
+    const tm_style = t.type_scale.title_medium;
+    for (halves) |h| {
+        const ir = periodItemRect(pr, h.zone);
+        const hover = std.meta.eql(s.hover, h.zone);
+        const pressed = std.meta.eql(s.pressed, h.zone);
+        // upstream ToggleButtonShapes: shape = CircleShape (CornerFull),
+        // checkedShape AND pressedShape = RoundedCornerShape(12dp).
+        const corner: f32 = if (h.checked or pressed) vperiod_item_corner else ir.h / 2;
+        const fill: Color = if (h.checked) cs.primary_container else cs.surface_container_lowest;
+        const fg: Color = if (h.checked) cs.on_primary_container else cs.on_surface_variant;
+        ui.paint.fillRRect(ctx, ir.x, ir.y, ir.w, ir.h, corner, fill);
+        if (hover or pressed) {
+            const alpha = if (pressed) t.state.pressed else t.state.hover;
+            ui.paint.fillRRect(ctx, ir.x, ir.y, ir.w, ir.h, corner, theme_mod.stateLayer(0, fg, alpha));
+        }
+        const bold = h.checked or tm_style.weight >= 500;
+        const m = ui.paint.measureTextLen(h.label, tm_style.size, bold);
+        ui.paint.textSlice(ctx, h.label, ir.x + (ir.w - m.width) / 2, ir.y + (ir.h - m.height) / 2 + m.ascent, tm_style.size, bold, fg);
+    }
+}
+
 fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cs = t.colors;
     const b = n.bounds;
     const tm = clampedTime(s.time.peek());
-    // the container
-    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, container_corner, cs.surface_container_high);
+    // the container — vibrantColors().containerColor = SurfaceContainer
+    // (the classic TimeInputTokens.ContainerColor is SurfaceContainerHigh)
+    const panel: Color = if (s.variant == .input and s.opts.vibrant) cs.surface_container else cs.surface_container_high;
+    ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, container_corner, panel);
     if (s.variant == .input) {
         // the input variant: two fields + the separator + the period
         // toggle, the supporting labels, the footer — no clock face
         paintInputField(n, ctx, .hour);
         paintInputField(n, ctx, .minute);
-        // upstream DisplaySeparator: LocalTextStyle(DisplayMedium), the
-        // -4dp optical nudge.
-        const dm0 = t.type_scale.display_medium;
-        const sep0 = inputSeparatorRect(b, s.opts.is_24h);
+        // upstream DisplaySeparator: LocalTextStyle (the field font —
+        // DisplayMedium classic / DisplayLarge vibrant), the -4dp nudge.
+        const dm0 = fieldFont(s);
+        const sep0 = inputSeparatorRect(b, s);
         const sep0_m = ui.paint.measureText(":", dm0.size, dm0.weight >= 500);
         ui.paint.text(ctx, ":", sep0.x + (sep0.w - sep0_m.width) / 2, sep0.y + sep_offset_y + (sep0.h - sep0_m.height) / 2 + sep0_m.ascent, dm0.size, dm0.weight >= 500, cs.on_surface);
-        if (!s.opts.is_24h) paintPeriodToggle(n, ctx, inputPeriodRect(b), tm);
+        if (!s.opts.is_24h) {
+            const pr = inputPeriodRect(b, s);
+            if (s.opts.vibrant) paintVibrantPeriodToggle(n, ctx, pr, tm) else paintPeriodToggle(n, ctx, pr, tm);
+        }
         paintFooter(n, ctx);
         return;
     }
@@ -1157,8 +1359,8 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
 fn fieldCaretFromPoint(n: *Node, s: *TpState, which: DialMode, x: f32, y: f32) usize {
     const e = editOf(s, which);
     const str = e.text();
-    const r = inputFieldRect(n.bounds, which, s.opts.is_24h);
-    const dm = s.opts.theme.type_scale.display_medium;
+    const r = inputFieldRect(n.bounds, which, s);
+    const dm = fieldFont(s);
     const m = ui.paint.measureText(str, dm.size, dm.weight >= 500);
     const tx = r.x + (r.w - m.width) / 2;
     return e.caretAt(x - tx, y - r.y, dm.size);
@@ -1312,7 +1514,7 @@ fn tpOnKey(n: *Node, ev: input.KeyEvent) bool {
         transformAfterEdit(n, target);
         return true;
     }
-    if (e.handleKey(ev, applyEditNode, s.opts.theme.type_scale.display_medium.size)) return true;
+    if (e.handleKey(ev, applyEditNode, fieldFont(s).size)) return true;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         // Upstream KeyboardOptions: hour = ImeAction.Next (→ the minute
@@ -1521,6 +1723,9 @@ fn tpSyncCb(userdata: ?*anyopaque) void {
     syncComponent(s, .minute);
     updateA11yValue(n);
     refreshSemanticsChildren(n);
+    // A sync can clear a field's error state — the vibrant panel's
+    // support-box reservation depends on it.
+    if (s.opts.vibrant) n.markLayoutDirty();
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
@@ -1581,17 +1786,17 @@ fn tpChildBounds(n: *Node, index: usize) Rect {
     var r: Rect = undefined;
     var idx = index;
     if (idx == 0) {
-        r = inputFieldRect(b, .hour, s.opts.is_24h);
+        r = inputFieldRect(b, .hour, s);
     } else if (idx == 1) {
-        r = inputFieldRect(b, .minute, s.opts.is_24h);
+        r = inputFieldRect(b, .minute, s);
     } else {
         idx -= 2;
         if (!s.opts.is_24h) {
-            const pr = inputPeriodRect(b);
+            const pr = inputPeriodRect(b, s);
             if (idx == 0) {
-                r = .{ .x = pr.x, .y = pr.y, .w = pr.w, .h = pr.h / 2 };
+                r = if (s.opts.vibrant) periodItemRect(pr, .am) else .{ .x = pr.x, .y = pr.y, .w = pr.w, .h = pr.h / 2 };
             } else if (idx == 1) {
-                r = .{ .x = pr.x, .y = pr.y + pr.h / 2, .w = pr.w, .h = pr.h / 2 };
+                r = if (s.opts.vibrant) periodItemRect(pr, .pm) else .{ .x = pr.x, .y = pr.y + pr.h / 2, .w = pr.w, .h = pr.h / 2 };
             } else {
                 r = modeToggleRect(n);
             }
@@ -1965,7 +2170,7 @@ test "time_picker: the input variant — tap a field, type digits, the time upda
     try std.testing.expectEqualStrings("30", s.minute_edit.text());
     // tap the SELECTED (hour) field → it focuses + lands the caret at the
     // tap point (a real text-field tap, upstream restore-only semantics)
-    const hr = inputFieldRect(n.bounds, .hour, false);
+    const hr = inputFieldRect(n.bounds, .hour, s);
     const hcx = hr.x + hr.w / 2;
     const hcy = hr.y + hr.h / 2;
     router.dispatchPointer(n, .{ .phase = .down, .x = hcx, .y = hcy, .raw_x = hcx, .raw_y = hcy });
@@ -2118,7 +2323,7 @@ test "time_picker: the input variant — a tap on the unselected field selects i
     n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
     // a tap on the UNSELECTED (minute) field swaps the selection — the
     // field keeps its own caret (no select-all)
-    tapRect(&router, n, inputFieldRect(n.bounds, .minute, false));
+    tapRect(&router, n, inputFieldRect(n.bounds, .minute, s));
     try std.testing.expectEqual(DialMode.minute, s.mode);
     try std.testing.expect(input.isFocused(n));
     const sel = s.minute_edit.selRange();
@@ -2127,13 +2332,13 @@ test "time_picker: the input variant — a tap on the unselected field selects i
     _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
     try std.testing.expect(!input.isFocused(n));
     // re-focus the hour field; Enter = ImeAction.Next → the minute field
-    tapRect(&router, n, inputFieldRect(n.bounds, .hour, false));
+    tapRect(&router, n, inputFieldRect(n.bounds, .hour, s));
     _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .enter });
     try std.testing.expectEqual(DialMode.minute, s.mode);
     // an INVALID hour blocks ImeAction.Next (upstream isHourInputValid
     // gate) — a multi-char insert lands "19" at once (hourInput 19 → the
     // error state, the committed time untouched)
-    tapRect(&router, n, inputFieldRect(n.bounds, .hour, false));
+    tapRect(&router, n, inputFieldRect(n.bounds, .hour, s));
     _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .unknown, .chr = 'a', .command = true });
     _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "19" });
     try std.testing.expectEqualStrings("19", s.hour_edit.text());
@@ -2198,7 +2403,7 @@ test "time_picker: the input variant — AM/PM is gated on a valid hour input" {
     defer n.deinit();
     const s = stateOf(n);
     n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
-    const pr = inputPeriodRect(n.bounds);
+    const pr = inputPeriodRect(n.bounds, s);
     const pm_r = Rect{ .x = pr.x, .y = pr.y + pr.h / 2, .w = pr.w, .h = pr.h / 2 };
     const am_r = Rect{ .x = pr.x, .y = pr.y, .w = pr.w, .h = pr.h / 2 };
     // PM: hour += 12 on the committed time → 22:30; the hour field re-syncs
@@ -2286,7 +2491,7 @@ test "time_picker: the input variant — the a11y children carry the field value
     try std.testing.expectEqualStrings("Switch to clock", sem.children[4].label);
     // the child bounds are the field/toggle rects in local space
     const hb = sem.child_bounds.?(n, 0);
-    const hr = inputFieldRect(n.bounds, .hour, false);
+    const hr = inputFieldRect(n.bounds, .hour, s);
     try std.testing.expectEqual(hr.x - n.bounds.x, hb.x);
     try std.testing.expectEqual(hr.y - n.bounds.y, hb.y);
 }
@@ -2341,6 +2546,7 @@ test "golden: the input variant (editable box, borderless plate, period toggle, 
     defer sig.deinit();
     const n = try timePicker(a, sig, null, null, .{ .mode = .input });
     defer n.deinit();
+    const s = stateOf(n);
     const total = inputTotalH(t);
     n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total });
     var r = try golden.Renderer.init(a, 360, @intFromFloat(total));
@@ -2352,20 +2558,20 @@ test "golden: the input variant (editable box, borderless plate, period toggle, 
     try std.testing.expectEqual(t.colors.surface_container_high, f2.pixelAt(180, 5));
     // the SELECTED (hour) field: SurfaceContainerHighest + the Outline
     // border (unfocused — no InputRouter in this test) + the DisplayMedium text
-    const hr = inputFieldRect(n.bounds, .hour, false);
+    const hr = inputFieldRect(n.bounds, .hour, s);
     try std.testing.expectEqual(t.colors.surface_container_highest, f2.pixelAt(@intFromFloat(hr.x + hr.w / 2), @intFromFloat(hr.y + hr.h / 2)));
     // the border pixel: Outline
     try std.testing.expect(f2.countColorApproxIn(hr, t.colors.outline) > 0);
     // the UNSELECTED (minute) field: the borderless plate —
     // SurfaceContainerHighest with NO Outline border anywhere inside
-    const mr = inputFieldRect(n.bounds, .minute, false);
+    const mr = inputFieldRect(n.bounds, .minute, s);
     try std.testing.expectEqual(t.colors.surface_container_highest, f2.pixelAt(@intFromFloat(mr.x + mr.w / 2), @intFromFloat(mr.y + mr.h / 2)));
     try std.testing.expect(f2.countColorApproxIn(mr, t.colors.on_surface) > 0); // the "30" ink
     // the period toggle: AM selected → TertiaryContainer top half
-    const pr = inputPeriodRect(n.bounds);
+    const pr = inputPeriodRect(n.bounds, s);
     try std.testing.expectEqual(t.colors.tertiary_container, f2.pixelAt(@intFromFloat(pr.x + 26), @intFromFloat(pr.y + 4)));
     // the supporting text ("Hour"/"Minute"): OnSurfaceVariant ink under each field
-    const sup = supportRect(n.bounds, .hour, false, 0, t);
+    const sup = supportRect(n.bounds, .hour, s, 0, t);
     try std.testing.expect(f2.countColorApproxIn(sup, t.colors.on_surface_variant) > 0);
     // the mode toggle: the clock glyph's OnSurfaceVariant ink at the
     // footer's leading edge
@@ -2398,14 +2604,14 @@ test "golden: the input variant's error state (ErrorContainer + error supporting
     var f2 = try r.readback(a);
     defer f2.deinit();
     // the minute field: ErrorContainer fill + the Error border
-    const mr = inputFieldRect(n.bounds, .minute, false);
+    const mr = inputFieldRect(n.bounds, .minute, s);
     try std.testing.expectEqual(t.colors.error_container, f2.pixelAt(@intFromFloat(mr.x + mr.w / 2), @intFromFloat(mr.y + mr.h / 2)));
     try std.testing.expect(f2.countColorApproxIn(mr, t.colors.@"error") > 0);
     // the error supporting text (Error ink) under the field
-    const sup = supportRect(n.bounds, .minute, false, 0, t);
+    const sup = supportRect(n.bounds, .minute, s, 0, t);
     try std.testing.expect(f2.countColorApproxIn(sup, t.colors.@"error") > 0);
     // the hour field is untouched: SurfaceContainerHighest, no error text
-    const hs = supportRect(n.bounds, .hour, false, 0, t);
+    const hs = supportRect(n.bounds, .hour, s, 0, t);
     try std.testing.expect(f2.countColorApproxIn(hs, t.colors.on_surface_variant) > 0);
 }
 
@@ -2421,7 +2627,7 @@ test "time_picker: the supporting error text wraps through the paragraph ABI" {
     const s = stateOf(n);
     n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
     // Focus the minute field and type an out-of-range value.
-    const mr = inputFieldRect(n.bounds, .minute, s.opts.is_24h);
+    const mr = inputFieldRect(n.bounds, .minute, s);
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = mr.x + 10, .y = mr.y + 10 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = mr.x + 10, .y = mr.y + 10 });
     _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" });
@@ -2431,7 +2637,7 @@ test "time_picker: the supporting error text wraps through the paragraph ABI" {
     // it wraps to multiple lines inside the 96dp field's band.
     const msg = supportText(s, .minute);
     try std.testing.expectEqualStrings("Minutes must be between 0 and 59", msg);
-    const sup = supportRect(n.bounds, .minute, s.opts.is_24h, 0, s.opts.theme);
+    const sup = supportRect(n.bounds, .minute, s, 0, s.opts.theme);
     const bs = s.opts.theme.type_scale.body_small;
     var buf: [256]u8 = undefined;
     @memcpy(buf[0..msg.len], msg);
@@ -2442,4 +2648,107 @@ test "time_picker: the supporting error text wraps through the paragraph ABI" {
     ui.paint.textLayoutSpan(l, z, ui.paint.textStyle(bs.size, @intCast(bs.weight), 0, bs.letter_spacing, 0xFF000000));
     try std.testing.expect(ui.paint.textLayoutWidth(l) <= sup.w);
     try std.testing.expect(ui.paint.textLayoutHeight(l) > bs.line_height * 1.5);
+}
+
+test "time_picker: the vibrant input variant — geometry (100x120 CornerLarge fields, the 56x120 side column, the compact panel)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(i32).init(a, 630); // 10:30 AM
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .mode = .input, .vibrant = true });
+    defer n.deinit();
+    const s = stateOf(n);
+    // valid fields: the vibrant variant reserves NO support box (upstream
+    // `shapes == null || !isValid`) → 16 + 120 + 24 + 40 + 12 = 212
+    const h = inputTotalHOf(s);
+    try std.testing.expectEqual(@as(f32, 212), h);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = h });
+    // the row: 100 + 16 + 100 + 8 + 56 = 280, centered at x = 40
+    const hr = inputFieldRect(n.bounds, .hour, s);
+    try std.testing.expectEqual(@as(f32, 40), hr.x);
+    try std.testing.expectEqual(vfield_w, hr.w);
+    try std.testing.expectEqual(vfield_h, hr.h);
+    const sep = inputSeparatorRect(n.bounds, s);
+    try std.testing.expectEqual(@as(f32, 140), sep.x);
+    try std.testing.expectEqual(vsep_w, sep.w);
+    const mr = inputFieldRect(n.bounds, .minute, s);
+    try std.testing.expectEqual(@as(f32, 156), mr.x);
+    const pr = inputPeriodRect(n.bounds, s);
+    try std.testing.expectEqual(@as(f32, 264), pr.x);
+    try std.testing.expectEqual(vperiod_w, pr.w);
+    try std.testing.expectEqual(vperiod_h, pr.h);
+    // the 56x56 items: AM at the column's top, PM below the 8dp gap —
+    // and the gap is dead space (upstream's updated-toggle MeasurePolicy)
+    const am = periodItemRect(pr, .am);
+    const pmr = periodItemRect(pr, .pm);
+    try std.testing.expectEqual(@as(f32, 56), am.h);
+    try std.testing.expectEqual(pr.y, am.y);
+    try std.testing.expectEqual(pr.y + 64, pmr.y);
+    try std.testing.expectEqual(Zone.am, zoneAt(n, pr.x + pr.w / 2, pr.y + 28));
+    try std.testing.expectEqual(Zone.none, zoneAt(n, pr.x + pr.w / 2, pr.y + 60));
+    try std.testing.expectEqual(Zone.pm, zoneAt(n, pr.x + pr.w / 2, pr.y + 92));
+    // PM flips the period exactly like the classic column → 10:30 → 22:30
+    tapRect(&router, n, pmr);
+    try std.testing.expectEqual(@as(i32, 22 * 60 + 30), sig.peek());
+    // an invalid input reserves the support box again — the panel
+    // re-measures taller (upstream's Column grows by the error text)
+    selectField(n, s, .minute);
+    _ = n.vtable.on_key.?(n, .{ .kind = .key_down, .key = .unknown, .chr = 'a', .command = true });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "9" });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "9" });
+    try std.testing.expect(fieldInvalid(s, .minute));
+    try std.testing.expectEqual(h + support_top_pad + supportH(s.opts.theme), inputTotalHOf(s));
+}
+
+test "golden: the vibrant input variant (CornerLarge plates, the circle/squircle period pills, no field labels)" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const sig = try ui.state.Signal(i32).init(a, 630); // 10:30 AM
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .mode = .input, .vibrant = true });
+    defer n.deinit();
+    const s = stateOf(n);
+    const total = inputTotalHOf(s);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total });
+    var r = try golden.Renderer.init(a, 360, @intFromFloat(total));
+    defer r.deinit();
+    r.paint(n, 0xFFFFFFFF);
+    var f2 = try r.readback(a);
+    defer f2.deinit();
+    // the vibrant panel: SurfaceContainer (vibrantColors().containerColor)
+    try std.testing.expectEqual(t.colors.surface_container, f2.pixelAt(180, 5));
+    // the SELECTED (hour) field, unfocused: a SurfaceContainerLowest plate
+    // with NO border (unfocusedBorderColor = Transparent) and Primary text
+    const hr = inputFieldRect(n.bounds, .hour, s);
+    try std.testing.expectEqual(t.colors.surface_container_lowest, f2.pixelAt(@intFromFloat(hr.x + hr.w / 2), @intFromFloat(hr.y + hr.h / 2)));
+    try std.testing.expectEqual(@as(u64, 0), f2.countColorApproxIn(hr, t.colors.outline));
+    try std.testing.expect(f2.countColorApproxIn(hr, t.colors.primary) > 0);
+    // the unselected minute plate: SurfaceContainerLowest + OnSurface ink
+    const mr = inputFieldRect(n.bounds, .minute, s);
+    try std.testing.expectEqual(t.colors.surface_container_lowest, f2.pixelAt(@intFromFloat(mr.x + mr.w / 2), @intFromFloat(mr.y + mr.h / 2)));
+    try std.testing.expect(f2.countColorApproxIn(mr, t.colors.on_surface) > 0);
+    // the CornerLarge (16dp) corner: 1dp in at y+4 falls OUTSIDE the
+    // rounding (a CornerSmall 8dp plate would cover it)
+    try std.testing.expectEqual(t.colors.surface_container, f2.pixelAt(@intFromFloat(mr.x + 1), @intFromFloat(mr.y + 4)));
+    try std.testing.expectEqual(t.colors.surface_container_lowest, f2.pixelAt(@intFromFloat(mr.x + 1), @intFromFloat(mr.y + 18)));
+    // the AM item (checked): a 12dp squircle — PrimaryContainer fill +
+    // OnPrimaryContainer label
+    const pr = inputPeriodRect(n.bounds, s);
+    const am = periodItemRect(pr, .am);
+    try std.testing.expectEqual(t.colors.primary_container, f2.pixelAt(@intFromFloat(am.x + am.w / 2), @intFromFloat(am.y + 10)));
+    try std.testing.expect(f2.countColorApproxIn(am, t.colors.on_primary_container) > 0);
+    // the PM item (unchecked): a CornerFull SurfaceContainerLowest
+    // circle — its corner pixels show the panel, the edge midpoint the fill
+    const pmr = periodItemRect(pr, .pm);
+    try std.testing.expectEqual(t.colors.surface_container_lowest, f2.pixelAt(@intFromFloat(pmr.x + 2), @intFromFloat(pmr.y + pmr.h / 2)));
+    try std.testing.expectEqual(t.colors.surface_container, f2.pixelAt(@intFromFloat(pmr.x + 2), @intFromFloat(pmr.y + 2)));
+    try std.testing.expect(f2.countColorApproxIn(pmr, t.colors.on_surface_variant) > 0); // the "PM" ink
+    // no Outline border or divider anywhere in the column (useUpdatedToggle)
+    try std.testing.expectEqual(@as(u64, 0), f2.countColorApproxIn(pr, t.colors.outline));
+    // valid vibrant fields paint NO supporting text — the band under the
+    // field is the bare panel (upstream `shapes == null || !isValid`)
+    const sup = supportRect(n.bounds, .minute, s, 0, t);
+    try std.testing.expectEqual(t.colors.surface_container, f2.pixelAt(@intFromFloat(sup.x + sup.w / 2), @intFromFloat(sup.y + 4)));
 }

@@ -121,22 +121,15 @@ pub const DevTools = struct {
         devtools.enabled = !devtools.enabled;
     }
 
-    /// Push a frame sample into the ring buffer. The sample is the frame
-    /// CADENCE (wall-clock ms between consecutive frames), not the render
-    /// duration — FPS must reflect the true frame rate, including paced/idle
-    /// time between frames. The render duration is displayed separately (the
-    /// "Frame:" line reads stats.frame_time_ms directly).
+    /// Push a frame sample into the ring buffer. Records the actual frame
+    /// render duration (`frame_time_ms`) into `frame_times` so idle wait time
+    /// between event-driven frames does not pollute the bar graph or
+    /// avg/p99 frame-time metrics.
     pub fn recordFrame(devtools: *DevTools, frame_time_ms: f32) void {
-        _ = frame_time_ms; // render duration shown in the Frame line, not here
-        const now_ms = sdl.c.SDL_GetTicks();
-        if (devtools.last_paint_ms) |last| {
-            const delta = now_ms - last;
-            if (delta > 0) {
-                devtools.cadence_ms = @floatFromInt(delta);
-                devtools.pushSample(devtools.cadence_ms);
-            }
-        }
-        devtools.last_paint_ms = now_ms;
+        devtools.last_paint_ms = sdl.c.SDL_GetTicks();
+        if (frame_time_ms <= 0) return;
+        devtools.cadence_ms = frame_time_ms;
+        devtools.pushSample(frame_time_ms);
     }
 
     /// Push a raw sample into the ring buffer (oldest overwritten when full).
@@ -299,7 +292,7 @@ pub const DevTools = struct {
         // subsystem's share of the process RSS.
         const rss_bytes: f32 = l.rss_mb * 1024.0 * 1024.0;
         for (0..SUBSYSTEM_COUNT) |i| {
-            const sub: Subsystem = @enumFromInt(i);
+            const sub: Subsystem = @fromBackingInt(@intCast(i));
             const row_y = MEM_ROWS_Y + @as(f32, @floatFromInt(i)) * MEM_ROW_H;
             kx.c.kx_draw_text(ctx, sub.name(), MEM_TEXT_X, row_y + 9, 10, TEXT);
             const live_line = std.fmt.bufPrintSentinel(&buf, "{d:.1}", .{
@@ -390,7 +383,7 @@ pub const MemoryLedger = struct {
     rss_count: usize = 0,
 
     pub fn recordAlloc(l: *MemoryLedger, sub: Subsystem, bytes: usize) void {
-        const i = @intFromEnum(sub);
+        const i = @backingInt(sub);
         l.live[i] += bytes;
         l.peak[i] = @max(l.peak[i], l.live[i]);
         l.alloc_count[i] += 1;
@@ -398,7 +391,7 @@ pub const MemoryLedger = struct {
 
     /// Saturating: an unmatched free can never drive the counter negative.
     pub fn recordFree(l: *MemoryLedger, sub: Subsystem, bytes: usize) void {
-        const i = @intFromEnum(sub);
+        const i = @backingInt(sub);
         l.live[i] -|= bytes;
         l.free_count[i] += 1;
     }
@@ -673,20 +666,20 @@ test "memory ledger: alloc/free accounting per subsystem" {
     l.recordAlloc(.renderer, 1000);
     l.recordAlloc(.renderer, 500);
     l.recordAlloc(.ui, 250);
-    try std.testing.expectEqual(@as(u64, 1500), l.live[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 1500), l.peak[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 2), l.alloc_count[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 250), l.live[@intFromEnum(Subsystem.ui)]);
+    try std.testing.expectEqual(@as(u64, 1500), l.live[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 1500), l.peak[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 2), l.alloc_count[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 250), l.live[@backingInt(Subsystem.ui)]);
     try std.testing.expectEqual(@as(u64, 1750), l.totalLive());
     // Free shrinks live but never the peak.
     l.recordFree(.renderer, 600);
-    try std.testing.expectEqual(@as(u64, 900), l.live[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 1500), l.peak[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 1), l.free_count[@intFromEnum(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 900), l.live[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 1500), l.peak[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 1), l.free_count[@backingInt(Subsystem.renderer)]);
     // Saturating free: an unmatched free cannot drive the counter negative.
     l.recordFree(.renderer, 10_000);
-    try std.testing.expectEqual(@as(u64, 0), l.live[@intFromEnum(Subsystem.renderer)]);
-    try std.testing.expectEqual(@as(u64, 2), l.free_count[@intFromEnum(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 0), l.live[@backingInt(Subsystem.renderer)]);
+    try std.testing.expectEqual(@as(u64, 2), l.free_count[@backingInt(Subsystem.renderer)]);
 }
 
 test "memory ledger: rss history wraps and averages" {
@@ -715,7 +708,7 @@ test "memory ledger: tracking allocator records byte deltas" {
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var ta: TrackingAllocator = .{ .ledger = &l, .subsystem = .ui, .backing = fba.allocator() };
     const alloc = ta.allocator();
-    const ui = @intFromEnum(Subsystem.ui);
+    const ui = @backingInt(Subsystem.ui);
 
     var slice = try alloc.alloc(u8, 100);
     try std.testing.expectEqual(@as(u64, 100), l.live[ui]);
@@ -819,4 +812,18 @@ test "golden: devtools timeline + memory panels paint (exact pixels)" {
     try std.testing.expect(f.countColor(Subsystem.renderer.color()) > 0);
     try std.testing.expect(f.countColor(Subsystem.ui.color()) > 0);
     try std.testing.expect(f.countColor(SPARK) > 0);
+}
+
+test "recordFrame stores frame_time_ms in frame_times instead of idle wait cadence" {
+    var dt = DevTools.init();
+    dt.last_paint_ms = 0; // simulate a long idle wait before this frame
+    dt.recordFrame(0); // unmeasured first frame after idle wait must NOT push wall-clock delta
+    try std.testing.expectEqual(@as(usize, 0), dt.history_count);
+    try std.testing.expectEqual(@as(f32, 0), dt.cadence_ms);
+
+    dt.last_paint_ms = 0;
+    dt.recordFrame(4.25);
+    try std.testing.expectEqual(@as(usize, 1), dt.history_count);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.25), dt.frame_times[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.25), dt.avgFrameTimeMs(), 0.001);
 }

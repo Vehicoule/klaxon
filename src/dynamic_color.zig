@@ -120,7 +120,7 @@ pub const Scheme = extern struct {
 /// dark scheme.
 pub fn scheme(seed: Color, variant: Variant, dark: bool, contrast_level: f64) Scheme {
     var out: Scheme = undefined;
-    kx_mcu_scheme(@intFromEnum(variant), seed, dark, contrast_level, &out);
+    kx_mcu_scheme(@backingInt(variant), seed, dark, contrast_level, &out);
     return out;
 }
 
@@ -320,7 +320,7 @@ test "scheme: tonal_spot light/dark reproduce M3 role contrast" {
 test "scheme: all nine variants resolve opaque roles" {
     const seed: Color = 0x4285F4FF; // Google Blue
     inline for (@typeInfo(Variant).@"enum".field_values) |v| {
-        const cs = schemeLight(seed, @enumFromInt(v));
+        const cs = schemeLight(seed, @fromBackingInt(@intCast(v)));
         try expect(cs.primary != 0);
         try expectEqualOpaque(cs.primary);
         try expectEqualOpaque(cs.on_primary);

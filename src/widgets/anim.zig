@@ -301,6 +301,7 @@ fn offsetDeinit(n: *Node) void {
 }
 const offset_vtable = ui.node.VTable{
     .measure = offsetMeasure,
+    .measure_pure = true,
     .layout = offsetLayout,
     .paint = offsetPaint,
     .deinit = offsetDeinit,
@@ -344,7 +345,8 @@ const ScaleState = struct {
 fn scaledRect(b: Rect, f: f32) Rect {
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    return .{ .x = cx - b.w * f / 2, .y = cy - b.h * f / 2, .w = b.w * f, .h = b.h * f };
+    if (@abs(f) < 1e-6) return .{ .x = cx, .y = cy, .w = 0, .h = 0 };
+    return ui.node.rectNormalize(.{ .x = cx - b.w * f / 2, .y = cy - b.h * f / 2, .w = b.w * f, .h = b.h * f });
 }
 
 fn applyScale(s: *ScaleState, v: anim.Vec4) void {
@@ -418,6 +420,7 @@ fn scalePreChildrenHit(n: *Node, px: f32, py: f32) ui.node.HitPoint {
     const b = n.bounds;
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
+    if (@abs(s.factor) < 1e-6) return .{ .x = cx, .y = cy };
     return .{ .x = cx + (px - cx) / s.factor, .y = cy + (py - cy) / s.factor };
 }
 fn scaleMapPaintRect(n: *Node, rect: Rect) Rect {
@@ -425,12 +428,12 @@ fn scaleMapPaintRect(n: *Node, rect: Rect) Rect {
     const b = n.bounds;
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
-    return .{
+    return ui.node.rectNormalize(.{
         .x = cx + (rect.x - cx) * s.factor,
         .y = cy + (rect.y - cy) * s.factor,
         .w = rect.w * s.factor,
         .h = rect.h * s.factor,
-    };
+    });
 }
 fn scaleDeinit(n: *Node) void {
     const s = stateOf(ScaleState, n);
@@ -440,6 +443,7 @@ fn scaleDeinit(n: *Node) void {
 }
 const scale_vtable = ui.node.VTable{
     .measure = scaleMeasure,
+    .measure_pure = true,
     .layout = scaleLayout,
     .paint = scalePaint,
     .deinit = scaleDeinit,

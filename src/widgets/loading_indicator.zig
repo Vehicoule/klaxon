@@ -70,7 +70,6 @@ const morph_spring: anim.Spring = anim.Spring.fromDampingRatio(200, 0.6, 1);
 /// The M3E shape sequences live in ui.shapes (shapes.indeterminate_sequence:
 /// SoftBurst -> Cookie9Sided -> Pentagon -> Pill -> Sunny -> Cookie4Sided ->
 /// Oval, wrapping; shapes.determinate_sequence: Circle -> SoftBurst).
-
 const LiState = struct {
     opts: LoadingIndicatorOptions,
     /// The determinate progress (0..1); null = the indeterminate morph loop.

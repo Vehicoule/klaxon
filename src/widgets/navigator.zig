@@ -148,6 +148,7 @@ fn pageDeinit(n: *Node) void {
 const page_vtable = ui.node.VTable{
     .measure = pageMeasure,
     .layout = pageLayout,
+    .measure_pure = true,
     .paint = noopPaint,
     .deinit = pageDeinit,
     .pre_children_paint = pagePrePaint,
@@ -180,7 +181,7 @@ fn pageWrapperOf(node: *Node) ?*Node {
 // --- Hero (shared element) ---
 
 pub const HeroOptions = struct {
-    tag: []const u8,
+    tag: []const u8 = "",
 };
 
 const HeroState = struct {
@@ -233,6 +234,7 @@ fn heroDeinit(n: *Node) void {
 }
 const hero_vtable = ui.node.VTable{
     .measure = heroMeasure,
+    .measure_pure = true,
     .layout = heroLayout,
     .paint = noopPaint,
     .deinit = heroDeinit,
@@ -302,6 +304,7 @@ fn flightDeinit(n: *Node) void {
 }
 const flight_vtable = ui.node.VTable{
     .measure = flightMeasure,
+    .measure_pure = true,
     .layout = flightLayout,
     .paint = noopPaint,
     .deinit = flightDeinit,
@@ -356,9 +359,20 @@ const NavViewState = struct {
 
     fn registerHero(s: *NavViewState, h: *Node, rect: Rect) void {
         const wrapper = pageWrapperOf(h) orelse return; // a hero outside a page never flies
+        // Map the hero's rect through any transformed ancestors inside the
+        // page (ScrollView, AnimatedOffset, AnimatedScale) into the page
+        // wrapper's child space so flight coordinates match the painted position.
+        var mapped = rect;
+        var cur = h.parent;
+        while (cur) |p| : (cur = p.parent) {
+            if (p == wrapper) break;
+            if (p.vtable.map_paint_rect) |m| {
+                if (p.state != null) mapped = ui.node.rectNormalize(m(p, mapped));
+            }
+        }
         for (s.heroes.items) |*e| {
             if (e.hero == h) {
-                e.rect = rect;
+                e.rect = mapped;
                 return;
             }
         }
@@ -366,7 +380,7 @@ const NavViewState = struct {
             .tag = s.node.allocator.dupe(u8, heroStateOf(h).tag) catch @panic("klaxon: out of memory"),
             .hero = h,
             .wrapper = wrapper,
-            .rect = rect,
+            .rect = mapped,
         }) catch @panic("klaxon: out of memory");
     }
 
@@ -440,6 +454,8 @@ const NavViewState = struct {
 
     fn finishTransition(s: *NavViewState) void {
         const t = s.transition orelse return;
+        if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.channel));
+        pageSetTransform(pageStateOf(t.entering), 0, 0, 1, 1);
         // Hero: the flying child returns to its hero wrapper (at the destination).
         if (t.hero) |f| {
             _ = s.node.remove(f.flight);
@@ -575,6 +591,10 @@ fn transitionComplete(userdata: ?*anyopaque) void {
 /// The Navigator mutated: sync the tree (wrappers) and start the transition.
 fn onChange(userdata: ?*anyopaque, kind: nav_mod.ChangeKind) void {
     const s: *NavViewState = @ptrCast(@alignCast(userdata.?));
+    // End any in-flight transition BEFORE mutating `pages_ui` so an
+    // interrupted push/pop/replace/reset retires the previous exiting
+    // wrapper and restores any flying hero child cleanly.
+    if (s.transition != null) s.finishTransition();
     switch (kind) {
         .push => {
             const page = s.nav.current().?;
@@ -607,10 +627,6 @@ fn onChange(userdata: ?*anyopaque, kind: nav_mod.ChangeKind) void {
             s.startTransition(page.route.transition, w, exiting, false);
         },
         .reset => {
-            // End any in-flight transition FIRST: it owns the exiting wrapper
-            // (finishTransition retires it — and syncs pages_ui — when its
-            // page left the stack).
-            if (s.transition != null) s.finishTransition();
             const root_w = s.pages_ui.items[0];
             const top_w = s.pages_ui.items[s.pages_ui.items.len - 1];
             // The middle pages (between the root and the top) leave
@@ -702,6 +718,7 @@ fn navDeinit(n: *Node) void {
 }
 const navigator_vtable = ui.node.VTable{
     .measure = navMeasure,
+    .measure_pure = true,
     .layout = navLayout,
     .paint = noopPaint,
     .on_key = navOnKey,

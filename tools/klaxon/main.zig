@@ -83,12 +83,12 @@ fn run(cli: *Cli, args_vec: std.process.Args) !u8 {
         return cmdZig(cli, root, &.{"-Doptimize=ReleaseSmall"}, rest);
     } else if (std.mem.eql(u8, cmd, "test")) {
         const root = try projectRoot(cli);
-        var code = try cmdZig(cli, root, &.{"test"}, &.{});
+        var code = try cmdZig(cli, root, &.{"test"}, rest);
         if (code != 0) return code;
-        code = try cmdZig(cli, root, &.{"test-golden"}, &.{});
+        code = try cmdZig(cli, root, &.{"test-golden"}, rest);
         return code;
     } else if (std.mem.eql(u8, cmd, "test-golden")) {
-        const root = try klaxonRootForCommand(cli, "test-golden");
+        const root = try projectRoot(cli);
         return cmdZig(cli, root, &.{"test-golden"}, rest);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         const root = try klaxonRootForCommand(cli, "bench");
@@ -278,7 +278,7 @@ fn klaxonRoot(cli: *const Cli) ![]const u8 {
     }
     const cwd = try cwdAlloc(cli);
     if (try walkUp(cli, cwd, isKlaxonRoot)) |root| return root;
-    if (projectRoot(cli)) |root| {
+    if (try walkUp(cli, cwd, isProjectRoot)) |root| {
         const marker = try joinPath(cli.arena, &.{ root, ".klaxon" });
         if (Io.Dir.cwd().openFile(cli.io, marker, .{})) |f| {
             defer f.close(cli.io);
@@ -287,7 +287,7 @@ fn klaxonRoot(cli: *const Cli) ![]const u8 {
             const path = std.mem.trim(u8, buf[0..n], " \r\n\t");
             if (isKlaxonRoot(cli, path)) return try cli.arena.dupe(u8, path);
         } else |_| {}
-    } else |_| {}
+    }
     // exe-relative: <repo>/zig-out/bin/klaxon — useful right after `zig build cli`.
     if (std.mem.indexOfScalar(u8, cli.argv0, std.fs.path.sep) != null) {
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -387,10 +387,8 @@ fn cmdDoctor(cli: *const Cli) !u8 {
     const deps_dir = try joinPath(cli.arena, &.{ deps_root, "deps" });
     const sdl_lib = try std.fmt.allocPrint(cli.arena, "{s}/SDL/build-{s}/libSDL3.a", .{ deps_dir, host_tag });
     const skia_lib = try std.fmt.allocPrint(cli.arena, "{s}/skia/out/{s}/libskia.a", .{ deps_dir, host_tag });
-    const wamr_lib = try std.fmt.allocPrint(cli.arena, "{s}/wamr/build-{s}/libiwasm.a", .{ deps_dir, host_tag });
     const sdl_ok = existsDir(cli, try joinPath(cli.arena, &.{ deps_dir, "SDL" })) and exists(cli, sdl_lib);
     const skia_ok = exists(cli, skia_lib);
-    const wamr_ok = exists(cli, wamr_lib);
     try checks.append(cli.arena, .{
         .name = "deps/SDL3",
         .status = if (sdl_ok) .ok else .missing,
@@ -402,13 +400,6 @@ fn cmdDoctor(cli: *const Cli) !u8 {
         .name = "deps/skia",
         .status = if (skia_ok) .ok else .missing,
         .detail = try std.fmt.allocPrint(cli.arena, "out/{s}/libskia.a", .{host_tag}),
-        .hint = "run `klaxon deps` (scripts/fetch-deps.sh) inside the klaxon checkout",
-        .kind = .essential,
-    });
-    try checks.append(cli.arena, .{
-        .name = "deps/wamr",
-        .status = if (wamr_ok) .ok else .missing,
-        .detail = try std.fmt.allocPrint(cli.arena, "build-{s}", .{host_tag}),
         .hint = "run `klaxon deps` (scripts/fetch-deps.sh) inside the klaxon checkout",
         .kind = .essential,
     });
@@ -612,10 +603,23 @@ const template_build_zig =
     \\    const app = klaxon.artifact("app");
     \\    b.installArtifact(app);
     \\
-    \\    const run = b.addRunArtifact(app);
-    \\    run.step.dependOn(b.getInstallStep());
-    \\    const run_step = b.step("run", "Build and run the app");
-    \\    run_step.dependOn(&run.step);
+    \\    const is_wasm = target.result.os.tag == .emscripten;
+    \\    const is_android = target.result.os.tag == .linux and target.result.abi == .android;
+    \\    const is_ios = target.result.os.tag == .ios;
+    \\    if (!is_wasm and !is_android and !is_ios) {
+    \\        const run = b.addRunArtifact(app);
+    \\        run.step.dependOn(b.getInstallStep());
+    \\        const run_step = b.step("run", "Build and run the app");
+    \\        run_step.dependOn(&run.step);
+    \\
+    \\        const run_tests = b.addRunArtifact(klaxon.artifact("app-tests"));
+    \\        const test_step = b.step("test", "Run unit tests");
+    \\        test_step.dependOn(&run_tests.step);
+    \\
+    \\        const run_golden = b.addRunArtifact(klaxon.artifact("app-golden"));
+    \\        const golden_step = b.step("test-golden", "Run golden tests only");
+    \\        golden_step.dependOn(&run_golden.step);
+    \\    }
     \\}
     \\
 ;
@@ -624,6 +628,7 @@ const template_main_zig =
     \\// main.zig — a Klaxon app (scaffolded by `klaxon create`).
     \\// The framework arrives as the "klaxon" module — see build.zig.
     \\const std = @import("std");
+    \\const builtin = @import("builtin");
     \\const klaxon = @import("klaxon");
     \\
     \\const ui = klaxon.ui;
@@ -635,23 +640,33 @@ const template_main_zig =
     \\
     \\pub fn main(init: std.process.Init.Minimal) !void {
     \\    _ = init;
+    \\    const is_wasm = builtin.os.tag == .emscripten;
+    \\    const is_android = builtin.os.tag == .linux and builtin.abi == .android;
+    \\    const is_ios = builtin.os.tag == .ios;
     \\    var debug_alloc = std.heap.DebugAllocator(.{}){};
-    \\    defer _ = debug_alloc.deinit();
-    \\    const allocator = debug_alloc.allocator();
+    \\    defer if (!is_wasm and !is_android and !is_ios) {
+    \\        _ = debug_alloc.deinit();
+    \\    };
+    \\    const allocator = if (is_wasm or is_android or is_ios)
+    \\        std.heap.c_allocator
+    \\    else
+    \\        debug_alloc.allocator();
     \\
     \\    // Window + event loop. KX_BACKEND_AUTO walks the platform chain
     \\    // (graphite → ganesh → raster) — see docs/ARCHITECTURE.md.
-    \\    var host = try host_mod.Host.init(allocator, width, height, klaxon.kx.c.KX_BACKEND_AUTO, null);
-    \\    defer host.deinit();
-    \\    ui.input.setCurrent(&host.input); // the router is process-global (single-window P0)
-    \\    ui.anim.setCurrent(&host.timeline); // the animation timeline, same pattern
+    \\    const host_ptr = try allocator.create(host_mod.Host);
+    \\    defer if (!is_wasm) allocator.destroy(host_ptr);
+    \\    host_ptr.* = try host_mod.Host.init(allocator, width, height, klaxon.kx.c.KX_BACKEND_AUTO, null);
+    \\    defer if (!is_wasm) host_ptr.deinit();
+    \\    ui.input.setCurrent(&host_ptr.input); // the router is process-global (single-window P0)
+    \\    ui.anim.setCurrent(&host_ptr.timeline); // the animation timeline, same pattern
     \\
     \\    // Widget tree: a padded column — replace this with your UI.
     \\    const root = try widgets.container.container(allocator, .{
     \\        .color = 0x181828FF,
     \\        .padding = .all(24),
     \\    });
-    \\    defer root.deinit();
+    \\    defer if (!is_wasm) root.deinit();
     \\    const col = try widgets.layout.column(allocator, .{ .gap = 16 });
     \\    root.add(col);
     \\    col.add(try widgets.text.text(allocator, "Hello from Klaxon", .{ .size = 28, .color = 0xFFFFFFFF }));
@@ -660,7 +675,19 @@ const template_main_zig =
     \\    root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) });
     \\
     \\    std.debug.print("klaxon app — {d}x{d}, close the window to quit\n", .{ width, height });
-    \\    try host.run(root, 0, null, null); // max_frames = 0 → run until close
+    \\    try host_ptr.run(root, 0, null, null); // max_frames = 0 → run until close
+    \\}
+    \\
+    \\test "app widget tree layout" {
+    \\    const allocator = std.testing.allocator;
+    \\    const root = try widgets.container.container(allocator, .{
+    \\        .color = 0x181828FF,
+    \\        .padding = .all(24),
+    \\    });
+    \\    defer root.deinit();
+    \\    root.layout(.{ .x = 0, .y = 0, .w = 640, .h = 480 });
+    \\    try std.testing.expectEqual(@as(f32, 640), root.bounds.w);
+    \\    try std.testing.expectEqual(@as(f32, 480), root.bounds.h);
     \\}
     \\
 ;

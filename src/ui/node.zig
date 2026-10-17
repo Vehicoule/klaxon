@@ -135,6 +135,8 @@ pub const VTable = struct {
     on_pointer: ?*const fn (node: *Node, ev: input_mod.PointerEvent) bool = null,
     /// Keyboard input (Phase 1c) — delivered to the focused node's chain.
     on_key: ?*const fn (node: *Node, ev: input_mod.KeyEvent) bool = null,
+    /// Focus lost (called by InputRouter.focus when focus moves away from this node).
+    on_blur: ?*const fn (node: *Node) void = null,
     /// The node edits text (TextField/SearchBar/SearchView): the host
     /// raises the platform IME while it's focused (SDL_StartTextInput +
     /// SetTextInputArea) — desktop always-on paths ignore this.
@@ -444,15 +446,32 @@ pub const Node = struct {
     }
 
     /// Propagate "subtree is not fully measure-pure" up the chain (stops at
-    /// the first ancestor already flagged). Once set it stays set — a removed
-    /// impure child leaves the flag behind rather than recomputing the whole
-    /// subtree (conservative: the cost is lost caching, never stale sizes).
+    /// the first ancestor already flagged).
     fn markImpureUp(node: *Node) void {
         var n = node;
         while (true) {
             if (n.impure_descendant) return;
             n.impure_descendant = true;
             n.m_valid = false; // a measure cached while pure may now be stale
+            const p = n.parent orelse return;
+            n = p;
+        }
+    }
+
+    /// Re-evaluate `impure_descendant` up the ancestor chain after detaching
+    /// a child so removing a temporary impure child restores measure caching.
+    fn recomputeImpureUp(node: *Node) void {
+        var n = node;
+        while (n.impure_descendant) {
+            var still_impure = false;
+            for (n.children.items) |c| {
+                if (!(c.vtable.measure_pure and !c.impure_descendant)) {
+                    still_impure = true;
+                    break;
+                }
+            }
+            if (still_impure) return;
+            n.impure_descendant = false;
             const p = n.parent orelse return;
             n = p;
         }
@@ -499,6 +518,8 @@ pub const Node = struct {
                 // ancestors instead of dying at the next event.
                 input_mod.captureOnDetach(child, node);
                 child.parent = null;
+                if (!(child.vtable.measure_pure and !child.impure_descendant))
+                    node.recomputeImpureUp();
                 node.markLayoutDirty();
                 return true;
             }
@@ -514,17 +535,20 @@ pub const Node = struct {
         const total = node.children.items.len;
         const s = @min(start, total);
         const n = @min(count, @min(out.len, total - s));
+        var any_impure = false;
         for (node.children.items[s .. s + n], out[0..n]) |c, *slot| {
             // Damage each leaving rect (the parent chain is still intact
             // for the walk); dedup makes the repeated ancestor marks cheap.
             c.markDirty();
             input_mod.captureOnDetach(c, node); // see remove()
             c.parent = null;
+            if (!(c.vtable.measure_pure and !c.impure_descendant)) any_impure = true;
             slot.* = c;
         }
         const tail = node.children.items[s + n .. total];
         std.mem.copyForwards(*Node, node.children.items[s .. s + tail.len], tail);
         node.children.items.len -= n;
+        if (any_impure) node.recomputeImpureUp();
         if (n > 0) node.markLayoutDirty();
         return n;
     }
@@ -587,7 +611,7 @@ pub const Node = struct {
             // damage is provisional anyway: first layout+paint sets the
             // real bounds, and a stateless transform is identity here.
             if (p.vtable.map_paint_rect) |m| {
-                if (p.state != null) r = m(p, r);
+                if (p.state != null) r = rectNormalize(m(p, r));
             }
             n = p;
         }
@@ -786,7 +810,7 @@ pub const Node = struct {
         // Entry points (frame root, popup overlay, one-off paints) probe the
         // ancestor chain once; the recursion then passes the composed affine
         // down instead of re-walking ancestors per node.
-        paintInner(node, ctx, visible, node.mapRectToRoot(.{ .x = 0, .y = 0, .w = 1, .h = 1 }));
+        paintInner(node, ctx, visible, node.rootAffine());
     }
 
     /// paint with the strict-ancestors' affine already composed.
@@ -862,16 +886,31 @@ pub const Node = struct {
 
     /// A rect-affine map packed as a Rect (x=dx, y=dy, w=sx, h=sy). Every
     /// map_paint_rect impl is rect-affine — translate or uniform scale — so
-    /// the composed map applied to the unit rect IS the affine.
+    /// probing two zero-size points recovers the signed affine even when
+    /// `map_paint_rect` normalizes non-empty rects.
     /// The paint traversal propagates one composed affine down the tree —
     /// replacing the per-node ancestors walk (mapRectToRoot) with an O(1)
     /// rect transform while keeping every visit/hook semantic identical.
     const PaintAff = Rect;
 
-    /// Probe a node's OWN map_paint_rect as an affine (identity when none).
+    /// Probe a node's OWN map_paint_rect as a signed affine (identity when none).
     fn ownAffine(node: *Node) PaintAff {
-        const unit = Rect{ .x = 0, .y = 0, .w = 1, .h = 1 };
-        return if (node.vtable.map_paint_rect) |m| rectNormalize(m(node, unit)) else unit;
+        const m = node.vtable.map_paint_rect orelse return .{ .x = 0, .y = 0, .w = 1, .h = 1 };
+        const p0 = m(node, .{ .x = 0, .y = 0, .w = 0, .h = 0 });
+        const p1 = m(node, .{ .x = 1, .y = 1, .w = 0, .h = 0 });
+        return .{ .x = p0.x, .y = p0.y, .w = p1.x - p0.x, .h = p1.y - p0.y };
+    }
+
+    /// Compose the strict-ancestors' signed affine for `node`.
+    fn rootAffine(node: *Node) PaintAff {
+        var aff: PaintAff = .{ .x = 0, .y = 0, .w = 1, .h = 1 };
+        var n = node;
+        while (n.parent) |p| {
+            if (p.torn_down) break;
+            if (p.state != null) aff = affCompose(ownAffine(p), aff);
+            n = p;
+        }
+        return aff;
     }
 
     /// outer ∘ inner — apply `inner` first (child space → parent space).

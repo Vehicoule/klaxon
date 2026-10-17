@@ -56,6 +56,7 @@ const ListState = struct {
     // image plus the offset/window/size it was rendered at.
     backing: u64 = 0,
     backing_ctx: ?*kx.Ctx = null,
+    backing_serial: u64 = 0,
     backing_offset: f32 = 0,
     backing_first: usize = 0,
     backing_w: i32 = 0,
@@ -77,10 +78,13 @@ fn childrenSig(s: *const ListState, n: *Node) usize {
 
 fn dropBacking(s: *ListState) void {
     if (s.backing != 0) {
-        if (s.backing_ctx) |c| ui.paint.imageDestroy(c, s.backing);
+        if (s.backing_ctx != null and s.backing_serial != 0 and ui.paint.ctxSerialAlive(s.backing_serial)) {
+            ui.paint.imageDestroy(s.backing_ctx.?, s.backing);
+        }
     }
     s.backing = 0;
     s.backing_ctx = null;
+    s.backing_serial = 0;
 }
 
 fn strideOf(s: *const ListState) f32 {
@@ -194,8 +198,9 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         return true;
     }
 
+    const cur_serial = ui.paint.ctxSerial(ctx);
     const dy = s.scroll.offset - s.backing_offset;
-    const usable = s.backing != 0 and s.backing_ctx == ctx and
+    const usable = s.backing != 0 and s.backing_ctx == ctx and s.backing_serial == cur_serial and
         s.backing_w == iw and s.backing_h == ih and
         (dy != 0 or childrenSig(s, n) == s.backing_sig);
     if (usable and @abs(dy) >= h) dropBacking(s); // a full page: no shared pixels
@@ -220,8 +225,10 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
             if (!(c.dirty or c.layout_dirty)) continue;
             any_dirty = true;
             repaint = ui.node.rectUnion(repaint, .{
-                .x = c.bounds.x - ix, .y = c.bounds.y - s.scroll.offset - iy,
-                .w = c.bounds.w, .h = c.bounds.h,
+                .x = c.bounds.x - ix,
+                .y = c.bounds.y - s.scroll.offset - iy,
+                .w = c.bounds.w,
+                .h = c.bounds.h,
             });
         }
         // Churning content (animated rows each frame): the offscreen pass +
@@ -257,7 +264,10 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
         // root space: map before intersecting or a scrolled ancestor puts
         // the band nowhere near the rows (empty backing → blank list).
         const band_screen = ui.node.rectIntersect(child_region, n.mapRectToRoot(.{
-            .x = ix, .y = iy + repaint.y, .w = repaint.w, .h = repaint.h,
+            .x = ix,
+            .y = iy + repaint.y,
+            .w = repaint.w,
+            .h = repaint.h,
         }));
         ui.paint.spriteBatchBegin(ctx); // row atlas blits → one mesh
         for (n.children.items) |c| {
@@ -272,6 +282,7 @@ fn listScrollChildrenPaint(n: *Node, ctx: *kx.Ctx, child_region: Rect) bool {
     if (img != 0) {
         s.backing = img;
         s.backing_ctx = ctx;
+        s.backing_serial = cur_serial;
         s.backing_offset = s.scroll.offset;
         s.backing_w = iw;
         s.backing_h = ih;
@@ -478,7 +489,6 @@ fn testList(count: usize) !*Node {
         .item_height = 48,
     });
 }
-
 
 test "repro: a fast fling never blanks the viewport" {
     var router = input.InputRouter{};

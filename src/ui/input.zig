@@ -376,7 +376,10 @@ pub const InputRouter = struct {
         // The previously focused node's focus styling (caret, focus border,
         // unfloated label) must repaint — dirty it (its damage_overflow
         // covers paint outside its bounds, e.g. a text field's cutout label).
-        if (self.focused) |old| if (old != node) old.markDirty();
+        if (self.focused) |old| if (old != node) {
+            if (old.vtable.on_blur) |b| b(old);
+            old.markDirty();
+        };
         self.focused = node;
     }
 

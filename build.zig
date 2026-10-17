@@ -65,21 +65,29 @@ pub fn build(b: *std.Build) void {
     };
     const is_macos = target.result.os.tag == .macos;
 
+    // --- external app mode (Phase 5a) ---
+    // `klaxon create`d projects depend on klaxon and pass -Dapp-root=<their
+    // root>: the app's src/main.zig is compiled here as the "app" artifact,
+    // with the framework exposed as the "klaxon" module (@import("klaxon")).
+    // Declared before the wasm/android/ios early returns so external projects
+    // can also target web/mobile without "invalid option: -Dapp-root".
+    const app_root_opt = b.option([]const u8, "app-root", "external project root — builds <app-root>/src/main.zig as the 'app' artifact");
+
     // The wasm target gets its own build graph (static lib + emcc link step);
     // the native steps (run/test/test-golden/gallery/...) are not defined for it.
     if (is_wasm) {
-        addWasmWeb(b, target, optimize, tag);
+        addWasmWeb(b, target, optimize, tag, app_root_opt);
         return;
     }
 
     // Phase 3d/3e: android + ios get their own build graphs (static lib +
     // external link step); the native steps are not defined for them.
     if (is_android) {
-        addAndroidLib(b, target, optimize, tag);
+        addAndroidLib(b, target, optimize, tag, app_root_opt);
         return;
     }
     if (is_ios) {
-        addIosApp(b, target, optimize, tag);
+        addIosApp(b, target, optimize, tag, app_root_opt);
         return;
     }
 
@@ -109,12 +117,7 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&b.addInstallFile(b.path(dat), "bin/icudtl.dat").step);
     }
 
-    // --- external app mode (Phase 5a) ---
-    // `klaxon create`d projects depend on klaxon and pass -Dapp-root=<their
-    // root>: the app's src/main.zig is compiled here as the "app" artifact,
-    // with the framework exposed as the "klaxon" module (@import("klaxon")).
-    // None of the in-repo apps/test steps are registered in this mode.
-    if (b.option([]const u8, "app-root", "external project root — builds <app-root>/src/main.zig as the 'app' artifact")) |app_root| {
+    if (app_root_opt) |app_root| {
         addExternalApp(b, target, optimize, translate_sdl, translate_kx, kx_skia, is_macos, tag, app_root);
         return;
     }
@@ -342,6 +345,41 @@ fn addExternalApp(
     app.root_module.addImport("klaxon", klaxon_mod);
     linkRuntime(b, app.root_module, kx_skia, target, is_macos, tag);
     b.installArtifact(app);
+
+    const app_tests = b.addTest(.{
+        .name = "app-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{app_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = !is_windows_local(target),
+        }),
+    });
+    app_tests.root_module.addImport("klaxon", klaxon_mod);
+    linkRuntime(b, app_tests.root_module, kx_skia, target, is_macos, tag);
+    b.installArtifact(app_tests);
+    const run_tests = b.addRunArtifact(app_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
+
+    const app_golden = b.addTest(.{
+        .name = "app-golden",
+        .root_module = b.createModule(.{
+            .root_source_file = b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{app_root})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = !is_windows_local(target),
+        }),
+        .test_runner = .{ .path = b.path("src/test_runner_golden.zig"), .mode = .simple },
+    });
+    app_golden.root_module.addImport("klaxon", klaxon_mod);
+    linkRuntime(b, app_golden.root_module, kx_skia, target, is_macos, tag);
+    b.installArtifact(app_golden);
+    const run_golden = b.addRunArtifact(app_golden);
+    const golden_step = b.step("test-golden", "Run golden tests only");
+    golden_step.dependOn(&run_golden.step);
 }
 
 /// material-color-utilities (deps/mcu, vendored Apache-2.0 — UPSTREAM.md
@@ -649,6 +687,7 @@ fn addWasmWeb(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tag: []const u8,
+    app_root_opt: ?[]const u8,
 ) void {
     const emsdk = "deps/emsdk";
     // Emscripten sysroot: <emscripten.h>, <GLES3/gl32.h>, musl headers.
@@ -686,17 +725,18 @@ fn addWasmWeb(
         "-nostdinc++",
     };
     kx_skia.root_module.addCSourceFiles(.{
-        .files = &.{
+        .files = &([_][]const u8{
             "kx_skia/src/kx_skia_common.cpp",
             "kx_skia/src/kx_skia_wasm.cpp",
             // emdawnwebgpu runtime impl (navigator.gpu → wgpu C API); the
             // matching library_webgpu*.js libs are added at the emcc link.
             "deps/emdawnwebgpu_pkg/webgpu/src/webgpu.cpp",
-        },
+        } ++ mcu_sources),
         .flags = shim_flags,
         .language = .cpp,
     });
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
+    kx_skia.root_module.addIncludePath(b.path("deps/mcu"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
     // ICU common headers (ubrk.h — grapheme-cluster boundaries); the wasm
@@ -752,7 +792,7 @@ fn addWasmWeb(
 
     // App selection: -Dweb-app=hello (default) | gallery — mirrors -Dios-app.
     const web_app = b.option([]const u8, "web-app", "web app to build: hello|gallery") orelse "hello";
-    const app_name: []const u8 = if (std.mem.eql(u8, web_app, "gallery")) "gallery" else "hello";
+    const app_name: []const u8 = if (app_root_opt != null) "app" else if (std.mem.eql(u8, web_app, "gallery")) "gallery" else "hello";
     const root_src: []const u8 = if (std.mem.eql(u8, app_name, "gallery")) "src/gallery_main.zig" else "src/main.zig";
 
     // --- app as a static library (Zig cannot link an exe for emscripten) ---
@@ -760,15 +800,28 @@ fn addWasmWeb(
         .name = app_name,
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path(root_src),
+            .root_source_file = if (app_root_opt) |ar| b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{ar})) else b.path(root_src),
             .target = target,
             .optimize = optimize,
             .link_libc = false, // emcc links musl
             .link_libcpp = false, // pure Zig app; emcc links libc++ at the final link
         }),
     });
-    app.root_module.addImport("sdl_c", translate_sdl.createModule());
-    app.root_module.addImport("kx_c", translate_kx.createModule());
+    if (app_root_opt != null) {
+        const klaxon_mod = b.createModule(.{
+            .root_source_file = b.path("src/klaxon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+            .link_libcpp = false,
+        });
+        klaxon_mod.addImport("sdl_c", translate_sdl.createModule());
+        klaxon_mod.addImport("kx_c", translate_kx.createModule());
+        app.root_module.addImport("klaxon", klaxon_mod);
+    } else {
+        app.root_module.addImport("sdl_c", translate_sdl.createModule());
+        app.root_module.addImport("kx_c", translate_kx.createModule());
+    }
     b.installArtifact(app);
     b.installArtifact(kx_skia);
 
@@ -821,7 +874,7 @@ fn addWasmWeb(
         // _malloc/_free are wasm exports callable as JS globals
         // (kx_a11y.js uses _malloc/_free for the scratch buffer); they are
         // not runtime methods — listing them there just warns.
-        "-sEXPORTED_FUNCTIONS=_main,_kx_a11y_dump_tree,_kx_a11y_free_string,_kx_a11y_key,_kx_a11y_root_node,_kx_a11y_text,_malloc,_free",
+        "-sEXPORTED_FUNCTIONS=_main,_kx_a11y_dump_tree,_kx_a11y_free_string,_kx_a11y_key,_kx_a11y_root_node,_kx_a11y_text,_kx_a11y_focus_node,_kx_a11y_activate_node,_malloc,_free",
         "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS",
         opt_flag,
     }) catch unreachable;
@@ -851,13 +904,14 @@ fn addAndroidLib(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tag: []const u8,
+    app_root_opt: ?[]const u8,
 ) void {
     _ = tag; // deps tag for the CMake/NDK link (not used by Zig here)
 
     // -Dandroid-app=gallery|hello (default: gallery)
     const app_opt = b.option([]const u8, "android-app", "Android app to build: gallery|hello") orelse "gallery";
     const is_hello = std.mem.eql(u8, app_opt, "hello");
-    const app_name: []const u8 = if (is_hello) "hello" else "gallery";
+    const app_name: []const u8 = if (app_root_opt != null) "app" else if (is_hello) "hello" else "gallery";
     const root_src: []const u8 = if (is_hello) "src/main.zig" else "src/gallery_android.zig";
 
     // C bindings: SDL3 (sdl_c) + kx_skia (kx_c) via zig translate-c.
@@ -880,20 +934,78 @@ fn addAndroidLib(
         .optimize = optimize,
     });
 
+    const android_root_src = if (app_root_opt != null) blk: {
+        const wf = b.addWriteFiles();
+        break :blk wf.add("android_app_root.zig",
+            \\const std = @import("std");
+            \\const builtin = @import("builtin");
+            \\const klaxon = @import("klaxon");
+            \\const app_main = @import("app_main");
+            \\pub const std_options_debug_io: std.Io = klaxon.ios_io.io;
+            \\pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;
+            \\pub const std_options_elf_debug_info_search_paths: ?fn (exe_path: []const u8) switch (builtin.object_format) {
+            \\    .elf => std.debug.ElfFile.DebugInfoSearchPaths,
+            \\    else => void,
+            \\} = struct {
+            \\    fn search(_: []const u8) std.debug.ElfFile.DebugInfoSearchPaths {
+            \\        return .none;
+            \\    }
+            \\}.search;
+            \\export fn SDL_main(argc: c_int, argv: [*:null]?[*:0]u8) callconv(.c) c_int {
+            \\    _ = argc;
+            \\    _ = argv;
+            \\    const init: std.process.Init.Minimal = undefined;
+            \\    app_main.main(init) catch return 1;
+            \\    return 0;
+            \\}
+            \\pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
+            \\    var buf: [1024]u8 = undefined;
+            \\    const len = @min(msg.len, buf.len - 1);
+            \\    @memcpy(buf[0..len], msg[0..len]);
+            \\    buf[len] = 0;
+            \\    klaxon.sdl.c.SDL_Log("PANIC: %s", buf[0..len :0].ptr);
+            \\    std.c.abort();
+            \\}
+            \\
+        );
+    } else b.path(root_src);
+
     // App as a static library (Zig provides bionic libc for android targets).
     const app = b.addLibrary(.{
         .name = app_name,
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path(root_src),
+            .root_source_file = android_root_src,
             .target = target,
             .optimize = optimize,
             .link_libc = true, // Zig provides Android bionic libc
             .pic = true, // required: linked into libmain.so (shared)
         }),
     });
-    app.root_module.addImport("sdl_c", translate_sdl.createModule());
-    app.root_module.addImport("kx_c", translate_kx.createModule());
+    if (app_root_opt) |ar| {
+        const klaxon_mod = b.createModule(.{
+            .root_source_file = b.path("src/klaxon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+        });
+        klaxon_mod.addImport("sdl_c", translate_sdl.createModule());
+        klaxon_mod.addImport("kx_c", translate_kx.createModule());
+        const app_main_mod = b.createModule(.{
+            .root_source_file = b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{ar})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+        });
+        app_main_mod.addImport("klaxon", klaxon_mod);
+        app.root_module.addImport("klaxon", klaxon_mod);
+        app.root_module.addImport("app_main", app_main_mod);
+    } else {
+        app.root_module.addImport("sdl_c", translate_sdl.createModule());
+        app.root_module.addImport("kx_c", translate_kx.createModule());
+    }
     b.installArtifact(app);
 
     // Step: android-lib → zig-out/lib/lib<app>.a (CMake/NDK links the shim + Skia + SDL).
@@ -920,6 +1032,7 @@ fn addIosApp(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tag: []const u8,
+    app_root_opt: ?[]const u8,
 ) void {
     // Guard: ReleaseSmall only (Zig 0.17 std.Io.Threaded iOS bug in Debug/ReleaseSafe).
     // Note: use .small (not .ReleaseSmall) — deprecated enum aliases only work
@@ -955,19 +1068,55 @@ fn addIosApp(
     // App as a static library. src/main_ios.zig est la racine du graphe iOS
     // (callbacks SDL + start(), avec l'override std_options_debug_io —
     // gallery_main.zig n'était qu'un placeholder).
+    const ios_root_src = if (app_root_opt != null) blk: {
+        const wf = b.addWriteFiles();
+        break :blk wf.add("ios_app_root.zig",
+            \\const std = @import("std");
+            \\const klaxon = @import("klaxon");
+            \\const app_main = @import("app_main");
+            \\pub const std_options_debug_io: std.Io = klaxon.ios_io.io;
+            \\pub fn main(init: std.process.Init.Minimal) !void {
+            \\    return app_main.main(init);
+            \\}
+            \\
+        );
+    } else b.path("src/main_ios.zig");
+
     const app = b.addLibrary(.{
-        .name = "gallery",
+        .name = if (app_root_opt != null) "app" else "gallery",
         .linkage = .static,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main_ios.zig"),
+            .root_source_file = ios_root_src,
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
         }),
     });
-    app.root_module.addImport("sdl_c", translate_sdl.createModule());
-    app.root_module.addImport("kx_c", translate_kx.createModule());
+    if (app_root_opt) |ar| {
+        const klaxon_mod = b.createModule(.{
+            .root_source_file = b.path("src/klaxon.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        klaxon_mod.addImport("sdl_c", translate_sdl.createModule());
+        klaxon_mod.addImport("kx_c", translate_kx.createModule());
+        const app_main_mod = b.createModule(.{
+            .root_source_file = b.graph.cwdRelativePath(b.fmt("{s}/src/main.zig", .{ar})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        app_main_mod.addImport("klaxon", klaxon_mod);
+        app.root_module.addImport("klaxon", klaxon_mod);
+        app.root_module.addImport("app_main", app_main_mod);
+    } else {
+        app.root_module.addImport("sdl_c", translate_sdl.createModule());
+        app.root_module.addImport("kx_c", translate_kx.createModule());
+    }
     // Backend selection: -Dios-backend=auto (default) | graphite-metal | raster
     const ios_backend = b.option([]const u8, "ios-backend", "iOS rendering backend (default: auto)") orelse "auto";
     // App selection: -Dios-app=gallery (default) | hello
@@ -987,8 +1136,8 @@ fn addIosApp(
         "kx_skia/src/kx_skia_ios.mm",
         "kx_skia/src/kx_a11y_ios.mm",
         "kx_skia/src/kx_ios_sdl_main.c",
-    };
-    var shim_objs: [4][]const u8 = undefined;
+    } ++ mcu_sources;
+    var shim_objs: [shim_sources.len][]const u8 = undefined;
     var last_compile_step: *std.Build.Step = &mkdir_shim.step;
     const version_min_flag = if (is_sim) "-mios-simulator-version-min=15.0" else "-mios-version-min=15.0";
     for (shim_sources, 0..) |src, i| {
@@ -1021,8 +1170,9 @@ fn addIosApp(
                 "-DSK_GRAPHITE",                    "-DSK_METAL",       "-DNDEBUG",
                 // libicu.a is built with symbol renaming off (Skia).
                 "-DU_DISABLE_RENAMING=1",           "-I",               "kx_skia/include",
-                "-I",                               "deps/skia",        "-I",
-                "deps/skia/include",                "-I",               "deps/skia/third_party/externals/icu/source/common",
+                "-I",                               "deps/mcu",         "-I",
+                "deps/skia",                        "-I",               "deps/skia/include",
+                "-I",                               "deps/skia/third_party/externals/icu/source/common",
                 "-I",                               "deps/SDL/include", "-c",
                 src,                                "-o",               obj_path,
             };
@@ -1030,10 +1180,10 @@ fn addIosApp(
         compile.step.dependOn(last_compile_step);
         last_compile_step = &compile.step;
     }
-    const archive = b.addSystemCommand(&.{
-        "xcrun",      "ar",         "rcs",        "zig-out/lib/libkx_skia_ios.a",
-        shim_objs[0], shim_objs[1], shim_objs[2], shim_objs[3],
-    });
+    var archive_argv: std.ArrayList([]const u8) = .empty;
+    archive_argv.appendSlice(b.allocator, &.{ "xcrun", "ar", "rcs", "zig-out/lib/libkx_skia_ios.a" }) catch unreachable;
+    archive_argv.appendSlice(b.allocator, &shim_objs) catch unreachable;
+    const archive = b.addSystemCommand(archive_argv.items);
     archive.step.dependOn(last_compile_step);
 
     // Final link: xcrun clang++ compiles the SDL_main TU + links the static
@@ -1058,7 +1208,7 @@ fn addIosApp(
     } else {
         argv.append(b.allocator, "-mios-version-min=15.0") catch unreachable;
     }
-    argv.append(b.allocator, "zig-out/lib/libgallery.a") catch unreachable;
+    argv.append(b.allocator, if (app_root_opt != null) "zig-out/lib/libapp.a" else "zig-out/lib/libgallery.a") catch unreachable;
     // kx_skia shim .o (compiled by xcrun clang++ from kx_skia_common.cpp + kx_skia_ios.mm)
     argv.append(b.allocator, "zig-out/lib/libkx_skia_ios.a") catch unreachable;
     // SDL3 static

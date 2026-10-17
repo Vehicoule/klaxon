@@ -89,6 +89,34 @@ pub const Edit = struct {
     /// Horizontal scroll offset for single-line text fields when the text
     /// exceeds the visible clip width (keeps the caret inside the viewport).
     scroll_x: f32 = 0,
+    /// Optional prefix-measure hook the owning widget wires to its
+    /// incrementally-shaped paint segmentation (text_field's segs). Called
+    /// by `caretX` on the single-line fast path instead of a whole-buffer
+    /// measure or a paragraph build — O(cached segs), not O(text) shaping.
+    /// Signature: (edit, byte_off, size) -> advance of text[0..byte_off].
+    measure_prefix: ?*const fn (e: *Edit, byte_off: usize, size: f32) f32 = null,
+    /// The strong-RTL memo (content-hash keyed): a buffer with any strong
+    /// RTL codepoint or bidi control routes caret geometry through the
+    /// paragraph (mirrored runs); a clean buffer paints L→R in logical
+    /// order so prefix advances answer the same question far cheaper.
+    bidi_key: u64 = 0,
+    bidi_key_set: bool = false,
+    bidi_rtl: bool = false,
+
+    /// Whether the buffer holds any strong-RTL codepoint or bidi control
+    /// (Unicode Bidi_Class R/AL blocks + the isolates/controls that can
+    /// reorder). Memoized on the content hash — the scan is a UTF-8 decode
+    /// + range check, ~2 orders cheaper than a paragraph build.
+    pub fn hasStrongRtl(e: *Edit) bool {
+        const str = e.text();
+        const key = std.hash.Wyhash.hash(0, str);
+        if (!e.bidi_key_set or e.bidi_key != key) {
+            e.bidi_rtl = scanStrongRtl(str);
+            e.bidi_key = key;
+            e.bidi_key_set = true;
+        }
+        return e.bidi_rtl;
+    }
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) Edit {
         return .{
@@ -613,6 +641,17 @@ pub const Edit = struct {
     /// null when the paragraph can't build; callers fall back to the
     /// prefix-width measure.
     pub fn caretX(e: *Edit, byte_off: usize, size: f32) ?f32 {
+        // Fast path (single-line, no strong-RTL content): the run paints
+        // L→R in logical order — every seg draws its glyphs left-to-right
+        // at its own offset — so the caret x is exactly the prefix advance.
+        // The widget's seg-memoized measure makes this O(cached segs);
+        // without the hook a one-shot measure still skips the paragraph.
+        if (e.wrap_width == 0 and !e.hasStrongRtl()) {
+            const str = e.text();
+            const off = @min(byte_off, str.len);
+            if (e.measure_prefix) |mp| return mp(e, off, size);
+            return ui.paint.measureTextLen(str[0..off], size, e.hit_weight >= 600).width;
+        }
         return (e.caretRect(byte_off, size) orelse return null)[0];
     }
 
@@ -743,6 +782,33 @@ pub fn utf16ToByteIndex(str: []const u8, pos16: usize) usize {
 /// chars count 2 units. A mid-codepoint offset lands on the position
 /// after the whole codepoint; caret offsets are grapheme boundaries in
 /// practice, so that case is a clamp, not a normal path.
+/// Conservative strong-RTL / bidi-control scan: true when the text holds
+/// any codepoint whose presence can reorder the painted glyph sequence
+/// (Unicode Bidi_Class R/AL blocks + the isolates and marks that steer
+/// the bidi algorithm). Over-flags deliberately (a few LTR-neutral chars
+/// in RTL blocks count) — a false positive just takes the paragraph path.
+fn scanStrongRtl(str: []const u8) bool {
+    var i: usize = 0;
+    while (i < str.len) {
+        const n = std.unicode.utf8ByteSequenceLength(str[i]) catch return true;
+        if (i + n > str.len) return true; // truncated seq — play safe
+        const cp = std.unicode.utf8Decode(str[i..][0..n]) catch return true;
+        if (isRtlCp(cp)) return true;
+        i += n;
+    }
+    return false;
+}
+
+fn isRtlCp(cp: u21) bool {
+    return (cp >= 0x0590 and cp <= 0x08FF) or // Hebrew/Arabic/Syriac/Thaana/N'Ko/Samaritan/Mandaic blocks
+        (cp >= 0xFB1D and cp <= 0xFDFF) or // Hebrew + Arabic presentation forms A
+        (cp >= 0xFE70 and cp <= 0xFEFF) or // Arabic presentation forms B
+        (cp >= 0x10800 and cp <= 0x10FFF) or // astral RTL scripts
+        (cp >= 0x1E800 and cp <= 0x1EFFF) or // Mende/Adlam/…
+        cp == 0x200F or cp == 0x202B or cp == 0x202E or
+        (cp >= 0x2066 and cp <= 0x2069); // bidi isolates
+}
+
 fn byteToUtf16Index(str: []const u8, off: usize) i32 {
     var u16n: usize = 0;
     var i: usize = 0;

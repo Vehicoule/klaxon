@@ -203,6 +203,8 @@ test "widgets" {
     std.testing.refAllDecls(@import("registry.zig"));
     std.testing.refAllDecls(@import("devtools.zig"));
     std.testing.refAllDecls(@import("inspector.zig"));
+    std.testing.refAllDecls(@import("platform/mod.zig"));
+    std.testing.refAllDecls(@import("c_abi.zig"));
 }
 
 test "gallery" {

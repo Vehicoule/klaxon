@@ -931,7 +931,7 @@ test "toolbar: i18n — the group + defaulted FAB labels localize and re-resolve
     try i18n.setLocale("es");
     i18n_mod.setCurrent(i18n);
     defer i18n_mod.setCurrent(null);
-    const n = try toolbar(a, &.{.{ .icon = .search } }, .{ .fab_icon = .check });
+    const n = try toolbar(a, &.{.{ .icon = .search }}, .{ .fab_icon = .check });
     defer n.deinit();
     const sem = n.semantics.?;
     try std.testing.expectEqualStrings("Barra de herramientas", sem.label);

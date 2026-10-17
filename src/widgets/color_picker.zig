@@ -798,13 +798,13 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.focus = .none;
                 s.hex_edit.dragging = false;
                 s.hex_edit.drag_word = false;
-                resetHex(s, hsvToColor(s.h, s.s, s.v));
+                resetHex(s, hsvToColorAlpha(s.h, s.s, s.v, s.a));
                 n.markDirty();
             } else if (chanIndex(s.focus)) |ci| {
                 s.focus = .none;
                 s.chan_edits[ci].dragging = false;
                 s.chan_edits[ci].drag_word = false;
-                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
+                resetChan(s, hsvToColorAlpha(s.h, s.s, s.v, s.a), ci);
                 n.markDirty();
             }
             return false;
@@ -862,7 +862,7 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.focus = .none;
                 s.hex_edit.dragging = false;
                 s.hex_edit.drag_word = false;
-                resetHex(s, hsvToColor(s.h, s.s, s.v));
+                resetHex(s, hsvToColorAlpha(s.h, s.s, s.v, s.a));
                 n.markDirty();
                 return true;
             }
@@ -870,7 +870,7 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.focus = .none;
                 s.chan_edits[ci].dragging = false;
                 s.chan_edits[ci].drag_word = false;
-                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
+                resetChan(s, hsvToColorAlpha(s.h, s.s, s.v, s.a), ci);
                 n.markDirty();
                 return true;
             }
@@ -975,7 +975,7 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
                 return true;
             },
             .escape, .back => {
-                resetChan(s, hsvToColor(s.h, s.s, s.v), ci);
+                resetChan(s, hsvToColorAlpha(s.h, s.s, s.v, s.a), ci);
                 s.focus = .none;
                 n.markDirty();
                 return true;
@@ -990,20 +990,22 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
     if (s.focus == .hex) {
         switch (ev.key) {
             .enter => {
-                if (hexToColor(s.hex_edit.text())) |c| {
+                if (hexToColor(s.hex_edit.text())) |parsed| {
+                    const cur_alpha: Color = @intFromFloat(@round(std.math.clamp(s.a, 0, 1) * 255));
+                    const c: Color = (parsed & 0xFFFFFF00) | cur_alpha;
                     applyExternalColor(s, n, c);
                     if (s.sig) |sig| sig.set(c);
                     if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
                 } else {
                     // Invalid: revert.
-                    resetHex(s, hsvToColor(s.h, s.s, s.v));
+                    resetHex(s, hsvToColorAlpha(s.h, s.s, s.v, s.a));
                 }
                 s.focus = .none;
                 n.markDirty();
                 return true;
             },
             .escape, .back => {
-                resetHex(s, hsvToColor(s.h, s.s, s.v));
+                resetHex(s, hsvToColorAlpha(s.h, s.s, s.v, s.a));
                 s.focus = .none;
                 n.markDirty();
                 return true;
@@ -1096,6 +1098,7 @@ fn cpLocaleCb(userdata: ?*anyopaque) void {
 
 const cp_vtable = ui.node.VTable{
     .measure = cpMeasure,
+    .measure_pure = true,
     .layout = cpLayout,
     .paint = cpPaint,
     .on_pointer = cpPointer,

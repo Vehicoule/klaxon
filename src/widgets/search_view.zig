@@ -388,11 +388,21 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_w = b.w - textStart(t) - right;
     const clip_x = mirrorX(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, header_h);
+    if (!focused) s.edit.clearComposition();
     s.edit.ensureTicker(); // the caret blink (a focused view stays awake)
     if (hasText(s) or s.edit.comp.items.len > 0) {
         const str = s.text();
         const m = ui.paint.measureText(str, style.size, false);
-        const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
+        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        var comp_m = ui.paint.TextMetrics{};
+        if (s.edit.comp.items.len > 0) {
+            const comp = s.composition();
+            comp_m = ui.paint.measureText(comp, style.size, false);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        }
+        s.edit.updateScroll(caret_rel, caret_w, m.width + comp_m.width, clip_w);
+        const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl) - s.edit.scroll_x;
         // Selection highlight behind the glyphs (TextSelectionColors —
         // primary @ 0.4 over the run's x range for [caret, anchor)).
         const sel = s.edit.selRange();
@@ -410,21 +420,19 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         ui.paint.text(ctx, str, tx, ty + m.ascent, style.size, false, header_ink);
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
-        var caret_x = tx + (s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width);
+        const caret_x = tx + caret_rel;
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
             const comp = s.composition();
-            const comp_m = ui.paint.measureText(comp, style.size, false);
             ui.paint.text(ctx, comp, tx + m.width, ty + m.ascent, style.size, false, header_ink);
             ui.paint.fillRect(ctx, tx + m.width, ty + m.ascent + 1, comp_m.width, 1, header_ink);
-            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_x = tx + m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
         }
         if (focused and s.edit.caret_on) {
             ui.paint.fillRect(ctx, caret_x, ty, caret_w, m.height, header_primary);
         }
     } else {
+        s.edit.scroll_x = 0;
         if (s.placeholder.len > 0) {
             const m = ui.paint.measureText(s.placeholder, style.size, false);
             const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
@@ -503,7 +511,7 @@ fn caretAt(n: *Node, s: *SearchViewState, x: f32, y: f32) usize {
     const style = s.opts.theme.type_scale.body_large;
     const m = ui.paint.measureText(str, style.size, false);
     const b = n.bounds;
-    const tx = mirrorX(b.x, b.w, b.x + textStart(s.opts.theme), m.width, ui.i18n.direction() == .rtl);
+    const tx = mirrorX(b.x, b.w, b.x + textStart(s.opts.theme), m.width, ui.i18n.direction() == .rtl) - s.edit.scroll_x;
     const ty = b.y + (header_h - style.line_height) / 2;
     return s.edit.caretAt(x - tx, y - ty, style.size);
 }
@@ -675,9 +683,11 @@ fn applyEdit(n: *Node, s: *SearchViewState) void {
 
 /// Clear the query (the clear button): keep the focus, fire on_changed.
 fn clearQuery(n: *Node, s: *SearchViewState) void {
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.caret = 0;
     s.edit.sel_anchor = 0;
+    s.edit.scroll_x = 0;
     setSentinel(&s.edit.buf);
     applyEdit(n, s);
 }
@@ -686,6 +696,7 @@ fn clearQuery(n: *Node, s: *SearchViewState) void {
 /// (M3's "insert" arrow — the field fills, the view stays open).
 fn fillQuery(n: *Node, s: *SearchViewState, i: usize) void {
     const label = s.items.items[i].label;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(label.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(label) catch @panic("klaxon: out of memory");
@@ -747,9 +758,7 @@ fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
             return true;
         },
         .escape => {
-            s.edit.comp.clearRetainingCapacity();
-            s.edit.comp_cursor = 0;
-            setSentinel(&s.edit.comp);
+            s.edit.clearComposition();
             closeSearchView(n, s); // M3: Escape dismisses the view
             return true;
         },
@@ -796,8 +805,11 @@ fn applyOpen(n: *Node, s: *SearchViewState, open: bool) void {
     s.clear_hovered = false;
     if (open) {
         input.requestFocus(n); // the query field takes the focus while open
-    } else if (input.isFocused(n)) {
-        input.requestFocus(null); // a dismissed view drops the focus
+    } else {
+        s.edit.clearComposition();
+        if (input.isFocused(n)) {
+            input.requestFocus(null); // a dismissed view drops the focus
+        }
     }
     syncBackHandler(n, s);
     if (ui.anim.timeline()) |tl| {
@@ -882,6 +894,7 @@ fn svQuerySyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.query_sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
@@ -889,6 +902,10 @@ fn svQuerySyncCb(userdata: ?*anyopaque) void {
     s.edit.clampOffsets(); // the caret rides the new text's bounds
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
+}
+
+fn searchViewOnBlur(n: *Node) void {
+    stateOf(n).edit.clearComposition();
 }
 
 fn searchViewDeinit(n: *Node) void {
@@ -955,11 +972,13 @@ fn searchViewPaintBounds(n: *Node) Rect {
 
 const search_view_vtable = ui.node.VTable{
     .measure = searchViewMeasure,
+    .measure_pure = true,
     .layout = searchViewLayout,
     .paint = searchViewPaint,
     .deinit = searchViewDeinit,
     .on_pointer = searchViewOnPointer,
     .on_key = searchViewOnKey,
+    .on_blur = searchViewOnBlur,
     .wants_text_input = true,
     .paint_bounds = searchViewPaintBounds,
 };
@@ -1083,6 +1102,7 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");

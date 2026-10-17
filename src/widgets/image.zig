@@ -24,6 +24,7 @@ const ImageState = struct {
     src_h: i32,
     id: u64 = 0, // kx image handle, created lazily at first paint
     ctx: ?*kx.Ctx = null,
+    ctx_serial: u64 = 0,
 };
 
 fn imageMeasure(n: *Node, c: Constraints) Size {
@@ -36,15 +37,19 @@ fn imageLayout(n: *Node, bounds: Rect) void {
 }
 fn imagePaint(n: *Node, ctx: *kx.Ctx) void {
     const s: *ImageState = @ptrCast(@alignCast(n.state.?));
-    if (s.ctx != ctx) {
+    const cur_serial = ui.paint.ctxSerial(ctx);
+    if (s.ctx != ctx or s.ctx_serial != cur_serial) {
         // First paint or context switch: (re)upload on this ctx. Releasing the
-        // old handle touches the old ctx (alive per the lifetime rule above).
+        // old handle only touches the old ctx when it is still alive.
         if (s.id != 0) {
-            if (s.ctx) |old| ui.paint.imageDestroy(old, s.id);
+            if (s.ctx != null and s.ctx_serial != 0 and ui.paint.ctxSerialAlive(s.ctx_serial)) {
+                ui.paint.imageDestroy(s.ctx.?, s.id);
+            }
             s.id = 0;
         }
         s.id = ui.paint.imageCreate(ctx, s.pixels.ptr, s.src_w, s.src_h);
         s.ctx = ctx;
+        s.ctx_serial = cur_serial;
     }
     if (s.id != 0) {
         ui.paint.imageDraw(ctx, s.id, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
@@ -53,12 +58,14 @@ fn imagePaint(n: *Node, ctx: *kx.Ctx) void {
 fn imageDeinit(n: *Node) void {
     const s: *ImageState = @ptrCast(@alignCast(n.state.?));
     if (s.id != 0) {
-        if (s.ctx) |ctx| ui.paint.imageDestroy(ctx, s.id);
+        if (s.ctx != null and s.ctx_serial != 0 and ui.paint.ctxSerialAlive(s.ctx_serial)) {
+            ui.paint.imageDestroy(s.ctx.?, s.id);
+        }
     }
     n.allocator.free(s.pixels);
     n.allocator.destroy(s);
 }
-const image_vtable = ui.node.VTable{ .measure = imageMeasure, .layout = imageLayout, .paint = imagePaint, .deinit = imageDeinit };
+const image_vtable = ui.node.VTable{ .measure = imageMeasure, .measure_pure = true, .layout = imageLayout, .paint = imagePaint, .deinit = imageDeinit };
 
 /// Image from raw RGBA pixels (memory order R,G,B,A — matches kx readback).
 /// Copies the pixels. Natural size = pixel size; stretches to the bounds.

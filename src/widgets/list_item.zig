@@ -115,7 +115,11 @@ fn isClickable(s: *ListItemState) bool {
 /// neither → one. `opts.lines` forces the container class when set.
 const ItemType = enum { one, two, three };
 fn itemType(s: *ListItemState) ItemType {
-    if (s.opts.lines) |l| return switch (l) { .one => .one, .two => .two, .three => .three };
+    if (s.opts.lines) |l| return switch (l) {
+        .one => .one,
+        .two => .two,
+        .three => .three,
+    };
     const oh = hasOverline(s);
     const sh = hasSupporting(s);
     if (oh and sh) return .three;
@@ -520,7 +524,10 @@ test "list_item: the item type derives from the content; three-line top-aligns a
     var found = false;
     var x: i32 = 16;
     while (x < 240) : (x += 1) {
-        if (f.pixelAt(x, ink_y) == t.colors.on_surface_variant) { found = true; break; }
+        if (f.pixelAt(x, ink_y) == t.colors.on_surface_variant) {
+            found = true;
+            break;
+        }
     }
     try std.testing.expect(found);
 }

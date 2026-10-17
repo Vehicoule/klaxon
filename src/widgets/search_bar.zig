@@ -251,11 +251,21 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_x = mx(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, container_h);
     const style = t.type_scale.body_large;
+    if (!focused) s.edit.clearComposition();
     s.edit.ensureTicker(); // the caret blink (focused bars stay awake)
     if (hasText(s) or s.edit.comp.items.len > 0) {
         const str = s.text();
         const m = ui.paint.measureText(str, style.size, false);
-        const tx = mx(b.x, b.w, tr.x, m.width, rtl);
+        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        var comp_m = ui.paint.TextMetrics{};
+        if (s.edit.comp.items.len > 0) {
+            const comp = s.composition();
+            comp_m = ui.paint.measureText(comp, style.size, false);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        }
+        s.edit.updateScroll(caret_rel, caret_w, m.width + comp_m.width, clip_w);
+        const tx = mx(b.x, b.w, tr.x, m.width, rtl) - s.edit.scroll_x;
         const baseline = tr.y + m.ascent;
         // Selection highlight behind the glyphs (TextSelectionColors —
         // primary @ 0.4 over the run's x range for [caret, anchor)).
@@ -274,21 +284,19 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         ui.paint.text(ctx, str, tx, baseline, style.size, false, content);
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
-        var caret_x = tx + (s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width);
+        const caret_x = tx + caret_rel;
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
             const comp = s.composition();
-            const comp_m = ui.paint.measureText(comp, style.size, false);
             ui.paint.text(ctx, comp, tx + m.width, baseline, style.size, false, content);
             ui.paint.fillRect(ctx, tx + m.width, baseline + 1, comp_m.width, 1, content);
-            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_x = tx + m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
         }
         if (focused and s.edit.caret_on) {
             ui.paint.fillRect(ctx, caret_x, tr.y, caret_w, m.height, caret);
         }
     } else {
+        s.edit.scroll_x = 0;
         if (s.placeholder.len > 0) {
             const m = ui.paint.measureText(s.placeholder, style.size, false);
             const tx = mx(b.x, b.w, tr.x, m.width, rtl);
@@ -311,7 +319,7 @@ fn caretAt(n: *Node, s: *SearchBarState, x: f32, y: f32) usize {
     const tr = textRect(n);
     const m = ui.paint.measureText(str, s.opts.theme.type_scale.body_large.size, false);
     const b = n.bounds;
-    const tx = if (ui.i18n.direction() == .rtl) b.x + b.w - (tr.x - b.x) - m.width else tr.x;
+    const tx = (if (ui.i18n.direction() == .rtl) b.x + b.w - (tr.x - b.x) - m.width else tr.x) - s.edit.scroll_x;
     return s.edit.caretAt(x - tx, y - tr.y, s.opts.theme.type_scale.body_large.size);
 }
 
@@ -418,9 +426,11 @@ fn applyEdit(n: *Node, s: *SearchBarState) void {
 
 /// Clear the text (the clear button): keep the focus, fire on_changed.
 fn clearText(n: *Node, s: *SearchBarState) void {
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.caret = 0;
     s.edit.sel_anchor = 0;
+    s.edit.scroll_x = 0;
     setSentinel(&s.edit.buf);
     applyEdit(n, s);
 }
@@ -442,9 +452,7 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
             return true;
         },
         .escape => {
-            s.edit.comp.clearRetainingCapacity();
-            s.edit.comp_cursor = 0;
-            setSentinel(&s.edit.comp);
+            s.edit.clearComposition();
             input.requestFocus(null);
             n.markDirty();
             return true;
@@ -463,6 +471,7 @@ fn searchBarSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
@@ -471,6 +480,10 @@ fn searchBarSyncCb(userdata: ?*anyopaque) void {
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
+}
+
+fn searchBarOnBlur(n: *Node) void {
+    stateOf(n).edit.clearComposition();
 }
 
 fn searchBarDeinit(n: *Node) void {
@@ -484,11 +497,13 @@ fn searchBarDeinit(n: *Node) void {
 
 const search_bar_vtable = ui.node.VTable{
     .measure = searchBarMeasure,
+    .measure_pure = true,
     .layout = searchBarLayout,
     .paint = searchBarPaint,
     .deinit = searchBarDeinit,
     .on_pointer = searchBarOnPointer,
     .on_key = searchBarOnKey,
+    .on_blur = searchBarOnBlur,
     .wants_text_input = true,
 };
 
@@ -560,6 +575,7 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");

@@ -379,7 +379,7 @@ fn paddingDirLayout(n: *Node, bounds: Rect) void {
 fn paddingDirDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(PaddingDirState, n));
 }
-const padding_dir_vtable = ui.node.VTable{ .measure = paddingDirMeasure, .layout = paddingDirLayout, .paint = noopPaint, .deinit = paddingDirDeinit, .auto_retain = true };
+const padding_dir_vtable = ui.node.VTable{ .measure = paddingDirMeasure, .layout = paddingDirLayout, .paint = noopPaint, .deinit = paddingDirDeinit, .auto_retain = true, .measure_pure = true };
 
 /// Padding with directional insets: start/end resolve against the current
 /// text direction (start = left in LTR, right in RTL). Resolved at every
@@ -422,7 +422,7 @@ fn alignLayout(n: *Node, bounds: Rect) void {
 fn alignDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(AlignState, n));
 }
-const align_vtable = ui.node.VTable{ .measure = alignMeasure, .layout = alignLayout, .paint = noopPaint, .deinit = alignDeinit, .auto_retain = true };
+const align_vtable = ui.node.VTable{ .measure = alignMeasure, .layout = alignLayout, .paint = noopPaint, .deinit = alignDeinit, .auto_retain = true, .measure_pure = true };
 
 /// Align (named alignTo — `align` is a Zig keyword).
 pub fn alignTo(allocator: std.mem.Allocator, opts: AlignOptions) !*Node {
@@ -476,7 +476,7 @@ fn constrainedBoxLayout(n: *Node, bounds: Rect) void {
 fn constrainedBoxDeinit(n: *Node) void {
     n.allocator.destroy(stateOf(ConstrainedBoxState, n));
 }
-const constrained_box_vtable = ui.node.VTable{ .measure = constrainedBoxMeasure, .layout = constrainedBoxLayout, .paint = noopPaint, .deinit = constrainedBoxDeinit, .auto_retain = true };
+const constrained_box_vtable = ui.node.VTable{ .measure = constrainedBoxMeasure, .layout = constrainedBoxLayout, .paint = noopPaint, .deinit = constrainedBoxDeinit, .auto_retain = true, .measure_pure = true };
 
 pub fn constrainedBox(allocator: std.mem.Allocator, opts: ConstrainedBoxOptions) !*Node {
     const node = try Node.create(allocator, &constrained_box_vtable);
@@ -499,7 +499,7 @@ fn expandedLayout(n: *Node, bounds: Rect) void {
     if (n.children.items.len == 0) return;
     n.children.items[0].layout(bounds); // fill semantics
 }
-const expanded_vtable = ui.node.VTable{ .measure = expandedMeasure, .layout = expandedLayout, .paint = noopPaint, .auto_retain = true };
+const expanded_vtable = ui.node.VTable{ .measure = expandedMeasure, .layout = expandedLayout, .paint = noopPaint, .auto_retain = true, .measure_pure = true };
 
 /// Expanded — the child takes a share (weight) of the flex container's
 /// REMAINING main-axis space (after non-flex children, gaps and padding).

@@ -402,9 +402,12 @@ fn fieldFromValue(comptime FT: type, def: FT, v: Value, slot_builder: ?SlotBuild
             // structs start from the field default when there is one
             if (def) |d| return try fieldFromValue(o.child, d, v, slot_builder, slot_userdata);
             if (comptime @typeInfo(o.child) == .@"struct") {
-                var fresh: o.child = .{};
-                try applyFields(o.child, &fresh, v, slot_builder, slot_userdata);
-                return fresh;
+                if (comptime isDefaultInitStruct(o.child)) {
+                    var fresh: o.child = .{};
+                    try applyFields(o.child, &fresh, v, slot_builder, slot_userdata);
+                    return fresh;
+                }
+                return error.UnsupportedFieldType;
             }
             // scalars/pointers never read the default
             return try fieldFromValue(o.child, undefined, v, slot_builder, slot_userdata);
@@ -501,6 +504,15 @@ fn isByteSlice(comptime T: type) bool {
         .pointer => |p| p.size == .slice and p.child == u8,
         else => false,
     };
+}
+
+fn isDefaultInitStruct(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return false;
+    inline for (info.@"struct".field_types) |FT| {
+        if (@typeInfo(FT) == .pointer and @typeInfo(@typeInfo(FT).pointer.child) == .@"fn") return false;
+    }
+    return true;
 }
 
 fn buildSlot(v: Value, slot_builder: ?SlotBuilder, slot_userdata: ?*anyopaque) !*Node {

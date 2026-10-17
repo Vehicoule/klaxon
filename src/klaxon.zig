@@ -20,3 +20,6 @@ pub const ui = @import("ui.zig");
 pub const theme = @import("theme.zig");
 pub const widgets = @import("widgets.zig");
 pub const host = @import("host.zig");
+pub const platform = @import("platform.zig");
+pub const c_abi = @import("c_abi.zig");
+pub const ios_io = @import("ios_io.zig");
