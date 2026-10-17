@@ -2,9 +2,13 @@
 
 Every M3E widget in `src/widgets/` is ported verbatim from its upstream
 Compose material3 source (draw math, measure logic, state layers, tokens) —
-not approximated. The vendored Kotlin sources live in `.ref/material3/`
-(Apache-2.0, `androidx/androidx` androidx-main); re-fetch with
-`scripts/fetch-m3e-ref.sh`.
+not approximated. The vendored Kotlin sources live in `.ref/` (Apache-2.0,
+`androidx/androidx`), **pinned** to the commit in `.ref/LOCK`
+(androidx-main `677148640cfc`, 2026-10-17): `material3/` widgets+tokens,
+`material-ripple/` + `foundation-interaction/` + `animation/` for the
+indication/interaction machinery. Re-fetch with
+`scripts/fetch-m3e-ref.sh`; check upstream drift with
+`scripts/m3e-drift.sh`.
 
 Port contract per widget:
 

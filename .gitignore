@@ -35,3 +35,6 @@ conformance/results-*.json
 # bench container host-side SDK caches
 bench/container/sdk/
 bench/results/_logs/
+
+# m3e drift-check scratch output (scripts/m3e-drift.sh)
+.ref-next/
