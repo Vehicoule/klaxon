@@ -51,6 +51,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -137,6 +138,7 @@ const SegState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *SegState {
@@ -629,6 +631,7 @@ fn segDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = n } });
     if (s.multi_sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segMultiSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = segLocaleCb, .userdata = n });
     input.releaseNode(n);
     for (s.items.items) |*def| {
         if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&def.anim.chan)); // the cb points into this item
@@ -651,6 +654,27 @@ fn segHitBounds(n: *Node) Rect {
         .w = b.w,
         .h = h,
     };
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the segment children are app strings, verbatim).
+fn attachSegSemantics(n: *Node, multi: bool) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .group, // a radio group (single) / toggle group (multi)
+        .label = i18n_mod.tr("Segmented button"),
+        .focusable = true, // takes the keyboard focus (arrow nav)
+        .value = if (!multi and s.items.items.len > 0) s.items.items[s.selected].label else "",
+        .children = s.sem_children.items,
+        .child_bounds = segChildBounds,
+    });
+}
+
+fn segLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachSegSemantics(n, stateOf(n).multi);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const seg_vtable = ui.node.VTable{
@@ -713,14 +737,8 @@ fn segBuild(allocator: std.mem.Allocator, items: []const SegmentedItem, opts: Se
             .actions = ui.semantics.Actions.initOne(.activate),
         }) catch @panic("klaxon: out of memory");
     }
-    ui.semantics.attach(node, .{
-        .role = .group, // a radio group (single) / toggle group (multi)
-        .label = "Segmented button",
-        .focusable = true, // takes the keyboard focus (arrow nav)
-        .value = if (!multi and s.items.items.len > 0) s.items.items[s.selected].label else "",
-        .children = s.sem_children.items,
-        .child_bounds = segChildBounds,
-    }); // Phase 2c
+    attachSegSemantics(node, multi); // Phase 2c
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = segLocaleCb, .userdata = node });
     return node;
 }
 
@@ -1084,4 +1102,24 @@ test "golden: the selected icon-less segment paints the check glyph; the label s
     const week_w = ui.paint.measureText("Week", t.type_scale.label_large.size, true).width;
     const cx1 = 20 + (w - border_w) + (w - (icon_size + icon_gap + week_w)) / 2;
     try std.testing.expectEqual(@as(u32, 0), f.countColorApproxIn(.{ .x = cx1 + 2, .y = 32, .w = 8, .h = 16 }, t.colors.on_surface));
+}
+
+test "segmented_button: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Segmented button\": \"Botón segmentado\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try segmentedButton(a, &.{ .{ .label = "Day" }, .{ .label = "Week" } }, null, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Botón segmentado", n.semantics.?.label);
+    try i18n.setLocale("en");
+    const sem = n.semantics.?;
+    try std.testing.expectEqualStrings("Segmented button", sem.label);
+    // the segment children survive (app labels, verbatim)
+    try std.testing.expectEqual(@as(usize, 2), sem.children.len);
+    try std.testing.expectEqualStrings("Day", sem.children[0].label);
 }

@@ -24,6 +24,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
 const golden = @import("../golden.zig"); // tests
@@ -90,6 +91,7 @@ const AvatarState = struct {
     hovered: bool = false,
     /// Owned image pixels (for deinit).
     image_owned: ?[]u8 = null,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *AvatarState {
@@ -225,10 +227,25 @@ fn avDeinit(n: *Node) void {
     const s = stateOf(n);
     n.allocator.free(s.label);
     if (s.image_owned) |pixels| n.allocator.free(pixels);
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = avLocaleCb, .userdata = n });
     n.allocator.destroy(s);
 }
 
 // --- VTable ---
+
+/// An empty app label resolves the localized "Avatar" — the callback
+/// re-attaches in the new locale.
+fn avLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .image,
+        .label = if (s.label.len > 0) s.label else i18n_mod.tr("Avatar"),
+        .focusable = s.opts.tappable,
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
 
 const av_vtable = ui.node.VTable{
     .measure = avMeasure,
@@ -304,11 +321,8 @@ pub fn avatar(
 
     node.state = @ptrCast(s);
 
-    ui.semantics.attach(node, .{
-        .role = .image,
-        .label = if (s.label.len > 0) s.label else "Avatar",
-        .focusable = opts.tappable,
-    });
+    avLocaleCb(node); // the same path resolves the label in the active locale
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = avLocaleCb, .userdata = node });
 
     return node;
 }
@@ -430,4 +444,25 @@ test "golden: the image avatar draws the exact pixels stretched into the bounds"
 fn tapCounterCb(userdata: ?*anyopaque) void {
     const count: *u32 = @ptrCast(@alignCast(userdata.?));
     count.* += 1;
+}
+
+test "avatar: i18n — the default label localizes; an app label is verbatim" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Avatar\": \"Imagen de perfil\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    // no a11y_label + no initials → the localized fallback
+    const n = try avatar(a, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Imagen de perfil", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Avatar", n.semantics.?.label);
+    const n2 = try avatar(a, null, .{ .a11y_label = "Jane's photo" });
+    defer n2.deinit();
+    try i18n.setLocale("es");
+    try std.testing.expectEqualStrings("Jane's photo", n2.semantics.?.label);
 }

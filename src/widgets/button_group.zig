@@ -42,6 +42,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const button_w = @import("button.zig");
@@ -106,6 +107,7 @@ const GroupState = struct {
     /// physical finger motion (PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *GroupState {
@@ -398,6 +400,7 @@ fn groupDeinit(n: *Node) void {
     s.items.deinit();
     s.widths.deinit();
     s.sem_children.deinit();
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = groupLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -410,6 +413,26 @@ fn groupHitBounds(n: *Node) Rect {
     const b = n.bounds;
     const h = @max(b.h, s.opts.theme.platform.hit_target_min);
     return .{ .x = b.x, .y = b.y + (b.h - h) / 2, .w = b.w, .h = h };
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the item children are app strings, verbatim).
+fn attachGroupSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .group,
+        .label = i18n_mod.tr("Button group"),
+        .focusable = true, // takes the keyboard focus (arrow nav)
+        .children = s.sem_children.items,
+        .child_bounds = groupChildBounds,
+    });
+}
+
+fn groupLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachGroupSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const group_vtable = ui.node.VTable{
@@ -461,13 +484,8 @@ pub fn buttonGroup(allocator: std.mem.Allocator, items: []const ButtonGroupItem,
             .actions = ui.semantics.Actions.initOne(.activate),
         }) catch @panic("klaxon: out of memory");
     }
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = "Button group",
-        .focusable = true, // takes the keyboard focus (arrow nav)
-        .children = s.sem_children.items,
-        .child_bounds = groupChildBounds,
-    });
+    attachGroupSemantics(node);
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = groupLocaleCb, .userdata = node });
     return node;
 }
 
@@ -583,4 +601,22 @@ test "button_group: disabled item claims but does not fire" {
     router.dispatchPointer(n, .{ .phase = .up, .x = 20, .y = 28 });
     try std.testing.expectEqual(@as(u32, 0), c);
     try std.testing.expectEqual(@as(i32, -1), stateOf(n).pressed); // never pressed
+}
+
+test "button_group: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Button group\": \"Grupo de botones\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try buttonGroup(a, &.{ .{ .label = "Copy" }, .{ .label = "Paste" } }, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Grupo de botones", n.semantics.?.label);
+    try i18n.setLocale("en");
+    const sem = n.semantics.?;
+    try std.testing.expectEqualStrings("Button group", sem.label);
+    try std.testing.expectEqual(@as(usize, 2), sem.children.len);
 }

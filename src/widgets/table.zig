@@ -38,6 +38,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const scroll_mod = @import("../ui/scroll.zig");
 const scroll_util = @import("scroll_util.zig");
@@ -163,6 +164,7 @@ const TableState = struct {
     /// Column widths — computed in measure, reused by paint (was: a heap
     /// ArrayList rebuilt per frame). clearRetainingCapacity on mutation.
     col_ws: std.array_list.Managed(f32),
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *TableState {
@@ -583,10 +585,20 @@ fn tblDeinit(n: *Node) void {
     }
     s.rows.deinit();
     s.col_ws.deinit();
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tblLocaleCb, .userdata = n });
     n.allocator.destroy(s);
 }
 
 // --- VTable ---
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn tblLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    ui.semantics.attach(n, .{ .role = .group, .label = i18n_mod.tr("Data table"), .focusable = false });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
 
 const tbl_vtable = ui.node.VTable{
     .measure = tblMeasure,
@@ -659,11 +671,8 @@ pub fn table(
 
     node.state = @ptrCast(s);
 
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = "Data table",
-        .focusable = false,
-    });
+    tblLocaleCb(node); // the same path resolves the label in the active locale
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = tblLocaleCb, .userdata = node });
 
     return node;
 }
@@ -1018,4 +1027,20 @@ fn fillCellCb(userdata: ?*anyopaque, ctx: *kx.Ctx, args: CellPaintArgs) bool {
     c.count.* += 1;
     ui.paint.fillRect(ctx, args.rect.x, args.rect.y, args.rect.w, args.rect.h, 0xFF0000FF);
     return true;
+}
+
+test "table: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Data table\": \"Tabla de datos\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try table(a, &.{"A"}, &.{&.{"1"}}, null, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Tabla de datos", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Data table", n.semantics.?.label);
 }

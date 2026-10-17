@@ -188,7 +188,7 @@ fn weekdayShort(wd: usize) []const u8 {
     return weekday_names_short[wd];
 }
 const weekday_letters = [_][:0]const u8{ "S", "M", "T", "W", "T", "F", "S" };
-fn weekdayLetter(wd: usize) [:0]const u8 {
+pub fn weekdayLetter(wd: usize) [:0]const u8 {
     if (wd > 6) return "?";
     if (i18n_mod.current()) |i| {
         if (i.current) |loc| return loc.weekday_letter[wd];

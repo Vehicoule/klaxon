@@ -39,6 +39,7 @@
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
 
@@ -82,7 +83,7 @@ pub const AppBarOptions = struct {
     scrolled: bool = false, // content scrolled under the bar (initial state)
 };
 
-const AppBarState = struct { opts: AppBarOptions, scrolled: bool };
+const AppBarState = struct { opts: AppBarOptions, scrolled: bool, i18n: ?*i18n_mod.I18n = null };
 
 fn stateOf(n: *Node) *AppBarState {
     return @ptrCast(@alignCast(n.state.?));
@@ -226,7 +227,17 @@ fn appBarPaint(n: *Node, ctx: *kx.Ctx) void {
 }
 
 fn appBarDeinit(n: *Node) void {
+    i18n_mod.unsubscribeLocale(stateOf(n).i18n, .{ .fn_ptr = appBarLocaleCb, .userdata = n });
     n.allocator.destroy(stateOf(n));
+}
+
+/// The a11y label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn appBarLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    ui.semantics.attach(n, .{ .role = .group, .label = i18n_mod.tr("App bar") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const app_bar_vtable = ui.node.VTable{
@@ -252,7 +263,8 @@ pub fn appBar(allocator: std.mem.Allocator, opts: AppBarOptions) !*Node {
     if (opts.title) |title| node.add(title);
     if (opts.subtitle) |subtitle| node.add(subtitle);
     if (opts.actions) |actions| node.add(actions);
-    ui.semantics.attach(node, .{ .role = .group, .label = "App bar" }); // Phase 2c
+    appBarLocaleCb(node); // Phase 2c — the same path resolves the label
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = appBarLocaleCb, .userdata = node });
     return node;
 }
 
@@ -338,4 +350,20 @@ test "golden: scrolled app_bar paints surface_container" {
     const cs = theme_mod.light.colors;
     try std.testing.expect(f.countColor(cs.surface_container) > 128 * 64 - 800);
     try std.testing.expectEqual(@as(u32, 0), f.countColor(cs.surface));
+}
+
+test "app_bar: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"App bar\": \"Barra de aplicaciones\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try appBar(a, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Barra de aplicaciones", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("App bar", n.semantics.?.label);
 }

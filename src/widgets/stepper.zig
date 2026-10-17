@@ -20,6 +20,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
 
@@ -54,6 +55,7 @@ const StepperState = struct {
     sig: ?*ui.state.Signal(usize),
     steps: std.array_list.Managed(StepDef),
     hovered: i32 = -1,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const StepDef = struct {
@@ -206,10 +208,20 @@ fn stDeinit(n: *Node) void {
     const s = stateOf(n);
     for (s.steps.items) |*step| n.allocator.free(step.label);
     s.steps.deinit();
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = stLocaleCb, .userdata = n });
     n.allocator.destroy(s);
 }
 
 // --- VTable ---
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn stLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    ui.semantics.attach(n, .{ .role = .group, .label = i18n_mod.tr("Stepper"), .focusable = false });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
 
 const st_vtable = ui.node.VTable{
     .measure = stMeasure,
@@ -252,11 +264,8 @@ pub fn stepper(
 
     node.state = @ptrCast(s);
 
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = "Stepper",
-        .focusable = false,
-    });
+    stLocaleCb(node); // the same path resolves the label in the active locale
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = stLocaleCb, .userdata = node });
 
     return node;
 }
@@ -352,4 +361,20 @@ test "golden: the connector after a completed step is primary; before an upcomin
     const conn1: ui.node.Rect = .{ .x = conn1_x0 + 2, .y = cy - 0.5, .w = conn1_x1 - conn1_x0 - 4, .h = 1 };
     try std.testing.expect(f.countColorIn(conn1, t.colors.outline_variant) > 0);
     try std.testing.expectEqual(@as(u64, 0), f.countColorIn(conn1, t.colors.primary));
+}
+
+test "stepper: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Stepper\": \"Pasos\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try stepper(a, null, &.{ .{ .label = "A" }, .{ .label = "B" } }, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Pasos", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Stepper", n.semantics.?.label);
 }

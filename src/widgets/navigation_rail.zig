@@ -61,6 +61,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -135,6 +136,7 @@ const RailState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *RailState {
@@ -522,11 +524,33 @@ fn railOnKey(n: *Node, ev: input.KeyEvent) bool {
 fn railDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = railSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = railLocaleCb, .userdata = n });
     input.releaseNode(n);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
     s.sem_children.deinit();
     n.allocator.destroy(s);
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the item children are app strings, verbatim).
+fn attachRailSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .group, // a tab group (single choice)
+        .label = i18n_mod.tr("Navigation rail"),
+        .focusable = true, // takes the keyboard focus (arrow nav)
+        .value = if (s.items.items.len > 0) s.items.items[s.selected].label else "",
+        .children = s.sem_children.items,
+        .child_bounds = railChildBounds,
+    });
+}
+
+fn railLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachRailSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const rail_vtable = ui.node.VTable{
@@ -585,14 +609,8 @@ pub fn navigationRail(allocator: std.mem.Allocator, items: []const NavRailItem, 
             .actions = ui.semantics.Actions.initOne(.activate),
         }) catch @panic("klaxon: out of memory");
     }
-    ui.semantics.attach(node, .{
-        .role = .group, // a tab group (single choice)
-        .label = "Navigation rail",
-        .focusable = true, // takes the keyboard focus (arrow nav)
-        .value = if (s.items.items.len > 0) s.items.items[s.selected].label else "",
-        .children = s.sem_children.items,
-        .child_bounds = railChildBounds,
-    }); // Phase 2c
+    attachRailSemantics(node); // Phase 2c
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = railLocaleCb, .userdata = node });
     return node;
 }
 
@@ -901,4 +919,25 @@ test "golden: an overflowing rail clips its items to its bounds" {
     // the zone's left edge (off the centered 24dp icon) stays surface
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(@as(i32, @intFromFloat(ind_x)) + 2, @intFromFloat(ind_y + 16)));
     try std.testing.expect(f.countColorIn(.{ .x = r1.x + (r1.w - 24) / 2, .y = r1.y + v1.ind_y + ind_ivp, .w = 24, .h = 24 }, t.colors.on_surface_variant) > 0); // item 1's icon
+}
+
+test "navigation_rail: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Navigation rail\": \"Barra lateral\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const items = [_]NavRailItem{ .{ .label = "Home", .icon = .home }, .{ .label = "Music", .icon = .play } };
+    const n = try navigationRail(a, &items, null, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Barra lateral", n.semantics.?.label);
+    try i18n.setLocale("en");
+    const sem = n.semantics.?; // re-attached by the locale callback
+    try std.testing.expectEqualStrings("Navigation rail", sem.label);
+    // the virtual children survive the re-attach (app labels, verbatim)
+    try std.testing.expectEqual(@as(usize, 2), sem.children.len);
+    try std.testing.expectEqualStrings("Home", sem.children[0].label);
 }

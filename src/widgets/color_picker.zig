@@ -43,6 +43,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const text_edit = @import("text_edit.zig");
@@ -245,6 +246,7 @@ pub const CPState = struct {
     alpha_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     swatch_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     hex_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 pub fn stateOf(n: *Node) *CPState {
@@ -715,9 +717,29 @@ fn cpDeinit(n: *Node) void {
     const s = stateOf(n);
     // Unsubscribe from the signal before destroying the state.
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = cpSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = cpLocaleCb, .userdata = n });
     input.releaseNode(n);
     s.hex_edit.deinit();
     n.allocator.destroy(s);
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the value is the live hex text, verbatim).
+fn attachCpSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .group,
+        .label = i18n_mod.tr("Color picker"),
+        .value = s.hex_edit.text(),
+        .focusable = true,
+    });
+}
+
+fn cpLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachCpSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 // --- Focus change ---
@@ -773,12 +795,8 @@ pub fn colorPicker(
         sg.subscribe(.{ .callback = .{ .fn_ptr = cpSyncCb, .userdata = node } });
     }
 
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = "Color picker",
-        .value = s.hex_edit.text(),
-        .focusable = true,
-    });
+    attachCpSemantics(node);
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = cpLocaleCb, .userdata = node });
 
     return node;
 }
@@ -1145,4 +1163,20 @@ test "golden: the preview swatch paints the selected color" {
 fn changeCounterCb(userdata: ?*anyopaque) void {
     const count: *u32 = @ptrCast(@alignCast(userdata.?));
     count.* += 1;
+}
+
+test "color_picker: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Color picker\": \"Selector de color\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try colorPicker(a, null, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Selector de color", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Color picker", n.semantics.?.label);
 }

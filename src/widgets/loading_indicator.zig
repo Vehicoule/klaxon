@@ -34,6 +34,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
@@ -92,6 +93,7 @@ const LiState = struct {
     loop_running: bool = false, // the indeterminate loop launched
     anim_channel: u8 = 0, // morph channel marker (stable address)
     rot_channel: u8 = 0, // global rotation channel marker (stable address)
+    i18n: ?*i18n_mod.I18n = null,
     /// calculateScaleFactor(polys) × ActiveIndicatorScale — built once with
     /// the geometry (upstream remembers it per polygon list).
     scale_factor: f32 = 1,
@@ -424,9 +426,29 @@ fn liDeinit(n: *Node) void {
         tl.removeTicker(.{ .fn_ptr = liTickerCb, .userdata = n });
     }
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = liSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = liLocaleCb, .userdata = n });
     input.releaseNode(n);
     deinitGeometry(n.allocator, s);
     n.allocator.destroy(s);
+}
+
+/// Indeterminate announces no value; determinate announces the clamped
+/// progress percentage (the same pattern as the slider). The label is
+/// tr()-resolved — the locale callback re-attaches in the new locale.
+fn attachLiSemantics(n: *Node) void {
+    const s = stateOf(n);
+    if (s.sig) |sig| {
+        ui.semantics.attach(n, .{ .role = .progress, .label = i18n_mod.tr("Loading indicator"), .value = s.value_buf[0..s.value_len], .value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(sig.peek(), 0, 1) * 100 } });
+    } else {
+        ui.semantics.attach(n, .{ .role = .progress, .label = i18n_mod.tr("Loading indicator") });
+    }
+}
+
+fn liLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachLiSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const li_vtable = ui.node.VTable{
@@ -453,16 +475,14 @@ pub fn loadingIndicator(allocator: std.mem.Allocator, progress: ?*ui.state.Signa
         &shapes.determinate_sequence
     else
         &shapes.indeterminate_sequence);
-    // Phase 2c: indeterminate announces no value; determinate announces the
-    // clamped progress percentage (the same pattern as the slider).
+    // Phase 2c
     if (progress) |sig| {
         const str = std.fmt.bufPrint(&s.value_buf, "{d:.0}%", .{std.math.clamp(sig.peek(), 0, 1) * 100}) catch "";
         s.value_len = str.len;
-        ui.semantics.attach(node, .{ .role = .progress, .label = "Loading indicator", .value = s.value_buf[0..s.value_len], .value_range = .{ .min = 0, .max = 100, .now = std.math.clamp(sig.peek(), 0, 1) * 100 } });
         sig.subscribe(.{ .callback = .{ .fn_ptr = liSyncCb, .userdata = node } });
-    } else {
-        ui.semantics.attach(node, .{ .role = .progress, .label = "Loading indicator" });
     }
+    attachLiSemantics(node);
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = liLocaleCb, .userdata = node });
     return node;
 }
 
@@ -684,4 +704,28 @@ test "loading_indicator: determinate announces its progress value (a11y); indete
     const ind = try loadingIndicator(std.testing.allocator, null, .{});
     defer ind.deinit();
     try std.testing.expectEqualStrings("", ind.semantics.?.value);
+}
+
+test "loading_indicator: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Loading indicator\": \"Indicador de carga\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const sig = try ui.state.Signal(f32).init(a, 0.4);
+    defer sig.deinit();
+    const n = try loadingIndicator(a, sig, .{});
+    defer n.deinit();
+    const sem = n.semantics.?;
+    try std.testing.expectEqualStrings("Indicador de carga", sem.label);
+    try std.testing.expectEqualStrings("40%", sem.value);
+    try i18n.setLocale("en");
+    // the re-attach preserves the live value + range
+    const sem2 = n.semantics.?;
+    try std.testing.expectEqualStrings("Loading indicator", sem2.label);
+    try std.testing.expectEqualStrings("40%", sem2.value);
+    try std.testing.expectEqual(@as(f32, 40), sem2.value_range.?.now);
 }

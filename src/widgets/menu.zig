@@ -37,6 +37,7 @@ const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const anim = ui.anim;
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
 const layout_w = @import("layout.zig"); // tests
@@ -100,6 +101,7 @@ const MenuState = struct {
     open_progress: f32 = 0,
     open_target: f32 = 0,
     open_channel: u8 = 0, // channel marker (stable address)
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *MenuState {
@@ -508,6 +510,7 @@ fn menuDeinit(n: *Node) void {
     const s = stateOf(n);
     if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.open_channel));
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = menuSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = menuLocaleCb, .userdata = n });
     // Node.deinit calls input.releaseNode(n) FIRST: it clears the router's
     // open_popup only when it still points to THIS node. No unconditional
     // setOpenPopup(null) here — a rebuild replaces an open menu with a new
@@ -520,6 +523,25 @@ fn menuDeinit(n: *Node) void {
     }
     s.items.deinit();
     n.allocator.destroy(s);
+}
+
+/// The a11y label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn attachMenuSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .menu,
+        .label = i18n_mod.tr("Menu"),
+        .focusable = true, // takes the keyboard focus while open
+        .value = if (s.items.items.len > 0) s.items.items[0].label else "",
+    });
+}
+
+fn menuLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachMenuSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const menu_vtable = ui.node.VTable{
@@ -618,12 +640,8 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
     node.add(anchor);
     for (rows) |item_node| node.add(item_node);
     allocator.free(rows);
-    ui.semantics.attach(node, .{
-        .role = .menu,
-        .label = "Menu",
-        .focusable = true, // takes the keyboard focus while open
-        .value = if (s.items.items.len > 0) s.items.items[0].label else "",
-    }); // Phase 2c
+    attachMenuSemantics(node); // Phase 2c
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = menuLocaleCb, .userdata = node });
     if (sig) |sg| {
         sg.subscribe(.{ .callback = .{ .fn_ptr = menuSyncCb, .userdata = node } });
         if (sg.peek()) applyOpen(node, s, true); // starts open
@@ -862,4 +880,23 @@ test "golden: the open menu paints ABOVE a later sibling (the overlay pass)" {
     try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(30, 44));
     // below the panel (y > 40 + 8 + 96 + 8 = 152) the sibling shows through
     try std.testing.expectEqual(@as(Color, 0xFF00FFFF), f.pixelAt(30, 200));
+}
+
+test "menu: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Menu\": \"Menú\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const anchor = try anchorBox(a, 120, 40);
+    const m = try menu(a, anchor, &.{ .{ .label = "Copy" }, .{ .label = "Paste" } }, null, null, .{});
+    defer m.deinit();
+    try std.testing.expectEqualStrings("Menú", m.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Menu", m.semantics.?.label);
+    // the item labels are app strings — untouched
+    try std.testing.expectEqualStrings("Copy", m.semantics.?.value);
 }

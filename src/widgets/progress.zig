@@ -64,6 +64,7 @@
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const shapes = ui.shapes;
 const node_mod = ui.node;
@@ -184,6 +185,7 @@ const ProgressState = struct {
     /// effProgress reads `displayed` until it completes.
     static_animating: bool = false,
     node: ?*Node = null, // back-pointer for the update callback's markDirty
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *ProgressState {
@@ -1012,7 +1014,17 @@ fn progressDeinit(n: *Node) void {
     }
     s.circ_prog.deinit(n.allocator);
     s.circ_trk.deinit(n.allocator);
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = progressLocaleCb, .userdata = n });
     n.allocator.destroy(s);
+}
+
+/// The a11y label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn progressLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    ui.semantics.attach(n, .{ .role = .progress, .label = i18n_mod.tr("Progress") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const progress_vtable = ui.node.VTable{
@@ -1165,7 +1177,8 @@ pub fn progressIndicator(allocator: std.mem.Allocator, opts: ProgressOptions) !*
         s.prog_effect.?.run(); // subscribe
     }
     node.state = s;
-    ui.semantics.attach(node, .{ .role = .progress, .label = "Progress" }); // Phase 2c
+    progressLocaleCb(node); // Phase 2c — the same path resolves the label
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = progressLocaleCb, .userdata = node });
     if (wantsPhaseLoop(s)) startPhaseLoop(node, s); // layout retries when no timeline exists yet
     return node;
 }
@@ -1666,4 +1679,20 @@ test "golden: circular determinate paints the ring and a quarter arc" {
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(42, 24)); // right (arc end)
     try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(24, 42)); // bottom
     try std.testing.expectEqual(t.colors.secondary_container, f.pixelAt(6, 24)); // left
+}
+
+test "progress: i18n — the framework label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Progress\": \"Progreso\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try progressIndicator(a, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Progreso", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Progress", n.semantics.?.label);
 }

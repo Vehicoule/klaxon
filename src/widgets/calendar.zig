@@ -9,6 +9,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const date_picker_w = @import("date_picker.zig");
 const golden = @import("../golden.zig");
@@ -41,7 +42,8 @@ const chevron_icon: f32 = 24;
 const grid_h: f32 = grid_rows * (cell + cell_gap); // 240
 const total_h: f32 = header_h + weekday_h + grid_h + h_pad; // 312
 
-const weekday_letters = [_][:0]const u8{ "S", "M", "T", "W", "T", "F", "S" };
+// Weekday letters resolve per-frame through the active locale's CLDR
+// `weekday_letter` table (Sunday-first, the grid's convention).
 
 // --- State ---
 
@@ -50,6 +52,7 @@ const CalState = struct {
     selected: ?*ui.state.Signal(?i64),
     displayed: ?*ui.state.Signal(i64),
     hovered_day: ?i64 = null,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *CalState {
@@ -119,7 +122,8 @@ fn calPaint(n: *Node, ctx: *kx.Ctx) void {
     // Weekday row.
     const wd_y = b.y + header_h;
     const ls = t.type_scale.body_small;
-    for (weekday_letters, 0..) |letter, col| {
+    for (0..7) |col| {
+        const letter = date_picker_w.weekdayLetter(col);
         const cx = b.x + h_pad + @as(f32, @floatFromInt(col)) * (cell_w + cell_gap) + cell_w / 2;
         const m = ui.paint.measureText(letter, ls.size, false);
         ui.paint.text(ctx, letter, cx - m.width / 2, wd_y + (weekday_h - ls.line_height) / 2 + ls.line_height * 0.8, ls.size, false, t.colors.on_surface_variant);
@@ -243,7 +247,16 @@ fn pageMonth(s: *CalState, n: *Node, delta: i32) void {
 // --- Deinit ---
 
 fn calDeinit(n: *Node) void {
+    i18n_mod.unsubscribeLocale(stateOf(n).i18n, .{ .fn_ptr = calLocaleCb, .userdata = n });
     n.allocator.destroy(stateOf(n));
+}
+
+/// The painted weekday letters read the locale live — a switch just needs
+/// a repaint + the a11y label re-resolved.
+fn calLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    ui.semantics.attach(n, .{ .role = .group, .label = i18n_mod.tr("Calendar"), .focusable = false });
+    n.markDirty();
 }
 
 // --- VTable ---
@@ -272,11 +285,8 @@ pub fn calendar(
     s.* = .{ .opts = opts, .selected = selected, .displayed = displayed };
     node.state = @ptrCast(s);
 
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = "Calendar",
-        .focusable = false,
-    });
+    calLocaleCb(node); // the same path resolves the label in the active locale
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = calLocaleCb, .userdata = node });
 
     return node;
 }
@@ -366,4 +376,36 @@ test "golden: the selected day paints a primary-filled cell with on_primary ink"
     // the filled circle (r = 18 → ~1017px, minus the day-number ink) dominates
     // the today stroke (~100px) — font-independent (the fill needs no glyphs)
     try std.testing.expect(f2.countColorIn(panel, t.colors.primary) > base_primary + 400);
+}
+
+test "calendar: i18n — the weekday letters paint in the locale; the a11y label re-resolves" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("fr", "{\"@@locale\": \"fr\", \"Calendar\": \"Calendrier\"}", .ltr);
+    try i18n.setLocale("fr");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const fixed_today = date_picker_w.daysFromCivil(2026, 10, 15);
+    const n = try calendar(a, null, null, .{ .theme = theme_mod.light, .today = fixed_today });
+    defer n.deinit();
+    // the group label resolved through tr() at build
+    try std.testing.expectEqualStrings("Calendrier", n.semantics.?.label);
+    // the fr CLDR letters paint (Sunday-first: D L M M J V S)
+    var r = try golden.Renderer.init(a, 300, 340);
+    defer r.deinit();
+    n.layout(.{ .x = 10, .y = 10, .w = 280, .h = total_h });
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    const wd_y = 10 + header_h;
+    const cell_w = (280 - h_pad * 2 - cell_gap * 6) / 7;
+    // "D" has ink in its left half where "S" would leave a gap — probe the
+    // left column center for the letter's left-edge ink
+    const lcol = Rect{ .x = 10 + h_pad, .y = wd_y + weekday_h / 2 - 8, .w = cell_w, .h = 16 };
+    try std.testing.expect(f.countColorApproxIn(lcol, theme_mod.light.colors.on_surface_variant) > 0);
+    // a switch re-resolves the label + repaints (the callback marks dirty)
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Calendar", n.semantics.?.label);
 }
