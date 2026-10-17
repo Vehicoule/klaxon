@@ -44,6 +44,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
@@ -69,7 +70,9 @@ pub const SideSheetOptions = struct {
     modal: bool = false,
     width: f32 = 256, // m3_comp_sheet_side_docked_container_width
     theme: Theme = theme_mod.light,
-    label: []const u8 = "Side sheet",
+    /// The semantics label — null resolves the localized "Side sheet"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
 /// M3E measurement tokens.
@@ -88,6 +91,7 @@ const SideSheetState = struct {
     panel_w: f32 = 0, // laid-out panel width (drives the slide offset)
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const Callback = ui.state.Callback;
@@ -426,8 +430,24 @@ fn sheetDeinit(n: *Node) void {
         if (input.current()) |r| r.popBackHandler(n); // destroyed while open
         s.back_registered = false;
     }
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = sheetLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
+}
+
+/// The scrim + panel a11y labels — tr()-resolved, so the locale callback
+/// re-attaches in the new locale.
+fn attachSheetSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close sheet"), .actions = ui.semantics.Actions.initOne(.activate) });
+    ui.semantics.attach(s.panel, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Side sheet") });
+}
+
+fn sheetLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachSheetSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const sheet_vtable = ui.node.VTable{
@@ -572,9 +592,9 @@ pub fn sideSheet(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_
     node.add(scrim);
     node.add(panel);
     if (opts.content) |content| panel.add(content);
-    ui.semantics.attach(scrim, .{ .role = .button, .label = "Close sheet", .actions = ui.semantics.Actions.initOne(.activate) }); // Phase 2c
-    ui.semantics.attach(panel, .{ .role = .group, .label = opts.label }); // Phase 2c
+    attachSheetSemantics(node); // Phase 2c
     open.subscribe(.{ .callback = .{ .fn_ptr = sheetSyncCb, .userdata = node } });
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = sheetLocaleCb, .userdata = node });
     syncBackHandler(node, s); // already open at build: register immediately
     return node;
 }
@@ -877,4 +897,25 @@ test "golden: a closed side sheet paints nothing past its bounds — no ghost ov
     defer f.deinit();
     const right = Rect{ .x = 320, .y = 0, .w = 160, .h = 200 };
     try std.testing.expectEqual(@as(u64, 0), f.countNotIn(right, bg));
+}
+
+test "side_sheet: i18n — the framework labels localize + re-resolve on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Side sheet\": \"Hoja lateral\", \"Close sheet\": \"Cerrar hoja\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const open = try ui.state.Signal(bool).init(a, false);
+    defer open.deinit();
+    const d = try sideSheet(a, open, null, .{ .modal = true });
+    defer d.deinit();
+    const s = stateOf(d);
+    try std.testing.expectEqualStrings("Cerrar hoja", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Hoja lateral", s.panel.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Close sheet", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Side sheet", s.panel.semantics.?.label);
 }

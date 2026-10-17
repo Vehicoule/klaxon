@@ -950,7 +950,7 @@ fn dpDeinit(n: *Node) void {
     const s = stateOf(n);
     s.sel.unsubscribe(.{ .callback = .{ .fn_ptr = dpSelSyncCb, .userdata = n } });
     s.disp.unsubscribe(.{ .callback = .{ .fn_ptr = dpDispSyncCb, .userdata = n } });
-    if (s.i18n) |i| i.locale_sig.unsubscribe(.{ .callback = .{ .fn_ptr = dpLocaleCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = dpLocaleCb, .userdata = n });
     n.allocator.free(s.title_z);
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -999,8 +999,7 @@ pub fn datePicker(allocator: std.mem.Allocator, selected: *ui.state.Signal(?i64)
     attachSemantics(node); // Phase 2c
     selected.subscribe(.{ .callback = .{ .fn_ptr = dpSelSyncCb, .userdata = node } });
     displayed.subscribe(.{ .callback = .{ .fn_ptr = dpDispSyncCb, .userdata = node } });
-    s.i18n = i18n_mod.current();
-    if (s.i18n) |i| i.locale_sig.subscribe(.{ .callback = .{ .fn_ptr = dpLocaleCb, .userdata = node } });
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = dpLocaleCb, .userdata = node });
     return node;
 }
 

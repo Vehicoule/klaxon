@@ -49,6 +49,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
@@ -105,7 +106,9 @@ pub const DialogOptions = struct {
     /// text-button node the caller builds — it owns its own callback).
     action: ?*Node = null,
     theme: Theme = theme_mod.light,
-    label: []const u8 = "Dialog",
+    /// The semantics label — null resolves the localized "Dialog"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
 const DialogState = struct {
@@ -114,11 +117,15 @@ const DialogState = struct {
     on_closed: ?Callback = null,
     scrim: *Node, // internal scrim node
     panel: *Node, // internal panel node
+    /// full-screen top-bar close button (null on the basic variant) — its
+    /// a11y label re-resolves on a locale switch.
+    close_btn: ?*Node = null,
     alpha: f32 = 0, // 0 = closed, 1 = open (animated)
     anim_to: f32 = 0,
     laid_out: bool = false,
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const Callback = ui.state.Callback;
@@ -420,6 +427,7 @@ fn dialogDeinit(n: *Node) void {
         if (input.current()) |r| r.popBackHandler(n); // destroyed while open
         s.back_registered = false;
     }
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = dialogLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -557,6 +565,7 @@ pub fn dialog(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_clo
     errdefer allocator.destroy(panel_bg);
     panel.add(panel_bg);
     const layout_w = @import("layout.zig");
+    var close_btn_owned: ?*Node = null;
     if (opts.variant == .full_screen) {
         // The top bar (AppBarTokens single-row): the close icon button at
         // the start, the title slot expanded over the middle (the action
@@ -570,9 +579,10 @@ pub fn dialog(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_clo
         const close_btn = try icon_button_w.iconButton(allocator, null, .{ .fn_ptr = closeTopBarCb, .userdata = node }, .{
             .icon = .close,
             .variant = .standard,
-            .a11y_label = "Close dialog",
+            .a11y_label = i18n_mod.tr("Close dialog"),
             .theme = opts.theme,
         });
+        close_btn_owned = close_btn;
         top_bar.add(close_btn);
         const title_slot = try layout_w.expanded(allocator, 1);
         top_bar.add(title_slot);
@@ -618,17 +628,35 @@ pub fn dialog(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_clo
         }
         panel.add(col);
     }
-    s.* = .{ .sig = open, .opts = opts, .on_closed = on_closed, .panel = panel, .scrim = scrim };
+    s.* = .{ .sig = open, .opts = opts, .on_closed = on_closed, .panel = panel, .scrim = scrim, .close_btn = close_btn_owned };
     node.state = s;
     // Paint order: scrim (behind), panel (front).
     node.add(scrim);
     node.add(panel);
-    ui.semantics.attach(scrim, .{ .role = .button, .label = "Close dialog", .actions = ui.semantics.Actions.initOne(.activate) }); // Phase 2c
-    // full-screen is a plain dialog (assertive alert is the basic variant's)
-    ui.semantics.attach(panel, .{ .role = if (opts.variant == .full_screen) .dialog else .alert, .label = opts.label }); // Phase 2c
+    attachDialogSemantics(node);
     open.subscribe(.{ .callback = .{ .fn_ptr = dialogSyncCb, .userdata = node } });
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = dialogLocaleCb, .userdata = node });
     syncBackHandler(node, s); // already open at build: register immediately
     return node;
+}
+
+/// The scrim + panel (+ the full-screen close button's) a11y labels —
+/// tr()-resolved, so the locale callback re-attaches in the new locale.
+fn attachDialogSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close dialog"), .actions = ui.semantics.Actions.initOne(.activate) });
+    // full-screen is a plain dialog (assertive alert is the basic variant's)
+    ui.semantics.attach(s.panel, .{ .role = if (s.opts.variant == .full_screen) .dialog else .alert, .label = s.opts.label orelse i18n_mod.tr("Dialog") });
+    if (s.close_btn) |b| {
+        if (b.semantics) |sem| sem.label = i18n_mod.tr("Close dialog");
+    }
+}
+
+fn dialogLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachDialogSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 // --- tests ---
@@ -932,4 +960,36 @@ test "golden: dialog full-screen paints the surface everywhere + the top bar" {
     defer f2.deinit();
     try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(2, 2));
     try std.testing.expectEqual(@as(Color, 0x112233FF), f2.pixelAt(240, 160));
+}
+
+test "dialog: i18n — the framework labels localize + re-resolve on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Dialog\": \"Diálogo\", \"Close dialog\": \"Cerrar diálogo\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const open = try ui.state.Signal(bool).init(a, false);
+    defer open.deinit();
+    const d = try dialog(a, open, null, .{
+        .variant = .full_screen,
+        .title = try text_w.text(a, "Edit", .{}),
+    });
+    defer d.deinit();
+    const s = stateOf(d);
+    try std.testing.expectEqualStrings("Cerrar diálogo", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Diálogo", s.panel.semantics.?.label);
+    try std.testing.expectEqualStrings("Cerrar diálogo", s.close_btn.?.semantics.?.label);
+    // a locale switch re-resolves the cached semantics + the icon button's
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Close dialog", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Dialog", s.panel.semantics.?.label);
+    try std.testing.expectEqualStrings("Close dialog", s.close_btn.?.semantics.?.label);
+    // an app-supplied label is verbatim — a switch leaves it alone
+    const d2 = try dialog(a, open, null, .{ .label = "My dialog" });
+    defer d2.deinit();
+    try i18n.setLocale("es");
+    try std.testing.expectEqualStrings("My dialog", stateOf(d2).panel.semantics.?.label);
 }

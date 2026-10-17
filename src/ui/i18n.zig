@@ -1335,6 +1335,22 @@ pub fn amPm() struct { am: []const u8, pm: []const u8 } {
     return .{ .am = "AM", .pm = "PM" };
 }
 
+/// Subscribe `cb` to the installed i18n's locale_sig — the return goes in
+/// the widget's state and feeds unsubscribeLocale at deinit (null when no
+/// i18n is installed: nothing to unsubscribe, tr() stays the literal).
+/// Widgets built before an i18n is installed don't re-resolve — install
+/// order is the app's contract (same as L10nText).
+pub fn subscribeLocale(cb: state_mod.Callback) ?*I18n {
+    const i = current() orelse return null;
+    i.locale_sig.subscribe(.{ .callback = cb });
+    return i;
+}
+
+/// The subscribeLocale counterpart — null-safe.
+pub fn unsubscribeLocale(i: ?*I18n, cb: state_mod.Callback) void {
+    if (i) |x| x.locale_sig.unsubscribe(.{ .callback = cb });
+}
+
 /// Push the process-global direction into the paragraph engine — the bidi
 /// base level every paragraph (simple draw and kx_text_layout) is built
 /// against. An RTL base puts trailing neutrals and weak-direction runs on

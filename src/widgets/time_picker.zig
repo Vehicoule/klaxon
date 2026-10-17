@@ -1552,7 +1552,7 @@ fn updateA11yValue(n: *Node) void {
 fn tpDeinit(n: *Node) void {
     const s = stateOf(n);
     s.time.unsubscribe(.{ .callback = .{ .fn_ptr = tpSyncCb, .userdata = n } });
-    if (s.i18n) |i| i.locale_sig.unsubscribe(.{ .callback = .{ .fn_ptr = tpLocaleCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tpLocaleCb, .userdata = n });
     input.releaseNode(n);
     s.hour_edit.deinit();
     s.minute_edit.deinit();
@@ -1624,8 +1624,7 @@ pub fn timePicker(allocator: std.mem.Allocator, time: *ui.state.Signal(i32), on_
     updateA11yValue(node);
     attachSemantics(node); // Phase 2c — the input variant adds its virtual children
     time.subscribe(.{ .callback = .{ .fn_ptr = tpSyncCb, .userdata = node } });
-    s.i18n = i18n_mod.current();
-    if (s.i18n) |i| i.locale_sig.subscribe(.{ .callback = .{ .fn_ptr = tpLocaleCb, .userdata = node } });
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = tpLocaleCb, .userdata = node });
     return node;
 }
 

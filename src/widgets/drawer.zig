@@ -89,6 +89,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
@@ -121,7 +122,9 @@ pub const DrawerOptions = struct {
     theme: Theme = theme_mod.light,
     kind: DrawerKind = .modal,
     width: f32 = 360, // NavigationDrawerTokens.ContainerWidth (max)
-    label: []const u8 = "Navigation drawer", // panel semantic label (borrowed)
+    /// The panel semantics label — null resolves the localized
+    /// "Navigation drawer" (an app string is verbatim).
+    label: ?[]const u8 = null,
     gestures_enabled: bool = true, // upstream gesturesEnabled (anchoredDraggable)
     /// Upstream DrawerState.confirmStateChange: vetoes drawer-initiated
     /// transitions (scrim tap, Escape/back, drag settle). Called with the
@@ -148,6 +151,7 @@ const DrawerState = struct {
     /// The anchoredDraggable pan recognizer (horizontal slide; sees events
     /// that bubble up unconsumed).
     pan: ui.gestures.Recognizer = .{ .kind = .pan },
+    i18n: ?*i18n_mod.I18n = null,
     dragging: bool = false, // the drawer claimed the pointer (capture moved)
     /// The node holding keyboard focus when the drawer opened — restored on
     /// close when it is still in the tree (popup-style focus return).
@@ -662,8 +666,24 @@ fn drawerDeinit(n: *Node) void {
         if (input.current()) |r| r.popBackHandler(n); // destroyed while open
         s.back_registered = false;
     }
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = drawerLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
+}
+
+/// The scrim + panel a11y labels — tr()-resolved, so the locale callback
+/// re-attaches in the new locale.
+fn attachDrawerSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close drawer"), .actions = ui.semantics.Actions.initOne(.activate) });
+    ui.semantics.attach(s.panel, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Navigation drawer") });
+}
+
+fn drawerLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    attachDrawerSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const drawer_vtable = ui.node.VTable{
@@ -713,9 +733,9 @@ pub fn drawer(allocator: std.mem.Allocator, open: *ui.state.Signal(bool), on_clo
     node.add(scrim);
     node.add(panel);
     if (opts.content) |content| panel.add(content);
-    ui.semantics.attach(scrim, .{ .role = .button, .label = "Close drawer", .actions = ui.semantics.Actions.initOne(.activate) }); // Phase 2c
-    ui.semantics.attach(panel, .{ .role = .group, .label = opts.label }); // Phase 2c
+    attachDrawerSemantics(node); // Phase 2c
     open.subscribe(.{ .callback = .{ .fn_ptr = drawerSyncCb, .userdata = node } });
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = drawerLocaleCb, .userdata = node });
     if (opts.kind != .permanent) syncBackHandler(node, s); // already open at build: register immediately
     return node;
 }
@@ -974,4 +994,25 @@ test "golden: a closed drawer paints nothing past its bounds — no ghost over s
     defer f.deinit();
     const left = Rect{ .x = 0, .y = 0, .w = 120, .h = 200 };
     try std.testing.expectEqual(@as(u64, 0), f.countNotIn(left, bg));
+}
+
+test "drawer: i18n — the framework labels localize + re-resolve on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Navigation drawer\": \"Cajón de navegación\", \"Close drawer\": \"Cerrar cajón\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const open = try ui.state.Signal(bool).init(a, false);
+    defer open.deinit();
+    const d = try drawer(a, open, null, .{});
+    defer d.deinit();
+    const s = stateOf(d);
+    try std.testing.expectEqualStrings("Cerrar cajón", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Cajón de navegación", s.panel.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Close drawer", s.scrim.semantics.?.label);
+    try std.testing.expectEqualStrings("Navigation drawer", s.panel.semantics.?.label);
 }
