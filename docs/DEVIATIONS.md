@@ -49,7 +49,8 @@ Each widget's header carries the same list; these are the tracked ones
   weight(1f) distributes the mean); no checked-icon crossfade; the
   multi-choice row (`segmentedButtonMulti`) is a u64 bitmask capped at 64
   segments.
-- `icon_button.zig` — no elevation shadows; instant shape morphs.
+- `icon_button.zig` — no elevation shadows. (Shape morphs now spring via
+  the timeline — AnimatedShape parity.)
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
 - `slider.zig` — the value indicator doesn't morph its shape (upstream's

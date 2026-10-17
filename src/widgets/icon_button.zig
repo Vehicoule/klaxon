@@ -39,7 +39,8 @@
 // checked (outlinedIconToggleButtonBorder → null).
 //
 // v1 deviations (documented, fixed later):
-//   - Flat colors (no elevation shadows — Phase 3); instant shape morphs.
+//   - Flat colors (no elevation shadows — Phase 3). Shape morphs spring
+//     via the timeline (AnimatedShape parity); headless snaps.
 //   - Checked + disabled (outlined toggle): container OnSurface@0.10, icon
 //     OnSurface@0.38 (the token's SelectedDisabledContainer* + DisabledColor).
 //   - The outlined border width follows the size token (1/1/1/2/3);
@@ -156,6 +157,12 @@ const IconButtonState = struct {
     /// finger (PointerEvent.raw_x/raw_y doc).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The painted corner radius — springs toward `cornerTarget` on every
+    /// state change (upstream's AnimatedShape morph), -1 = uninitialized
+    /// (snaps to the target on the first paint, when bounds exist).
+    corner: f32 = -1,
+    /// Animation channel marker (a stable address — see switch.zig).
+    corner_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *IconButtonState {
@@ -172,8 +179,10 @@ fn currentColors(s: *IconButtonState, vc: IBColors) CurrentColors {
     return .{ .container = vc.container, .icon = vc.icon, .on = vc.icon };
 }
 
-/// The corner radius for the current state (pressed > checked > unselected).
-fn radiusFor(s: *IconButtonState, height: f32) f32 {
+/// The corner radius TARGET for the current state (pressed > checked >
+/// unselected) — the paint reads `s.corner`, which `retargetCorner` springs
+/// toward this value (upstream's AnimatedShape: every state change morphs).
+fn cornerTarget(s: *IconButtonState, height: f32) f32 {
     const d = dimsFor(s.opts.size);
     if (s.pressed) return d.pressed_corner;
     if (isChecked(s)) {
@@ -182,6 +191,32 @@ fn radiusFor(s: *IconButtonState, height: f32) f32 {
         return if (s.opts.shape == .round) d.square_corner else height / 2;
     }
     return if (s.opts.shape == .round) height / 2 else d.square_corner;
+}
+
+fn cornerCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).corner = v[0];
+    n.markDirty();
+}
+
+/// Retarget the corner spring toward the current state's target — the
+/// channel's velocity carries through a mid-flight retarget (upstream's
+/// Animatable). No timeline (headless/tests) → the value snaps.
+fn retargetCorner(n: *Node, s: *IconButtonState) void {
+    if (n.bounds.h <= 0) return; // unlaid-out: the first paint snaps
+    const target = cornerTarget(s, n.bounds.h);
+    if (ui.anim.timeline()) |tl| {
+        if (s.corner >= 0 and s.corner != target) {
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(.{ s.corner, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&s.corner_channel))),
+                .from = .{ s.corner, 0, 0, 0 },
+                .channel = @ptrCast(&s.corner_channel),
+                .on_update = .{ .fn_ptr = cornerCb, .userdata = n },
+            });
+            return;
+        }
+    }
+    s.corner = target;
 }
 
 fn iconButtonMeasure(n: *Node, c: Constraints) Size {
@@ -227,7 +262,8 @@ fn iconButtonPaint(n: *Node, ctx: *kx.Ctx) void {
     const d = dimsFor(s.opts.size);
     const vc = variantColors(t, s.opts.variant, s.sig != null);
     const cc = currentColors(s, vc);
-    const radius = radiusFor(s, b.h);
+    if (s.corner < 0) s.corner = cornerTarget(s, b.h); // lazy snap (pre-anim)
+    const radius = s.corner;
     // container
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, cc.container);
@@ -272,6 +308,7 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed = true;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
+            retargetCorner(n, s); // the press morph springs (AnimatedShape)
             n.markDirty();
             return true;
         },
@@ -281,6 +318,7 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // slop) must not fire on a later up.
             const was_pressed = s.pressed;
             s.pressed = false;
+            retargetCorner(n, s); // release → morph back
             n.markDirty();
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.sig) |sig| sig.set(!sig.peek());
@@ -297,6 +335,7 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
                     s.pressed = false;
+                    retargetCorner(n, s);
                     n.markDirty();
                 }
             }
@@ -305,6 +344,7 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
             s.pressed = false;
+            retargetCorner(n, s);
             n.markDirty();
             return true;
         },
@@ -347,6 +387,7 @@ fn iconButtonSyncCb(userdata: ?*anyopaque) void {
     const cc = currentColors(s, vc);
     if (n.children.items.len > 0) icon_w.setColor(n.children.items[0], cc.icon);
     if (n.semantics) |sem| sem.checked = s.sig.?.peek();
+    retargetCorner(n, s); // the checked morph springs
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
@@ -354,6 +395,7 @@ fn iconButtonSyncCb(userdata: ?*anyopaque) void {
 fn iconButtonDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = iconButtonSyncCb, .userdata = n } });
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.corner_channel));
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -415,6 +457,38 @@ pub fn iconButton(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on
 }
 
 // --- tests ---
+
+test "icon_button: the corner radius springs through the press/toggle morphs" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const sig = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer sig.deinit();
+    const b = try iconButton(std.testing.allocator, sig, null, .{ .size = .small, .a11y_label = "x" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 40, .h = 40 });
+    const s = stateOf(b);
+    const d = dimsFor(.small);
+    const rest: f32 = 20; // round → h/2
+    try std.testing.expectEqual(@as(f32, -1), s.corner); // lazy until painted
+    s.corner = cornerTarget(s, 40); // first-paint snap
+    try std.testing.expectEqual(rest, s.corner);
+    // press → springs toward pressed_corner (8), mid-flight value is a blend
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 20, .y = 20, .raw_x = 20, .raw_y = 20 });
+    try std.testing.expect(tl.hasActive());
+    tl.tick(0);
+    tl.tick(16);
+    try std.testing.expect(s.corner < rest and s.corner > d.pressed_corner - 1);
+    tl.tick(2000); // settled
+    try std.testing.expectApproxEqAbs(d.pressed_corner, s.corner, 0.01);
+    // release + click toggles → the checked morph springs to the square corner
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .up, .x = 20, .y = 20, .raw_x = 20, .raw_y = 20 });
+    try std.testing.expect(tl.hasActive());
+    tl.tick(2016);
+    tl.tick(4000); // settle through the unchecked→checked morph
+    try std.testing.expectApproxEqAbs(d.square_corner, s.corner, 0.01);
+}
 
 fn pressCounterCb(userdata: ?*anyopaque) void {
     const c: *u32 = @ptrCast(@alignCast(userdata.?));
