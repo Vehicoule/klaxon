@@ -56,7 +56,10 @@ Each widget's header carries the same list; these are the tracked ones
   label animates in on drag start). Steps/ticks, the pressed value
   bubble, the corner-inset thumb mapping and PageUp/PageDown
   (actualSteps/10 clamped to [1,10] ticks) match upstream.
-- `split_button.zig` — trailing half is pointer-only (a11y activation pending).
+- `split_button.zig` — filled only; no checked trailing morph; trailing
+  icon geometric center (upstream optical nudge); instant corner morph;
+  no embedded menu. (a11y: the halves are virtual button children and
+  ArrowDown activates the trailing — ARIA menu-button.)
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
   only; no selection handles or undo; the text run stays LTR under RTL
   chrome (arrows move logically under RTL); the text_field label lerps

@@ -26,9 +26,10 @@
 //   - state layer: OnPrimary @ hover 0.08 / focus 0.10 / pressed 0.12 over
 //     the container, per half
 //   - input: each half is its own press zone (a drag past the touch slop is
-//     a scroll, not a press); Enter/Space fires the LEADING action (the
-//     trailing half is pointer-only in v1 — two a11y actions land with the
-//     action system)
+//     a scroll, not a press); Enter/Space fires the LEADING action,
+//     ArrowDown the trailing (ARIA menu-button); a11y exposes the two
+//     halves as virtual button children whose activation taps land in the
+//     half's zone
 //
 // v1 deviations (documented, fixed later):
 //   - Filled style only (tonal / elevated / outlined variants are
@@ -69,6 +70,9 @@ pub const SplitButtonOptions = struct {
     /// side in RTL).
     leading_icon: ?icon_w.IconName = null,
     trailing_icon: icon_w.IconName = .arrow_down,
+    /// The trailing half's a11y label (upstream contentDescription — the
+    /// trailing button is its own semantic node).
+    trailing_label: []const u8 = "Expand",
     theme: Theme = theme_mod.light,
 };
 
@@ -114,6 +118,10 @@ const SplitState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The two halves as virtual a11y children (upstream: two sibling
+    /// composables — TalkBack/VoiceOver focus each half separately).
+    /// Fixed-size: the halves never change count; the slice is borrowed.
+    sem_children: [2]ui.semantics.Semantics = undefined,
 };
 
 fn stateOf(n: *Node) *SplitState {
@@ -360,8 +368,26 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
     return false;
 }
 
-/// Keyboard activation (Phase 2c): Enter/Space fire the LEADING action (the
-/// primary action; the trailing half is pointer-only in v1).
+/// Half `index`'s rect in NODE-LOCAL space (Semantics.child_bounds — the
+/// a11y bridge maps it to window space; an activation tap lands in the
+/// half's zone and the pointer path resolves it like a real click).
+fn splitChildBounds(n: *Node, index: usize) Rect {
+    const s = stateOf(n);
+    const b = n.bounds;
+    const local = Rect{ .x = 0, .y = 0, .w = b.w, .h = b.h };
+    const tw = trailWidth(s);
+    const lead_w = @max(b.w - between - tw, 0);
+    var r: Rect = if (index == 0)
+        .{ .x = 0, .y = 0, .w = lead_w, .h = local.h }
+    else
+        .{ .x = lead_w + between, .y = 0, .w = @max(local.w - lead_w - between, 0), .h = local.h };
+    if (ui.i18n.direction() == .rtl) r = .{ .x = local.w - r.x - r.w, .y = r.y, .w = r.w, .h = r.h };
+    return r;
+}
+
+/// Keyboard activation: Enter/Space fire the leading action; ArrowDown
+/// fires the trailing action — the ARIA menu-button pattern (the trailing
+/// icon is a chevron-down; the half opens the menu).
 fn splitOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
@@ -369,6 +395,10 @@ fn splitOnKey(n: *Node, ev: input.KeyEvent) bool {
     switch (ev.key) {
         .enter, .space => {
             if (s.on_press) |cb| cb.fn_ptr(cb.userdata);
+            return true;
+        },
+        .down => {
+            if (s.on_trailing) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
         else => {},
@@ -425,12 +455,21 @@ pub fn splitButton(allocator: std.mem.Allocator, on_press: ?Callback, on_trailin
         .on_trailing = on_trailing,
     };
     node.state = s;
+    // The two halves as a11y children — TalkBack/VoiceOver expose the
+    // trailing button separately like upstream's two composables, and an
+    // activate lands in its zone (resolved by the pointer path).
+    s.sem_children = .{
+        .{ .role = .button, .label = s.label, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
+        .{ .role = .button, .label = s.opts.trailing_label, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
+    };
     ui.semantics.attach(node, .{
         .role = .button,
         .label = s.label,
         .focusable = opts.enabled,
         .disabled = !opts.enabled,
         .actions = ui.semantics.Actions.initOne(.activate),
+        .children = &s.sem_children,
+        .child_bounds = splitChildBounds,
     }); // Phase 2c
     return node;
 }
@@ -496,10 +535,20 @@ test "split_button: the leading and trailing halves fire their callbacks; keyboa
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = tx, .y = 20, .raw_x = tx, .raw_y = 20 });
     try std.testing.expectEqual(@as(u32, 1), lead);
     try std.testing.expectEqual(@as(u32, 1), trail);
-    // keyboard: Enter fires the leading action
+    // keyboard: Enter fires the leading action; ArrowDown the trailing
+    // (the ARIA menu-button pattern — the trailing half opens the menu)
     input.requestFocus(n);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
     try std.testing.expectEqual(@as(u32, 2), lead);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .down });
+    try std.testing.expectEqual(@as(u32, 2), trail);
+    // a11y: the two halves are virtual button children; an activation tap
+    // in the trailing child's rect resolves through the pointer path
+    try std.testing.expectEqual(@as(usize, 2), n.semantics.?.children.len);
+    try std.testing.expectEqualStrings("Expand", n.semantics.?.children[1].label);
+    const tr = n.semantics.?.child_bounds.?(n, 1);
+    try std.testing.expectApproxEqAbs(lead_w + between, tr.x, 0.001);
+    try std.testing.expectApproxEqAbs(tw, tr.w, 0.001);
     // disabled: no interaction
     const dis = try splitButton(a, cb_lead, cb_trail, .{ .label = "Save", .enabled = false });
     defer dis.deinit();
