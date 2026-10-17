@@ -11,8 +11,8 @@
 //   - header: a 72dp row (SearchViewTokens FullScreenHeaderContainerHeight)
 //     — the leading back button (a 48dp touch box, the
 //     24dp arrow visual at 16..40), the query text (body_large OnSurface,
-//     a 1dp Primary caret at the text end while focused), the trailing
-//     clear button (a 48dp box, shown iff the query is non-empty)
+//     a 1dp Primary caret while focused), the trailing clear button (a
+//     48dp box, shown iff the query is non-empty)
 //   - divider: 1dp outline_variant, full width, under the header
 //   - suggestions: 56dp one-line rows (ListTokens) — the leading icon
 //     (24dp OnSurfaceVariant) at 16, the label (body_large OnSurface) at
@@ -48,11 +48,20 @@
 // Remaining deviations (documented):
 //   - No predictive-back scrubbing (the router's back stack has no
 //     BackEvent progress channel — cancellation replays the enter spec);
-//     the caret is static (no blink) and always at the text end; no IME
-//     panel placement (the query field renders/edits the buffer but there
-//     is no on-screen keyboard yet); the suggestion list does not scroll —
-//     rows past the bounds clip; RTL mirrors the chrome but the text runs
-//     stay LTR (no bidi — same as text.zig/search_bar.zig).
+//     no IME panel placement (the query field renders/edits the buffer but
+//     there is no on-screen keyboard yet); the suggestion list does not
+//     scroll — rows past the bounds clip; RTL mirrors the chrome but the
+//     text runs stay LTR (no bidi — same as text.zig/search_bar.zig).
+//   - The caret is a real editing position: click places it at the nearest
+//     grapheme boundary (SkParagraph getGlyphPositionAtCoordinate through
+//     kx_text_position_at), it blinks at Compose's 500ms cadence while
+//     focused (a timeline ticker re-shows it on every edit/move), and
+//     typing/backspace/delete/left/right apply AT the caret. Selection is
+//     real too: drag or shift+arrows/home/end extend the range (primary
+//     @0.4 highlight, collapsed anchors, delete replaces the range).
+//     Cmd/Ctrl+A/C/X/V ride the platform clipboard (ui.clipboard); paste
+//     strips line terminators to stay single-line. Still missing: no
+//     selection handles or double-click word select.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -60,6 +69,7 @@ const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
+const text_edit = @import("text_edit.zig");
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -138,7 +148,9 @@ const ItemDef = struct {
 };
 
 const SearchViewState = struct {
-    buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
+    /// The shared editing core (text_edit.zig): buffer, IME composition,
+    /// caret/selection, blink ticker.
+    edit: text_edit.Edit,
     placeholder: [:0]const u8, // owned
     label_z: [:0]const u8, // owned
     items: std.array_list.Managed(ItemDef),
@@ -180,17 +192,12 @@ const SearchViewState = struct {
     /// Stable channel addresses for the timeline (the switch idiom).
     progress_channel: u8 = 0,
     field_channel: u8 = 0,
-    /// IME composition (preedit) — same contract as text_field's: replaced
-    /// wholesale by text_editing, committed+cleared by text_input.
-    comp: std.array_list.Managed(u8) = undefined,
-
     fn text(s: *SearchViewState) [:0]const u8 {
-        // Sentinel slice via the many-item pointer (see search_bar.zig).
-        return s.buf.items.ptr[0..s.buf.items.len :0];
+        return s.edit.text();
     }
 
     fn composition(s: *SearchViewState) [:0]const u8 {
-        return s.comp.items.ptr[0..s.comp.items.len :0];
+        return s.edit.composition();
     }
 };
 
@@ -198,26 +205,11 @@ fn stateOf(n: *Node) *SearchViewState {
     return @ptrCast(@alignCast(n.state.?));
 }
 
-/// Write the null sentinel at items[len] (the P0 TextField helper).
-/// Grows if the buffer is exactly full — writing the sentinel past
-/// capacity was a heap OOB (an empty/zero-cap buffer is the first case).
-fn setSentinel(buf: *std.array_list.Managed(u8)) void {
-    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
-    buf.items.len += 1;
-    buf.items[buf.items.len - 1] = 0;
-    buf.items.len -= 1;
-}
-
-/// An owned null-terminated copy of a string.
-fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
-    const buf = try allocator.alloc(u8, str.len + 1);
-    @memcpy(buf[0..str.len], str);
-    buf[str.len] = 0;
-    return buf[0..str.len :0];
-}
+const setSentinel = text_edit.setSentinel;
+const dupeZ = text_edit.dupeZ;
 
 fn hasText(s: *SearchViewState) bool {
-    return s.buf.items.len > 0;
+    return s.edit.buf.items.len > 0;
 }
 
 /// Mirror a horizontal rect across the view for RTL chrome.
@@ -393,20 +385,32 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_w = b.w - textStart(t) - right;
     const clip_x = mirrorX(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, header_h);
-    if (hasText(s) or s.comp.items.len > 0) {
-        const m = ui.paint.measureText(s.text(), style.size, false);
+    s.edit.ensureTicker(); // the caret blink (a focused view stays awake)
+    if (hasText(s) or s.edit.comp.items.len > 0) {
+        const str = s.text();
+        const m = ui.paint.measureText(str, style.size, false);
         const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
-        ui.paint.text(ctx, s.text(), tx, ty + m.ascent, style.size, false, header_ink);
-        var caret_x = tx + m.width;
-        if (s.comp.items.len > 0) {
-            // Preedit after the committed text, underlined (IME convention).
-            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
-            ui.paint.text(ctx, s.composition(), caret_x, ty + m.ascent, style.size, false, header_ink);
-            ui.paint.fillRect(ctx, caret_x, ty + m.ascent + 1, comp_m.width, 1, header_ink);
-            caret_x += comp_m.width;
+        // Selection highlight behind the glyphs (TextSelectionColors —
+        // primary @ 0.4 over the run's x range for [caret, anchor)).
+        const sel = s.edit.selRange();
+        if (sel.hi > sel.lo) {
+            const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
+            const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+            ui.paint.fillRect(ctx, hx0, ty, hx1 - hx0, m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
         }
-        if (focused) {
-            // the caret at the end of the text (+ composition)
+        ui.paint.text(ctx, str, tx, ty + m.ascent, style.size, false, header_ink);
+        var caret_x = tx + ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        if (s.edit.comp.items.len > 0) {
+            // Preedit after the committed text, underlined (IME convention);
+            // SDL's comp_start puts the caret INSIDE the composition.
+            const comp = s.composition();
+            const comp_m = ui.paint.measureText(comp, style.size, false);
+            ui.paint.text(ctx, comp, tx + m.width, ty + m.ascent, style.size, false, header_ink);
+            ui.paint.fillRect(ctx, tx + m.width, ty + m.ascent + 1, comp_m.width, 1, header_ink);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_x = tx + m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        }
+        if (focused and s.edit.caret_on) {
             ui.paint.fillRect(ctx, caret_x, ty, caret_w, m.height, header_primary);
         }
     } else {
@@ -415,7 +419,7 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
             const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
             ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, header_muted);
         }
-        if (focused) {
+        if (focused and s.edit.caret_on) {
             // the caret at the (mirrored) start (empty text)
             const caret_x = mirrorX(b.x, b.w, b.x + textStart(t), 0, rtl);
             ui.paint.fillRect(ctx, caret_x, ty, caret_w, style.line_height, header_primary);
@@ -480,6 +484,19 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.clipReset(ctx); // the animated surface clip
 }
 
+/// Byte offset of the grapheme boundary nearest the press — the shared
+/// text_edit hit test over the painted run (its mirrored left is the
+/// probe's origin; the y is the header's text line box).
+fn caretAt(n: *Node, s: *SearchViewState, x: f32, y: f32) usize {
+    const str = s.text();
+    const style = s.opts.theme.type_scale.body_large;
+    const m = ui.paint.measureText(str, style.size, false);
+    const b = n.bounds;
+    const tx = mirrorX(b.x, b.w, b.x + textStart(s.opts.theme), m.width, ui.i18n.direction() == .rtl);
+    const ty = b.y + (header_h - style.line_height) / 2;
+    return text_edit.caretFromPoint(str, x - tx, y - ty, style.size);
+}
+
 fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!s.open) return false;
@@ -503,6 +520,10 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             } else {
                 // the header text area / empty space: the query keeps focus
                 input.requestFocus(n);
+                // Click-to-caret: the press maps to the nearest grapheme
+                // boundary and collapses the selection onto it.
+                s.edit.dragging = true;
+                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), false);
             }
             // the press is modal — nothing under the view sees it
             n.markDirty();
@@ -517,6 +538,7 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.clear_pressed = false;
             s.fill_pressed = -1;
             s.pressed_index = -1;
+            s.edit.dragging = false;
             n.markDirty();
             if (was_back) {
                 if (inBack(s, b, ev.x, ev.y)) closeSearchView(n, s); // M3: the nav icon dismisses
@@ -532,6 +554,12 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             return true;
         },
         .move => {
+            // A held primary button drags the caret — drag-select (the
+            // pointer is captured, so moves keep arriving off-bounds).
+            if (s.edit.dragging) {
+                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), true);
+                return true;
+            }
             // A drag beyond the touch slop is a scroll, not a press: cancel
             // the pressed state. The move is NOT claimed (return false) so
             // it keeps bubbling to scrollable ancestors.
@@ -635,8 +663,10 @@ fn applyEdit(n: *Node, s: *SearchViewState) void {
 
 /// Clear the query (the clear button): keep the focus, fire on_changed.
 fn clearQuery(n: *Node, s: *SearchViewState) void {
-    s.buf.clearRetainingCapacity();
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.caret = 0;
+    s.edit.sel_anchor = 0;
+    setSentinel(&s.edit.buf);
     applyEdit(n, s);
 }
 
@@ -644,10 +674,13 @@ fn clearQuery(n: *Node, s: *SearchViewState) void {
 /// (M3's "insert" arrow — the field fills, the view stays open).
 fn fillQuery(n: *Node, s: *SearchViewState, i: usize) void {
     const label = s.items.items[i].label;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(label.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(label) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(label.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(label) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.caret = s.edit.buf.items.len; // a wholesale replace → caret at the end
+    s.edit.sel_anchor = s.edit.caret;
+    s.edit.resetBlink();
     applyEdit(n, s);
 }
 
@@ -668,75 +701,48 @@ fn closeSearchView(n: *Node, s: *SearchViewState) void {
     _ = n;
 }
 
+/// The widget's applyEdit adapted to text_edit's callback signature.
+fn applyEditNode(n: *Node) void {
+    applyEdit(n, stateOf(n));
+}
+
 fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.open) return false;
-    switch (ev.kind) {
-        .text_input => {
-            // A commit discharges the composition (see text_field).
-            s.comp.clearRetainingCapacity();
-            setSentinel(&s.comp);
-            // Reject (never truncate) input that would grow the text past
-            // the documented cap — a paste/IME burst is applied whole or
-            // not at all.
-            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
-            s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
-            s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
-            setSentinel(&s.buf);
-            applyEdit(n, s);
+    // The shared editing core: text_input/text_editing, the Cmd/Ctrl
+    // clipboard chords, backspace/delete, arrows/home/end.
+    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (ev.kind == .key_down) switch (ev.key) {
+        .up => {
+            moveHighlight(n, s, -1);
             return true;
         },
-        .text_editing => {
-            s.comp.clearRetainingCapacity();
-            if (ev.text.len <= ui.state.TextSignal.max_len) {
-                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+        .down => {
+            moveHighlight(n, s, 1);
+            return true;
+        },
+        .enter => {
+            // M3: Enter activates the highlighted suggestion; without
+            // one it submits the query (imeAction = Search).
+            if (s.highlight >= 0 and s.highlight < @as(i32, @intCast(s.items.items.len))) {
+                const i: usize = @intCast(s.highlight);
+                if (s.items.items[i].enabled) {
+                    select(n, s, i);
+                    return true;
+                }
             }
-            setSentinel(&s.comp);
-            n.markDirty(); // repaint only — comp is not a committed edit
+            if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .key_down => switch (ev.key) {
-            .backspace => {
-                // An open composition eats the backspace (codepoint first).
-                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
-                // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (target.items.len > 0) {
-                    const last = target.items[target.items.len - 1];
-                    target.items.len -= 1;
-                    if ((last & 0xC0) != 0x80) break;
-                }
-                setSentinel(target);
-                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
-                return true;
-            },
-            .up => {
-                moveHighlight(n, s, -1);
-                return true;
-            },
-            .down => {
-                moveHighlight(n, s, 1);
-                return true;
-            },
-            .enter => {
-                // M3: Enter activates the highlighted suggestion; without
-                // one it submits the query (imeAction = Search).
-                if (s.highlight >= 0 and s.highlight < @as(i32, @intCast(s.items.items.len))) {
-                    const i: usize = @intCast(s.highlight);
-                    if (s.items.items[i].enabled) {
-                        select(n, s, i);
-                        return true;
-                    }
-                }
-                if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
-                return true;
-            },
-            .escape => {
-                closeSearchView(n, s); // M3: Escape dismisses the view
-                return true;
-            },
-            else => {},
+        .escape => {
+            s.edit.comp.clearRetainingCapacity();
+            s.edit.comp_cursor = 0;
+            setSentinel(&s.edit.comp);
+            closeSearchView(n, s); // M3: Escape dismisses the view
+            return true;
         },
-    }
+        else => {},
+    };
     return false;
 }
 
@@ -864,10 +870,11 @@ fn svQuerySyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.query_sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.clampOffsets(); // the caret rides the new text's bounds
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
 }
@@ -890,8 +897,7 @@ fn searchViewDeinit(n: *Node) void {
     s.sem_children.deinit();
     n.allocator.free(s.placeholder);
     n.allocator.free(s.label_z);
-    s.buf.deinit();
-    s.comp.deinit();
+    s.edit.deinit(); // the blink ticker + both buffers
     n.allocator.destroy(s);
 }
 
@@ -973,8 +979,7 @@ pub fn searchView(
     const s = try allocator.create(SearchViewState);
     errdefer allocator.destroy(s);
     s.* = .{
-        .buf = std.array_list.Managed(u8).init(allocator),
-        .comp = std.array_list.Managed(u8).init(allocator),
+        .edit = text_edit.Edit.init(allocator, node),
         .placeholder = placeholder,
         .label_z = label_z,
         .items = std.array_list.Managed(ItemDef).init(allocator),
@@ -991,8 +996,7 @@ pub fn searchView(
         for (s.items.items) |it| allocator.free(it.label);
         s.items.deinit();
         s.sem_children.deinit();
-        s.buf.deinit();
-        s.comp.deinit();
+        s.edit.deinit();
     }
     try s.items.ensureTotalCapacity(items.len);
     try s.sem_children.ensureTotalCapacity(items.len);
@@ -1013,11 +1017,13 @@ pub fn searchView(
             .actions = if (it.enabled) ui.semantics.Actions.initOne(.activate) else .{},
         });
     }
-    s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
-        s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
+        s.edit.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
     }
-    setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
+    setSentinel(&s.edit.buf); // null-terminates the (possibly empty) buffer
+    s.edit.caret = s.edit.buf.items.len; // the caret starts at the end
+    s.edit.sel_anchor = s.edit.caret;
     node.state = s;
     if (!open.peek()) node.setVisible(false); // hidden until the signal opens it
     ui.semantics.attach(node, .{
@@ -1048,10 +1054,13 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.caret = s.edit.buf.items.len; // programmatic replace → caret at the end
+    s.edit.sel_anchor = s.edit.caret;
+    s.edit.resetBlink();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
     ui.semantics.notifyControlChanged(n);

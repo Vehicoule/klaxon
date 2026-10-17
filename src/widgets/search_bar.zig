@@ -35,8 +35,9 @@
 //   - Collapsed pill only: the expanded full-screen view + suggestions
 //     dropdown (SearchView), the avatar leading icon (30dp CornerFull),
 //     prefix/suffix, and the inset focus ring (FocusIndicatorColor) are
-//     follow-ups. The caret is static (no blink), always at the text end.
-//     RTL mirrors the chrome; the text run itself stays LTR (no bidi).
+//     follow-ups. The caret is real (text_edit.zig): click-to-position,
+//     500ms blink, drag/shift selection, Cmd/Ctrl chords. RTL mirrors the
+//     chrome; the text run itself stays LTR (no bidi).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -44,6 +45,7 @@ const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
+const text_edit = @import("text_edit.zig");
 const golden = @import("../golden.zig"); // tests
 
 const Node = ui.node.Node;
@@ -86,7 +88,9 @@ const text_end_no_icon: f32 = 16; // TextFieldPadding without a trailing icon
 const caret_w: f32 = 1;
 
 const SearchBarState = struct {
-    buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
+    /// The shared editing core (text_edit.zig): buffer, IME composition,
+    /// caret/selection, blink ticker.
+    edit: text_edit.Edit,
     placeholder: [:0]const u8, // owned
     opts: SearchBarOptions,
     /// Live text channel (registry/designer): the widget sets it on edit; an
@@ -103,17 +107,13 @@ const SearchBarState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
-    /// IME composition (preedit) — same contract as text_field's: replaced
-    /// wholesale by text_editing, committed+cleared by text_input.
-    comp: std.array_list.Managed(u8) = undefined,
 
     fn text(s: *SearchBarState) [:0]const u8 {
-        // Sentinel slice via the many-item pointer (see input.zig).
-        return s.buf.items.ptr[0..s.buf.items.len :0];
+        return s.edit.text();
     }
 
     fn composition(s: *SearchBarState) [:0]const u8 {
-        return s.comp.items.ptr[0..s.comp.items.len :0];
+        return s.edit.composition();
     }
 };
 
@@ -121,26 +121,11 @@ fn stateOf(n: *Node) *SearchBarState {
     return @ptrCast(@alignCast(n.state.?));
 }
 
-/// Write the null sentinel at items[len] (the P0 TextField helper).
-/// Grows if the buffer is exactly full — writing the sentinel past
-/// capacity was a heap OOB (an empty/zero-cap buffer is the first case).
-fn setSentinel(buf: *std.array_list.Managed(u8)) void {
-    buf.ensureUnusedCapacity(1) catch @panic("klaxon: out of memory");
-    buf.items.len += 1;
-    buf.items[buf.items.len - 1] = 0;
-    buf.items.len -= 1;
-}
-
-/// An owned null-terminated copy of a string.
-fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
-    const buf = try allocator.alloc(u8, str.len + 1);
-    @memcpy(buf[0..str.len], str);
-    buf[str.len] = 0;
-    return buf[0..str.len :0];
-}
+const setSentinel = text_edit.setSentinel;
+const dupeZ = text_edit.dupeZ;
 
 fn hasText(s: *SearchBarState) bool {
-    return s.buf.items.len > 0;
+    return s.edit.buf.items.len > 0;
 }
 
 /// The clear button's zone (the trailing min-interactive box), in the
@@ -266,20 +251,33 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_x = mx(b.x, b.w, b.x + textStart(t), clip_w, rtl);
     ui.paint.clipRect(ctx, clip_x, b.y, clip_w, container_h);
     const style = t.type_scale.body_large;
-    if (hasText(s) or s.comp.items.len > 0) {
-        const m = ui.paint.measureText(s.text(), style.size, false);
+    s.edit.ensureTicker(); // the caret blink (focused bars stay awake)
+    if (hasText(s) or s.edit.comp.items.len > 0) {
+        const str = s.text();
+        const m = ui.paint.measureText(str, style.size, false);
         const tx = mx(b.x, b.w, tr.x, m.width, rtl);
-        ui.paint.text(ctx, s.text(), tx, tr.y + m.ascent, style.size, false, content);
-        var caret_x = tx + m.width;
-        if (s.comp.items.len > 0) {
-            // Preedit after the committed text, underlined (IME convention).
-            const comp_m = ui.paint.measureText(s.composition(), style.size, false);
-            ui.paint.text(ctx, s.composition(), caret_x, tr.y + m.ascent, style.size, false, content);
-            ui.paint.fillRect(ctx, caret_x, tr.y + m.ascent + 1, comp_m.width, 1, content);
-            caret_x += comp_m.width;
+        const baseline = tr.y + m.ascent;
+        // Selection highlight behind the glyphs (TextSelectionColors —
+        // primary @ 0.4 over the run's x range for [caret, anchor)).
+        const sel = s.edit.selRange();
+        if (sel.hi > sel.lo) {
+            const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
+            const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+            ui.paint.fillRect(ctx, hx0, tr.y, hx1 - hx0, m.height, ui.paint.withAlphaScaled(caret, 0.4));
         }
-        if (focused) {
-            // the caret at the end of the text (+ composition)
+        ui.paint.text(ctx, str, tx, baseline, style.size, false, content);
+        var caret_x = tx + ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        if (s.edit.comp.items.len > 0) {
+            // Preedit after the committed text, underlined (IME convention);
+            // SDL's comp_start puts the caret INSIDE the composition.
+            const comp = s.composition();
+            const comp_m = ui.paint.measureText(comp, style.size, false);
+            ui.paint.text(ctx, comp, tx + m.width, baseline, style.size, false, content);
+            ui.paint.fillRect(ctx, tx + m.width, baseline + 1, comp_m.width, 1, content);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_x = tx + m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        }
+        if (focused and s.edit.caret_on) {
             ui.paint.fillRect(ctx, caret_x, tr.y, caret_w, m.height, caret);
         }
     } else {
@@ -288,13 +286,25 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
             const tx = mx(b.x, b.w, tr.x, m.width, rtl);
             ui.paint.text(ctx, s.placeholder, tx, tr.y + m.ascent, style.size, false, muted);
         }
-        if (focused) {
+        if (focused and s.edit.caret_on) {
             // the caret at the (mirrored) start (empty text)
             const caret_x = mx(b.x, b.w, tr.x, 0, rtl);
             ui.paint.fillRect(ctx, caret_x, tr.y, caret_w, style.line_height, caret);
         }
     }
     ui.paint.clipReset(ctx);
+}
+
+/// Byte offset of the grapheme boundary nearest the press — the shared
+/// text_edit hit test over the painted run (its mirrored left is the
+/// probe's origin; the y is the text line box's).
+fn caretAt(n: *Node, s: *SearchBarState, x: f32, y: f32) usize {
+    const str = s.text();
+    const tr = textRect(n);
+    const m = ui.paint.measureText(str, s.opts.theme.type_scale.body_large.size, false);
+    const b = n.bounds;
+    const tx = if (ui.i18n.direction() == .rtl) b.x + b.w - (tr.x - b.x) - m.width else tr.x;
+    return text_edit.caretFromPoint(str, x - tx, y - tr.y, s.opts.theme.type_scale.body_large.size);
 }
 
 fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -309,6 +319,10 @@ fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
             } else {
                 s.pressed = true;
                 input.requestFocus(n);
+                // Click-to-caret: the press maps to the nearest grapheme
+                // boundary and collapses the selection onto it.
+                s.edit.dragging = true;
+                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), false);
             }
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
@@ -320,11 +334,18 @@ fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
             const was_pressed = s.pressed;
             s.clear_pressed = false;
             s.pressed = false;
+            s.edit.dragging = false;
             n.markDirty();
             if (was_clear and on_clear) clearText(n, s);
             return was_clear or was_pressed;
         },
         .move => {
+            // A held primary button drags the caret — drag-select (the
+            // pointer is captured, so moves keep arriving off-bounds).
+            if (s.edit.dragging) {
+                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), true);
+                return true;
+            }
             // A drag beyond the touch slop is a scroll, not a press: cancel
             // the pressed state. The move is NOT claimed (return false) so
             // it keeps bubbling to scrollable ancestors.
@@ -388,66 +409,39 @@ fn applyEdit(n: *Node, s: *SearchBarState) void {
 
 /// Clear the text (the clear button): keep the focus, fire on_changed.
 fn clearText(n: *Node, s: *SearchBarState) void {
-    s.buf.clearRetainingCapacity();
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.caret = 0;
+    s.edit.sel_anchor = 0;
+    setSentinel(&s.edit.buf);
     applyEdit(n, s);
+}
+
+/// The widget's applyEdit adapted to text_edit's callback signature.
+fn applyEditNode(n: *Node) void {
+    applyEdit(n, stateOf(n));
 }
 
 fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
-    switch (ev.kind) {
-        .text_input => {
-            // A commit discharges the composition (see text_field).
-            s.comp.clearRetainingCapacity();
-            setSentinel(&s.comp);
-            // Reject (never truncate) input that would grow the text past
-            // the documented cap — a paste/IME burst is applied whole or
-            // not at all.
-            if (s.buf.items.len + ev.text.len > ui.state.TextSignal.max_len) return true;
-            s.buf.ensureTotalCapacity(s.buf.items.len + ev.text.len + 1) catch @panic("klaxon: out of memory");
-            s.buf.appendSlice(ev.text) catch @panic("klaxon: out of memory");
-            setSentinel(&s.buf);
-            applyEdit(n, s);
+    // The shared editing core: text_input/text_editing, the Cmd/Ctrl
+    // clipboard chords, backspace/delete, arrows/home/end.
+    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (ev.kind == .key_down) switch (ev.key) {
+        .enter => {
+            if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .text_editing => {
-            s.comp.clearRetainingCapacity();
-            if (ev.text.len <= ui.state.TextSignal.max_len) {
-                s.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
-            }
-            setSentinel(&s.comp);
-            n.markDirty(); // repaint only — comp is not a committed edit
+        .escape => {
+            s.edit.comp.clearRetainingCapacity();
+            s.edit.comp_cursor = 0;
+            setSentinel(&s.edit.comp);
+            input.requestFocus(null);
+            n.markDirty();
             return true;
         },
-        .key_down => switch (ev.key) {
-            .backspace => {
-                // An open composition eats the backspace (codepoint first).
-                const target = if (s.comp.items.len > 0) &s.comp else &s.buf;
-                // Delete the last UTF-8 codepoint (continuation bytes first).
-                while (target.items.len > 0) {
-                    const last = target.items[target.items.len - 1];
-                    target.items.len -= 1;
-                    if ((last & 0xC0) != 0x80) break;
-                }
-                setSentinel(target);
-                if (target == &s.comp) n.markDirty() else applyEdit(n, s);
-                return true;
-            },
-            .enter => {
-                if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
-                return true;
-            },
-            .escape => {
-                s.comp.clearRetainingCapacity();
-                setSentinel(&s.comp);
-                input.requestFocus(null);
-                n.markDirty();
-                return true;
-            },
-            else => {},
-        },
-    }
+        else => {},
+    };
     return false;
 }
 
@@ -460,10 +454,11 @@ fn searchBarSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.clampOffsets(); // the caret rides the new text's bounds
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
@@ -474,8 +469,7 @@ fn searchBarDeinit(n: *Node) void {
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = searchBarSyncCb, .userdata = n } });
     input.releaseNode(n);
     n.allocator.free(s.placeholder);
-    s.buf.deinit();
-    s.comp.deinit();
+    s.edit.deinit(); // the blink ticker + both buffers
     n.allocator.destroy(s);
 }
 
@@ -513,8 +507,7 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     };
     errdefer allocator.destroy(s);
     s.* = .{
-        .buf = std.array_list.Managed(u8).init(allocator),
-        .comp = std.array_list.Managed(u8).init(allocator),
+        .edit = text_edit.Edit.init(allocator, node),
         .placeholder = placeholder,
         .opts = opts,
         .sig = sig,
@@ -523,14 +516,15 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     };
     errdefer {
         allocator.free(s.placeholder);
-        s.buf.deinit();
-        s.comp.deinit();
+        s.edit.deinit();
     }
-    s.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.ensureTotalCapacity(initial.len + 1) catch @panic("klaxon: out of memory");
     if (initial.len > 0) {
-        s.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
+        s.edit.buf.appendSlice(initial) catch @panic("klaxon: out of memory");
     }
-    setSentinel(&s.buf); // null-terminates the (possibly empty) buffer
+    setSentinel(&s.edit.buf); // null-terminates the (possibly empty) buffer
+    s.edit.caret = s.edit.buf.items.len; // the caret starts at the end
+    s.edit.sel_anchor = s.edit.caret;
     node.state = s;
     ui.semantics.attach(node, .{
         .role = .text_field,
@@ -557,10 +551,13 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
-    s.buf.clearRetainingCapacity();
-    s.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
-    s.buf.appendSlice(str) catch @panic("klaxon: out of memory");
-    setSentinel(&s.buf);
+    s.edit.buf.clearRetainingCapacity();
+    s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
+    s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");
+    setSentinel(&s.edit.buf);
+    s.edit.caret = s.edit.buf.items.len; // programmatic replace → caret at the end
+    s.edit.sel_anchor = s.edit.caret;
+    s.edit.resetBlink();
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
@@ -805,4 +802,70 @@ test "golden: disabled paints the OnSurface@0.38 content" {
     // differs ±1 from blendOver — count approx)
     const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), t.colors.surface_container_high);
     try std.testing.expect(f.countColorApproxIn(.{ .x = 72, .y = 28, .w = 60, .h = 24 }, dis) > 0);
+}
+
+test "search_bar: click places the caret; shift-selects; edits at the caret" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try searchBar(std.testing.allocator, null, null, null, .{ .initial = "abc" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 360, .h = 56 });
+    const s = stateOf(b);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret); // starts at the end
+    // a press near the text run's left edge → the nearest boundary (0 or 1)
+    router.dispatchPointer(b, .{ .phase = .down, .x = textStart(theme_mod.light) + 1, .y = 28 });
+    try std.testing.expect(input.isFocused(b));
+    try std.testing.expect(s.edit.caret <= 1);
+    // a press far past the run end → the end
+    router.dispatchPointer(b, .{ .phase = .down, .x = 250, .y = 28 });
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret);
+    // shift+home selects the whole line; typing replaces the range
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .home, .shift = true });
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 3), s.edit.sel_anchor);
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "Z" });
+    try std.testing.expectEqualStrings("Z", text(b));
+    // left/right move by codepoint
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret);
+}
+
+test "search_bar: Cmd/Ctrl chords — select-all, copy, cut, paste" {
+    const Clip = struct {
+        var store: [64]u8 = undefined;
+        var len: usize = 0;
+        fn getImpl(alloc: std.mem.Allocator) ?[]u8 {
+            if (len == 0) return null;
+            const out = alloc.alloc(u8, len) catch return null;
+            @memcpy(out, store[0..len]);
+            return out;
+        }
+        fn setImpl(txt: []const u8) void {
+            len = @min(txt.len, store.len);
+            @memcpy(store[0..len], txt[0..len]);
+        }
+    };
+    ui.clipboard.install(.{ .get = Clip.getImpl, .set = Clip.setImpl });
+    defer ui.clipboard.install(.{});
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try searchBar(std.testing.allocator, null, null, null, .{ .initial = "abc" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 360, .h = 56 });
+    const s = stateOf(b);
+    router.focus(b);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'a' });
+    try std.testing.expectEqual(@as(usize, 3), s.edit.caret); // caret at the end
+    try std.testing.expectEqual(@as(usize, 0), s.edit.sel_anchor); // anchor at the start
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'c' });
+    try std.testing.expectEqual(@as(usize, 3), Clip.len);
+    try std.testing.expectEqualStrings("abc", Clip.store[0..Clip.len]);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'x' });
+    try std.testing.expectEqual(@as(usize, 0), text(b).len);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .command = true, .chr = 'v' });
+    try std.testing.expectEqualStrings("abc", text(b));
 }
