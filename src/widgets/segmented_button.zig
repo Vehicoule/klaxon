@@ -6,8 +6,9 @@
 // Spec: m3.material.io/components/segmented-buttons + Compose
 // SegmentedButton.kt (SingleChoiceSegmentedButtonRow / SegmentedButton) +
 // OutlinedSegmentedButtonTokens:
-//   - row: segments are EQUAL width (weight 1f), 40dp tall (ContainerHeight),
-//     min width 58dp (ButtonDefaults.MinWidth); the segments OVERLAP by the
+//   - row: segments are EQUAL width (weight 1f over the row's IntrinsicSize
+//     .Min — the mean of the contents, floored at ButtonDefaults.MinWidth
+//     58dp), 40dp tall (ContainerHeight); the segments OVERLAP by the
 //     border width (spacedBy(-space), space = OutlineWidth = 1dp) so the
 //     borders coincide — no double border
 //   - shapes (itemShape on CornerFull): count == 1 -> full; first -> the
@@ -37,14 +38,15 @@
 //     left/right (up/down) arrows move the selection, skipping disabled
 //     segments and wrapping (RTL flips left/right)
 //
-// v1 deviations (documented, fixed later):
-//   - Equal width = the WIDEST content (Compose weight(1f) + IntrinsicSize
-//     .Min distributes the row's intrinsic width evenly — the mean; v1 uses
-//     the max, the common visual case).
-//   - No checked-icon crossfade / icon-less-to-icon transition animation
-//     (the M3E segment morph lands with the animation system, Phase 3).
+//   - the check icon is upstream's AnimatedVisibility: fade + scale-in
+//     from the bottom-left (FastSpatial spring) on select, instant exit
+//     while the label offset springs back to center
+//
+// v1 deviations (documented):
 //   - Multi-choice (`segmentedButtonMulti`) is a u64 bitmask — selectable
 //     segments cap at 64; a click/space toggles, arrows move the cursor.
+//   - A squeezed segment clips its label (upstream wraps to a second
+//     line via IntrinsicSize.Min; Klaxon labels paint single-line).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -88,10 +90,27 @@ const icon_size: f32 = 18; // IconSize
 const icon_gap: f32 = 8; // IconSpacing (private val in SegmentedButton.kt)
 const border_w: f32 = 1; // OutlineWidth (also the row overlap)
 
+/// The check-icon AnimatedVisibility state (upstream: fadeIn +
+/// scaleIn(0, origin bottom-left) on enter, instant exit — while the
+/// label offset springs -(IconSize+Spacing)/2 → 0). `a` carries the
+/// transition for the label offset on BOTH directions; `shown` is the
+/// target visibility (the icon paints only while `shown`, at alpha/scale
+/// `a`; on exit `shown` flips instantly and `a` decays so the label
+/// slides back). `chan` is the stable timeline channel (items.items
+/// never re-allocs after init — same guarantee the a11y children rely
+/// on).
+const CheckAnim = struct {
+    n: *Node,
+    a: f32 = 0,
+    shown: bool = false,
+    chan: u8 = 0,
+};
+
 const ItemDef = struct {
     label: [:0]const u8, // owned
     icon: ?icon_w.IconName,
     enabled: bool,
+    anim: CheckAnim,
 };
 
 const SegState = struct {
@@ -132,21 +151,24 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
     return buf[0..str.len :0];
 }
 
-/// The segment width: all segments are equal, sized to the widest content
-/// (icon slot + gap + label + paddings) with the 58dp min width. Upstream's
-/// SegmentedButtonContentMeasurePolicy reserves `max(IconSize, iconWidth) +
-/// IconSpacing` for EVERY segment — the check-icon slot exists even when the
-/// icon content is empty (the -13dp offset then re-centers the label, which
-/// is what an icon-less label's centered paint below reproduces).
+/// The segment width: upstream distributes the Row's intrinsic width
+/// evenly across weight(1f) children — each segment's slot is the MEAN
+/// of the contents (icon slot + gap + label + paddings), floored at the
+/// 58dp min width. Upstream's SegmentedButtonContentMeasurePolicy
+/// reserves `max(IconSize, iconWidth) + IconSpacing` for EVERY segment —
+/// the check-icon slot exists even when the icon content is empty (the
+/// -13dp offset then re-centers the label, which is what an icon-less
+/// label's centered paint below reproduces).
 fn segWidth(s: *SegState, t: Theme) f32 {
+    const count = s.items.items.len;
+    if (count == 0) return seg_min_w;
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
-    var w: f32 = seg_min_w;
+    var sum: f32 = 0;
     for (s.items.items) |def| {
-        const cw = seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText(def.label, ls.size, bold).width;
-        w = @max(w, cw);
+        sum += seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText(def.label, ls.size, bold).width;
     }
-    return w;
+    return @max(seg_min_w, sum / @as(f32, @floatFromInt(count)));
 }
 
 /// The segment's rect in LTR space (the segments overlap by the border
@@ -246,6 +268,7 @@ fn segSelect(n: *Node, index: usize) void {
     if (index >= s.items.items.len) return;
     if (!s.items.items[index].enabled) return;
     s.selected = index;
+    retargetAllChecks(s); // the old check exits, the new one scales in
     if (s.sig) |sig| sig.set(index); // the sync callback re-reads (idempotent)
     n.markDirty();
     if (n.semantics) |sem| {
@@ -264,6 +287,7 @@ fn segToggle(n: *Node, index: usize) void {
     if (index >= s.items.items.len or index >= 64) return;
     if (!s.items.items[index].enabled) return;
     s.mask ^= @as(u64, 1) << @intCast(index);
+    retargetCheck(s, index);
     if (s.multi_sig) |sig| sig.set(s.mask);
     s.cursor = index;
     n.markDirty();
@@ -281,6 +305,7 @@ fn segSyncCb(userdata: ?*anyopaque) void {
     const v = s.sig.?.peek();
     if (v < s.items.items.len and v != s.selected) {
         s.selected = v;
+        retargetAllChecks(s);
         if (n.semantics) |sem| {
             sem.value = s.items.items[v].label;
             for (s.sem_children.items, 0..) |*c, i| c.checked = (i == v);
@@ -297,11 +322,61 @@ fn segMultiSyncCb(userdata: ?*anyopaque) void {
     const v = s.multi_sig.?.peek();
     if (v != s.mask) {
         s.mask = v;
+        retargetAllChecks(s);
         if (n.semantics != null) {
             for (s.sem_children.items, 0..) |*c, i| c.checked = isSel(s, i);
             ui.semantics.notifyControlChanged(n);
         }
         n.markDirty();
+    }
+}
+
+fn checkCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const anim: *CheckAnim = @ptrCast(@alignCast(userdata.?));
+    anim.a = v[0];
+    anim.n.markDirty();
+}
+
+/// Retarget segment `i`'s check transition after its selection flipped:
+/// the spatial spring carries `a` to the target; the paint reads `shown`
+/// for the icon's visibility and `a` for the label offset — an exit is
+/// instant for the icon while the label slides back (upstream's
+/// ExitTransition.None). A custom `icon` replaces the whole slot, no
+/// check anim. No timeline → snap.
+fn retargetCheck(s: *SegState, i: usize) void {
+    const def = &s.items.items[i];
+    if (def.icon != null) return;
+    const anim = &def.anim;
+    const show = isSel(s, i);
+    if (anim.shown == show and anim.a == @as(f32, @floatFromInt(@intFromBool(show)))) return;
+    anim.shown = show;
+    if (ui.anim.timeline()) |tl| {
+        const target: f32 = if (show) 1 else 0;
+        const from: ui.anim.Vec4 = .{ anim.a, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, tl.channelVelocity(@ptrCast(&anim.chan))),
+            .from = from,
+            .channel = @ptrCast(&anim.chan),
+            .on_update = .{ .fn_ptr = checkCb, .userdata = anim },
+        });
+    } else {
+        anim.a = @floatFromInt(@intFromBool(show));
+        anim.n.markDirty();
+    }
+}
+
+/// Refresh every segment's check target (selection changed wholesale —
+/// the sync callbacks and the factories).
+fn retargetAllChecks(s: *SegState) void {
+    for (0..s.items.items.len) |i| retargetCheck(s, i);
+}
+
+/// Settle the check state without animation (construction — upstream's
+/// initialOffset likewise skips the first-measure animation).
+fn snapChecks(s: *SegState) void {
+    for (s.items.items, 0..) |*def, i| {
+        def.anim.shown = def.icon == null and isSel(s, i);
+        def.anim.a = @floatFromInt(@intFromBool(def.anim.shown));
     }
 }
 
@@ -391,20 +466,31 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     else
         cs.on_surface;
     const lm = ui.paint.measureText(def.label, ls.size, bold);
-    // Upstream icon slot: multi-checked segments show the check mark (the
-    // default SegmentedButtonDefaults.Icon); a checked item icon yields to
-    // the check — the icon is the affordance, not decoration.
-    const shown_icon: ?icon_w.IconName = if (s.multi and selected) .check else def.icon;
-    var content_w = lm.width;
-    if (shown_icon != null) content_w += icon_size + icon_gap;
-    const cx = sr.x + (sr.w - content_w) / 2;
+    // Upstream content box: the icon slot is ALWAYS reserved (IconSize +
+    // IconSpacing) and the label's offset animates
+    // -(IconSize+Spacing)/2 → 0 as the check enters (the measure
+    // policy's animatable). A custom `icon` fills the slot in both
+    // states (upstream: the icon lambda is the whole slot — a checked
+    // icon does NOT yield to the check); with no icon the default
+    // SegmentedButtonDefaults.Icon paints the check when selected.
+    const cw = icon_size + icon_gap + lm.width;
+    const cx = sr.x + (sr.w - cw) / 2;
     const baseline = sr.y + (sr.h - lm.height) / 2 + lm.ascent;
-    var tx = cx;
-    if (shown_icon) |iname| {
-        paintIcon(ctx, iname, tx, sr.y + (sr.h - icon_size) / 2, icon_size, fg);
-        tx += icon_size + icon_gap;
+    const icon_y = sr.y + (sr.h - icon_size) / 2;
+    if (def.icon) |iname| {
+        paintIcon(ctx, iname, cx, icon_y, icon_size, fg);
+    } else if (def.anim.shown) {
+        // The check enters fading + scaling from its bottom-left corner
+        // (scaleIn transformOrigin (0,1)); the exit is instant — `shown`
+        // is already false while `a` decays for the label offset.
+        const isz = icon_size * def.anim.a;
+        paintIcon(ctx, .check, cx, icon_y + icon_size - isz, isz, ui.paint.withAlphaScaled(fg, def.anim.a));
     }
-    ui.paint.text(ctx, def.label, tx, baseline, ls.size, bold, fg);
+    const label_off: f32 = if (def.icon != null)
+        0
+    else
+        std.math.lerp(-(icon_size + icon_gap) / 2, 0, def.anim.a);
+    ui.paint.text(ctx, def.label, cx + icon_size + icon_gap + label_off, baseline, ls.size, bold, fg);
     ui.paint.clipReset(ctx); // restores
     // border — upstream disabled*BorderColor = OutlineColor @ 0.12 (the
     // DisabledOutlineColor OnSurface token is not the one the colors use)
@@ -544,7 +630,10 @@ fn segDeinit(n: *Node) void {
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = n } });
     if (s.multi_sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segMultiSyncCb, .userdata = n } });
     input.releaseNode(n);
-    for (s.items.items) |*def| n.allocator.free(def.label);
+    for (s.items.items) |*def| {
+        if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&def.anim.chan)); // the cb points into this item
+        n.allocator.free(def.label);
+    }
     s.items.deinit();
     s.sem_children.deinit();
     n.allocator.destroy(s);
@@ -606,10 +695,11 @@ fn segBuild(allocator: std.mem.Allocator, items: []const SegmentedItem, opts: Se
         const label = try dupeZ(allocator, item.label);
         errdefer allocator.free(label); // iteration scope: freed only if THIS iteration fails before the append
         // No catch-free here: on append failure the errdefer frees the copy.
-        try s.items.append(.{ .label = label, .icon = item.icon, .enabled = item.enabled });
+        try s.items.append(.{ .label = label, .icon = item.icon, .enabled = item.enabled, .anim = .{ .n = node } });
     }
     node.state = s;
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
+    snapChecks(s); // the initial check state is settled — no enter anim
     // Per-segment virtual a11y children — VoiceOver reads/selects each
     // segment (radio or checkbox by mode), not just an opaque group. The
     // borrowed slice is stable (items never re-alloc after init);
@@ -648,6 +738,7 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
         sg.subscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = node } });
         const v = sg.peek();
         if (v < s.items.items.len) s.selected = v; // the signal wins
+        snapChecks(s);
         if (node.semantics) |sem| {
             sem.value = s.items.items[s.selected].label;
             for (s.sem_children.items, 0..) |*c, i| c.checked = (i == s.selected);
@@ -670,6 +761,7 @@ pub fn segmentedButtonMulti(allocator: std.mem.Allocator, items: []const Segment
     if (sig) |sg| {
         sg.subscribe(.{ .callback = .{ .fn_ptr = segMultiSyncCb, .userdata = node } });
         s.mask = sg.peek(); // the signal wins
+        snapChecks(s);
         for (s.sem_children.items, 0..) |*c, i| c.checked = isSel(s, i);
     }
     return node;
@@ -689,9 +781,9 @@ test "segmented_button: measures equal-width segments overlapping by the border;
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     const t = theme_mod.light;
     const ls = t.type_scale.label_large;
-    // every segment reserves the 26dp icon slot (upstream measure policy)
-    const w_month = seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Month", ls.size, true).width;
-    const w = @max(seg_min_w, w_month); // all segments = the widest content
+    // every segment reserves the 26dp icon slot (upstream measure policy);
+    // weight(1f) shares the row's intrinsic width evenly — the MEAN
+    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + (ui.paint.measureText("Day", ls.size, true).width + ui.paint.measureText("Week", ls.size, true).width + ui.paint.measureText("Month", ls.size, true).width) / 3);
     try std.testing.expectApproxEqAbs(@as(f32, 3) * w - 2 * border_w, sz.w, 0.001);
     try std.testing.expectEqual(seg_height, sz.h);
     // a single segment: full width, no overlap
@@ -715,10 +807,11 @@ test "segmented_button: click selects (signal + on_change); arrows move AND sele
     n.layout(.{ .x = 0, .y = 0, .w = 300, .h = 40 });
     try std.testing.expectEqual(@as(usize, 0), selectedIndex(n));
     try std.testing.expectEqualStrings("Day", n.semantics.?.value);
-    // click the 3rd segment (the widest item sets the segment width; the
-    // segments overlap by 1dp)
+    // click the 3rd segment (weight(1f): the mean of the contents sets
+    // the segment width; the segments overlap by 1dp)
     const t = theme_mod.light;
-    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Month", t.type_scale.label_large.size, true).width);
+    const ls = t.type_scale.label_large;
+    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureText("Day", ls.size, true).width + ui.paint.measureText("Week", ls.size, true).width + ui.paint.measureText("Month", ls.size, true).width) / 3);
     const x3 = @as(f32, @floatFromInt(2)) * (w - border_w) + 10;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
@@ -769,7 +862,8 @@ test "segmented_button: multi-choice toggles a bitmask — click, cursor+space, 
     try std.testing.expect(!n.semantics.?.children[1].checked.?);
     // click segment 1 → toggles its bit ON without clearing segment 0
     const t = theme_mod.light;
-    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Underline", t.type_scale.label_large.size, true).width);
+    const ls = t.type_scale.label_large;
+    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureText("Bold", ls.size, true).width + ui.paint.measureText("Italic", ls.size, true).width + ui.paint.measureText("Underline", ls.size, true).width) / 3);
     const x1 = w - border_w + 10;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
@@ -934,4 +1028,60 @@ test "segmented_button: RTL mirrors the row (the first segment sits at the end s
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 100, .y = 20, .raw_x = 100, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 100, .y = 20, .raw_x = 100, .raw_y = 20 });
     try std.testing.expectEqual(@as(usize, 0), selectedIndex(n));
+}
+
+test "segmented_button: the check scales in on select, exits instantly while the label offset springs back" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try segmentedButton(a, &.{ .{ .label = "A" }, .{ .label = "B" } }, null, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 40 });
+    const s = stateOf(n);
+    // settled at construction: seg 0 selected → shown at a=1; seg 1 hidden
+    try std.testing.expect(s.items.items[0].anim.shown and s.items.items[0].anim.a == 1);
+    try std.testing.expect(!s.items.items[1].anim.shown and s.items.items[1].anim.a == 0);
+    segSelect(n, 1);
+    tl.tick(0); // lazy start
+    // upstream: the exit is instant (shown already false) while `a`
+    // still carries the label's offset slide; the new check is mid-scale
+    try std.testing.expect(!s.items.items[0].anim.shown);
+    try std.testing.expect(s.items.items[0].anim.a > 0.5);
+    try std.testing.expect(s.items.items[1].anim.shown);
+    try std.testing.expect(s.items.items[1].anim.a < 0.5);
+    tl.tick(800); // the springs settle
+    try std.testing.expectEqual(@as(f32, 0), s.items.items[0].anim.a);
+    try std.testing.expectEqual(@as(f32, 1), s.items.items[1].anim.a);
+    // re-select mid-flight: the channel retargets, no snap
+    segSelect(n, 0);
+    tl.tick(1000);
+    try std.testing.expect(s.items.items[0].anim.shown);
+    try std.testing.expect(s.items.items[0].anim.a < 1); // still rising
+}
+
+test "golden: the selected icon-less segment paints the check glyph; the label shifts right" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const n = try segmentedButton(a, &.{ .{ .label = "Day" }, .{ .label = "Week" } }, null, null, .{ .selected = 0, .theme = t });
+    defer n.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 260, 80);
+    defer r.deinit();
+    n.layout(.{ .x = 20, .y = 20, .w = 220, .h = 40 });
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const w = segWidthFit(stateOf(n), t, n.bounds);
+    // the check sits at the content box's leading edge: the label ("Day")
+    // is centered in the box, so the icon zone is the slot's left band.
+    // Icon ink = on_secondary_container over the secondary_container fill
+    // (AA'd — probe approximately).
+    const icon_x = 20 + (w - (icon_size + icon_gap + ui.paint.measureText("Day", t.type_scale.label_large.size, true).width)) / 2;
+    try std.testing.expect(f.countColorApproxIn(.{ .x = icon_x, .y = 30, .w = icon_size, .h = icon_size }, t.colors.on_secondary_container) > 0);
+    // the unselected segment has NO check: its leading icon zone is clear
+    // of glyph ink (the "Week" label is inset by the reserved slot)
+    const week_w = ui.paint.measureText("Week", t.type_scale.label_large.size, true).width;
+    const cx1 = 20 + (w - border_w) + (w - (icon_size + icon_gap + week_w)) / 2;
+    try std.testing.expectEqual(@as(u32, 0), f.countColorApproxIn(.{ .x = cx1 + 2, .y = 32, .w = 8, .h = 16 }, t.colors.on_surface));
 }
