@@ -717,13 +717,20 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         // frame (the cache key is the full string, which always changes).
         const baseline = baselineIn(tr.y, tr.h, m);
         // Selection highlight — behind the glyphs (upstream:
-        // TextSelectionColors background, primary @ 0.4). The range is
-        // contiguous in the painted logical order.
+        // TextSelectionColors background, primary @ 0.4). The paragraph
+        // reports one box per run when the range crosses a bidi boundary;
+        // the prefix-width fallback spans the range as a single rect.
         const sel = s.edit.selRange();
         if (sel.hi > sel.lo) {
-            const hx0 = tx + runXAt(s, sel.lo);
-            const hx1 = tx + runXAt(s, sel.hi);
-            ui.paint.fillRect(ctx, hx0, baseline - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(fc.caret, 0.4));
+            var boxes: [8][4]f32 = undefined;
+            if (s.edit.caretBoxes(sel.lo, sel.hi, style.size, &boxes)) |nb| {
+                for (boxes[0..nb]) |bx|
+                    ui.paint.fillRect(ctx, tx + bx[0], baseline - m.ascent, bx[2], m.ascent + m.descent, ui.paint.withAlphaScaled(fc.caret, 0.4));
+            } else {
+                const hx0 = tx + runXAt(s, sel.lo);
+                const hx1 = tx + runXAt(s, sel.hi);
+                ui.paint.fillRect(ctx, hx0, baseline - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(fc.caret, 0.4));
+            }
         }
         var sx = tx;
         for (s.segs.items) |seg| {
@@ -734,7 +741,10 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
             sx += seg.m.width;
         }
-        var caret_x = tx + runXAt(s, s.edit.caret);
+        // The caret's visual edge — direction-aware under RTL via the
+        // paragraph's caret rect; the segmented prefix-sum is the
+        // fallback when the paragraph can't build.
+        var caret_x = tx + (s.edit.caretX(s.edit.caret, style.size) orelse runXAt(s, s.edit.caret));
         if (has_comp) {
             // Preedit: appended visually after the committed text with the
             // platform-conventional underline (Compose marks the composing
@@ -842,7 +852,7 @@ fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     // The shared editing core: text_input/text_editing, the Cmd/Ctrl
     // clipboard chords, backspace/delete, arrows/home/end.
-    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (s.edit.handleKey(ev, applyEditNode, bodyLarge(s.opts.theme).size)) return true;
     if (ev.kind == .key_down) switch (ev.key) {
         .enter => {
             if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
@@ -1501,6 +1511,44 @@ test "text_field: the caret steps by grapheme cluster over emoji" {
     s.edit.sel_anchor = 1;
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .delete });
     try std.testing.expectEqualStrings("ab", text(b));
+}
+
+test "text_field: under RTL the arrows step in the visual direction" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const prev_rtl = ui.paint.textDirectionRtl();
+    ui.paint.setTextDirection(true);
+    defer ui.paint.setTextDirection(prev_rtl);
+    // Hebrew "אבג" — 6 bytes, a pure RTL run: the logical start sits at
+    // the visual right edge, so arrows step in the direction the caret
+    // appears to move (left = logical forward, right = logical back).
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "\xD7\x90\xD7\x91\xD7\x92" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    router.focus(b);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .home }); // visual left = logical end
+    try std.testing.expectEqual(@as(usize, 6), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // visual right = logical back
+    try std.testing.expectEqual(@as(usize, 4), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end }); // visual right edge = logical 0
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left }); // visual left = logical forward
+    try std.testing.expectEqual(@as(usize, 2), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 4), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 6), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left }); // clamped at the visual edge
+    try std.testing.expectEqual(@as(usize, 6), s.edit.caret);
+    // select-all then left collapses onto the VISUAL left edge (logical hi)
+    _ = router.dispatchKey(.{ .kind = .key_down, .command = true, .chr = 'a' });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 6), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .command = true, .chr = 'a' });
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // collapses to logical lo = visual right
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
 }
 
 test "text_field: double-click selects the word; word-drag extends by word" {

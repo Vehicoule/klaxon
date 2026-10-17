@@ -542,10 +542,17 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     if (!empty) {
         const sel = s.edit.selRange();
         if (sel.hi > sel.lo) {
-            // The selection highlight sits behind the glyphs.
-            const hx0 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.lo], s.opts.size, false).width;
-            const hx1 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.hi], s.opts.size, false).width;
-            ui.paint.fillRect(ctx, hx0, text_y - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(s.opts.color, 0.3));
+            // The selection highlight sits behind the glyphs — one box
+            // per run when the range crosses a bidi boundary.
+            var boxes: [8][4]f32 = undefined;
+            if (s.edit.caretBoxes(sel.lo, sel.hi, s.opts.size, &boxes)) |nb| {
+                for (boxes[0..nb]) |bx|
+                    ui.paint.fillRect(ctx, text_x + bx[0], text_y - m.ascent, bx[2], m.ascent + m.descent, ui.paint.withAlphaScaled(s.opts.color, 0.3));
+            } else {
+                const hx0 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.lo], s.opts.size, false).width;
+                const hx1 = text_x + ui.paint.measureTextLen(s.edit.text()[0..sel.hi], s.opts.size, false).width;
+                ui.paint.fillRect(ctx, hx0, text_y - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(s.opts.color, 0.3));
+            }
         }
     }
     if (str.len > 0) ui.paint.text(ctx, str, text_x, text_y, s.opts.size, false, if (empty) s.opts.hint else s.opts.color);
@@ -553,7 +560,8 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     if (focused) s.edit.ensureTicker(); // the caret blink
     const has_comp = s.edit.comp.items.len > 0;
     if (!empty or has_comp) {
-        var caret_x = text_x + ui.paint.measureTextLen(s.edit.text()[0..s.edit.caret], s.opts.size, false).width;
+        // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+        var caret_x = text_x + (s.edit.caretX(s.edit.caret, s.opts.size) orelse ui.paint.measureTextLen(s.edit.text()[0..s.edit.caret], s.opts.size, false).width);
         if (has_comp) {
             // The live preedit paints underlined after the committed text;
             // comp_start positions the IME cursor inside it.
@@ -620,7 +628,7 @@ fn inputApplyEdit(n: *Node) void {
 
 fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(TextFieldState, n);
-    if (s.edit.handleKey(ev, inputApplyEdit)) return true;
+    if (s.edit.handleKey(ev, inputApplyEdit, s.opts.size)) return true;
     if (ev.kind == .key_down) switch (ev.key) {
         .enter => {
             if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);

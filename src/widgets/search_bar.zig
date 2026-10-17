@@ -261,12 +261,20 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
         // primary @ 0.4 over the run's x range for [caret, anchor)).
         const sel = s.edit.selRange();
         if (sel.hi > sel.lo) {
-            const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
-            const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
-            ui.paint.fillRect(ctx, hx0, tr.y, hx1 - hx0, m.height, ui.paint.withAlphaScaled(caret, 0.4));
+            // One box per run when the range crosses a bidi boundary.
+            var boxes: [8][4]f32 = undefined;
+            if (s.edit.caretBoxes(sel.lo, sel.hi, style.size, &boxes)) |nb| {
+                for (boxes[0..nb]) |bx|
+                    ui.paint.fillRect(ctx, tx + bx[0], tr.y, bx[2], m.height, ui.paint.withAlphaScaled(caret, 0.4));
+            } else {
+                const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
+                const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+                ui.paint.fillRect(ctx, hx0, tr.y, hx1 - hx0, m.height, ui.paint.withAlphaScaled(caret, 0.4));
+            }
         }
         ui.paint.text(ctx, str, tx, baseline, style.size, false, content);
-        var caret_x = tx + ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+        var caret_x = tx + (s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width);
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
@@ -427,7 +435,7 @@ fn searchBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.opts.enabled) return false;
     // The shared editing core: text_input/text_editing, the Cmd/Ctrl
     // clipboard chords, backspace/delete, arrows/home/end.
-    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (s.edit.handleKey(ev, applyEditNode, s.opts.theme.type_scale.body_large.size)) return true;
     if (ev.kind == .key_down) switch (ev.key) {
         .enter => {
             if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);

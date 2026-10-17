@@ -59,6 +59,7 @@ pub const Edit = struct {
     hit_layout: ?*ui.paint.TextLayout = null,
     hit_key: u64 = 0,
     hit_size: f32 = 0,
+    hit_rtl: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) Edit {
         return .{
@@ -263,8 +264,11 @@ pub const Edit = struct {
     /// arrows/home/end navigation. Widget keys (enter, escape, activation)
     /// return false — the widget's own switch handles them.
     /// `apply_edit` runs the widget's post-edit follow-ups (re-layout,
-    /// signal mirror, a11y, on_changed) on the owning node.
-    pub fn handleKey(e: *Edit, ev: input.KeyEvent, apply_edit: *const fn (*Node) void) bool {
+    /// signal mirror, a11y, on_changed) on the owning node. `size` is the
+    /// run's painted text size — the arrows step in SCREEN direction
+    /// through the same memoized layout the hit test builds, so it must
+    /// match the paint size for the geometry to agree.
+    pub fn handleKey(e: *Edit, ev: input.KeyEvent, apply_edit: *const fn (*Node) void, size: f32) bool {
         const n = e.node orelse return false;
         switch (ev.kind) {
             .text_input => {
@@ -399,34 +403,38 @@ pub const Edit = struct {
                         apply_edit(n);
                         return true;
                     },
-                    // Logical caret motion — one grapheme cluster per
-                    // press (UAX #29 via the paint backend, like Compose's
-                    // BreakIterator). Shift extends; a plain arrow over an
-                    // open selection collapses onto the range's edge.
+                    // Visual caret motion — one position per press in the
+                    // arrow's SCREEN direction: the logical neighbours'
+                    // caret x pick the step, so RTL and mixed-direction
+                    // text move the way the caret appears to move
+                    // (Compose's visual motion). Identical to the
+                    // grapheme step under pure LTR. Shift extends; a
+                    // plain arrow over an open selection collapses onto
+                    // the range's visual edge.
                     .left => {
                         const sel = e.selRange();
                         if (sel.hi > sel.lo and !ev.shift) {
-                            e.moveCaret(sel.lo, false);
+                            e.moveCaret(e.visualEdge(sel.lo, sel.hi, -1, size), false);
                             return true;
                         }
-                        e.moveCaret(e.graphemeStep(e.caret, -1), ev.shift);
+                        e.moveCaret(e.visualStep(-1, size), ev.shift);
                         return true;
                     },
                     .right => {
                         const sel = e.selRange();
                         if (sel.hi > sel.lo and !ev.shift) {
-                            e.moveCaret(sel.hi, false);
+                            e.moveCaret(e.visualEdge(sel.lo, sel.hi, 1, size), false);
                             return true;
                         }
-                        e.moveCaret(e.graphemeStep(e.caret, 1), ev.shift);
+                        e.moveCaret(e.visualStep(1, size), ev.shift);
                         return true;
                     },
                     .home => {
-                        e.moveCaret(0, ev.shift); // single line: the run start
+                        e.moveCaret(e.visualEdge(0, e.buf.items.len, -1, size), ev.shift);
                         return true;
                     },
                     .end => {
-                        e.moveCaret(e.buf.items.len, ev.shift); // the run end
+                        e.moveCaret(e.visualEdge(0, e.buf.items.len, 1, size), ev.shift);
                         return true;
                     },
                     else => {},
@@ -436,35 +444,100 @@ pub const Edit = struct {
         return false;
     }
 
-    /// The byte offset of the grapheme boundary nearest a point in the
-    /// run's own space (`px/py` are already relative to the run's painted
-    /// left/top) — SkParagraph's getGlyphPositionAtCoordinate, Compose's
-    /// TextLayoutResult.getOffsetForPosition. The probe builds under LTR:
-    /// the text widgets paint the run in logical order (the text-run-LTR
-    /// deviation), so the hit test must agree with what is on screen. Falls
-    /// back to the run's near edge when the paragraph can't build. The
-    /// paragraph is memoized on (content hash, size): drags reuse it.
-    pub fn caretAt(e: *Edit, px: f32, py: f32, size: f32) usize {
+    /// The memoized hit-test/motion layout: a single-span unconstrained
+    /// paragraph in the GLOBAL text direction — the same direction the
+    /// paint path builds its run — so hit-testing, caret geometry and
+    /// arrow stepping all agree with what is on screen (a mirrored RTL
+    /// run hit-tests its glyphs where they are painted). Keyed on
+    /// (content hash, size, direction); drags and arrows reuse it.
+    fn hitLayout(e: *Edit, size: f32) ?*ui.paint.TextLayout {
         const str = e.text();
-        if (str.len == 0) return 0;
+        if (str.len == 0) return null;
         const key = std.hash.Wyhash.hash(0, str);
-        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size) {
+        const rtl = ui.paint.textDirectionRtl();
+        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size or e.hit_rtl != rtl) {
             if (e.hit_layout) |old| ui.paint.textLayoutDestroy(old);
             const l = ui.paint.textLayoutBegin(0) orelse { // fields clip
                 e.hit_layout = null;
-                return if (px <= 0) 0 else str.len;
+                return null;
             };
-            const prev_rtl = ui.paint.textDirectionRtl();
-            ui.paint.setTextDirection(false);
-            defer ui.paint.setTextDirection(prev_rtl);
             ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(size, 400, 0, 0, 0xFF0000FF));
             e.hit_layout = l;
             e.hit_key = key;
             e.hit_size = size;
+            e.hit_rtl = rtl;
         }
-        const pos = ui.paint.textLayoutPositionAt(e.hit_layout.?, px, py);
-        if (pos < 0) return if (px <= 0) 0 else str.len;
+        return e.hit_layout;
+    }
+
+    /// The byte offset of the grapheme boundary nearest a point in the
+    /// run's own space (`px/py` are already relative to the run's painted
+    /// left/top) — SkParagraph's getGlyphPositionAtCoordinate, Compose's
+    /// TextLayoutResult.getOffsetForPosition. Falls back to the run's
+    /// near edge (logical start under LTR, logical end under RTL) when
+    /// the paragraph can't build.
+    pub fn caretAt(e: *Edit, px: f32, py: f32, size: f32) usize {
+        const str = e.text();
+        if (str.len == 0) return 0;
+        const near: usize = if (ui.paint.textDirectionRtl()) str.len else 0;
+        const l = e.hitLayout(size) orelse return if (px <= 0) near else str.len - near;
+        const pos = ui.paint.textLayoutPositionAt(l, px, py);
+        if (pos < 0) return if (px <= 0) near else str.len - near;
         return utf16ToByteIndex(str, @intCast(pos));
+    }
+
+    /// The caret's visual x for `byte_off` in layout space — the leading
+    /// edge of the grapheme at that offset, direction-aware under RTL.
+    /// null when the paragraph can't build; callers fall back to the
+    /// prefix-width measure.
+    pub fn caretX(e: *Edit, byte_off: usize, size: f32) ?f32 {
+        const l = e.hitLayout(size) orelse return null;
+        var r: [4]f32 = undefined;
+        if (!ui.paint.textLayoutCaretRect(l, byteToUtf16Index(e.text(), byte_off), &r)) return null;
+        return r[0];
+    }
+
+    /// The glyph boxes covering byte range [lo, hi) in layout space —
+    /// one per run when the range crosses a bidi boundary, which is what
+    /// the selection highlight must paint under mixed direction. `out`
+    /// gets {x,y,w,h} quads; null when the paragraph can't build.
+    pub fn caretBoxes(e: *Edit, lo: usize, hi: usize, size: f32, out: [][4]f32) ?usize {
+        const str = e.text();
+        const l = e.hitLayout(size) orelse return null;
+        return ui.paint.textLayoutRectsForRange(l, byteToUtf16Index(str, lo), byteToUtf16Index(str, hi), out);
+    }
+
+    /// The next caret position in SCREEN direction `dir` (-1 = visual
+    /// left, +1 = visual right): the logical neighbours' caret x decide
+    /// which lies toward `dir`, so RTL runs and bidi boundaries move the
+    /// way the caret appears to move — identical to the grapheme step
+    /// under pure LTR. A position sharing the caret's x (the two sides
+    /// of a bidi boundary) counts toward either direction and wins by
+    /// proximity. Falls back to the logical step when the paragraph
+    /// can't build.
+    fn visualStep(e: *Edit, dir: i32, size: f32) usize {
+        const cur = e.caretX(e.caret, size) orelse return e.graphemeStep(e.caret, dir);
+        var best: usize = e.caret;
+        var best_dx: f32 = std.math.floatMax(f32);
+        for ([_]usize{ e.graphemeStep(e.caret, -1), e.graphemeStep(e.caret, 1) }) |pos| {
+            if (pos == e.caret) continue;
+            const dx = (e.caretX(pos, size) orelse continue) - cur;
+            if ((dir < 0 and dx > 0.5) or (dir > 0 and dx < -0.5)) continue; // wrong side
+            if (@abs(dx) < best_dx) {
+                best = pos;
+                best_dx = @abs(dx);
+            }
+        }
+        return best;
+    }
+
+    /// The range edge toward screen direction `dir` — the caret x of lo
+    /// vs hi picks the visual side (under RTL the logical lo can sit on
+    /// the right). null-fallback keeps the logical edge.
+    fn visualEdge(e: *Edit, lo: usize, hi: usize, dir: i32, size: f32) usize {
+        const lx = e.caretX(lo, size) orelse return if (dir < 0) lo else hi;
+        const hx = e.caretX(hi, size) orelse return if (dir < 0) lo else hi;
+        return if (dir < 0) (if (lx <= hx) lo else hi) else (if (lx >= hx) lo else hi);
     }
 };
 
@@ -499,6 +572,21 @@ pub fn utf16ToByteIndex(str: []const u8, pos16: usize) usize {
         i += l;
     }
     return i;
+}
+
+/// Byte offset → UTF-16 position (utf16ToByteIndex's inverse) — astral
+/// chars count 2 units. A mid-codepoint offset lands on the position
+/// after the whole codepoint; caret offsets are grapheme boundaries in
+/// practice, so that case is a clamp, not a normal path.
+fn byteToUtf16Index(str: []const u8, off: usize) i32 {
+    var u16n: usize = 0;
+    var i: usize = 0;
+    while (i < @min(off, str.len)) {
+        const l = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        u16n += if (l == 4) 2 else 1;
+        i += l;
+    }
+    return @intCast(u16n);
 }
 
 fn caretTickCb(userdata: ?*anyopaque, now_ms: u64) void {

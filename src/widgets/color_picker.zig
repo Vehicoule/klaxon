@@ -638,15 +638,23 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
     if (s.focus == .hex) {
         const sel = s.hex_edit.selRange();
         if (sel.hi > sel.lo) {
-            const hx0 = text_x + ui.paint.measureTextLen(hex_z[0..sel.lo], ts.size, bold).width;
-            const hx1 = text_x + ui.paint.measureTextLen(hex_z[0..sel.hi], ts.size, bold).width;
-            ui.paint.fillRect(ctx, hx0, text_y - hm.ascent, hx1 - hx0, hm.ascent + hm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+            // One box per run when the range crosses a bidi boundary.
+            var boxes: [8][4]f32 = undefined;
+            if (s.hex_edit.caretBoxes(sel.lo, sel.hi, ts.size, &boxes)) |nb| {
+                for (boxes[0..nb]) |bx|
+                    ui.paint.fillRect(ctx, text_x + bx[0], text_y - hm.ascent, bx[2], hm.ascent + hm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+            } else {
+                const hx0 = text_x + ui.paint.measureTextLen(hex_z[0..sel.lo], ts.size, bold).width;
+                const hx1 = text_x + ui.paint.measureTextLen(hex_z[0..sel.hi], ts.size, bold).width;
+                ui.paint.fillRect(ctx, hx0, text_y - hm.ascent, hx1 - hx0, hm.ascent + hm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+            }
         }
         s.hex_edit.ensureTicker(); // the caret blink
     }
     ui.paint.text(ctx, hex_z, text_x, text_y, ts.size, bold, t.colors.on_surface);
     if (s.focus == .hex and s.hex_edit.caret_on) {
-        const caret_x = text_x + ui.paint.measureTextLen(hex_z[0..s.hex_edit.caret], ts.size, bold).width;
+        // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+        const caret_x = text_x + (s.hex_edit.caretX(s.hex_edit.caret, ts.size) orelse ui.paint.measureTextLen(hex_z[0..s.hex_edit.caret], ts.size, bold).width);
         ui.paint.fillRect(ctx, caret_x, text_y - hm.ascent, 1, hm.ascent + hm.descent, t.colors.primary);
     }
 
@@ -669,15 +677,23 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
         if (focused) {
             const sel = e.selRange();
             if (sel.hi > sel.lo) {
-                const sx0 = dx + ui.paint.measureTextLen(digits[0..sel.lo], ts.size, bold).width;
-                const sx1 = dx + ui.paint.measureTextLen(digits[0..sel.hi], ts.size, bold).width;
-                ui.paint.fillRect(ctx, sx0, ly - dm.ascent, sx1 - sx0, dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+                // One box per run when the range crosses a bidi boundary.
+                var boxes: [8][4]f32 = undefined;
+                if (e.caretBoxes(sel.lo, sel.hi, ts.size, &boxes)) |nb| {
+                    for (boxes[0..nb]) |bx|
+                        ui.paint.fillRect(ctx, dx + bx[0], ly - dm.ascent, bx[2], dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+                } else {
+                    const sx0 = dx + ui.paint.measureTextLen(digits[0..sel.lo], ts.size, bold).width;
+                    const sx1 = dx + ui.paint.measureTextLen(digits[0..sel.hi], ts.size, bold).width;
+                    ui.paint.fillRect(ctx, sx0, ly - dm.ascent, sx1 - sx0, dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
+                }
             }
             e.ensureTicker();
         }
         ui.paint.text(ctx, digits, dx, ly, ts.size, bold, t.colors.on_surface);
         if (focused and e.caret_on) {
-            const caret_dx = dx + ui.paint.measureTextLen(digits[0..e.caret], ts.size, bold).width;
+            // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+            const caret_dx = dx + (e.caretX(e.caret, ts.size) orelse ui.paint.measureTextLen(digits[0..e.caret], ts.size, bold).width);
             ui.paint.fillRect(ctx, caret_dx, ly - dm.ascent, 1, dm.ascent + dm.descent, t.colors.primary);
         }
     }
@@ -939,7 +955,7 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
 
     // Hex field: the shared editing core consumes text_input, the IME
     // preedit, clipboard chords, backspace/delete and caret motion.
-    if (s.focus == .hex and s.hex_edit.handleKey(ev, hexApplyEdit)) return true;
+    if (s.focus == .hex and s.hex_edit.handleKey(ev, hexApplyEdit, s.opts.theme.type_scale.body_large.size)) return true;
 
     // Numeric fields: the same core, digit-filtered (bytes/percents).
     if (chanIndex(s.focus)) |ci| {
@@ -949,7 +965,7 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
                 if (ch < '0' or ch > '9') return true; // swallow non-digits
             }
         }
-        if (e.handleKey(ev, chanApplyEdit)) return true;
+        if (e.handleKey(ev, chanApplyEdit, s.opts.theme.type_scale.body_large.size)) return true;
         if (ev.kind != .key_down) return true;
         switch (ev.key) {
             .enter => {

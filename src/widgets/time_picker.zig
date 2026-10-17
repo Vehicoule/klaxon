@@ -937,14 +937,22 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
         if (focused) {
             const sel = e.selRange();
             if (sel.hi > sel.lo) {
-                const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], dm.size, dm_bold).width;
-                const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], dm.size, dm_bold).width;
-                ui.paint.fillRect(ctx, hx0, baseline - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(cs.primary, 0.4));
+                // One box per run when the range crosses a bidi boundary.
+                var boxes: [8][4]f32 = undefined;
+                if (e.caretBoxes(sel.lo, sel.hi, dm.size, &boxes)) |nb| {
+                    for (boxes[0..nb]) |bx|
+                        ui.paint.fillRect(ctx, tx + bx[0], baseline - m.ascent, bx[2], m.ascent + m.descent, ui.paint.withAlphaScaled(cs.primary, 0.4));
+                } else {
+                    const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], dm.size, dm_bold).width;
+                    const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], dm.size, dm_bold).width;
+                    ui.paint.fillRect(ctx, hx0, baseline - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(cs.primary, 0.4));
+                }
             }
         }
         ui.paint.text(ctx, str, tx, baseline, dm.size, dm_bold, fg);
         // The IME preedit rides after the buffer text (underlined).
-        var cx = tx + ui.paint.measureTextLen(str[0..e.caret], dm.size, dm_bold).width;
+        // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+        var cx = tx + (e.caretX(e.caret, dm.size) orelse ui.paint.measureTextLen(str[0..e.caret], dm.size, dm_bold).width);
         if (e.comp.items.len > 0) {
             const comp = e.composition();
             const pre_w = ui.paint.measureTextLen(str, dm.size, dm_bold).width;
@@ -1298,7 +1306,7 @@ fn tpOnKey(n: *Node, ev: input.KeyEvent) bool {
         transformAfterEdit(n, target);
         return true;
     }
-    if (e.handleKey(ev, applyEditNode)) return true;
+    if (e.handleKey(ev, applyEditNode, s.opts.theme.type_scale.display_medium.size)) return true;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         // Upstream KeyboardOptions: hour = ImeAction.Next (→ the minute

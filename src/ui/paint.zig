@@ -302,6 +302,26 @@ pub fn textLayoutPositionAt(l: *TextLayout, dx: f32, dy: f32) i32 {
     return kx.c.kx_text_position_at(l, dx, dy);
 }
 
+/// The caret box for the position BEFORE UTF-16 unit `pos` (ABI 0.24.0) —
+/// the glyph's leading edge, or the last glyph's trailing edge at the
+/// text end. Direction-aware: under RTL the leading edge is the right
+/// side of the box. `out` = {x, top, 0, h} in layout space. False when
+/// the paragraph could not be built.
+pub fn textLayoutCaretRect(l: *TextLayout, pos: i32, out: *[4]f32) bool {
+    return kx.c.kx_text_caret_rect(l, pos, out);
+}
+
+/// Per-run glyph boxes covering the UTF-16 range [lo, hi) (ABI 0.24.0) —
+/// the selection highlight. A range crossing a bidi boundary yields one
+/// box per run, so callers fill a rect per entry rather than spanning
+/// min..max. `out` receives {x,y,w,h} quads; returns the box count
+/// (≤ out.len) or null when the paragraph could not be built.
+pub fn textLayoutRectsForRange(l: *TextLayout, lo: i32, hi: i32, out: [][4]f32) ?usize {
+    const n = kx.c.kx_text_rects_for_range(l, lo, hi, @ptrCast(out.ptr), @intCast(out.len));
+    if (n < 0) return null;
+    return @intCast(n);
+}
+
 /// Grapheme-cluster caret step (ABI 0.23.0): the byte offset of the next
 /// (`dir >= 0`) or previous (`dir < 0`) UAX #29 boundary past `byte_off`
 /// — null at the string edge or when the backend lacks ICU. Callers keep
@@ -530,8 +550,8 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 
 // --- tests ---
 
-test "kx ABI version reports 0.21.0 (paragraph base direction)" {
-    try std.testing.expectEqualStrings("0.23.0", std.mem.span(kx.c.kx_abi_version()));
+test "kx ABI version reports 0.24.0 (caret rect)" {
+    try std.testing.expectEqualStrings("0.24.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "paragraph base direction setter round-trips (default LTR)" {

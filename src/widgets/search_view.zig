@@ -397,12 +397,20 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         // primary @ 0.4 over the run's x range for [caret, anchor)).
         const sel = s.edit.selRange();
         if (sel.hi > sel.lo) {
-            const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
-            const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
-            ui.paint.fillRect(ctx, hx0, ty, hx1 - hx0, m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
+            // One box per run when the range crosses a bidi boundary.
+            var boxes: [8][4]f32 = undefined;
+            if (s.edit.caretBoxes(sel.lo, sel.hi, style.size, &boxes)) |nb| {
+                for (boxes[0..nb]) |hb|
+                    ui.paint.fillRect(ctx, tx + hb[0], ty, hb[2], m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
+            } else {
+                const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
+                const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+                ui.paint.fillRect(ctx, hx0, ty, hx1 - hx0, m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
+            }
         }
         ui.paint.text(ctx, str, tx, ty + m.ascent, style.size, false, header_ink);
-        var caret_x = tx + ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        // The caret's visual x — direction-aware under RTL (prefix-width fallback).
+        var caret_x = tx + (s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width);
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
@@ -715,7 +723,7 @@ fn searchViewOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (!s.open) return false;
     // The shared editing core: text_input/text_editing, the Cmd/Ctrl
     // clipboard chords, backspace/delete, arrows/home/end.
-    if (s.edit.handleKey(ev, applyEditNode)) return true;
+    if (s.edit.handleKey(ev, applyEditNode, s.opts.theme.type_scale.body_large.size)) return true;
     if (ev.kind == .key_down) switch (ev.key) {
         .up => {
             moveHighlight(n, s, -1);

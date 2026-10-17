@@ -87,6 +87,13 @@
 //            atomically. -1 at the edge. Plus kx_text_word_range
 //            (UBRK_WORD segment containing an offset — double-click word
 //            select). Additive.
+//   0.24.0 — kx_text_caret_rect: visual (bidi-aware) caret box for a
+//            UTF-16 caret offset — the leading edge of the grapheme
+//            cluster's box, direction-aware via the run direction, so
+//            arrow stepping in mixed-direction text lands on visual
+//            edges. Plus kx_text_rects_for_range (per-run glyph boxes
+//            covering a UTF-16 range — the selection highlight).
+//            Additive.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -179,6 +186,25 @@ void kx_text_layout_destroy(kx_text_layout* layout);
 // (SkParagraph::getGlyphPositionAtCoordinate — the same call Compose's
 // TextLayoutResult.getOffsetForPosition rides). -1 on null/unbuilt.
 int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy);
+
+// Caret rect (0.24.0): the visual caret box for the position BEFORE
+// UTF-16 code unit `pos` — the leading edge of that grapheme cluster's
+// box (the trailing edge of the last cluster when pos == the layout's
+// UTF-16 length), direction-aware via the run direction, so visual arrow
+// stepping in bidi text lands on the correct edge. out_xywh receives
+// {x, top, 0, height} in the layout's space; pos clamps to
+// [0, utf16_len]. false when the paragraph is unbuilt or the offset is
+// out of range (an empty layout reports a caret at the origin).
+bool kx_text_caret_rect(kx_text_layout* layout, int32_t pos, float out_xywh[4]);
+
+// Range boxes (0.24.0): tight glyph boxes covering the UTF-16 range
+// [lo16, hi16) — one box per run when the range crosses a bidi boundary,
+// which is what a selection highlight must paint under mixed direction.
+// out_xywh receives {x, y, w, h} quads; returns the count copied
+// (clamped to cap), the full box count when out_xywh is null, or -1 when
+// unbuilt. A collapsed or reversed range reports 0.
+int32_t kx_text_rects_for_range(kx_text_layout* layout, int32_t lo16,
+                                int32_t hi16, float* out_xywh, int32_t cap);
 
 // Grapheme-cluster navigation (0.23.0): the byte offset of the next
 // (dir >= 0) or previous (dir < 0) user-perceived-character boundary after

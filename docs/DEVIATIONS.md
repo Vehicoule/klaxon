@@ -71,14 +71,18 @@ Each widget's header carries the same list; these are the tracked ones
   the halves are virtual button children and ArrowDown activates the
   trailing — ARIA menu-button.)
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
-  only; no selection handles or undo; the text run stays LTR under RTL
-  chrome (arrows move logically under RTL); the text_field label lerps
+  only; no selection handles or undo; the text_field label lerps
   size, not weight/tracking. All three ride the shared `text_edit.zig`
   core: real caret (click-to-position hit test, 500ms blink), selection
   (shift/drag + highlight + range edits), grapheme-cluster arrows and
   double-click word select via ICU UBRK (ABI 0.23.0), Cmd/Ctrl+A/C/X/V
-  on the platform clipboard. The legacy `input.zig` textField
-  (conformance-only) rides the same `text_edit.zig` core — caret,
+  on the platform clipboard. Caret geometry is direction-aware (ABI
+  0.24.0): arrows step in the arrow's SCREEN direction, home/end land on
+  the visual run edges, the painted caret uses the paragraph's caret
+  rect, and the selection paints one box per bidi run — under RTL the
+  hit test, motion and paint all agree with the mirrored run. The legacy
+  `input.zig` textField (conformance-only) rides the same `text_edit.zig`
+  core — caret,
   selection, grapheme arrows, word select, clipboard, underlined IME
   preedit.
 - `time_picker.zig` — the text-input variant (`opts.mode = .input`,

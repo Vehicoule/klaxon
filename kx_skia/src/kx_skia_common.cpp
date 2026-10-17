@@ -3468,7 +3468,7 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.23.0";
+    return "0.24.0";
 }
 
 // Paragraph base direction (0.21.0) — the bidi base level every paragraph
@@ -3496,6 +3496,7 @@ struct kx_text_layout {
     float max_width = 0;
     std::unique_ptr<skia::textlayout::ParagraphBuilder> builder;
     std::unique_ptr<skia::textlayout::Paragraph> paragraph;
+    int32_t utf16_len = 0; // UTF-16 units fed to the builder (0.24.0)
 };
 
 kx_text_layout* kx_text_layout_begin(float max_width) {
@@ -3543,6 +3544,10 @@ void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text
     layout->builder->pushStyle(ts);
     layout->builder->addText(text);
     layout->builder->pop();
+    // UTF-16 code-unit tally (0.24.0) — the index space getRectsForRange
+    // and getGlyphPositionAtCoordinate speak (same helper as
+    // updateForegroundPaint ranges).
+    layout->utf16_len += (int32_t)kx_utf16_len(text, std::strlen(text));
 }
 
 // Builds + lays out once; no-op afterwards.
@@ -3578,6 +3583,67 @@ int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy) {
     auto* p = kx_layout_paragraph(layout);
     if (!p) return -1;
     return static_cast<int32_t>(p->getGlyphPositionAtCoordinate(dx, dy).position);
+}
+
+// Caret box for the position BEFORE UTF-16 unit `pos` (0.24.0): the
+// leading edge of the grapheme cluster at pos (the trailing edge of the
+// last cluster when pos == utf16_len — a visual caret, direction-aware
+// via the box's run direction). out = {x, top, w=0, h}; false when
+// unbuilt/out of range.
+bool kx_text_caret_rect(kx_text_layout* layout, int32_t pos, float out_xywh[4]) {
+    auto* p = kx_layout_paragraph(layout);
+    if (!p || !out_xywh) return false;
+    const int32_t len = layout->utf16_len;
+    if (len == 0) { // empty paragraph: caret sits at the origin
+        out_xywh[0] = 0; out_xywh[1] = 0; out_xywh[2] = 0;
+        out_xywh[3] = p->getHeight();
+        return true;
+    }
+    pos = std::clamp<int32_t>(pos, 0, len);
+    // The grapheme cluster AT the position: its layout bounds exist for
+    // any unit (surrogate pairs and ZWJ clusters included), unlike a
+    // unit-width getRectsForRange which maps back to an empty UTF-8 span.
+    // The caret sits on the cluster's leading edge — the trailing edge
+    // of the LAST cluster when pos == len.
+    skia::textlayout::Paragraph::GlyphInfo gi;
+    const bool at_end = (pos == len);
+    if (!p->getGlyphInfoAtUTF16Offset(static_cast<size_t>(at_end ? pos - 1 : pos), &gi))
+        return false;
+    const auto& b = gi.fGraphemeLayoutBounds;
+    const bool ltr = gi.fDirection == skia::textlayout::TextDirection::kLtr;
+    out_xywh[0] = at_end ? (ltr ? b.fRight : b.fLeft) : (ltr ? b.fLeft : b.fRight);
+    out_xywh[1] = b.fTop;
+    out_xywh[2] = 0;
+    out_xywh[3] = b.height();
+    return true;
+}
+
+// Glyph boxes covering the UTF-16 range [lo16, hi16) (0.24.0) — the
+// visual selection highlight: one box per run when a range crosses a
+// bidi boundary. Writes {x,y,w,h} quads, returns boxes copied (≤ cap),
+// or the full count when out_xywh is null (sizing). -1 when unbuilt.
+int32_t kx_text_rects_for_range(kx_text_layout* layout, int32_t lo16,
+                                int32_t hi16, float* out_xywh, int32_t cap) {
+    auto* p = kx_layout_paragraph(layout);
+    if (!p) return -1;
+    lo16 = std::clamp<int32_t>(lo16, 0, layout->utf16_len);
+    hi16 = std::clamp<int32_t>(hi16, 0, layout->utf16_len);
+    if (hi16 < lo16) std::swap(lo16, hi16);
+    if (lo16 == hi16) return 0;
+    auto boxes = p->getRectsForRange(
+        static_cast<unsigned>(lo16), static_cast<unsigned>(hi16),
+        skia::textlayout::RectHeightStyle::kTight,
+        skia::textlayout::RectWidthStyle::kTight);
+    const int32_t n = static_cast<int32_t>(boxes.size());
+    if (!out_xywh) return n;
+    const int32_t k = std::min<int32_t>(n, std::max<int32_t>(cap, 0));
+    for (int32_t i = 0; i < k; i++) {
+        out_xywh[i * 4 + 0] = boxes[i].rect.fLeft;
+        out_xywh[i * 4 + 1] = boxes[i].rect.fTop;
+        out_xywh[i * 4 + 2] = boxes[i].rect.width();
+        out_xywh[i * 4 + 3] = boxes[i].rect.height();
+    }
+    return k;
 }
 
 // UTF-8 → UTF-16 with a byte-offset map (both units of a surrogate pair
