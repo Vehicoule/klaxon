@@ -123,8 +123,10 @@ Each widget's header carries the same list; these are the tracked ones
   (`resizable` + `on_col_resize` — a ±4dp grab zone on each data
   column's trailing header border drags the width, clamped to the
   column minimum, persisted in the widget and reported live + on
-  settle); remaining: text-only cells (`cell_paint` takes over a
-  cell's draw — no child widgets in cells), no virtualization.
+  settle); row paint is windowed by index math and column widths are
+  memoized (virtualized in the flat-data sense); remaining: text-only
+  cells (`cell_paint` takes over a cell's draw — no child widgets in
+  cells).
 - `tree.zig` — drag-and-drop reordering landed (`draggable` +
   `on_move`): slop-promoted pointer drags, primary insertion-gap
   indicator, self-subtree drops rejected, in-place model move reported by

@@ -37,8 +37,9 @@
 // divider marks the hovered border, a primary bar tracks the drag.
 //
 // Remaining deviations: text-only cells (`cell_paint` takes over a cell's
-// draw — real child widgets in cells stay out of scope), no
-// virtualization (every row paints; the body clip culls them).
+// draw — real child widgets in cells stay out of scope). Virtualized in
+// the flat sense: rows are data, not nodes — the paint pass jumps to the
+// first visible row by index math, and column widths compute once (memo).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -247,7 +248,11 @@ fn tblMeasure(n: *Node, c: Constraints) Size {
     const ncols = s.columns.items.len;
     if (ncols == 0) return .{ .w = 0, .h = 0 };
 
-    computeColWidths(s);
+    // Lazy like the paint/hit-test paths: widths are a pure function of
+    // the (immutable) columns+rows+theme — a resize marks layout dirty
+    // and re-enters measure, where the col_ws memo still holds (the user
+    // override re-applies inside computeColWidths only on rebuild).
+    if (s.col_ws.items.len == 0) computeColWidths(s);
 
     var total_w: f32 = if (s.opts.selectable) select_col_w else 0;
     for (s.col_ws.items) |w| total_w += w;
@@ -489,9 +494,15 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
     const body_h = @max(0, b.h - header_h);
     if (body_h > 0) {
         ui.paint.clipRect(ctx, b.x, body_y, b.w, body_h);
-        var ry = body_y - s.scroll.offset;
-        for (s.rows.items, 0..) |row, ri| {
-            if (ry >= body_y + body_h) break; // fully below the viewport
+        // Fixed row_h → the visible window is index math: jump to the
+        // first (possibly clipped) row instead of scanning from row 0.
+        var ri: usize = @intFromFloat(@max(0, s.scroll.offset) / row_h);
+        var ry = body_y - s.scroll.offset + @as(f32, @floatFromInt(ri)) * row_h;
+        while (ri < s.rows.items.len and ry < body_y + body_h) : ({
+            ri += 1;
+            ry += row_h;
+        }) {
+            const row = s.rows.items[ri];
             if (ry + row_h > body_y) { // fully above → clipped away anyway
                 // Selected row: the SurfaceVariant fill; else the hover
                 // state layer (tappable).
@@ -527,7 +538,6 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
                     ui.paint.fillRect(ctx, b.x, ry + row_h, b.w, separator_h, t.colors.outline_variant);
                 }
             }
-            ry += row_h;
         }
         ui.paint.clipReset(ctx);
     }
@@ -642,6 +652,9 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
                 const w = @max(col_min_w, s.resize_start_w + ev.raw_x - s.resize_grab_x);
                 if (ci < s.user_ws.items.len and s.user_ws.items[ci] != w) {
                     s.user_ws.items[ci] = w;
+                    // The col_ws memo is lazy now — apply the override
+                    // directly so the next measure keeps the drag.
+                    if (ci < s.col_ws.items.len) s.col_ws.items[ci] = w;
                     n.markLayoutDirty(); // the width feeds measure
                     if (s.opts.on_col_resize) |cb| cb.fn_ptr(cb.userdata, ci, w);
                 }
@@ -754,6 +767,7 @@ fn tblLocaleCb(userdata: ?*anyopaque) void {
 
 const tbl_vtable = ui.node.VTable{
     .measure = tblMeasure,
+    .measure_pure = true, // memo writes only (col_ws) — same constraints → same size
     .layout = tblLayout,
     .paint = tblPaint,
     .on_pointer = tblPointer,
@@ -1294,4 +1308,31 @@ test "table: without resizable a header-border tap still sorts" {
     router.dispatchPointer(n2, .{ .phase = .up, .x = s2.col_ws.items[0] - 1, .y = header_h / 2 });
     try std.testing.expectEqual(@as(i32, -1), s2.sort_col); // no sort fired
     try std.testing.expectEqual(@as(f32, 0), s2.user_ws.items[0]); // no drag = no resize
+}
+
+test "table: a scrolled big table paints only the visible window" {
+    const a = std.testing.allocator;
+    const t = theme_mod.light;
+    // 200 one-column rows; row 50 is selected — its fill marks it.
+    var cells: [200][1][]const u8 = undefined;
+    for (&cells, 0..) |*c, i| c.*[0] = try std.fmt.allocPrint(a, "row {d}", .{i});
+    defer for (&cells) |*c| a.free(c[0]);
+    var rows: [200][]const []const u8 = undefined;
+    for (&rows, 0..) |*r, i| r.* = &cells[i];
+    const n = try table(a, &.{"Name"}, &rows, null, null, .{ .theme = t });
+    defer n.deinit();
+    setRowSelected(n, 50, true);
+    var r = try golden.Renderer.init(a, 200, 240);
+    defer r.deinit();
+    // a 3-row viewport: header + rows 50, 51, 52 visible
+    n.layout(.{ .x = 0, .y = 0, .w = 180, .h = header_h + 3 * row_h });
+    _ = setScrollOffset(n, 50 * row_h); // row 50 lands at the body's top
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    const x: i32 = 170; // right of the cell text, inside the row fill
+    // the first visible row is row 50 — its selected fill
+    try std.testing.expectEqual(t.colors.surface_variant, f.pixelAt(x, @intFromFloat(header_h + 6)));
+    // the next row down is unselected — the container's surface shows
+    try std.testing.expectEqual(t.colors.surface, f.pixelAt(x, @intFromFloat(header_h + row_h + 6)));
 }
