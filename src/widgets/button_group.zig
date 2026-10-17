@@ -28,11 +28,14 @@
 //     a drag past gestures.SLOP cancels (and bubbles to scrollables),
 //     arrows move the focus between items (RTL mirrors the row so the
 //     start-side shape follows the reading direction)
+//   - press expansion: the pressed item grows by up to ExpandedRatio (15%)
+//     of its width on the fast-spatial spring, paid by compressing the
+//     immediate neighbor(s) bounded by their content padding (upstream's
+//     compressionLimit) — the release waits for the rise to cross 0.75
+//     before decaying so a quick tap still lands the punch; the inner-
+//     corner morph rides the same channel
 //
 // v1 deviations (documented, fixed later):
-//   - No animated corner morph or pressed-width expansion — upstream
-//     animates the pressed item to grow ~15% while compressing its
-//     neighbours; v1 keeps static proportional widths + instant corners.
 //   - No overflow menu (ButtonGroup overflow → the trailing "more" slot).
 //   - Action-only: no toggle/selected state (upstream's checked = CornerFull
 //     has no signal in this API; single-choice groups are the segmented
@@ -84,11 +87,29 @@ const inner_corner_pressed: f32 = 4;
 // The a11y touch-target floor is theme.platform.hit_target_min (48 mobile /
 // 24 desktop) — read from s.opts.theme where used.
 
+/// ButtonGroupDefaults.ExpandedRatio — the pressed item grows by up to
+/// 15% of its width, paid by compressing the immediate neighbor(s).
+const expanded_ratio: f32 = 0.15;
+
+/// Per-item press expansion channel — upstream's pressedAnimatable
+/// (FastSpatial spring 0→1 while held). The release waits for the value
+/// to cross 0.75 before animating back so a quick tap still lands the
+/// full punch (upstream's `waitUntil { value > 0.75f }`).
+const PressAnim = struct {
+    n: *Node,
+    idx: usize,
+    a: f32 = 0,
+    chan: u32 = 0,
+    target: f32 = 0,
+    release_wait: bool = false,
+};
+
 const ItemDef = struct {
     label: [:0]const u8, // owned
     icon: ?icon_w.IconName,
     on_press: ?Callback,
     enabled: bool,
+    anim: PressAnim,
 };
 
 const GroupState = struct {
@@ -96,6 +117,9 @@ const GroupState = struct {
     /// Per-item intrinsic content widths, measured once at init (the label
     /// text never changes).
     widths: std.array_list.Managed(f32),
+    /// Scratch for the expansion pass (resolvedWidths) — sized to the item
+    /// count at init so paint/hit never allocate.
+    adj_widths: std.array_list.Managed(f32),
     /// Live per-item a11y descriptors — the semantics tree's virtual
     /// children borrow this slice.
     sem_children: std.array_list.Managed(ui.semantics.Semantics),
@@ -146,12 +170,55 @@ fn mirrorX(b: Rect, r: Rect) Rect {
     return .{ .x = b.x + b.w - (r.x - b.x) - r.w, .y = r.y, .w = r.w, .h = r.h };
 }
 
+/// The items' resolved widths in `b`: scaled intrinsic widths, then the
+/// expansion pass — each pressing item (a > 0) grows by up to
+/// expanded_ratio of its width, paid by compressing the immediate
+/// neighbor(s), bounded by their content padding (upstream's default
+/// compressionLimit = the button's end content padding) and the
+/// neighbor's own width. The row total is conserved; several items may
+/// be mid-flight at once (a release decay overlapping the next press),
+/// so the pass mutates the scratch sequentially like upstream's
+/// widths[] loop in NonAdaptiveButtonGroupMeasurePolicy.
+fn resolvedWidths(s: *GroupState, b: Rect) []f32 {
+    const out = s.adj_widths.items;
+    const count = s.items.items.len;
+    const scale = widthScale(s, b);
+    const lim = button_w.dimsFor(s.opts.size).h_padding;
+    for (0..count) |i| out[i] = s.widths.items[i] * scale;
+    for (0..count) |p| {
+        const a = s.items.items[p].anim.a;
+        if (a <= 0 or count < 2) continue;
+        if (p > 0 and p + 1 < count) {
+            // Middle: grows both sides — per-side take capped at
+            // ratio·w/2 AND the neighbors' padding; can't exceed the
+            // neighbor's width.
+            const growth = a * @min(expanded_ratio * out[p] / 2, lim);
+            const gl = @min(growth, out[p - 1]);
+            const gr = @min(growth, out[p + 1]);
+            out[p - 1] -= gl;
+            out[p + 1] -= gr;
+            out[p] += gl + gr;
+        } else if (p == 0) {
+            // First: expands into the next item only (inner side).
+            const gr = @min(a * @min(expanded_ratio * out[0], lim), out[1]);
+            out[1] -= gr;
+            out[0] += gr;
+        } else {
+            // Last: expands into the previous item only.
+            const gl = @min(a * @min(expanded_ratio * out[count - 1], lim), out[count - 2]);
+            out[count - 2] -= gl;
+            out[count - 1] += gl;
+        }
+    }
+    return out;
+}
+
 /// Item `index`'s rect in LTR space; the caller mirrors for RTL.
 fn itemRectLtr(s: *GroupState, b: Rect, index: usize) Rect {
-    const scale = widthScale(s, b);
+    const ws = resolvedWidths(s, b);
     var x = b.x;
-    for (0..index) |i| x += s.widths.items[i] * scale + space_between;
-    return .{ .x = x, .y = b.y, .w = s.widths.items[index] * scale, .h = b.h };
+    for (0..index) |i| x += ws[i] + space_between;
+    return .{ .x = x, .y = b.y, .w = ws[index], .h = b.h };
 }
 
 /// The item's rect in NODE-LOCAL space (Semantics.child_bounds maps it to
@@ -169,13 +236,15 @@ const Corners = struct { tl: f32, tr: f32, br: f32, bl: f32 };
 /// The item's corner radii (upstream connectedLeading/Trailing/Middle
 /// ButtonShapes): the row's outer corners keep the button shape, the inner
 /// corners take inner_corner; the PRESSED item morphs only its inner
-/// corners to inner_corner_pressed — outer corners stay (a pressed middle
-/// item morphs all four; a single item has no inner sides, so press shows
-/// the state layer only). Instant morph (upstream animates it).
+/// corners toward inner_corner_pressed — outer corners stay (a pressed
+/// middle item morphs all four; a single item has no inner sides, so
+/// press shows the state layer only). The morph rides the same press
+/// channel as the width expansion (upstream's animated press shape).
 fn itemCorners(s: *GroupState, h: f32, i: usize) Corners {
     const count = s.items.items.len;
     const outer: f32 = if (s.opts.shape == .round) h / 2 else button_w.dimsFor(s.opts.size).square_corner;
-    const inner: f32 = if (s.pressed == @as(i32, @intCast(i))) inner_corner_pressed else inner_corner;
+    const a = s.items.items[i].anim.a;
+    const inner: f32 = inner_corner + (inner_corner_pressed - inner_corner) * a;
     return .{
         .tl = if (i == 0) outer else inner,
         .bl = if (i == 0) outer else inner,
@@ -286,6 +355,53 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+fn pressAnimCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const anim: *PressAnim = @ptrCast(@alignCast(userdata.?));
+    anim.a = v[0];
+    // The deferred release: once the expand lands (≥0.75), retarget 0 —
+    // upstream's `waitUntil { value > 0.75f }` before animateTo(0).
+    if (anim.release_wait and v[0] >= 0.75) {
+        anim.release_wait = false;
+        retargetPress(stateOf(anim.n), anim.idx, 0);
+    }
+    anim.n.markDirty();
+}
+
+/// Retarget item `i`'s expansion channel (target 0 or 1) on the theme's
+/// fast-spatial spring, carrying the channel's in-flight velocity. No
+/// timeline → snap.
+fn retargetPress(s: *GroupState, i: usize, target: f32) void {
+    const anim = &s.items.items[i].anim;
+    if (anim.target == target) return;
+    anim.target = target;
+    anim.release_wait = false;
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ anim.a, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&anim.chan))),
+            .from = from,
+            .channel = @ptrCast(&anim.chan),
+            .on_update = .{ .fn_ptr = pressAnimCb, .userdata = anim },
+        });
+    } else {
+        anim.a = target;
+        anim.n.markDirty();
+    }
+}
+
+/// The press ended (up / slop-cancel / outside-down): animate the item
+/// back — but let the punch land first when it's still short of 0.75
+/// (upstream waits for the rise before releasing).
+fn releasePress(s: *GroupState, i: i32) void {
+    if (i < 0) return;
+    const anim = &s.items.items[@intCast(i)].anim;
+    if (anim.a >= 0.75) {
+        retargetPress(s, @intCast(i), 0);
+    } else {
+        anim.release_wait = true;
+    }
+}
+
 fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     const b = n.bounds;
@@ -295,6 +411,7 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
             if (hit < 0) return false;
             if (!s.items.items[@intCast(hit)].enabled) return true; // claim, don't press
             s.pressed = hit;
+            retargetPress(s, @intCast(hit), 1);
             s.focus_idx = hit;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
@@ -305,6 +422,7 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // Click = down + up on the same item (the router captured us).
             const was = s.pressed;
             s.pressed = -1;
+            releasePress(s, was);
             n.markDirty();
             if (was >= 0 and itemAt(s, b, ev.x) == was) {
                 const def = s.items.items[@intCast(was)];
@@ -319,6 +437,7 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    releasePress(s, s.pressed);
                     s.pressed = -1;
                     n.markDirty();
                 }
@@ -333,6 +452,7 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
+            releasePress(s, s.pressed);
             s.pressed = -1;
             n.markDirty();
             return true;
@@ -396,9 +516,13 @@ fn groupOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 fn groupDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        for (s.items.items) |*def| tl.cancelChannel(@ptrCast(&def.anim.chan));
+    }
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
     s.widths.deinit();
+    s.adj_widths.deinit();
     s.sem_children.deinit();
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = groupLocaleCb, .userdata = n });
     input.releaseNode(n);
@@ -457,6 +581,7 @@ pub fn buttonGroup(allocator: std.mem.Allocator, items: []const ButtonGroupItem,
     s.* = .{
         .items = std.array_list.Managed(ItemDef).init(allocator),
         .widths = std.array_list.Managed(f32).init(allocator),
+        .adj_widths = std.array_list.Managed(f32).init(allocator),
         .sem_children = std.array_list.Managed(ui.semantics.Semantics).init(allocator),
         .opts = opts,
     };
@@ -466,12 +591,14 @@ pub fn buttonGroup(allocator: std.mem.Allocator, items: []const ButtonGroupItem,
         for (s.items.items) |*def| allocator.free(def.label);
         s.items.deinit();
         s.widths.deinit();
+        s.adj_widths.deinit();
     }
-    for (items) |item| {
+    for (items, 0..) |item, i| {
         const label = try dupeZ(allocator, item.label);
         errdefer allocator.free(label); // iteration scope
-        try s.items.append(.{ .label = label, .icon = item.icon, .on_press = item.on_press, .enabled = item.enabled });
+        try s.items.append(.{ .label = label, .icon = item.icon, .on_press = item.on_press, .enabled = item.enabled, .anim = .{ .n = node, .idx = i } });
         try s.widths.append(itemContentWidth(opts.theme, opts, s.items.items[s.items.items.len - 1]));
+        try s.adj_widths.append(0);
     }
     node.state = s;
     // Per-item virtual a11y children — VoiceOver reads/activates each
@@ -583,6 +710,78 @@ test "button_group: pressed item morphs its inner corners to extra-small (M3E sq
     try std.testing.expectEqual(r2.h / 2, cor0p.tl); // outer stays
     try std.testing.expectEqual(inner_corner_pressed, cor0p.tr); // inner morphs
     router.dispatchPointer(n, .{ .phase = .up, .x = r1.x + r1.w / 2, .y = 38 });
+}
+
+test "button_group: press expands the item ~15% while the neighbors pay (animated)" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try buttonGroup(a, &.{ .{ .label = "Copy" }, .{ .label = "Paste" }, .{ .label = "Cut" } }, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = 56 });
+    const s = stateOf(n);
+    const w0 = itemRectLtr(s, n.bounds, 0).w;
+    const w1 = itemRectLtr(s, n.bounds, 1).w;
+    const w2 = itemRectLtr(s, n.bounds, 2).w;
+
+    // Press the middle item — the expand rides the fast-spatial spring.
+    const r1 = itemRectLtr(s, n.bounds, 1);
+    router.dispatchPointer(n, .{ .phase = .down, .x = r1.x + r1.w / 2, .y = 28 });
+    tl.tick(0); // lazy start arm
+    tl.tick(400); // settled near 1
+    try std.testing.expect(s.items.items[1].anim.a > 0.9);
+    const nw0 = itemRectLtr(s, n.bounds, 0).w;
+    const nw1 = itemRectLtr(s, n.bounds, 1).w;
+    const nw2 = itemRectLtr(s, n.bounds, 2).w;
+    try std.testing.expect(nw1 > w1);
+    try std.testing.expect(nw0 < w0);
+    try std.testing.expect(nw2 < w2);
+    // The row total is conserved — the neighbors paid for the growth.
+    try std.testing.expectApproxEqAbs(w0 + w1 + w2, nw0 + nw1 + nw2, 0.01);
+    // The inner-corner morph rides the same channel (8 → 4 by `a`).
+    try std.testing.expect(itemCorners(s, r1.h, 1).tl < inner_corner);
+    try std.testing.expect(itemCorners(s, r1.h, 1).tl > inner_corner_pressed - 0.01);
+
+    // Release — the punch already landed, so the decay starts at once.
+    router.dispatchPointer(n, .{ .phase = .up, .x = r1.x + r1.w / 2, .y = 28 });
+    tl.tick(800);
+    tl.tick(1200);
+    try std.testing.expectEqual(@as(f32, 0), s.items.items[1].anim.a);
+    try std.testing.expectApproxEqAbs(w1, itemRectLtr(s, n.bounds, 1).w, 0.01);
+}
+
+test "button_group: a quick tap still lands the punch (release waits for 0.75)" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try buttonGroup(a, &.{ .{ .label = "A" }, .{ .label = "B" } }, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 56 });
+    const s = stateOf(n);
+    const r0 = itemRectLtr(s, n.bounds, 0);
+    router.dispatchPointer(n, .{ .phase = .down, .x = r0.x + r0.w / 2, .y = 28 });
+    tl.tick(0);
+    tl.tick(10); // a is still small
+    try std.testing.expect(s.items.items[0].anim.a < 0.75);
+    router.dispatchPointer(n, .{ .phase = .up, .x = r0.x + r0.w / 2, .y = 28 });
+    // The release is deferred — the rise keeps going.
+    try std.testing.expect(s.items.items[0].anim.release_wait);
+    try std.testing.expectEqual(@as(f32, 1), s.items.items[0].anim.target);
+    tl.tick(400); // crosses 0.75 → auto-retargets to 0
+    try std.testing.expectEqual(@as(f32, 0), s.items.items[0].anim.target);
+    tl.tick(900);
+    try std.testing.expectEqual(@as(f32, 0), s.items.items[0].anim.a);
+    try std.testing.expect(!s.items.items[0].anim.release_wait);
 }
 
 test "button_group: disabled item claims but does not fire" {
