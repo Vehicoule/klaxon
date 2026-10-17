@@ -78,9 +78,11 @@
 //   - Predictive back (DrawerPredictiveBackHandler + the predictiveBack*
 //     scale modifiers on Android 14+) is deferred — Klaxon has no system
 //     back-progress events; Escape/edge dismissal works.
-//   - horizontalScaleDown (the content counter-scale under overshoot) —
-//     during spring overshoot the panel content stretches with the surface
-//     instead of keeping its aspect ratio.
+//   - horizontalScaleUp's goal is covered differently: the panel surface
+//     fill stretches into the screen-edge gap on overshoot (panelBgPaint's
+//     `extra`) rather than scaling the container layer, so the children
+//     never distort and horizontalScaleDown's counter-scale has nothing
+//     to undo (same visual result, cheaper path).
 //   - The drag gesture engages only on events that reach the drawer via
 //     bubbling: a child that consumes .move (a horizontal scrollable)
 //     keeps the gesture (content wins — close to upstream's nested-scroll
@@ -420,7 +422,11 @@ fn applyProgress(n: *Node, s: *DrawerState, progress: f32, alpha: f32) void {
     // in its bounds and painted/hit-tested past the sheet edge (a ghost
     // over sibling content). Hide the subtree outright: a closed drawer
     // paints nothing.
-    s.panel.setVisible(progress > 0.001);
+    const open = progress > 0.001;
+    s.panel.setVisible(open);
+    if (s.opts.kind == .modal) {
+        ui.semantics.syncModalFocus(s.panel, open, &s.saved_focus, &s.focus_saved);
+    }
     markInternalsDirty(n, s);
 }
 
@@ -706,7 +712,11 @@ fn drawerDeinit(n: *Node) void {
 fn attachDrawerSemantics(n: *Node) void {
     const s = stateOf(n);
     ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close drawer"), .actions = ui.semantics.Actions.initOne(.activate) });
-    ui.semantics.attach(s.panel, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Navigation drawer") });
+    ui.semantics.attach(s.panel, .{
+        .role = .group,
+        .label = s.opts.label orelse i18n_mod.tr("Navigation drawer"),
+        .modal = s.opts.kind == .modal,
+    });
 }
 
 fn drawerLocaleCb(userdata: ?*anyopaque) void {
