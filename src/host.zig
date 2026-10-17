@@ -1311,7 +1311,11 @@ pub const Host = struct {
                     }
                     host.inspector.pickAt(root, px, py); // passive selection
                 }
-                if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
+                // Every button dispatches — the event carries its SDL
+                // button id (left/middle/right/Xn); widgets that don't
+                // care treat all buttons alike, consumers that do
+                // (context menus, secondary actions) can finally see them.
+                {
                     // Logical window units — the tree's layout space.
                     const sx = event.button.x;
                     const sy = event.button.y;
@@ -1319,6 +1323,7 @@ pub const Host = struct {
                         .phase = .down,
                         .x = sx,
                         .y = sy,
+                        .button = event.button.button,
                         .pointer = 0,
                         .time_ms = time_ms,
                     });
@@ -1336,13 +1341,14 @@ pub const Host = struct {
                         host.height,
                     ) != .none)
                     return false;
-                if (event.button.button == sdl.c.SDL_BUTTON_LEFT) {
+                {
                     const sx = event.button.x;
                     const sy = event.button.y;
                     host.input.dispatchPointer(root, .{
                         .phase = .up,
                         .x = sx,
                         .y = sy,
+                        .button = event.button.button,
                         .pointer = 0,
                         .time_ms = time_ms,
                     });

@@ -277,7 +277,12 @@ pub export fn kx_node_get_bounds(node_ptr: ?*const anyopaque) callconv(.c) KxRec
 
 pub export fn kx_node_set_bounds(node_ptr: ?*anyopaque, bounds: KxRect) callconv(.c) void {
     const n: *Node = @ptrCast(@alignCast(node_ptr orelse return));
+    // A teleport, not a layout pass — damage the old paint rect before
+    // the write (stale pixels would linger there) plus the subtree's new
+    // spot; the next layout pass may still reposition it via the parent.
+    n.markDirtyRect(n.paintRect());
     n.bounds = bounds.toRect();
+    n.markDirty();
 }
 
 pub export fn kx_node_layout(node_ptr: ?*anyopaque, bounds: KxRect) callconv(.c) void {
