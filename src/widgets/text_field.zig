@@ -496,7 +496,38 @@ fn fieldMetrics(s: *TextFieldState) ui.paint.TextMetrics {
         m.ascent = seg.m.ascent;
         m.descent = seg.m.descent;
     }
+    compactSegs(s);
     return m;
+}
+
+/// Bound the rope: past 64 segs, fold the first shaping-safe adjacent
+/// pair into one (the join was already a legal split, so the merged piece
+/// shapes identically). Edits only ever append at the tail — unbounded
+/// growth otherwise leaks a heap alloc per commit and costs O(#segs) in
+/// every reconcile/draw pass (input_ime grew ~560 segs in 600 frames).
+fn compactSegs(s: *TextFieldState) void {
+    while (s.segs.items.len > 64) {
+        var i: usize = 0;
+        var merged = false;
+        while (i + 1 < s.segs.items.len) : (i += 1) {
+            const a = &s.segs.items[i];
+            const b = &s.segs.items[i + 1];
+            if (!atomicBoundary(lastCpBefore(a.text, a.text.len)) or
+                !atomicBoundary(firstCpAt(b.text, 0))) continue;
+            const buf = s.segs.allocator.alloc(u8, a.text.len + b.text.len + 1) catch @panic("klaxon: out of memory");
+            @memcpy(buf[0..a.text.len], a.text);
+            @memcpy(buf[a.text.len..][0..b.text.len], b.text);
+            buf[a.text.len + b.text.len] = 0;
+            s.segs.allocator.free(@constCast(a.text.ptr)[0 .. a.text.len + 1]);
+            s.segs.allocator.free(@constCast(b.text.ptr)[0 .. b.text.len + 1]);
+            a.text = buf[0 .. a.text.len + b.text.len :0];
+            a.m = ui.paint.measureText(a.text, a.size, false);
+            _ = s.segs.orderedRemove(i + 1);
+            merged = true;
+            break;
+        }
+        if (!merged) return; // every adjacent join is shaping-unsafe — rare
+    }
 }
 fn segPush(s: *TextFieldState, piece: [:0]const u8, size: f32) void {
     const seg = s.segs.addOne() catch @panic("klaxon: out of memory");
@@ -689,7 +720,11 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         var sx = tx;
         for (s.segs.items) |seg| {
-            ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
+            // Skip segs outside the clip band — the canvas clips anyway,
+            // but issuing the op still pays strlen+probe+blob emit per seg
+            // (a long IME-grown buffer was ~560 ops/frame in input_ime).
+            if (sx + seg.m.width > clip_x and sx < clip_x + clip_w)
+                ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
             sx += seg.m.width;
         }
         var caret_x = tx + runXAt(s, s.edit.caret);
@@ -1125,6 +1160,30 @@ test "text_field: text past the old 255-byte cap round-trips (CJK included)" {
     const other = other_buf[0..];
     try sig.set(other);
     try std.testing.expectEqualStrings(other, text(b));
+}
+
+test "text_field: the seg rope compacts past 64 pieces (IME-style commit growth)" {
+    const sig = try ui.state.TextSignal.init(std.testing.allocator, "");
+    defer sig.deinit();
+    const b = try textField(std.testing.allocator, sig, null, null, .{});
+    defer b.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    router.focus(b);
+    // 120 commits of "word " — each lands as its own seg (a space
+    // boundary is shaping-safe), so the rope would grow unboundedly.
+    for (0..120) |_| _ = router.dispatchKey(.{ .kind = .text_input, .text = "word " });
+    const s = stateOf(b);
+    _ = fieldMetrics(s); // reconcile + compact
+    try std.testing.expect(s.segs.items.len <= 64);
+    // the merged rope still covers the whole buffer, measured identically
+    const want = ui.paint.measureTextLen(s.text(), bodyLarge(s.opts.theme).size, false);
+    try std.testing.expectApproxEqAbs(fieldMetrics(s).width, want.width, 0.5);
+    // and the seg texts concat back to the buffer bytes
+    var total: usize = 0;
+    for (s.segs.items) |seg| total += seg.text.len;
+    try std.testing.expectEqual(s.text().len, total);
 }
 
 test "text_field: input over the 1 MiB cap is rejected, not truncated" {

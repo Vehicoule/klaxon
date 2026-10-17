@@ -173,6 +173,10 @@ struct kx_ctx {
         // slot rect — blits of these batch into one drawVertices on GPU.
         bool atlas = false;
         SkRect src = SkRect::MakeEmpty();
+        // Lazy makeShader for the atlas/vertices path — one refcounted
+        // alloc per draw otherwise. Invalidated when `img` is replaced
+        // (the deferred GPU upload swaps it).
+        sk_sp<SkShader> shader;
     };
     std::unordered_map<uint64_t, KxImg> images;
     uint64_t next_image_id = 1;
@@ -192,6 +196,12 @@ struct kx_ctx {
     // Pooled offscreen surfaces, one per depth: grow-only — a fresh
     // RenderTarget per pass was ~0.2ms on Metal.
     std::vector<OffscreenPool> offscreen_pools;
+    // Backdrop-blur filter chains keyed on (sigma, scale): the 3-node
+    // SkImageFilters DAG was rebuilt per call (3 refcounted allocs per
+    // blurred band per frame). Apps use a handful of sigmas — 4 slots
+    // round-robin cover them.
+    struct { float sigma = 0.f, scale = 0.f; sk_sp<SkImageFilter> chain; } blur_chains[4];
+    int blur_chains_next = 0;
     // Video-style pixel streaming surface: kx_draw_pixels on GPU writes
     // into ONE persistent texture (writePixels) instead of alloc'ing a
     // fresh texture per frame — a real player's present path.
@@ -259,6 +269,20 @@ struct kx_ctx {
 // Forward — defined with the atlas block below; kx_count_op flushes pending
 // sprites before any real op so batch ordering stays exact.
 void kx_sprite_flush(kx_ctx* ctx);
+
+// Deferred GPU upload for a registry image — resets the cached shader
+// (it is bound to the pre-upload SkImage).
+static void kx_img_upgrade(kx_ctx* ctx, kx_ctx::KxImg& e) {
+    e.img = kx::gpu_image_upload(ctx->gpu, e.img);
+    e.shader.reset();
+}
+
+// Lazy per-image shader for the drawVertices batch — makeShader cost a
+// refcounted alloc per flush otherwise.
+static const sk_sp<SkShader>& kx_img_shader(kx_ctx::KxImg& e) {
+    if (!e.shader) e.shader = e.img->makeShader(SkSamplingOptions());
+    return e.shader;
+}
 
 // Font manager is process-global: text metrics are needed at layout time,
 // before/without a kx_ctx. Initialized once (thread-confined afterwards).
@@ -1865,7 +1889,7 @@ void kx_draw_image(kx_ctx* ctx, uint64_t image, float x, float y, float w, float
     // to upload through — convert at first draw (TextureFromImage no-ops on
     // already GPU-backed images).
     if (ctx->gpu && !it->second.img->isTextureBacked())
-        it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+        kx_img_upgrade(ctx, it->second);
     const SkImage* img = it->second.img.get();
     kx_count_op(ctx); // all paths below emit exactly one draw
     if (w == img->width() && h == img->height()) {
@@ -1977,7 +2001,7 @@ void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xfo
         return;
     }
     if (ctx->gpu && !it->second.img->isTextureBacked())
-        it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+        kx_img_upgrade(ctx, it->second);
     const SkImage* img = it->second.img.get();
     // Backend split (measured): on raster the direct blits win (drawVertices
     // is per-vertex interpolated triangles there — ~20x slower); on GPU
@@ -2041,7 +2065,7 @@ void kx_draw_image_atlas(kx_ctx* ctx, uint64_t image, const kx_sprite_xform* xfo
             idx[6 * i + 3] = v;     idx[6 * i + 4] = v + 2; idx[6 * i + 5] = v + 3;
         }
         SkPaint paint;
-        paint.setShader(img->makeShader(SkSamplingOptions()));
+        paint.setShader(kx_img_shader(it->second));
         kx_count_op(ctx); // the whole set is ONE draw
         ctx->canvas->drawVertices(b.detach(), SkBlendMode::kSrcOver, paint);
     }
@@ -2075,7 +2099,7 @@ void kx_draw_image_set(kx_ctx* ctx, const kx_image_quad* quads, int32_t count) {
         auto it = ctx->images.find(q.image);
         if (it == ctx->images.end()) continue;
         if (ctx->gpu && !it->second.img->isTextureBacked())
-            it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+            kx_img_upgrade(ctx, it->second);
         const SkImage* img = it->second.img.get();
         const SkRect src = q.sw > 0 && q.sh > 0
             ? SkRect::MakeXYWH(q.sx, q.sy, q.sw, q.sh)
@@ -2409,7 +2433,7 @@ void kx_draw_image_region_tinted(kx_ctx* ctx, uint64_t image,
         return;
     }
     if (ctx->gpu && !it->second.img->isTextureBacked())
-        it->second.img = kx::gpu_image_upload(ctx->gpu, it->second.img);
+        kx_img_upgrade(ctx, it->second);
     kx_count_op(ctx);
     SkPaint paint;
     SkPaint* pp = nullptr;
@@ -2924,18 +2948,28 @@ void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sig
         if (dev_sigma >= 20.f) scale = 0.25f;
         else if (dev_sigma >= 8.f) scale = 0.5f;
     }
-    if (scale < 1.f) {
-        const SkSamplingOptions linear(SkFilterMode::kLinear);
-        auto chain = SkImageFilters::MatrixTransform(
-            SkMatrix::Scale(1.f / scale, 1.f / scale), linear,
-            SkImageFilters::Blur(sigma * scale, sigma * scale,
-                SkImageFilters::MatrixTransform(
-                    SkMatrix::Scale(scale, scale), linear, nullptr)));
-        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, chain.get(), 0));
-    } else {
-        auto filter = SkImageFilters::Blur(sigma, sigma, nullptr, nullptr);
-        ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, filter.get(), 0));
+    SkImageFilter* chain = nullptr;
+    for (auto& slot : ctx->blur_chains) {
+        if (slot.sigma == sigma && slot.scale == scale) { chain = slot.chain.get(); break; }
     }
+    if (!chain) {
+        sk_sp<SkImageFilter> built;
+        if (scale < 1.f) {
+            const SkSamplingOptions linear(SkFilterMode::kLinear);
+            built = SkImageFilters::MatrixTransform(
+                SkMatrix::Scale(1.f / scale, 1.f / scale), linear,
+                SkImageFilters::Blur(sigma * scale, sigma * scale,
+                    SkImageFilters::MatrixTransform(
+                        SkMatrix::Scale(scale, scale), linear, nullptr)));
+        } else {
+            built = SkImageFilters::Blur(sigma, sigma, nullptr, nullptr);
+        }
+        auto& slot = ctx->blur_chains[ctx->blur_chains_next];
+        ctx->blur_chains_next = (ctx->blur_chains_next + 1) % 4;
+        slot.sigma = sigma; slot.scale = scale; slot.chain = built;
+        chain = slot.chain.get();
+    }
+    ctx->canvas->saveLayer(SkCanvas::SaveLayerRec(&r, nullptr, chain, 0));
     ctx->canvas->restore();
 }
 
