@@ -89,8 +89,8 @@ Each widget's header carries the same list; these are the tracked ones
   Arabic-Indic digits/separators (other native digit sets need the ICU
   upgrade path). (The paragraph bidi base direction follows the locale —
   fixed audit row above.)
-- `color_picker.zig` — no alpha slider (forced 0xFF), no RGB/HSL inputs,
-  no eyedropper.
+- `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
+  shipped: checkerboard + gradient bar feeding the Signal's alpha byte.)
 - `kx_skia_android.cpp` — font family/fallback hardcode Roboto/Droid Sans;
   the directory-scan manager covers devices without them.
 - `kx_skia_android_fontmgr_stub.cpp` — `GetSystemFontFamilies` clears the

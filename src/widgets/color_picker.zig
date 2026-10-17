@@ -15,21 +15,24 @@
 //   - Hue slider: a CornerFull 24dp bar with a 7-stop rainbow gradient
 //     (red→yellow→green→cyan→blue→magenta→red) via fillRRectGradient.
 //     A 4×32dp OnSurface cursor marks h.
+//   - Alpha slider: an 8dp checkerboard underlay clipped to the CornerFull
+//     bar + a transparent → opaque gradient of the current color; the
+//     cursor matches the hue cursor idiom. Feeds the low byte of the
+//     Signal(Color).
 //   - Preview swatch (48×48, CornerSmall 8dp, 1dp OutlineVariant stroke)
 //     + a hex text field (#RRGGBB).
 //
 // Panel: 320dp wide, SurfaceContainerHigh, CornerExtraLarge 28dp, 20dp
-// inner padding, 16dp gaps between sections. Total height 344dp.
+// inner padding, 16dp gaps between sections. Total height 384dp.
 //
-// Color model: internal HSV (h 0..360, s 0..1, v 0..1); external Color
-// (0xRRGGBBAA, alpha always 0xFF in v1). Conversions are pure + total.
+// Color model: internal HSV+A (h 0..360, s 0..1, v 0..1, a 0..1); external
+// Color (0xRRGGBBAA). Conversions are pure + total.
 //
 // State: `color` is a two-way Signal(Color) — always live, round-trips.
 // Dragging: sv or hue. Hex field: simplified single-line input (no IME,
 // no selection — v1).
 //
 // v1 deviations (documented, fixed later):
-//   - No alpha slider (alpha forced to 0xFF).
 //   - No RGB/HSL numeric inputs (hex only).
 //   - No preset swatches, no eyedropper.
 //   - Hex field: no IME, no selection, no caret blink, no click-to-position.
@@ -160,6 +163,12 @@ pub fn hsvToColor(h: f32, s: f32, v: f32) Color {
     return (@as(Color, rgb.r) << 24) | (@as(Color, rgb.g) << 16) | (@as(Color, rgb.b) << 8) | 0xFF;
 }
 
+/// HSV + alpha (0..1) -> Color (0xRRGGBBAA).
+fn hsvToColorAlpha(h: f32, s: f32, v: f32, a: f32) Color {
+    const alpha: Color = @intFromFloat(@round(std.math.clamp(a, 0, 1) * 255));
+    return (hsvToColor(h, s, v) & 0xFFFFFF00) | alpha;
+}
+
 /// Color (0xRRGGBBAA) -> "#RRGGBB" (7 chars + null = 8 bytes).
 pub fn colorToHex(c: Color, buf: *[8]u8) [:0]const u8 {
     const hex = "0123456789ABCDEF";
@@ -208,8 +217,8 @@ fn hueStops() [7]Color {
 
 // --- State ---
 
-const DragTarget = enum { none, sv, hue };
-const FocusTarget = enum { none, sv, hue, hex };
+const DragTarget = enum { none, sv, hue, alpha };
+const FocusTarget = enum { none, sv, hue, alpha, hex };
 
 pub const CPState = struct {
     opts: ColorPickerOptions,
@@ -218,6 +227,7 @@ pub const CPState = struct {
     h: f32 = 0,
     s: f32 = 1,
     v: f32 = 1,
+    a: f32 = 1,
     dragging: DragTarget = .none,
     hovered: DragTarget = .none,
     focus: FocusTarget = .none,
@@ -229,6 +239,7 @@ pub const CPState = struct {
     /// Cached layout rects (set in layout, used by paint/hit).
     sv_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     hue_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    alpha_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     swatch_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     hex_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 };
@@ -237,19 +248,21 @@ pub fn stateOf(n: *Node) *CPState {
     return @ptrCast(@alignCast(n.state.?));
 }
 
-/// Sync the internal HSV from the signal's color.
+/// Sync the internal HSV+A from the signal's color.
 fn syncHsv(s: *CPState) void {
     if (s.sig) |sig| {
-        const hsv = colorToHsv(sig.peek());
+        const c = sig.peek();
+        const hsv = colorToHsv(c);
         s.h = hsv.h;
         s.s = hsv.s;
         s.v = hsv.v;
+        s.a = @as(f32, @floatFromInt(c & 0xFF)) / 255;
     }
 }
 
-/// Push the current HSV to the signal + fire on_change + update hex + a11y.
+/// Push the current HSV+A to the signal + fire on_change + update hex + a11y.
 fn pushColor(s: *CPState, n: *Node) void {
-    const c = hsvToColor(s.h, s.s, s.v);
+    const c = hsvToColorAlpha(s.h, s.s, s.v, s.a);
     if (s.sig) |sig| sig.set(c);
     // Update hex buffer (unless the user is actively editing it).
     if (!s.hex_dirty) {
@@ -269,6 +282,7 @@ fn applyExternalColor(s: *CPState, n: *Node, c: Color) void {
     s.h = hsv.h;
     s.s = hsv.s;
     s.v = hsv.v;
+    s.a = @as(f32, @floatFromInt(c & 0xFF)) / 255;
     if (!s.hex_dirty) {
         _ = colorToHex(c, &s.hex_buf);
     }
@@ -292,12 +306,16 @@ fn hueY() f32 {
     return svY() + sv_height + section_gap;
 }
 
-fn previewY() f32 {
+fn alphaY() f32 {
     return hueY() + hue_h + section_gap;
 }
 
+fn previewY() f32 {
+    return alphaY() + hue_h + section_gap;
+}
+
 fn totalHeight(opts: ColorPickerOptions) f32 {
-    return panel_pad + sv_height + section_gap + hue_h + section_gap + hexH(opts.theme) + panel_pad;
+    return panel_pad + sv_height + section_gap + hue_h + section_gap + hue_h + section_gap + hexH(opts.theme) + panel_pad;
 }
 
 // --- Measure ---
@@ -320,6 +338,7 @@ fn cpLayout(n: *Node, bounds: Rect) void {
     const inner_w = bounds.w - panel_pad * 2;
     s.sv_rect = .{ .x = inner_x, .y = bounds.y + svY(), .w = inner_w, .h = sv_height };
     s.hue_rect = .{ .x = inner_x, .y = bounds.y + hueY(), .w = inner_w, .h = hue_h };
+    s.alpha_rect = .{ .x = inner_x, .y = bounds.y + alphaY(), .w = inner_w, .h = hue_h };
     s.swatch_rect = .{ .x = inner_x, .y = bounds.y + previewY(), .w = swatch_size, .h = swatch_size };
     s.hex_rect = .{
         .x = inner_x + swatch_size + hex_gap,
@@ -354,7 +373,7 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRRectGradient(ctx, sv.x, sv.y, sv.w, sv.h, sv_corner, sv.x, sv.y, sv.x, sv.y + sv.h, &val_stops);
 
     // SV cursor.
-    const cur_color = hsvToColor(s.h, s.s, s.v);
+    const cur_color = hsvToColorAlpha(s.h, s.s, s.v, s.a);
     const cx = sv.x + s.s * sv.w;
     const cy = sv.y + (1 - s.v) * sv.h;
     // White ring for visibility on any background.
@@ -372,6 +391,34 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRRect(ctx, hx - hue_cursor_w / 2, hcy - hue_cursor_h / 2, hue_cursor_w, hue_cursor_h, hue_cursor_corner, t.colors.on_surface);
     // Inner color strip on the cursor.
     ui.paint.fillRRect(ctx, hx - hue_cursor_w / 2 + 1, hcy - hue_cursor_h / 2 + 1, hue_cursor_w - 2, hue_cursor_h - 2, 1, pure_hue);
+
+    // --- Alpha slider ---
+    // Checkerboard underlay (8dp squares) + a transparent → opaque
+    // gradient of the current color — the universal alpha control idiom.
+    const ar = s.alpha_rect;
+    ui.paint.clipRRect(ctx, ar.x, ar.y, ar.w, ar.h, ar.h / 2);
+    const checker: f32 = 8;
+    var row: usize = 0;
+    var cy2 = ar.y;
+    while (cy2 < ar.y + ar.h) : (cy2 += checker) {
+        var col: usize = row;
+        var cx2 = ar.x;
+        while (cx2 < ar.x + ar.w) : (cx2 += checker) {
+            const c: Color = if (col % 2 == 0) 0xFFFFFFFF else 0xC8C8C8FF;
+            ui.paint.fillRect(ctx, cx2, cy2, @min(checker, ar.x + ar.w - cx2), @min(checker, ar.y + ar.h - cy2), c);
+            col += 1;
+        }
+        row += 1;
+    }
+    const a_stops = [_]Color{ cur_color & 0xFFFFFF00, cur_color | 0x000000FF };
+    ui.paint.fillRRectGradient(ctx, ar.x, ar.y, ar.w, ar.h, ar.h / 2, ar.x, ar.y, ar.x + ar.w, ar.y, &a_stops);
+    ui.paint.clipReset(ctx);
+
+    // Alpha cursor (same idiom as the hue cursor).
+    const ax = ar.x + s.a * ar.w;
+    const acy = ar.y + ar.h / 2;
+    ui.paint.fillRRect(ctx, ax - hue_cursor_w / 2, acy - hue_cursor_h / 2, hue_cursor_w, hue_cursor_h, hue_cursor_corner, t.colors.on_surface);
+    ui.paint.fillRRect(ctx, ax - hue_cursor_w / 2 + 1, acy - hue_cursor_h / 2 + 1, hue_cursor_w - 2, hue_cursor_h - 2, 1, cur_color);
 
     // --- Preview swatch ---
     const sw = s.swatch_rect;
@@ -401,14 +448,16 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
 fn zoneAt(s: *CPState, x: f32, y: f32) DragTarget {
     if (s.sv_rect.contains(x, y)) return .sv;
     if (s.hue_rect.contains(x, y)) return .hue;
+    if (s.alpha_rect.contains(x, y)) return .alpha;
     return .none;
 }
 
 fn cpHit(n: *Node, x: f32, y: f32) bool {
     const s = stateOf(n);
-    // SV square, hue slider, or hex field.
+    // SV square, hue/alpha sliders, or hex field.
     if (s.sv_rect.contains(x, y)) return true;
     if (s.hue_rect.contains(x, y)) return true;
+    if (s.alpha_rect.contains(x, y)) return true;
     if (s.hex_rect.contains(x, y)) return true;
     return n.bounds.contains(x, y);
 }
@@ -436,7 +485,12 @@ fn cpPointer(n: *Node, ev: input.PointerEvent) bool {
             const zone = zoneAt(s, ev.x, ev.y);
             if (zone != .none) {
                 s.dragging = zone;
-                s.focus = if (zone == .sv) .sv else .hue;
+                s.focus = switch (zone) {
+                    .sv => .sv,
+                    .hue => .hue,
+                    .alpha => .alpha,
+                    .none => .none,
+                };
                 input.requestFocus(n);
                 applyDrag(s, n, ev.x, ev.y);
                 n.markDirty();
@@ -508,6 +562,11 @@ fn applyDrag(s: *CPState, n: *Node, x: f32, y: f32) void {
         .hue => {
             const hue = s.hue_rect;
             s.h = std.math.clamp((x - hue.x) / hue.w, 0, 1) * 360;
+            pushColor(s, n);
+        },
+        .alpha => {
+            const ar = s.alpha_rect;
+            s.a = std.math.clamp((x - ar.x) / ar.w, 0, 1);
             pushColor(s, n);
         },
     }
@@ -595,6 +654,9 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
             } else if (s.focus == .hue) {
                 s.h = @mod(s.h - 5 + 360, 360);
                 pushColor(s, n);
+            } else if (s.focus == .alpha) {
+                s.a = std.math.clamp(s.a - 0.05, 0, 1);
+                pushColor(s, n);
             } else return false;
             return true;
         },
@@ -604,6 +666,9 @@ fn cpKey(n: *Node, ev: input.KeyEvent) bool {
                 pushColor(s, n);
             } else if (s.focus == .hue) {
                 s.h = @mod(s.h + 5, 360);
+                pushColor(s, n);
+            } else if (s.focus == .alpha) {
+                s.a = std.math.clamp(s.a + 0.05, 0, 1);
                 pushColor(s, n);
             } else return false;
             return true;
@@ -651,7 +716,7 @@ const cp_vtable = ui.node.VTable{
 
 /// Create an M3E color picker panel.
 ///
-/// `sig` — a live Signal(Color) (0xRRGGBBAA, alpha forced to 0xFF). The
+/// `sig` — a live Signal(Color) (0xRRGGBBAA). The
 /// picker syncs its internal HSV from the signal and writes back on change.
 /// `on_change` — fired after every color change.
 /// `opts` — panel options (width, theme).
@@ -676,6 +741,7 @@ pub fn colorPicker(
         .h = hsv.h,
         .s = hsv.s,
         .v = hsv.v,
+        .a = @as(f32, @floatFromInt(initial & 0xFF)) / 255,
     };
     _ = colorToHex(initial, &s.hex_buf);
 
@@ -710,7 +776,7 @@ fn cpSyncCb(userdata: ?*anyopaque) void {
 
 pub fn currentColor(n: *Node) Color {
     const s = stateOf(n);
-    return hsvToColor(s.h, s.s, s.v);
+    return hsvToColorAlpha(s.h, s.s, s.v, s.a);
 }
 
 pub fn currentHex(n: *Node) [:0]const u8 {
@@ -788,13 +854,13 @@ test "color helpers: colorToHsv / hsvToColor round-trip" {
     try std.testing.expectEqual(@as(Color, 0xFF), c2 & 0xFF);
 }
 
-test "color_picker: measure returns 320×344" {
+test "color_picker: measure returns 320×384" {
     const a = std.testing.allocator;
     const n = try colorPicker(a, null, null, .{});
     defer n.deinit();
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectApproxEqAbs(@as(f32, 320), sz.w, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 344), sz.h, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 384), sz.h, 0.001);
 }
 
 test "color_picker: SV drag updates the color (signal + on_change)" {
@@ -805,7 +871,7 @@ test "color_picker: SV drag updates the color (signal + on_change)" {
     const a = std.testing.allocator;
     const n = try colorPicker(a, sig, cb, .{});
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 344 });
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 384 });
 
     const s = stateOf(n);
     // Initial: red (h=0, s=1, v=1).
@@ -839,7 +905,7 @@ test "color_picker: hue drag updates the hue" {
     const a = std.testing.allocator;
     const n = try colorPicker(a, sig, null, .{});
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 344 });
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 384 });
 
     const s = stateOf(n);
     const hue = s.hue_rect;
@@ -859,6 +925,38 @@ test "color_picker: hue drag updates the hue" {
     try std.testing.expect(b > 200);
 }
 
+test "color_picker: the alpha slider writes the alpha byte" {
+    const sig = try ui.state.Signal(Color).init(std.testing.allocator, 0xFF0000FF);
+    defer sig.deinit();
+    const a = std.testing.allocator;
+    const n = try colorPicker(a, sig, null, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 384 });
+
+    const s = stateOf(n);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), s.a, 0.01);
+
+    // Drag to the middle of the alpha bar.
+    const ar = s.alpha_rect;
+    const ax = ar.x + ar.w / 2;
+    const ay = ar.y + ar.h / 2;
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = ax, .y = ay, .raw_x = ax, .raw_y = ay });
+    try std.testing.expect(s.dragging == .alpha);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s.a, 0.01);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = ax, .y = ay, .raw_x = ax, .raw_y = ay });
+
+    // The signal carries ~50% alpha; rgb stays red.
+    const c = sig.peek();
+    try std.testing.expect((c & 0xFF) >= 120 and (c & 0xFF) <= 135);
+    try std.testing.expect((c >> 24) > 200);
+    const ca = currentColor(n) & 0xFF;
+    try std.testing.expect(ca >= 120 and ca <= 135);
+
+    // An external color with alpha syncs the bar.
+    sig.set(0x00FF0040);
+    try std.testing.expectApproxEqAbs(@as(f32, 0x40) / 255, s.a, 0.02);
+}
+
 test "color_picker: keyboard arrows adjust SV" {
     const sig = try ui.state.Signal(Color).init(std.testing.allocator, 0xFF0000FF);
     defer sig.deinit();
@@ -868,7 +966,7 @@ test "color_picker: keyboard arrows adjust SV" {
     const a = std.testing.allocator;
     const n = try colorPicker(a, sig, null, .{});
     defer n.deinit();
-    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 344 });
+    n.layout(.{ .x = 0, .y = 0, .w = 320, .h = 384 });
 
     const s = stateOf(n);
     // Focus SV.
@@ -897,9 +995,9 @@ test "golden: the panel paints SurfaceContainerHigh; the SV square paints the hu
     const a = std.testing.allocator;
     const n = try colorPicker(a, null, null, .{ .theme = t });
     defer n.deinit();
-    var r = try golden.Renderer.init(std.testing.allocator, 360, 380);
+    var r = try golden.Renderer.init(std.testing.allocator, 360, 430);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 344 });
+    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 384 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
@@ -929,9 +1027,9 @@ test "golden: the SV saturation gradient goes white (S=0, left) → pure hue (S=
     // Initial color = red (h=0, s=1, v=1).
     const n = try colorPicker(a, null, null, .{ .theme = t });
     defer n.deinit();
-    var r = try golden.Renderer.init(std.testing.allocator, 360, 380);
+    var r = try golden.Renderer.init(std.testing.allocator, 360, 430);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 344 });
+    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 384 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
@@ -963,9 +1061,9 @@ test "golden: the preview swatch paints the selected color" {
     defer sig.deinit();
     const n = try colorPicker(a, sig, null, .{ .theme = t });
     defer n.deinit();
-    var r = try golden.Renderer.init(std.testing.allocator, 360, 380);
+    var r = try golden.Renderer.init(std.testing.allocator, 360, 430);
     defer r.deinit();
-    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 344 });
+    n.layout(.{ .x = 20, .y = 20, .w = 320, .h = 384 });
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
