@@ -28,7 +28,13 @@
 //
 // Sheet geometry (DrawerSheet): width clamps to [MinimumDrawerWidth 240,
 //   NavigationDrawerTokens.ContainerWidth 360], height = 100%
-//   (ContainerHeightPercent). AnchoredDraggable horizontal drag follows the
+//   (ContainerHeightPercent). The `content` slot inside is padded by the
+//   window safe-area insets — upstream wraps the content Column in
+//   windowInsetsPadding(DrawerDefaults.windowInsets = systemBars
+//   Vertical + Start): status/nav bars top + bottom plus the cutout on
+//   the anchored start edge, on all three sheet variants; the surface
+//   still paints edge-to-edge behind the system bars.
+//   AnchoredDraggable horizontal drag follows the
 //   finger (offset in [-width, 0], reverseDirection under RTL); release
 //   settles with DrawerPositionalThreshold 0.5 (fraction of the travel) and
 //   DrawerVelocityThreshold 400dp/s, then animates to the anchor with the
@@ -72,8 +78,6 @@
 //   - Predictive back (DrawerPredictiveBackHandler + the predictiveBack*
 //     scale modifiers on Android 14+) is deferred — Klaxon has no system
 //     back-progress events; Escape/edge dismissal works.
-//   - windowInsetsPadding on DrawerSheet (system-bar vertical + start
-//     insets) — Klaxon has no window-inset model.
 //   - horizontalScaleDown (the content counter-scale under overshoot) —
 //     during spring overshoot the panel content stretches with the surface
 //     instead of keeping its aspect ratio.
@@ -202,8 +206,34 @@ fn panelMeasure(n: *Node, c: Constraints) Size {
     return c.constrain(.{ .w = w, .h = h });
 }
 fn panelLayout(n: *Node, bounds: Rect) void {
-    // Fill semantics: the background and the content slot fill the panel.
-    for (n.children.items) |child| child.layout(bounds);
+    // Fill semantics: the background fills the panel edge-to-edge (the
+    // Surface draws under the system bars); the content slot is padded by
+    // the window safe-area insets — upstream wraps the content Column in
+    // windowInsetsPadding(windowInsets), and DrawerDefaults.windowInsets
+    // is systemBars Vertical + Start (status/nav bars top + bottom, the
+    // cutout on the anchored start edge) for all three sheet variants.
+    // The global is re-read each layout; an inset change applies on the
+    // next pass (the platform layer exposes no change signal yet).
+    const ds = stateOf(panelStateOf(n).drawer);
+    const dir = ui.i18n.direction();
+    const sa = ui.platform.window_insets.safeArea();
+    const e = (ui.layout.EdgeInsetsDirectional{
+        .start = if (dir == .rtl) sa.right else sa.left,
+        .top = sa.top,
+        .bottom = sa.bottom,
+    }).resolve(dir);
+    for (n.children.items) |child| {
+        if (ds.opts.content != null and child == ds.opts.content.?) {
+            child.layout(.{
+                .x = bounds.x + e.left,
+                .y = bounds.y + e.top,
+                .w = @max(0, bounds.w - e.hSum()),
+                .h = @max(0, bounds.h - e.vSum()),
+            });
+        } else {
+            child.layout(bounds);
+        }
+    }
 }
 fn panelPaint(n: *Node, ctx: *kx.Ctx) void {
     _ = n;
@@ -780,6 +810,35 @@ test "drawer: measure/layout fill the parent; the panel is 360 wide max" {
     try std.testing.expectEqual(@as(f32, 1), s.progress); // open: snapped at first layout
     try std.testing.expect(s.scrim.visible);
     try std.testing.expectApproxEqAbs(scrim_max_alpha, scrimStateOf(s.scrim).alpha, 1e-6);
+}
+
+test "drawer: the content slot is padded by the window safe-area insets" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, true);
+    defer open.deinit();
+    const content = try golden.solidBox(std.testing.allocator, 10, 10, 0xFF);
+    const d = try drawer(std.testing.allocator, open, null, .{
+        .body = try golden.solidBox(std.testing.allocator, 480, 200, 0xFF),
+        .content = content,
+    });
+    defer d.deinit();
+    // The host pushes the system-bar/cutout insets (test injection point);
+    // restore the zero default for the other tests.
+    ui.platform.window_insets.setSafeArea(.{ .top = 24, .bottom = 16, .left = 8, .right = 4 });
+    defer ui.platform.window_insets.set(.{});
+    d.layout(.{ .x = 0, .y = 0, .w = 480, .h = 200 });
+    // LTR start = left: the content insets to (8, 24) → 352×160 inside
+    // the 360×200 panel. The END-side inset (right = 4) does NOT apply —
+    // DrawerDefaults.windowInsets is Vertical + Start only.
+    try std.testing.expectEqual(@as(f32, 8), content.bounds.x);
+    try std.testing.expectEqual(@as(f32, 24), content.bounds.y);
+    try std.testing.expectEqual(@as(f32, 352), content.bounds.w);
+    try std.testing.expectEqual(@as(f32, 160), content.bounds.h);
+    // the background surface still paints edge-to-edge under the bars
+    const bg = stateOf(d).panel.children.items[0];
+    try std.testing.expectEqual(@as(f32, 0), bg.bounds.x);
+    try std.testing.expectEqual(@as(f32, 0), bg.bounds.y);
+    try std.testing.expectEqual(@as(f32, 360), bg.bounds.w);
+    try std.testing.expectEqual(@as(f32, 200), bg.bounds.h);
 }
 
 test "drawer: without a timeline the panel snaps open/closed on the signal" {

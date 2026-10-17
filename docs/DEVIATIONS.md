@@ -144,9 +144,13 @@ Each widget's header carries the same list; these are the tracked ones
   the upstream `updateAmplitudeAnimation` spec: a 500ms tween (standard
   easing up, emphasized-accelerate down, quantized to 1/12 morph steps)
   between the ring and the rounded-star path.
-- `drawer.zig` — no predictive back, window-inset padding, or content
-  scale-down during overshoot; `confirm_state_change` gates only
-  drawer-initiated transitions (the app owns the signal).
+- `drawer.zig` — no predictive back or content scale-down during
+  overshoot; `confirm_state_change` gates only drawer-initiated
+  transitions (the app owns the signal). The sheet `content` slot is
+  padded by `platform.window_insets.safeArea()` (Vertical + Start,
+  matching `DrawerDefaults.windowInsets`; the surface still paints
+  edge-to-edge) — inset changes apply on the next layout pass, the
+  platform layer exposes no change signal to resubscribe to.
 - `gestures.zig` — the long-press fires at its deadline without a pointer
   event (the arena registers a timeline ticker on pointer-down;
   `hasPendingTimeWork` wakes the host); in headless no-timeline tests it
