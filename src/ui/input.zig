@@ -74,9 +74,9 @@ pub const Key = enum(u32) {
 };
 
 pub const KeyEvent = struct {
-    pub const Kind = enum { key_down, text_input, text_editing };
+    pub const Kind = enum { key_down, key_up, text_input, text_editing };
     kind: Kind,
-    key: Key = .unknown, // key_down
+    key: Key = .unknown, // key_down / key_up
     text: []const u8 = "", // text_input / text_editing (UTF-8, borrowed)
     shift: bool = false, // modifier (Phase 2c: Shift+Tab = focus previous)
     /// The platform's primary shortcut modifier — Cmd on macOS/iOS, Ctrl
@@ -1390,6 +1390,11 @@ test "dispatchKey bubbles up the focused chain and reports handled" {
     try std.testing.expectEqual(@as(usize, 2), recState(child).keys.items.len);
     try std.testing.expectEqual(@as(usize, 1), recState(root).keys.items.len); // bubbled
     try std.testing.expectEqual(Key.enter, recState(root).last_key);
+    // key_up rides the same focused-chain + bubble path
+    recState(child).handled = true;
+    try std.testing.expect(router.dispatchKey(.{ .kind = .key_up, .key = .space }));
+    try std.testing.expectEqual(@as(usize, 3), recState(child).keys.items.len);
+    try std.testing.expectEqual(KeyEvent.Kind.key_up, recState(child).keys.items[2]);
 }
 
 test "up with no capture and no hit delivers nothing" {

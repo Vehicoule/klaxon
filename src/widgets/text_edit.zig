@@ -501,6 +501,9 @@ pub const Edit = struct {
                 n.markDirty(); // repaint only — comp is not a committed edit
                 return true;
             },
+            // A text field has no key_up behavior — bubble so a parent
+            // (e.g. a button tracking a keyboard press) can see it.
+            .key_up => return false,
             .key_down => {
                 // The sticky vertical-motion column survives only across
                 // consecutive up/down presses.

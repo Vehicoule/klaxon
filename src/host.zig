@@ -1604,17 +1604,7 @@ pub const Host = struct {
                 if (event.key.key == sdl.c.SDLK_ESCAPE or event.key.key == sdl.c.SDLK_AC_BACK) {
                     _ = host.input.dispatchBack();
                 } else {
-                    const shortcut_mod: u32 = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
-                        sdl.c.SDL_KMOD_LGUI | sdl.c.SDL_KMOD_RGUI // Cmd
-                    else
-                        sdl.c.SDL_KMOD_LCTRL | sdl.c.SDL_KMOD_RCTRL; // Ctrl
-                    const ev = input_mod.KeyEvent{
-                        .kind = .key_down,
-                        .key = sdlKeyToKey(event.key.key),
-                        .shift = (event.key.mod & (sdl.c.SDL_KMOD_LSHIFT | sdl.c.SDL_KMOD_RSHIFT)) != 0,
-                        .command = (event.key.mod & shortcut_mod) != 0,
-                        .chr = if (event.key.key >= 'a' and event.key.key <= 'z') @intCast(event.key.key) else 0,
-                    };
+                    const ev = sdlKeyEvent(.key_down, event.key.key, event.key.mod);
                     // The focused node sees keys first (Tab included —
                     // time_picker consumes it to walk its hour/minute
                     // fields and bubbles false off the edge); unhandled
@@ -1626,9 +1616,29 @@ pub const Host = struct {
                     }
                 }
             },
+            sdl.c.SDL_EVENT_KEY_UP => {
+                // Focused node + bubble only: a key release with no
+                // press-tracking consumer does nothing (no activation,
+                // no traversal — key_down already handled those).
+                _ = host.input.dispatchKey(sdlKeyEvent(.key_up, event.key.key, event.key.mod));
+            },
             else => {},
         }
         return false;
+    }
+
+    fn sdlKeyEvent(kind: input_mod.KeyEvent.Kind, key: u32, mod: u16) input_mod.KeyEvent {
+        const shortcut_mod: u32 = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
+            sdl.c.SDL_KMOD_LGUI | sdl.c.SDL_KMOD_RGUI // Cmd
+        else
+            sdl.c.SDL_KMOD_LCTRL | sdl.c.SDL_KMOD_RCTRL; // Ctrl
+        return .{
+            .kind = kind,
+            .key = sdlKeyToKey(key),
+            .shift = (mod & (sdl.c.SDL_KMOD_LSHIFT | sdl.c.SDL_KMOD_RSHIFT)) != 0,
+            .command = (mod & shortcut_mod) != 0,
+            .chr = if (key >= 'a' and key <= 'z') @intCast(key) else 0,
+        };
     }
 
     fn sdlKeyToKey(k: u32) input_mod.Key {
