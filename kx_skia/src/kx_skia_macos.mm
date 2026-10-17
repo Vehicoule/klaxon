@@ -44,7 +44,10 @@ struct GpuState {
 };
 
 bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
-    (void)backend; // unused on this platform
+    // Only Graphite Metal is implemented here — honoring any other request
+    // would label a Metal context as e.g. Ganesh GL and poison every
+    // backend-keyed heuristic downstream (iOS guards the same way).
+    if (backend != KX_BACKEND_GRAPHITE_METAL) return false;
     if (!sdl_window || !out) return false;
     auto* state = new GpuState();
     state->width = width;

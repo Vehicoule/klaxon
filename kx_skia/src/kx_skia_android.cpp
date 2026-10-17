@@ -77,7 +77,10 @@ struct GpuState {
 };
 
 bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
-    (void)backend; // unused on this platform
+    // Only Ganesh GLES is implemented here — honoring any other request
+    // would label a GLES context as e.g. Graphite Vulkan and poison every
+    // backend-keyed heuristic downstream (iOS guards the same way).
+    if (backend != KX_BACKEND_GANESH_GLES) return false;
     if (!out || !sdl_window) return false;
     auto* window = static_cast<SDL_Window*>(sdl_window);
     // The caller (host, android path) creates an ES 3.0 context on the SDL

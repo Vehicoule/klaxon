@@ -186,6 +186,10 @@ static bool gpu_init_webgpu(GpuState* state, int width, int height) {
 
 bool gpu_init(GpuState** out, void* sdl_window, int width, int height, kx_backend backend) {
     if (!out || !sdl_window) return false;
+    // Only WebGPU and WebGL2 exist here — honoring any other request
+    // would label a WebGL2 context as e.g. Graphite Metal and poison
+    // every backend-keyed heuristic downstream (iOS guards the same way).
+    if (backend != KX_BACKEND_GRAPHITE_WEBGPU && backend != KX_BACKEND_GANESH_WEBGL2) return false;
     if (backend == KX_BACKEND_GRAPHITE_WEBGPU) {
         auto* state = new GpuState();
         state->window = static_cast<SDL_Window*>(sdl_window);

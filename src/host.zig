@@ -577,11 +577,12 @@ pub const Host = struct {
 
         // Raster presents through an SDL streaming texture; GPU backends present
         // inside the shim (onscreen surface attached to the window). Mobile:
-        // no SDL renderer/texture — the GPU shim presents (Metal / EGL swap).
-        // Exception: iOS + raster — the simulator's software Metal doesn't
-        // execute GPU commands, so raster with SDL software renderer is the
-        // reliable path on the iOS simulator.
-        const use_sdl_present = !is_mobile or (is_ios and resolved_backend == kx.c.KX_BACKEND_RASTER);
+        // the GPU shim presents (Metal / EGL swap), but raster has no GPU
+        // shim to swap inside — without the SDL renderer the frames draw
+        // into a CPU buffer that never reaches the screen (iOS's software
+        // Metal made the same case explicit: SDL software renderer is the
+        // reliable present path whenever the resolved backend is raster).
+        const use_sdl_present = !is_mobile or resolved_backend == kx.c.KX_BACKEND_RASTER;
         const renderer = if (use_sdl_present and resolved_backend == kx.c.KX_BACKEND_RASTER)
             sdl.c.SDL_CreateRenderer(window, null) orelse return error.SdlRenderer
         else
