@@ -110,9 +110,12 @@ Each widget's header carries the same list; these are the tracked ones
   animates 0↔180, a column switch snaps); remaining: text-only cells
   (`cell_paint` takes over a cell's draw — no child widgets in cells),
   no column resizing, no virtualization.
-- `tree.zig` — no drag-and-drop reordering. (Keyboard nav with
-  selection-follows-focus, synchronous lazy children providers, per-node
-  icons and per-row virtual a11y children landed.)
+- `tree.zig` — drag-and-drop reordering landed (`draggable` +
+  `on_move`): slop-promoted pointer drags, primary insertion-gap
+  indicator, self-subtree drops rejected, in-place model move reported by
+  `userdata` tokens. (Keyboard nav with selection-follows-focus,
+  synchronous lazy children providers, per-node icons and per-row
+  virtual a11y children also landed.)
 - `carousel.zig` — the hero/center-aligned strategy landed (upstream's
   `HorizontalCenteredHeroCarousel`: even small count flanking a centered
   focal run, start-aligned fallback under 3 items) and

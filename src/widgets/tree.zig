@@ -27,7 +27,11 @@
 // child (label, "expanded"/"collapsed" value, checked = selected), the
 // group value tracks the focused row's label.
 //
-// Remaining deviations: no drag-and-drop reordering.
+// Drag-reorder (opts.draggable): a press arms on the row, a pointer move
+// past the 8dp touch slop lifts the node, a primary bar marks the
+// insertion gap and a chip floats the label under the pointer. The drop
+// moves the node inside the owned model (a drop into the dragged node's
+// own subtree is rejected) and `on_move` reports `userdata` tokens.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -69,11 +73,28 @@ pub const ChildrenProvider = struct {
     userdata: ?*anyopaque,
 };
 
+/// Reports a completed drag-reorder (`TreeOptions.draggable`): `moved` is
+/// the dragged node's `TreeNode.userdata` token, `new_parent` the target
+/// parent's token (null = the synthetic root — a top-level move), `index`
+/// the child's slot within it. Fires after the model already moved.
+pub const MoveCallback = struct {
+    fn_ptr: *const fn (userdata: ?*anyopaque, moved: ?*anyopaque, new_parent: ?*anyopaque, index: usize) void,
+    userdata: ?*anyopaque,
+};
+
 pub const TreeOptions = struct {
     theme: Theme = theme_mod.light,
     tappable: bool = false,
     /// The lazy-children provider — expanding a `lazy` node calls it once.
     children_provider: ?ChildrenProvider = null,
+    /// Drag-reorder rows: a press-and-move past the touch slop lifts the
+    /// node, a primary indicator marks the insertion gap, and the drop
+    /// moves the node in the model before `on_move` reports it. Dropping
+    /// into the dragged node's own subtree is rejected.
+    draggable: bool = false,
+    /// Called after a completed reorder — the model already moved (the
+    /// callback reports `userdata` tokens so the app can mirror it).
+    on_move: ?MoveCallback = null,
     /// The accessible name — null resolves the localized "Tree" (an app
     /// string is verbatim).
     a11y_label: ?[]const u8 = null,
@@ -109,6 +130,18 @@ const TreeState = struct {
     /// the slice — resynced by syncSemantics on every change).
     sem_children: std.array_list.Managed(ui.semantics.Semantics),
     i18n: ?*i18n_mod.I18n = null,
+    /// Drag-reorder (opts.draggable): the press arms `drag_armed` (flat
+    /// visible index); a move past the slop promotes it to `dragging` (the
+    /// row's node). `drop_gap` is the insertion gap — "insert before flat
+    /// row g" (== len appends after the last visible row), -1 = no valid
+    /// drop under the pointer.
+    drag_armed: i32 = -1,
+    dragging: ?*TreeNodeDef = null,
+    drag_px: f32 = 0,
+    drag_py: f32 = 0,
+    drag_x: f32 = 0,
+    drag_y: f32 = 0,
+    drop_gap: i32 = -1,
 };
 
 const TreeNodeDef = struct {
@@ -128,25 +161,32 @@ fn stateOf(n: *Node) *TreeState {
     return @ptrCast(@alignCast(n.state.?));
 }
 
-/// A visible tree node entry (flat list for measure/paint/input).
+/// A visible tree node entry (flat list for measure/paint/input). The
+/// `siblings`/`sib_index` pair locates the node for a drag drop — the
+/// parent list is where an insert/remove lands.
 const VisibleNode = struct {
     node: *TreeNodeDef,
     depth: usize,
+    /// The node owning `siblings` (the drop's parent) — null on the
+    /// synthetic root row, which has no siblings list.
+    parent: ?*TreeNodeDef = null,
+    siblings: *std.array_list.Managed(TreeNodeDef) = undefined,
+    sib_index: usize = 0,
 };
 
 /// Count visible nodes (expanded subtrees only). Returns the flat list
 /// of visible nodes with their depths.
 fn collectVisible(s: *TreeState, allocator: std.mem.Allocator) !std.array_list.Managed(VisibleNode) {
     var list = std.array_list.Managed(VisibleNode).init(allocator);
-    try collectNode(&s.root, 0, &list);
+    try collectNode(&s.root, 0, null, null, 0, &list);
     return list;
 }
 
-fn collectNode(node: *TreeNodeDef, depth: usize, list: *std.array_list.Managed(VisibleNode)) !void {
-    try list.append(.{ .node = node, .depth = depth });
+fn collectNode(node: *TreeNodeDef, depth: usize, parent: ?*TreeNodeDef, siblings: ?*std.array_list.Managed(TreeNodeDef), sib_index: usize, list: *std.array_list.Managed(VisibleNode)) !void {
+    try list.append(.{ .node = node, .depth = depth, .parent = parent, .siblings = siblings orelse undefined, .sib_index = sib_index });
     if (node.expanded) {
-        for (node.children.items) |*child| {
-            try collectNode(child, depth + 1, list);
+        for (node.children.items, 0..) |*child, ci| {
+            try collectNode(child, depth + 1, node, &node.children, ci, list);
         }
     }
 }
@@ -155,6 +195,109 @@ fn collectNode(node: *TreeNodeDef, depth: usize, list: *std.array_list.Managed(V
 /// resolved yet (the chevron affordance shows for both).
 fn expandable(node: *const TreeNodeDef) bool {
     return node.children.items.len > 0 or (node.lazy and !node.resolved);
+}
+
+// --- Drag-reorder ---
+
+/// Pointer-move distance that promotes an armed press to a real drag —
+/// the platform touch slop (8dp, ViewConfiguration.getScaledTouchSlop).
+const drag_slop: f32 = 8;
+
+/// True when `needle` sits inside `hay`'s subtree (or IS `hay`) — a drop
+/// whose target parent is inside the dragged subtree would orphan it.
+fn containsNode(hay: *TreeNodeDef, needle: *TreeNodeDef) bool {
+    for (hay.children.items) |*c| {
+        if (c == needle or containsNode(c, needle)) return true;
+    }
+    return false;
+}
+
+/// The insertion gap under pointer y: g ∈ [0, len] means "insert before
+/// flat visible row g" — the indicator bar sits at the row's top edge.
+/// Returns null when the target parent lies inside the dragged subtree
+/// (self-drop) — a no-op gap beside the dragged row stays allowed.
+fn dropGapAt(s: *TreeState, n: *Node, py: f32) ?i32 {
+    const dragged = s.dragging orelse return null;
+    const dy = py - n.bounds.y;
+    var list = collectVisible(s, n.allocator) catch return null;
+    defer list.deinit();
+    const len = list.items.len;
+    var g: i32 = @intFromFloat(@floor(dy / rowH(s.opts.theme) + 0.5));
+    g = @max(0, @min(@as(i32, @intCast(len)), g));
+    // Target parent: the parent of the row AT the gap (insert-before) —
+    // past-the-end gaps append to the last row's parent.
+    const parent: ?*TreeNodeDef = if (g == 0)
+        &s.root
+    else if (g >= @as(i32, @intCast(len)))
+        list.items[len - 1].parent
+    else
+        list.items[@intCast(g)].parent;
+    if (parent) |p| {
+        if (p == dragged or containsNode(dragged, p)) return null;
+    }
+    return g;
+}
+
+/// Move `dragged` into `target`'s slot — in-place model mutation (the
+/// widget owns the tree). A no-op landing (same list + same index) still
+/// runs: the callback is skipped, the model untouched.
+fn performDrop(n: *Node, s: *TreeState) void {
+    const dragged = s.dragging orelse return;
+    const gap = s.drop_gap;
+    if (gap < 0) return;
+    var list = collectVisible(s, n.allocator) catch return;
+    defer list.deinit();
+    const len = list.items.len;
+    const g: usize = @intCast(gap);
+    if (len == 0 or g > len) return;
+    var target_list: *std.array_list.Managed(TreeNodeDef) = undefined;
+    var target_index: usize = 0;
+    var target_parent: ?*TreeNodeDef = null;
+    if (g == 0) { // above the root row = first top-level child
+        target_list = &s.root.children;
+        target_parent = &s.root;
+    } else if (g >= len) {
+        const anchor = list.items[len - 1];
+        if (anchor.parent) |p| {
+            target_list = anchor.siblings;
+            target_index = anchor.sib_index + 1;
+            target_parent = p;
+        } else { // only the root row is visible — append to top level
+            target_list = &s.root.children;
+            target_index = s.root.children.items.len;
+            target_parent = &s.root;
+        }
+    } else {
+        const anchor = list.items[g];
+        target_list = anchor.siblings;
+        target_index = anchor.sib_index;
+        target_parent = anchor.parent;
+    }
+    if (target_parent) |p| {
+        if (p == dragged or containsNode(dragged, p)) return;
+    }
+    // Locate the dragged node's own slot — pointers into the lists stay
+    // valid only until the remove, so read everything first.
+    var from_list: ?*std.array_list.Managed(TreeNodeDef) = null;
+    var from_index: usize = 0;
+    for (list.items) |item| {
+        if (item.node == dragged) {
+            from_list = item.siblings;
+            from_index = item.sib_index;
+            break;
+        }
+    }
+    const fl = from_list orelse return;
+    if (fl == target_list and from_index == target_index) return; // no-op
+    if (fl == target_list and from_index + 1 == target_index) return; // ditto
+    const moved_value = dragged.*; // copy BEFORE the remove clobbers it
+    _ = fl.orderedRemove(from_index);
+    if (fl == target_list and target_index > from_index) target_index -= 1;
+    target_list.insert(target_index, moved_value) catch @panic("klaxon: out of memory");
+    n.markLayoutDirty();
+    n.markDirty();
+    postChange(n, s, true);
+    if (s.opts.on_move) |cb| cb.fn_ptr(cb.userdata, moved_value.userdata, if (target_parent) |p| p.userdata else null, target_index);
 }
 
 // --- Measure ---
@@ -254,6 +397,22 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
 
         y += rowH(t);
     }
+
+    // Drag-reorder overlay: the primary bar marks the insertion gap; the
+    // dragged row's label floats in a chip under the pointer.
+    if (s.dragging) |dragged| {
+        if (s.drop_gap >= 0) {
+            const gy = b.y + @as(f32, @floatFromInt(s.drop_gap)) * rowH(t);
+            ui.paint.fillRRect(ctx, b.x + 4, gy - 1, b.w - 8, 2, 1, t.colors.primary);
+        }
+        const lm = ui.paint.measureText(dragged.label, bs.size, false);
+        const chip_w = lm.width + 20;
+        const chip_h = rowH(t) * 0.72;
+        const chip_x = s.drag_x + 8;
+        const chip_y = s.drag_y - chip_h / 2;
+        ui.paint.fillRRect(ctx, chip_x, chip_y, chip_w, chip_h, 8, t.colors.secondary_container);
+        ui.paint.text(ctx, dragged.label, chip_x + 10, chip_y + (chip_h - lm.height) / 2 + lm.height * 0.8, bs.size, false, t.colors.on_secondary_container);
+    }
 }
 
 // --- Input ---
@@ -299,6 +458,14 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
                 s.focused = @intCast(vi.?);
                 postChange(n, s, false);
             }
+            // Drag-reorder arms on a non-root row press — a move past the
+            // touch slop promotes it (below slop the .move goes unconsumed
+            // so a scroll ancestor can still take the gesture).
+            if (s.opts.draggable and vi != null and vi.? > 0) {
+                s.drag_armed = @intCast(vi.?);
+                s.drag_px = ev.x;
+                s.drag_py = ev.y;
+            }
             // Press feedback (M3 pressed state layer) — the row stays
             // highlighted until the release; the tap itself is handled on
             // .up below (bubbling keeps the scroll view's drag take-over).
@@ -306,8 +473,48 @@ fn treePointer(n: *Node, ev: input.PointerEvent) bool {
                 s.pressed = @intCast(vi.?);
                 n.markDirty();
             }
+        } else if (ev.phase == .move) {
+            // Captured drag: once armed, slop promotes to a live drag; the
+            // indicator gap tracks the pointer row.
+            if (s.dragging != null) {
+                s.drag_x = ev.x;
+                s.drag_y = ev.y;
+                s.drop_gap = dropGapAt(s, n, ev.y) orelse -1;
+                n.markDirty();
+                return true;
+            }
+            if (s.opts.draggable and s.drag_armed > 0) {
+                const dx = ev.x - s.drag_px;
+                const dy = ev.y - s.drag_py;
+                if (dx * dx + dy * dy > drag_slop * drag_slop) {
+                    var list = collectVisible(s, n.allocator) catch return false;
+                    defer list.deinit();
+                    const ai: usize = @intCast(s.drag_armed);
+                    if (ai < list.items.len) { // row 0 is the synthetic root
+                        s.dragging = list.items[ai].node;
+                        s.drag_x = ev.x;
+                        s.drag_y = ev.y;
+                        s.drop_gap = dropGapAt(s, n, ev.y) orelse -1;
+                        s.pressed = -1;
+                        n.markDirty();
+                    }
+                    return true;
+                }
+            }
         }
         return false;
+    }
+    // Drop (or a plain release): a live drag consumes the up — the tap
+    // path below never sees the end of a drag.
+    if (s.dragging != null or s.drag_armed != -1) {
+        const was_dragging = s.dragging != null;
+        if (was_dragging) performDrop(n, s);
+        s.dragging = null;
+        s.drag_armed = -1;
+        s.drop_gap = -1;
+        if (s.pressed != -1) s.pressed = -1;
+        n.markDirty();
+        if (was_dragging) return true;
     }
     if (s.pressed != -1) {
         s.pressed = -1;
@@ -999,4 +1206,111 @@ test "tree: i18n — the group label + expanded values localize and re-resolve" 
     const sem2 = n.semantics.?; // re-attached by the locale callback
     try std.testing.expectEqualStrings("Tree", sem2.label);
     try std.testing.expectEqualStrings("expanded", sem2.children[0].value);
+}
+
+test "tree: drag-reorder moves a child and fires on_move" {
+    const a = std.testing.allocator;
+    var tok_a: i32 = 1;
+    var tok_root: i32 = 0;
+    const Probe = struct {
+        moved: ?*anyopaque = null,
+        parent: ?*anyopaque = null,
+        index: usize = 999,
+        fn cb(userdata: ?*anyopaque, moved: ?*anyopaque, parent: ?*anyopaque, index: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.* = .{ .moved = moved, .parent = parent, .index = index };
+        }
+    };
+    var probe = Probe{};
+    const root = TreeNode{
+        .label = "Root",
+        .userdata = &tok_root,
+        .children = &.{
+            .{ .label = "A", .userdata = &tok_a },
+            .{ .label = "B", .children = &.{.{ .label = "BC" }} },
+            .{ .label = "C" },
+        },
+    };
+    const n = try tree(a, &root, null, .{
+        .draggable = true,
+        .on_move = .{ .fn_ptr = Probe.cb, .userdata = &probe },
+    });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h * 5 });
+    const s = stateOf(n);
+    // Rows: 0=Root, 1=A, 2=B, 3=BC, 4=C. Drag A (row 1) down to the gap
+    // before C — y mid-row 4 → gap 4.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 100, .y = row_h + 10 });
+    try std.testing.expect(s.drag_armed == 1);
+    try std.testing.expect(s.dragging == null);
+    // Below the slop the move doesn't promote the drag.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .move, .x = 100, .y = row_h + 10 + drag_slop - 1 });
+    try std.testing.expect(s.dragging == null);
+    // Past the slop the drag engages.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .move, .x = 100, .y = row_h * 4 + 10 });
+    try std.testing.expect(s.dragging != null);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 100, .y = row_h * 4 + 10 });
+    // A moved to index 1 inside the root's children: [B, A, C].
+    try std.testing.expectEqualStrings("B", s.root.children.items[0].label);
+    try std.testing.expectEqualStrings("A", s.root.children.items[1].label);
+    try std.testing.expectEqualStrings("C", s.root.children.items[2].label);
+    try std.testing.expect(probe.moved == @as(?*anyopaque, &tok_a));
+    try std.testing.expect(probe.parent == @as(?*anyopaque, &tok_root));
+    try std.testing.expectEqual(@as(usize, 1), probe.index);
+}
+
+test "tree: a drop inside the dragged node's own subtree is rejected" {
+    const a = std.testing.allocator;
+    const root = TreeNode{
+        .label = "Root",
+        .children = &.{
+            .{ .label = "A" },
+            .{ .label = "B", .children = &.{.{ .label = "BC" }} },
+            .{ .label = "C" },
+        },
+    };
+    const n = try tree(a, &root, null, .{ .draggable = true });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h * 5 });
+    const s = stateOf(n);
+    // Drag B (row 2) into its own subtree — the gap before BC (row 3)
+    // targets parent B → invalid.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 100, .y = row_h * 2 + 10 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .move, .x = 100, .y = row_h * 3 + 10 });
+    try std.testing.expect(s.dragging != null);
+    try std.testing.expect(s.drop_gap == -1); // no valid gap shown
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 100, .y = row_h * 3 + 10 });
+    try std.testing.expectEqual(@as(usize, 3), s.root.children.items.len);
+    try std.testing.expectEqualStrings("A", s.root.children.items[0].label);
+    try std.testing.expectEqualStrings("B", s.root.children.items[1].label);
+    try std.testing.expectEqualStrings("C", s.root.children.items[2].label);
+}
+
+test "tree: a draggable press released inside the slop stays a plain tap" {
+    const a = std.testing.allocator;
+    var tapped = false;
+    const TapCb = struct {
+        fn cb(userdata: ?*anyopaque) void {
+            const self: *bool = @ptrCast(@alignCast(userdata.?));
+            self.* = true;
+        }
+    };
+    const root = TreeNode{
+        .label = "Root",
+        .children = &.{ .{ .label = "A" }, .{ .label = "B" } },
+    };
+    const n = try tree(a, &root, .{ .fn_ptr = TapCb.cb, .userdata = &tapped }, .{
+        .tappable = true,
+        .draggable = true,
+    });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h * 3 });
+    const s = stateOf(n);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 100, .y = row_h + 10 });
+    // A sub-slop wiggle then release → select row 1 like a normal tap.
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .move, .x = 101, .y = row_h + 11 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 100, .y = row_h + 10 });
+    try std.testing.expect(tapped);
+    try std.testing.expect(s.selected == 1);
+    try std.testing.expect(s.dragging == null);
 }
