@@ -30,8 +30,8 @@
 //     by arc length then y-scaled by amplitude; flat right-to-left track
 //     pieces; stop dot that shrinks as progress nears the end
 //   - determinate wavy amplitude ramp: 0 at p<=0.1 or p>=0.95 (upstream
-//     indicatorAmplitude; the 450ms cross-fade tween is skipped — progress
-//     is a construction-time constant in this API, deviation documented)
+//     indicatorAmplitude), cross-faded over 500ms — standard easing up,
+//     emphasized-accelerate down (updateAmplitudeAnimation)
 //   - circular determinate: gap-adjacent track arc + round-capped active arc
 //   - circular indeterminate: keyframed progress 0.1<->0.87 (Standard easing),
 //     4x90deg additional-rotation schedule (EmphasizedDecelerate) + 1080deg
@@ -46,16 +46,17 @@
 //     48dp (WaveSize), wavelength 15dp, star = circle(numVertices)
 //     vs star(numVertices, innerRadius 0.75, rounding 0.35/0.4,
 //     innerRounding 0.5) — via ui.shapes (the androidx.graphics.shapes
-//     port).
+//     port). At 0<amp<1 the active path is the circle→star Morph
+//     (Morph.asCubics flattened into the same arc-length table), quantized
+//     to 1/12 steps so the cross-fade rebuilds ~12 tables, not one per
+//     frame.
 //
 // Deliberate deviations: upstream reads progress as a lambda and animates
 // changes with ProgressAnimationSpec — here `progress_sig` carries the live
-// value and the same spring spec drives it; the wave offset/amplitude
-// micro-animations on attach are skipped (amplitude starts at target). The circle->star Morph exists upstream only
-// for intermediate amplitudes (0<amp<1 during the 450ms amplitude
-// cross-fade); the API here produces amplitude in {0,1} only, so the
-// progress path is the star or the track ring exactly like upstream's
-// no-morph branch (internal-CircularWavyProgressModifiers.kt:1399-1403).
+// value and the same spring spec drives it. The amplitude tween snaps on
+// the first read (upstream Animatable(initialValue)) and does not retarget
+// mid-flight — a newer target is picked up when the running job completes
+// (upstream's job-gate).
 //
 // Painting: everything emits polylines (kx_stroke_polyline) — the wave path
 // is sampled at ~1px x-resolution into a layout-allocated arc-length table
@@ -161,8 +162,17 @@ const ProgressState = struct {
     // change; freed in deinit. Never allocated per frame.
     circ_w: f32 = -1,
     circ_h: f32 = -1,
-    circ_amp: f32 = -1, // progress-path amplitude class: 1 = star, 0 = ring
-    circ_verts: usize = 0, // star vertex count (the wave offset period base)
+    circ_amp: f32 = -1, // progress-path amplitude class: 1 = star, 0 = ring, (0,1) = morph
+    circ_verts: usize = 0,
+    /// The amplitude micro-animation (upstream updateAmplitudeAnimation):
+    /// amp_display tweens to amp_target over DurationLong2 = 500ms when the
+    /// target changes while attached — Increasing gets EasingStandard,
+    /// Decreasing EasingEmphasizedAccelerate; the running job is NOT
+    /// retargeted mid-flight (upstream's job-completed gate).
+    amp_display: f32 = 0,
+    amp_target: f32 = -1, // -1 = snap the first read (upstream initialValue)
+    amp_running: bool = false,
+    amp_channel: u8 = 0, // timeline channel marker (stable address) // star vertex count (the wave offset period base)
     circ_prog: RingTable = .{},
     circ_trk: RingTable = .{},
     // Signal-driven progress (ProgressAnimationSpec): an Effect springs
@@ -444,27 +454,26 @@ fn circVertexCount(w: f32, h: f32) usize {
 /// outline is scaled by (size - strokeWidth) per axis and translated so its
 /// (approximate cubic) bounds center lands on the size center, then
 /// flattened into a RingTable. Returns a table with n==0 on <2 points.
-fn circBuildTable(a: std.mem.Allocator, poly: *const shapes.RoundedPolygon, w: f32, h: f32) !RingTable {
+/// The shared tail of circBuildTable: the flattened normalized points
+/// scaled by (w−stroke, h−stroke), recentered on the bounds' center, and
+/// arc-length indexed.
+fn circTableFromPoints(a: std.mem.Allocator, pts: []const shapes.Point, bounds_center: shapes.Point, w: f32, h: f32) !RingTable {
     var t: RingTable = .{};
     errdefer t.deinit(a);
     const sx = w - circular_stroke; // scaleMatrix.scale(width - stroke.width)
     const sy = h - circular_stroke;
-    const bb = poly.bounds(); // normalized 0..1 bounds
-    const ox = w / 2 - (bb.min[0] + bb.max[0]) / 2 * sx; // size.center - bounds.center
-    const oy = h / 2 - (bb.min[1] + bb.max[1]) / 2 * sy;
-    var pts = std.array_list.Managed(shapes.Point).init(a);
-    defer pts.deinit();
-    try poly.flatten(0.15 / @min(sx, sy), &pts); // ~0.15px at display scale
-    var np = pts.items.len;
+    const ox = w / 2 - bounds_center[0] * sx; // size.center - bounds.center
+    const oy = h / 2 - bounds_center[1] * sy;
+    var np = pts.len;
     // The closed outline's last anchor1 duplicates the first anchor0 — drop
     // it so the wrap edge (last real point -> first) carries the arc length.
-    while (np > 1 and @abs(pts.items[np - 1][0] - pts.items[0][0]) < 1e-6 and @abs(pts.items[np - 1][1] - pts.items[0][1]) < 1e-6) np -= 1;
+    while (np > 1 and @abs(pts[np - 1][0] - pts[0][0]) < 1e-6 and @abs(pts[np - 1][1] - pts[0][1]) < 1e-6) np -= 1;
     if (np < 2) return t;
     t.x = try a.alloc(f32, np + 1);
     t.y = try a.alloc(f32, np + 1);
     t.d = try a.alloc(f32, np + 1);
     var dd: f32 = 0;
-    for (pts.items, 0..) |p, i| {
+    for (pts, 0..) |p, i| {
         t.x[i] = p[0] * sx + ox;
         t.y[i] = p[1] * sy + oy;
         if (i > 0) {
@@ -487,13 +496,51 @@ fn circBuildTable(a: std.mem.Allocator, poly: *const shapes.RoundedPolygon, w: f
     return t;
 }
 
+fn circBuildTable(a: std.mem.Allocator, poly: *const shapes.RoundedPolygon, w: f32, h: f32) !RingTable {
+    const sx = w - circular_stroke;
+    const sy = h - circular_stroke;
+    const bb = poly.bounds(); // normalized 0..1 bounds
+    const center = shapes.Point{ (bb.min[0] + bb.max[0]) / 2, (bb.min[1] + bb.max[1]) / 2 };
+    var pts = std.array_list.Managed(shapes.Point).init(a);
+    defer pts.deinit();
+    try poly.flatten(0.15 / @min(sx, sy), &pts); // ~0.15px at display scale
+    return circTableFromPoints(a, pts.items, center, w, h);
+}
+
+/// The morph-interpolated outline → a RingTable (the circular wavy
+/// amplitude cross-fade's intermediate shapes — upstream's Morph path).
+fn circBuildTableCubics(a: std.mem.Allocator, cubics: []const shapes.Cubic, w: f32, h: f32) !RingTable {
+    const sx = w - circular_stroke;
+    const sy = h - circular_stroke;
+    var pts = std.array_list.Managed(shapes.Point).init(a);
+    defer pts.deinit();
+    try shapes.flattenCubics(cubics, 0.15 / @min(sx, sy), &pts);
+    // The cubics' bounds → the recenter origin (same math as RoundedPolygon
+    // .bounds: the min/max over every control point — approximation-free
+    // for our convex-ish outlines).
+    var lo = shapes.Point{ std.math.floatMax(f32), std.math.floatMax(f32) };
+    var hi = shapes.Point{ std.math.floatMin(f32), std.math.floatMin(f32) };
+    for (cubics) |c| {
+        for ([_]shapes.Point{ c.a0, c.c0, c.c1, c.a1 }) |p| {
+            lo[0] = @min(lo[0], p[0]);
+            lo[1] = @min(lo[1], p[1]);
+            hi[0] = @max(hi[0], p[0]);
+            hi[1] = @max(hi[1], p[1]);
+        }
+    }
+    const center = shapes.Point{ (lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2 };
+    return circTableFromPoints(a, pts.items, center, w, h);
+}
+
 /// Port of CircularShapes.update + CircularProgressDrawingCache
 /// .updateFullPaths: build the track ring (RoundedPolygon.circle(nv)) and
 /// the progress ring (the rounded star at amplitude 1, the track polygon
 /// otherwise — upstream's no-morph branch), both normalized + scaled +
 /// recentered + flattened. Rebuilt when (w, h, amplitude-class) change.
 fn ensureCircPaths(n: *Node, s: *ProgressState, w: f32, h: f32, amp: f32) void {
-    const amp_key: f32 = if (amp >= 1) 1 else 0;
+    // Quantize the morph parameter (1/12 steps): the 500ms transition
+    // rebuilds ~12 path tables instead of one per frame.
+    const amp_key: f32 = std.math.clamp(@round(amp * 12) / 12, 0, 1);
     if (s.circ_w == w and s.circ_h == h and s.circ_amp == amp_key) return;
     const a = n.allocator;
     if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= circular_stroke or h <= circular_stroke) {
@@ -521,11 +568,13 @@ fn ensureCircPaths(n: *Node, s: *ProgressState, w: f32, h: f32, amp: f32) void {
         return;
     };
     errdefer new_trk.deinit(a);
-    // getProgressPath (no Morph): the star at amplitude 1, the track ring
-    // otherwise. star(numVerticesPerRadius = nv, innerRadius = 0.75,
+    // getProgressPath: the star at amplitude 1, the track ring at 0, and
+    // the circle→star Morph (asCubics(amp) flattened) at intermediate
+    // amplitudes — upstream's animatable amplitude cross-fade.
+    // star(numVerticesPerRadius = nv, innerRadius = 0.75,
     // rounding = CornerRounding(0.35, smoothing 0.4), innerRounding = 0.5).
     var new_prog: RingTable = .{};
-    if (amp_key == 1) {
+    if (amp_key > 0) {
         var star_poly = shapes.star(a, nv, 1, 0.75, .{ .radius = 0.35, .smoothing = 0.4 }, .{ .radius = 0.5 }, .{ 0, 0 }) catch {
             new_trk.deinit(a);
             s.circ_prog.deinit(a);
@@ -540,12 +589,36 @@ fn ensureCircPaths(n: *Node, s: *ProgressState, w: f32, h: f32, amp: f32) void {
             return;
         };
         defer star_norm.deinit();
-        new_prog = circBuildTable(a, &star_norm, w, h) catch {
-            new_trk.deinit(a);
-            s.circ_prog.deinit(a);
-            s.circ_trk.deinit(a);
-            return;
-        };
+        if (amp_key >= 1) {
+            new_prog = circBuildTable(a, &star_norm, w, h) catch {
+                new_trk.deinit(a);
+                s.circ_prog.deinit(a);
+                s.circ_trk.deinit(a);
+                return;
+            };
+        } else {
+            // 0 < amp < 1: morph ring → star at the quantized amplitude.
+            var morph = shapes.Morph.init(a, &track_norm, &star_norm) catch {
+                new_trk.deinit(a);
+                s.circ_prog.deinit(a);
+                s.circ_trk.deinit(a);
+                return;
+            };
+            defer morph.deinit();
+            const cubics = morph.asCubics(a, amp_key) catch {
+                new_trk.deinit(a);
+                s.circ_prog.deinit(a);
+                s.circ_trk.deinit(a);
+                return;
+            };
+            defer a.free(cubics);
+            new_prog = circBuildTableCubics(a, cubics, w, h) catch {
+                new_trk.deinit(a);
+                s.circ_prog.deinit(a);
+                s.circ_trk.deinit(a);
+                return;
+            };
+        }
     } else {
         new_prog = circBuildTable(a, &track_norm, w, h) catch {
             new_trk.deinit(a);
@@ -674,6 +747,49 @@ fn wavyAmplitude(progress: f32) f32 {
     return if (progress <= 0.1 or progress >= 0.95) 0 else 1;
 }
 
+/// Upstream updateAmplitudeAnimation: the amp snaps to its target on the
+/// first read (Animatable(initialValue = target) — no intro ramp), then a
+/// target change while attached launches a 500ms tween — EasingStandard
+/// increasing, EasingEmphasizedAccelerate decreasing. A running job is not
+/// retargeted mid-flight (the job-completed gate); the next update picks
+/// up the newest target when it finishes.
+fn updateAmp(n: *Node, s: *ProgressState, target: f32) void {
+    if (s.amp_target < 0) {
+        s.amp_display = target;
+        s.amp_target = target;
+        return;
+    }
+    if (target == s.amp_target or s.amp_running) return;
+    s.amp_target = target;
+    if (anim.timeline()) |tl| {
+        const increasing = s.amp_display < target;
+        _ = tl.play(.{
+            .kind = anim.Animation.tweenAnim(.{ target, 0, 0, 0 }, 500, .{ .ease = if (increasing) .emphasized else .emphasized_accelerate }),
+            .from = .{ s.amp_display, 0, 0, 0 },
+            .channel = @ptrCast(&s.amp_channel),
+            .on_update = .{ .fn_ptr = ampUpdateCb, .userdata = n },
+            .on_complete = .{ .fn_ptr = ampDoneCb, .userdata = n },
+        });
+        s.amp_running = true;
+    } else {
+        s.amp_display = target; // no timeline: snap (tests, pre-host paint)
+    }
+}
+
+fn ampUpdateCb(userdata: ?*anyopaque, v: anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.amp_display = v[0];
+    n.markDirty();
+}
+
+fn ampDoneCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.amp_running = false;
+    n.markDirty();
+}
+
 /// The four indeterminate fractions (t1, h1, t2, h2 order is the caller's
 /// choice — we emit [tail, head] pairs as upstream getProgressFractions).
 fn indetFractions(t_ms: f32, out: *[4]f32) void {
@@ -754,17 +870,18 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 const wave_offset = @mod(elapsed / wave_offset_ms, 1);
                 var fr: [4]f32 = undefined;
                 var n_frac: usize = 2;
-                var amp: f32 = 1;
+                var amp_target: f32 = 1;
                 if (effProgress(s)) |p_raw| {
                     const p = clamp01(p_raw);
                     fr[0] = 0;
                     fr[1] = p;
-                    amp = wavyAmplitude(p);
+                    amp_target = wavyAmplitude(p);
                 } else {
                     indetFractions(@mod(elapsed, @as(f32, @floatFromInt(linear_indet_ms))), &fr);
                     n_frac = 4;
                 }
-                drawWavyLinear(n, s, ctx, b, fr[0..n_frac], amp, wave_offset, active, track, rtl);
+                updateAmp(n, s, amp_target);
+                drawWavyLinear(n, s, ctx, b, fr[0..n_frac], s.amp_display, wave_offset, active, track, rtl);
                 if (effProgress(s)) |p_raw| {
                     // wavy stop dot — determinate only. Upstream draws it in
                     // rotate(ltr?0:180): compute in LTR space, mirror the
@@ -798,7 +915,8 @@ fn progressPaint(n: *Node, ctx: *kx.Ctx) void {
                 var ys: [wave_seg_cap]f32 = undefined;
                 if (effProgress(s)) |p_raw| {
                     const p = clamp01(p_raw);
-                    const amp = wavyAmplitude(p); // indicatorAmplitude
+                    updateAmp(n, s, wavyAmplitude(p));
+                    const amp = s.amp_display; // indicatorAmplitude
                     ensureCircPaths(n, s, b.w, b.h, amp);
                     const lp = s.circ_prog.totalLen();
                     const lt = s.circ_trk.totalLen();
@@ -880,6 +998,7 @@ fn progressDeinit(n: *Node) void {
     if (anim.timeline()) |tl| {
         tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
         tl.cancelChannel(@ptrCast(&s.prog_channel));
+        tl.cancelChannel(@ptrCast(&s.amp_channel));
     }
     if (s.prog_effect) |e| e.deinit();
     if (s.path_x.len > 0) {
@@ -1287,6 +1406,92 @@ test "progress: circular wavy segment emission wraps, rotates and scrolls" {
     try std.testing.expectApproxEqAbs(lp / 9, sh1, 0.01);
     _ = s.circ_prog.emit(sh1, 20 + sh1, -@mod(circWaveOffset(s) * 360, 360), 24, 24, 0, 0, &xb, &yb);
     try std.testing.expect(!std.meta.eql(xa[0..10], xb[0..10]));
+}
+
+test "progress: circular wavy mid-amplitude morphs between ring and star" {
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.6 });
+    defer wavy.deinit();
+    const s = stateOf(wavy);
+    // amp 0.5 → the circle→star Morph branch: the progress outline is no
+    // longer the flat ring, but not yet the full-depth star.
+    ensureCircPaths(wavy, s, 48, 48, 0.5);
+    try std.testing.expectEqual(@as(f32, 0.5), s.circ_amp);
+    var rmin: f32 = std.math.inf(f32);
+    var rmax: f32 = 0;
+    for (0..s.circ_prog.n) |i| {
+        const dx = s.circ_prog.x[i] - 24;
+        const dy = s.circ_prog.y[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        rmin = @min(rmin, ri);
+        rmax = @max(rmax, ri);
+    }
+    // Star at full amp spans ~[16.5, 21.5]; the half morph's excursion is
+    // roughly half that but strictly positive.
+    try std.testing.expect(rmax - rmin > 0.8);
+    try std.testing.expect(rmax - rmin < 4);
+    try std.testing.expect(rmin > 14);
+    try std.testing.expect(rmax < 22.5);
+    // The track ring stays a quasi-circle regardless of the amp morph.
+    var tmin: f32 = std.math.inf(f32);
+    var tmax: f32 = 0;
+    for (0..s.circ_trk.n) |i| {
+        const dx = s.circ_trk.x[i] - 24;
+        const dy = s.circ_trk.y[i] - 24;
+        const ri = @sqrt(dx * dx + dy * dy);
+        tmin = @min(tmin, ri);
+        tmax = @max(tmax, ri);
+    }
+    try std.testing.expect(tmax - tmin < 1.5);
+    // Quantized amp keys share the cached table (1/12 steps): the cache
+    // hit check uses the quantized key, not the raw display value.
+    const table_ptr = s.circ_prog.x.ptr;
+    ensureCircPaths(wavy, s, 48, 48, 0.49); // same amp_key = 6/12
+    try std.testing.expectEqual(table_ptr, s.circ_prog.x.ptr);
+}
+
+test "progress: wavy amplitude tweens on target change, snapping the first read" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const wavy = try progressIndicator(std.testing.allocator, .{ .kind = .circular, .wavy = true, .progress = 0.6 });
+    defer wavy.deinit();
+    const s = stateOf(wavy);
+    // First read snaps (Animatable(initialValue = target)): no intro ramp.
+    updateAmp(wavy, s, 1);
+    try std.testing.expectEqual(@as(f32, 1), s.amp_display);
+    try std.testing.expect(!s.amp_running);
+    // A target change launches the 500ms tween. The timeline's lazy start
+    // pins start_ms at the first tick after play, so elapsed = t - 50 here.
+    // Decreasing uses emphasized-accelerate cubic-bezier(0.3, 0, 0.8, 0.15):
+    // a very slow start (at x=0.11 the eased progress is still < 1%), then
+    // a rush at the end.
+    tl.tick(0);
+    updateAmp(wavy, s, 0);
+    try std.testing.expect(s.amp_running);
+    tl.tick(50); // lazy start pins here (elapsed 0)
+    tl.tick(100); // elapsed 50 → x = 0.1 → eased ≈ 0.01 → amp ≈ 0.99
+    try std.testing.expect(s.amp_display > 0.95);
+    tl.tick(450); // elapsed 400 → x = 0.8 → eased ≈ 0.48 → amp ≈ 0.52
+    // Linear would be at 0.2 here: the accelerate curve lags until the end.
+    try std.testing.expect(s.amp_display > 0.4);
+    try std.testing.expect(s.amp_display < 0.65);
+    tl.tick(550); // elapsed 500 → completes
+    try std.testing.expectEqual(@as(f32, 0), s.amp_display);
+    try std.testing.expect(!s.amp_running);
+    // Increasing runs the standard (emphasized) cubic-bezier(0.2, 0, 0, 1):
+    // already ~19% at x=0.1 and ~75% at x=0.35.
+    updateAmp(wavy, s, 1);
+    try std.testing.expect(s.amp_running);
+    tl.tick(600); // lazy start (elapsed 0)
+    tl.tick(650); // elapsed 50 → x = 0.1 → eased ≈ 0.19
+    try std.testing.expect(s.amp_display > 0.1);
+    try std.testing.expect(s.amp_display < 0.4);
+    tl.tick(775); // elapsed 175 → x = 0.35 → eased ≈ 0.75
+    try std.testing.expect(s.amp_display > 0.7);
+    tl.tick(1100); // elapsed 500 → completes
+    try std.testing.expectEqual(@as(f32, 1), s.amp_display);
+    try std.testing.expect(!s.amp_running);
 }
 
 test "progress: circular wavy determinate runs the phase loop; flat circular determinate stays static" {

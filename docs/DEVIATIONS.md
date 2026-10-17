@@ -83,7 +83,10 @@ Each widget's header carries the same list; these are the tracked ones
 - `carousel.zig` — no contentPadding, no hero/center-aligned strategy, no
   parallax.
 - `progress.zig` — static `progress` snaps on rebuild (the spring runs on
-  `progress_sig` writes); wave attach micro-animations skipped.
+  `progress_sig` writes). The wavy amplitude runs the upstream
+  `updateAmplitudeAnimation` spec: a 500ms tween (standard easing up,
+  emphasized-accelerate down, quantized to 1/12 morph steps) between the
+  ring and the rounded-star path.
 - `drawer.zig` — no predictive back, window-inset padding, or content
   scale-down during overshoot; `confirm_state_change` gates only
   drawer-initiated transitions (the app owns the signal).
