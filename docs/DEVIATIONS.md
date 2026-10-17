@@ -70,7 +70,23 @@ Each widget's header carries the same list; these are the tracked ones
   double-click word select via ICU UBRK (ABI 0.23.0), Cmd/Ctrl+A/C/X/V
   on the platform clipboard.
   The legacy `input.zig` textField (conformance-only) still end-caret.
-- `time_picker.zig` — no text-input variant; en-only strings.
+- `time_picker.zig` — the text-input variant (`opts.mode = .input`,
+  upstream `TimeInput`) landed on the shared `text_edit.zig` core: the
+  selected field is a real editable box (caret/selection/clipboard,
+  `transformAfterEdit` = upstream `TimeInputTransformation` — non-digit /
+  >2-char / >99 edits revert wholesale, a lone char in a full field rolls
+  to just that char, a complete valid hour auto-advances, out-of-range
+  values paint the error state without touching the signal); the other
+  field is the borderless `TimeSelector` plate. `opts.mode_toggle` is the
+  footer dial⇄keyboard affordance (upstream's `toggle` slot). Remaining:
+  en-only strings; the classic (non-vibrant) `TimeInput` only — no
+  100x120 CornerFull style; supporting texts hand-wrapped (no real text
+  wrap, no liveRegion on the error text); the auto-advance always runs
+  (upstream suppresses it while an a11y service is enabled — no
+  equivalent query here); Tab walks the fields only in tests — the host
+  maps Tab to the global focus traversal, so in-app field navigation is
+  tap / auto-advance / Enter, and the AM/PM column is pointer-only (as in
+  the dial variant).
 - `table.zig` — sorting (a `sortable` column's header toggles a real
   stable asc/desc sort + the arrow icon), selection (the checkbox column +
   select-all with the tristate dash), and a wheel/drag body scroll under a
