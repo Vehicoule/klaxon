@@ -83,9 +83,8 @@
 //     interplay). The slop starts counting at the first .move the drawer
 //     sees (downs claimed by children are re-synthesized), so a drag on a
 //     button needs ~2×12px before it engages vs upstream's ~1 slop.
-//   - No confirmStateChange hook (upstream gates programmatic/drag closes
-//     on it); DrawerOptions.gestures_enabled covers the gesturesEnabled
-//     half.
+//   - confirm_state_change gates drawer-INITIATED transitions only; the
+//     app's own sig.set writes are unguarded (the app owns the signal).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -124,6 +123,12 @@ pub const DrawerOptions = struct {
     width: f32 = 360, // NavigationDrawerTokens.ContainerWidth (max)
     label: []const u8 = "Navigation drawer", // panel semantic label (borrowed)
     gestures_enabled: bool = true, // upstream gesturesEnabled (anchoredDraggable)
+    /// Upstream DrawerState.confirmStateChange: vetoes drawer-initiated
+    /// transitions (scrim tap, Escape/back, drag settle). Called with the
+    /// desired open state; false refuses the change. App-side sig.set is
+    /// NOT gated — the app owns the signal.
+    confirm_state_change: ?*const fn (userdata: ?*anyopaque, open: bool) bool = null,
+    confirm_userdata: ?*anyopaque = null,
     content: ?*Node = null, // the panel content
     body: ?*Node = null, // the page content (behind the scrim)
 };
@@ -410,8 +415,9 @@ fn drawerAnimCompleteCb(userdata: ?*anyopaque) void {
 
 /// Slide the panel + fade the scrim to `to` (0/1); without a timeline, snap.
 /// Upstream splits the spec by direction — open rides DefaultSpatial, close
-/// FastEffects (NavigationDrawer.kt:353-355, 501-502).
-fn animateProgress(n: *Node, s: *DrawerState, to: f32) void {
+/// FastEffects (NavigationDrawer.kt:353-355, 501-502). `v0` seeds the spring
+/// (a drag settle animates to the anchor WITH the release velocity).
+fn animateProgress(n: *Node, s: *DrawerState, to: f32, v0: anim.Vec4) void {
     s.anim_to = to;
     const from: anim.Vec4 = .{ s.progress, scrimStateOf(s.scrim).alpha, 0, 0 };
     const target: anim.Vec4 = .{ to, to * scrim_max_alpha, 0, 0 };
@@ -419,7 +425,7 @@ fn animateProgress(n: *Node, s: *DrawerState, to: f32) void {
     const spec = if (to == 0) springs.fast_effects else springs.spatial_spring;
     if (anim.timeline()) |tl| {
         _ = tl.play(.{
-            .kind = anim.Animation.springAnim(from, target, spec, .{ 0, 0, 0, 0 }),
+            .kind = anim.Animation.springAnim(from, target, spec, v0),
             .from = from,
             .channel = @ptrCast(&s.anim_channel),
             .on_update = .{ .fn_ptr = drawerAnimUpdateCb, .userdata = n },
@@ -440,13 +446,123 @@ fn drawerSyncCb(userdata: ?*anyopaque) void {
     syncBackHandler(n, s); // before the laid_out gate: registration tracks state
     if (!s.laid_out) return;
     const target: f32 = if (s.sig.peek()) 1 else 0;
-    if (target != s.anim_to) animateProgress(n, s, target);
+    if (target != s.anim_to) animateProgress(n, s, target, .{ 0, 0, 0, 0 });
 }
 
 fn closeDrawer(n: *Node) void {
     const s = stateOf(n);
+    // Upstream confirmStateChange gates drawer-initiated closes.
+    if (s.opts.confirm_state_change) |f| {
+        if (!f(s.opts.confirm_userdata, false)) return;
+    }
     s.sig.set(false);
     if (s.on_closed) |cb| cb.fn_ptr(cb.userdata);
+}
+
+/// AnchoredDraggable drag step: forward motion (open direction) increases
+/// progress by dx/panel_w; the running channel is cancelled so the spring
+/// can't overwrite the finger's position.
+fn dragStep(n: *Node, s: *DrawerState, dx: f32) void {
+    if (s.panel_w <= 0) return;
+    const p = std.math.clamp(s.progress + dx * forwardSign() / s.panel_w, 0, 1);
+    applyProgress(n, s, p, p * scrim_max_alpha);
+}
+
+/// Upstream settleToVelocity: the release velocity decides past
+/// DrawerVelocityThreshold (400dp/s), else the positional threshold
+/// (progress vs 0.5); the settle animates WITH the release velocity —
+/// and confirmStateChange vetoes the change (animate back to the signal).
+fn settleDrag(n: *Node, s: *DrawerState, vx: f32) void {
+    const fwd_v = vx * forwardSign();
+    const want_open = if (fwd_v >= drag_velocity)
+        true
+    else if (fwd_v <= -drag_velocity)
+        false
+    else
+        s.progress >= drag_positional;
+    if (want_open) {
+        if (s.opts.confirm_state_change) |f| {
+            if (!f(s.opts.confirm_userdata, true)) {
+                s.dragging = false;
+                animateProgress(n, s, if (s.sig.peek()) 1 else 0, .{ 0, 0, 0, 0 });
+                return;
+            }
+        }
+        s.sig.set(true); // drawerSyncCb animates; the velocity play below wins
+    } else {
+        closeDrawer(n); // confirm + on_closed inside; a veto keeps it open
+    }
+    s.dragging = false;
+    const v_prog = fwd_v / @max(s.panel_w, 1);
+    animateProgress(n, s, if (s.sig.peek()) 1 else 0, .{ v_prog, v_prog * scrim_max_alpha, 0, 0 });
+}
+
+/// AnchoredDraggable: pointer events that bubble up unconsumed feed the
+/// horizontal pan recognizer (a child claiming .move — a horizontal
+/// scrollable — wins, content-first like upstream's nested-scroll
+/// interplay). On engage the capture moves to the drawer mid-gesture; a
+/// down a child claimed is re-synthesized at the first move (slop counts
+/// from there).
+fn drawerOnPointer(n: *Node, ev: input.PointerEvent) bool {
+    const s = stateOf(n);
+    if (s.opts.kind == .permanent or !s.opts.gestures_enabled) return false;
+    switch (ev.phase) {
+        .down => {
+            _ = s.pan.feed(ev);
+            return false; // don't claim: children may still take the press
+        },
+        .move => {
+            if (s.pan.tracking == null and !s.dragging) {
+                var synth = ev;
+                synth.phase = .down;
+                _ = s.pan.feed(synth); // the missed down, re-synthesized here
+            }
+            if (s.pan.feed(ev)) |fire| switch (fire) {
+                .pan_start => |d| {
+                    // Horizontal drags only — a vertical pan keeps bubbling
+                    // (a scrollable ancestor or the page handles it).
+                    if (@abs(d.dy) > @abs(d.dx)) {
+                        s.pan.reset();
+                        return false;
+                    }
+                    s.dragging = true;
+                    if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel));
+                    // except = n: the previous owner's .outside_down bubbles
+                    // through us — without the skip it would reset this drag.
+                    if (input.current()) |r| r.captureNode(ev, n, n);
+                    dragStep(n, s, d.dx);
+                    return true;
+                },
+                .pan_update => |d| {
+                    dragStep(n, s, d.dx);
+                    return true;
+                },
+                else => {},
+            };
+            return s.dragging;
+        },
+        .up => {
+            if (s.pan.feed(ev)) |fire| switch (fire) {
+                .pan_end => |d| {
+                    dragStep(n, s, d.dx); // the last move→up displacement
+                    settleDrag(n, s, d.vx);
+                    return true;
+                },
+                else => {},
+            };
+            if (s.dragging) {
+                settleDrag(n, s, 0);
+                return true;
+            }
+            return false;
+        },
+        .outside_down => {
+            s.dragging = false;
+            s.pan.reset();
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// Escape / hardware-back while the drawer is open (the router consults the
@@ -519,7 +635,7 @@ fn drawerLayout(n: *Node, bounds: Rect) void {
         applyProgress(n, s, target, target * scrim_max_alpha);
         s.laid_out = true;
     } else if (target != s.anim_to) {
-        animateProgress(n, s, target);
+        animateProgress(n, s, target, .{ 0, 0, 0, 0 });
     }
 }
 
@@ -555,6 +671,7 @@ const drawer_vtable = ui.node.VTable{
     .layout = drawerLayout,
     .paint = drawerPaint,
     .deinit = drawerDeinit,
+    .on_pointer = drawerOnPointer,
     .on_key = drawerOnKey,
 };
 
@@ -759,6 +876,50 @@ test "drawer: the global back path closes it even when focus is outside" {
     // closed: back falls through to the navigator
     try std.testing.expect(router.dispatchBack());
     try std.testing.expectEqual(@as(u32, 1), popped);
+}
+
+test "drawer: an anchored drag opens/closes by position and velocity; confirm vetoes" {
+    const open = try ui.state.Signal(bool).init(std.testing.allocator, false);
+    defer open.deinit();
+    var vetoes: u32 = 0;
+    const d = try drawer(std.testing.allocator, open, null, .{
+        .body = try golden.solidBox(std.testing.allocator, 480, 200, 0xFF),
+        .confirm_state_change = struct {
+            fn f(ud: ?*anyopaque, want_open: bool) bool {
+                const c: *u32 = @ptrCast(@alignCast(ud.?));
+                c.* += 1;
+                return want_open; // refuse every close
+            }
+        }.f,
+        .confirm_userdata = &vetoes,
+    });
+    defer d.deinit();
+    d.layout(.{ .x = 0, .y = 0, .w = 480, .h = 200 });
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const s = stateOf(d);
+    // drag open past the 0.5 positional threshold (panel_w 360 → >180px)
+    router.dispatchPointer(d, .{ .phase = .down, .x = 10, .y = 100, .time_ms = 0 });
+    for ([_]f32{ 40, 100, 160, 220, 260 }, 1..) |x, i| {
+        router.dispatchPointer(d, .{ .phase = .move, .x = x, .y = 100, .time_ms = @intCast(i * 16) });
+    }
+    try std.testing.expect(s.dragging);
+    router.dispatchPointer(d, .{ .phase = .up, .x = 260, .y = 100, .time_ms = 96 });
+    try std.testing.expect(open.peek()); // progress ~0.72 → opened
+    try std.testing.expectEqual(@as(u32, 1), vetoes); // confirm consulted
+    // a short drag with a fast CLOSE velocity (<-400dp/s) closes — but the
+    // veto keeps it open
+    router.dispatchPointer(d, .{ .phase = .down, .x = 200, .y = 100, .time_ms = 200 });
+    router.dispatchPointer(d, .{ .phase = .move, .x = 150, .y = 100, .time_ms = 216 });
+    router.dispatchPointer(d, .{ .phase = .move, .x = 100, .y = 100, .time_ms = 232 }); // ~-3000dp/s over the window
+    router.dispatchPointer(d, .{ .phase = .up, .x = 90, .y = 100, .time_ms = 248 });
+    try std.testing.expect(open.peek()); // the veto refused the close
+    try std.testing.expectEqual(@as(u32, 2), vetoes);
+    // a tap (no drag) does not toggle anything
+    router.dispatchPointer(d, .{ .phase = .down, .x = 200, .y = 100, .time_ms = 300 });
+    router.dispatchPointer(d, .{ .phase = .up, .x = 200, .y = 100, .time_ms = 316 });
+    try std.testing.expect(open.peek());
 }
 
 test "golden: drawer paints the body, the scrim and the panel (open)" {

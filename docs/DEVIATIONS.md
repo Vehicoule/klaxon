@@ -79,8 +79,9 @@ Each widget's header carries the same list; these are the tracked ones
   parallax.
 - `progress.zig` — static `progress` snaps on rebuild (the spring runs on
   `progress_sig` writes); wave attach micro-animations skipped.
-- `drawer.zig` — no predictive back, window-inset padding, content
-  scale-down during overshoot, or `confirmStateChange`.
+- `drawer.zig` — no predictive back, window-inset padding, or content
+  scale-down during overshoot; `confirm_state_change` gates only
+  drawer-initiated transitions (the app owns the signal).
 - `gestures.zig` — long-press without a timeline fires on the first event
   after the deadline. (Slop is pointer-type aware — fixed audit row; the
   tap now holds for the double-tap window when on_double_tap exists.)
