@@ -277,15 +277,21 @@ fn performDrop(n: *Node, s: *TreeState) void {
         if (p == dragged or containsNode(dragged, p)) return;
     }
     // Locate the dragged node's own slot — pointers into the lists stay
-    // valid only until the remove, so read everything first.
+    // valid only until the remove, so read everything first. Selection
+    // and the focus cursor are flat indices — track them across the move
+    // by the node's label buffer pointer (unique + stable per node; the
+    // TreeNodeDef slot address shifts under orderedRemove).
     var from_list: ?*std.array_list.Managed(TreeNodeDef) = null;
     var from_index: usize = 0;
-    for (list.items) |item| {
+    var sel_label: ?[*]u8 = null;
+    var foc_label: ?[*]u8 = null;
+    for (list.items, 0..) |item, i| {
         if (item.node == dragged) {
             from_list = item.siblings;
             from_index = item.sib_index;
-            break;
         }
+        if (s.selected == @as(i32, @intCast(i))) sel_label = item.node.label.ptr;
+        if (s.focused == @as(i32, @intCast(i))) foc_label = item.node.label.ptr;
     }
     const fl = from_list orelse return;
     if (fl == target_list and from_index == target_index) return; // no-op
@@ -294,6 +300,17 @@ fn performDrop(n: *Node, s: *TreeState) void {
     _ = fl.orderedRemove(from_index);
     if (fl == target_list and target_index > from_index) target_index -= 1;
     target_list.insert(target_index, moved_value) catch @panic("klaxon: out of memory");
+    // Re-resolve the tracked rows to their post-move flat index.
+    if (sel_label != null or foc_label != null) {
+        var after = collectVisible(s, n.allocator) catch null;
+        if (after) |*al| {
+            defer al.deinit();
+            for (al.items, 0..) |item, i| {
+                if (item.node.label.ptr == sel_label) s.selected = @intCast(i);
+                if (item.node.label.ptr == foc_label) s.focused = @intCast(i);
+            }
+        }
+    }
     n.markLayoutDirty();
     n.markDirty();
     postChange(n, s, true);
@@ -389,10 +406,13 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
             lx += icon_size + label_pad;
         }
 
-        // Label.
+        // Label (the drag source dims — the floating chip carries it).
         const lm = ui.paint.measureText(node.label, bs.size, false);
         const ly = row_y + (rowH(t) - lm.height) / 2 + lm.height * 0.8;
-        const label_color = if (is_sel) t.colors.on_secondary_container else t.colors.on_surface;
+        var label_color = if (is_sel) t.colors.on_secondary_container else t.colors.on_surface;
+        if (s.dragging != null and item.node == s.dragging.?) {
+            label_color = ui.paint.withAlphaScaled(label_color, 0.38);
+        }
         ui.paint.text(ctx, node.label, lx, ly, bs.size, false, label_color);
 
         y += rowH(t);
@@ -1238,6 +1258,7 @@ test "tree: drag-reorder moves a child and fires on_move" {
     defer n.deinit();
     n.layout(.{ .x = 0, .y = 0, .w = 300, .h = row_h * 5 });
     const s = stateOf(n);
+    s.selected = 1; // A selected — the index must track the node, not the slot
     // Rows: 0=Root, 1=A, 2=B, 3=BC, 4=C. Drag A (row 1) down to the gap
     // before C — y mid-row 4 → gap 4.
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 100, .y = row_h + 10 });
@@ -1257,6 +1278,10 @@ test "tree: drag-reorder moves a child and fires on_move" {
     try std.testing.expect(probe.moved == @as(?*anyopaque, &tok_a));
     try std.testing.expect(probe.parent == @as(?*anyopaque, &tok_root));
     try std.testing.expectEqual(@as(usize, 1), probe.index);
+    // Selection + keyboard cursor followed A to its new flat index 3
+    // (rows now: Root, B, BC, A, C).
+    try std.testing.expect(s.selected == 3);
+    try std.testing.expect(s.focused == 3);
 }
 
 test "tree: a drop inside the dragged node's own subtree is rejected" {
