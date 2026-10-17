@@ -103,9 +103,11 @@ Each widget's header carries the same list; these are the tracked ones
 - `table.zig` — sorting (a `sortable` column's header toggles a real
   stable asc/desc sort + the arrow icon), selection (the checkbox column +
   select-all with the tristate dash), and a wheel/drag body scroll under a
-  pinned header are real; remaining: text-only cells (`cell_paint` takes
-  over a cell's draw — no child widgets in cells), the arrow's rotation
-  snaps (upstream animates it), no column resizing, no virtualization.
+  pinned header are real, and the sort arrow's rotation rides the
+  default spring (upstream's animateFloatAsState — a same-column flip
+  animates 0↔180, a column switch snaps); remaining: text-only cells
+  (`cell_paint` takes over a cell's draw — no child widgets in cells),
+  no column resizing, no virtualization.
 - `tree.zig` — no drag-and-drop reordering. (Keyboard nav with
   selection-follows-focus, synchronous lazy children providers, per-node
   icons and per-row virtual a11y children landed.)

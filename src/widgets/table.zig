@@ -14,7 +14,8 @@
 //     box geometry minus its state layer + draw-on animation)
 //   - sort arrow: the Material "arrow_upward" glyph at 16dp, OnSurface —
 //     painted on the sorted column (hovered unsorted sortable columns show
-//     it at half alpha, upstream's hover reveal), rotated 180° descending
+//     it at half alpha, upstream's hover reveal), rotating 180° descending
+//     on the default spring (upstream's animateFloatAsState)
 //
 // Interactions:
 //   - sorting: a `sortable` column's header toggles asc → desc on tap and
@@ -31,9 +32,8 @@
 //     header then scrolls away with the page, like upstream.
 //
 // Remaining deviations: text-only cells (`cell_paint` takes over a cell's
-// draw — real child widgets in cells stay out of scope), the arrow's
-// rotation snaps (upstream animates it), no column resizing, no
-// virtualization (every row paints; the body clip culls them).
+// draw — real child widgets in cells stay out of scope), no column
+// resizing, no virtualization (every row paints; the body clip culls them).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -158,6 +158,11 @@ const TableState = struct {
     /// The active sort column (-1 = unsorted).
     sort_col: i32 = -1,
     sort_asc: bool = true,
+    /// The sort arrow's animated rotation in degrees (0 = up/ascending).
+    /// Upstream rides it on animateFloatAsState; the chan byte gives the
+    /// timeline a stable key (the state's heap address is stable).
+    arrow_rot: f32 = 0,
+    arrow_chan: u8 = 0,
     /// The body scrolls under the pinned header; content = the rows region.
     scroll: scroll_mod.ScrollState = .{},
     input: scroll_util.ScrollInput = .{},
@@ -306,13 +311,45 @@ fn sortRows(n: *Node) void {
     n.markDirty();
 }
 
+fn arrowCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.arrow_rot = v[0];
+    n.markDirty();
+}
+
+/// Upstream carries the arrow rotation on animateFloatAsState — a
+/// direction flip on the active column animates 0↔180 on the default
+/// spring; switching columns snaps (each header owns its rotation state,
+/// and the freshly sorted one starts asc/up). No timeline → snap.
+fn retargetArrow(n: *Node, animate: bool) void {
+    const s = stateOf(n);
+    const target: f32 = if (s.sort_asc) 0 else 180;
+    if (animate) {
+        if (ui.anim.timeline()) |tl| {
+            const from: ui.anim.Vec4 = .{ s.arrow_rot, 0, 0, 0 };
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.default_spring, tl.channelVelocity(@ptrCast(&s.arrow_chan))),
+                .from = from,
+                .channel = @ptrCast(&s.arrow_chan),
+                .on_update = .{ .fn_ptr = arrowCb, .userdata = n },
+            });
+            return;
+        }
+    }
+    s.arrow_rot = target;
+    n.markDirty();
+}
+
 /// A sortable header tap: a new column sorts ascending, the same column
 /// toggles the direction.
 fn toggleSort(n: *Node, col: usize) void {
     const s = stateOf(n);
     const ci: i32 = @intCast(col);
-    s.sort_asc = if (s.sort_col == ci) !s.sort_asc else true;
+    const flip = s.sort_col == ci;
+    s.sort_asc = if (flip) !s.sort_asc else true;
     s.sort_col = ci;
+    retargetArrow(n, flip);
     sortRows(n);
 }
 
@@ -358,13 +395,12 @@ fn paintCellCheckbox(ctx: *kx.Ctx, cx: f32, cy: f32, v: CheckKind, t: Theme) voi
 
 /// The Material "arrow_upward" glyph in its 16dp slot: a stem + a
 /// two-segment head, stroked (no icon path crosses the ABI). Ascending
-/// points up; descending is the same glyph rotated 180° (upstream
-/// animates the rotation — it snaps here).
-fn paintSortArrow(ctx: *kx.Ctx, cx: f32, cy: f32, asc: bool, color: Color) void {
+/// points up; `deg` is the animated rotation (180° descending).
+fn paintSortArrow(ctx: *kx.Ctx, cx: f32, cy: f32, deg: f32, color: Color) void {
     ui.paint.save(ctx);
-    if (!asc) {
+    if (deg != 0) {
         ui.paint.translate(ctx, cx, cy);
-        ui.paint.rotate(ctx, 180);
+        ui.paint.rotate(ctx, deg);
         ui.paint.translate(ctx, -cx, -cy);
     }
     const stem_x = [_]f32{ cx, cx };
@@ -469,7 +505,7 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
             const active = s.sort_col == cii;
             const tw = ui.paint.measureText(col, hs.size, true).width;
             const ax = tx + tw + sort_arrow_gap + sort_arrow_w / 2;
-            paintSortArrow(ctx, ax, b.y + header_h / 2, if (active) s.sort_asc else true, ui.paint.withAlphaScaled(t.colors.on_surface, if (active) 1 else 0.5));
+            paintSortArrow(ctx, ax, b.y + header_h / 2, if (active) s.arrow_rot else 0, ui.paint.withAlphaScaled(t.colors.on_surface, if (active) 1 else 0.5));
         }
         cx += w;
     }
@@ -586,6 +622,7 @@ fn tblDeinit(n: *Node) void {
     s.rows.deinit();
     s.col_ws.deinit();
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tblLocaleCb, .userdata = n });
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.arrow_chan)); // the cb points into this state
     n.allocator.destroy(s);
 }
 
@@ -697,8 +734,11 @@ pub fn sortAscending(n: *Node) bool {
 pub fn setSort(n: *Node, col: usize, ascending: bool) void {
     const s = stateOf(n);
     if (col >= s.columns.items.len) return;
-    s.sort_col = @intCast(col);
+    const ci: i32 = @intCast(col);
+    const flip = s.sort_col == ci and s.sort_asc != ascending;
+    s.sort_col = ci;
     s.sort_asc = ascending;
+    retargetArrow(n, flip);
     sortRows(n);
 }
 
@@ -1043,4 +1083,25 @@ test "table: i18n — the framework label localizes + re-resolves on a locale sw
     try std.testing.expectEqualStrings("Tabla de datos", n.semantics.?.label);
     try i18n.setLocale("en");
     try std.testing.expectEqualStrings("Data table", n.semantics.?.label);
+}
+
+test "table: the sort arrow springs 0→180 on a direction flip and snaps on a column switch" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try table(a, &.{ "A", "B" }, &.{ &.{ "2", "y" }, &.{ "1", "x" } }, null, null, .{ .sortable = &.{ true, true } });
+    defer n.deinit();
+    const s = stateOf(n);
+    setSort(n, 0, true); // first sort — the arrow appears already up
+    try std.testing.expectEqual(@as(f32, 0), s.arrow_rot);
+    setSort(n, 0, false); // same-column flip — the rotation animates
+    tl.tick(0); // lazy start — arms the spring
+    tl.tick(120);
+    try std.testing.expect(s.arrow_rot > 0 and s.arrow_rot < 180);
+    tl.tick(800); // the spring settles
+    try std.testing.expectEqual(@as(f32, 180), s.arrow_rot);
+    setSort(n, 1, true); // a new column's arrow starts asc — no unwind
+    try std.testing.expectEqual(@as(f32, 0), s.arrow_rot);
 }
