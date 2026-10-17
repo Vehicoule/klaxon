@@ -752,6 +752,7 @@ pub const Host = struct {
             defer kx.a11yShutdown();
         }
         var quit = false;
+        host.syncWindowInsets(root); // first layout reads real insets
         // max_frames = 0 means run forever (mobile: the app lives until the
         // OS terminates it; native demos use a finite budget for testing).
         while (!quit and (max_frames == 0 or host.stats.frames < max_frames)) {
@@ -1210,9 +1211,20 @@ pub const Host = struct {
         // Moving the window between displays at different DPR fires these
         // without RESIZED — the backing pixel size and display_scale change,
         // so the canvas + buffers must be rebuilt (same work as a resize).
+        // Window/display geometry changes can move the usable-bounds
+        // margins — resync the safe-area insets (fullscreen toggles,
+        // display moves, dock/menu-bar changes all arrive here).
+        if (event.type == sdl.c.SDL_EVENT_WINDOW_MOVED or
+            event.type == sdl.c.SDL_EVENT_WINDOW_DISPLAY_CHANGED or
+            event.type == sdl.c.SDL_EVENT_WINDOW_ENTER_FULLSCREEN or
+            event.type == sdl.c.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
+        {
+            host.syncWindowInsets(root);
+        }
         if (event.type == sdl.c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED or
             event.type == sdl.c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED)
         {
+            host.syncWindowInsets(root);
             host.resize(host.width, host.height);
             root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
             root.dirty = true;
@@ -1222,6 +1234,7 @@ pub const Host = struct {
             const w: c_int = @intCast(event.window.data1);
             const h: c_int = @intCast(event.window.data2);
             if (w > 0 and h > 0) {
+                host.syncWindowInsets(root);
                 host.resize(w, h);
                 // The surface is recreated (garbage pixels) and the tree is
                 // laid out at the new size: full repaint, no dirty-rect.
@@ -1475,6 +1488,46 @@ pub const Host = struct {
         if (host.texture) |t| {
             sdl.c.SDL_DestroyTexture(t);
             host.texture = sdl.c.SDL_CreateTexture(host.renderer.?, sdl.c.SDL_PIXELFORMAT_ABGR8888, sdl.c.SDL_TEXTUREACCESS_STREAMING, host.pixel_width, host.pixel_height);
+        }
+    }
+
+    /// Push the window's safe-area insets into `ui.platform.window_insets`:
+    /// the display's usable bounds exclude status/nav bars, notches and
+    /// dock/taskbar margins — the window rect minus the usable rect gives
+    /// the per-edge margin in window (logical) points. Re-queried at
+    /// startup and on moves/resizes/fullscreen/display changes; a changed
+    /// inset marks the tree layout-dirty since widgets read the global
+    /// during layout (the module has no change signal yet).
+    /// Keyboard height has no SDL query — hosts on mobile set it via the
+    /// platform layer directly.
+    fn syncWindowInsets(host: *Host, root: *Node) void {
+        const disp = sdl.c.SDL_GetDisplayForWindow(host.window);
+        if (disp == 0) return;
+        var ub: sdl.c.SDL_Rect = undefined;
+        if (!sdl.c.SDL_GetDisplayUsableBounds(disp, &ub)) return;
+        var wx: c_int = 0;
+        var wy: c_int = 0;
+        _ = sdl.c.SDL_GetWindowPosition(host.window, &wx, &wy);
+        // Window rect in global screen space — logical points, the same
+        // space usable bounds report (insets are layout-space units).
+        const wl: f32 = @floatFromInt(wx);
+        const wt: f32 = @floatFromInt(wy);
+        const wr = wl + @as(f32, @floatFromInt(host.width));
+        const wb = wt + @as(f32, @floatFromInt(host.height));
+        const ul: f32 = @floatFromInt(ub.x);
+        const ut: f32 = @floatFromInt(ub.y);
+        const ur = ul + @as(f32, @floatFromInt(ub.w));
+        const ubt = ut + @as(f32, @floatFromInt(ub.h));
+        const sa: ui.platform.window_insets.SafeArea = .{
+            .top = @max(0, ut - wt),
+            .bottom = @max(0, wb - ubt),
+            .left = @max(0, ul - wl),
+            .right = @max(0, wr - ur),
+        };
+        const prev = ui.platform.window_insets.safeArea();
+        if (prev.top != sa.top or prev.bottom != sa.bottom or prev.left != sa.left or prev.right != sa.right) {
+            ui.platform.window_insets.setSafeArea(sa);
+            root.markLayoutDirty();
         }
     }
 
