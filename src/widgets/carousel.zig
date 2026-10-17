@@ -53,6 +53,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const scroll_mod = @import("../ui/scroll.zig");
 const theme_mod = @import("../theme.zig");
@@ -84,8 +85,9 @@ pub const CarouselOptions = struct {
     /// first/last items rest inset by this much.
     padding_before: f32 = 0,
     padding_after: f32 = 0,
-    /// The semantic label of the strip (a list of items).
-    label: []const u8 = "Carousel",
+    /// The semantic label of the strip (a list of items) — null resolves
+    /// the localized "Carousel" (an app string is verbatim).
+    label: ?[]const u8 = null,
     theme: Theme = theme_mod.light,
 };
 
@@ -859,6 +861,7 @@ const CarouselState = struct {
     /// Channel owning the release snap/fling spring — a retargeted play
     /// cancels it in place; a fresh grab cancels it directly.
     anim_channel: u8 = 0,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const Track = struct {
@@ -1252,8 +1255,23 @@ fn carouselSetOffset(n: *Node, offset: f32) void {
 
 fn carouselDeinit(n: *Node) void {
     const s = stateOf(n);
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = carouselLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
+}
+
+/// The strip label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn carouselLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .list,
+        .label = s.opts.label orelse i18n_mod.tr("Carousel"),
+        .focusable = true, // takes the keyboard focus (arrow nav)
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const carousel_vtable = ui.node.VTable{
@@ -1287,11 +1305,8 @@ pub fn carousel(allocator: std.mem.Allocator, opts: CarouselOptions) !*Node {
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts };
     node.state = s;
-    ui.semantics.attach(node, .{
-        .role = .list,
-        .label = opts.label,
-        .focusable = true, // takes the keyboard focus (arrow nav)
-    });
+    carouselLocaleCb(node);
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = carouselLocaleCb, .userdata = node });
     return node;
 }
 
@@ -1566,4 +1581,20 @@ test "golden: uncontained carousel keeps every focal item at the slot width" {
     try std.testing.expectEqual(@as(f32, 158), c.children.items[1].bounds.w);
     // the cut-off edge item is narrower (the medium keyline)
     try std.testing.expect(c.children.items[2].bounds.w <= 158);
+}
+
+test "carousel: i18n — the default label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Carousel\": \"Carrusel\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const c = try carousel(a, .{});
+    defer c.deinit();
+    try std.testing.expectEqualStrings("Carrusel", c.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Carousel", c.semantics.?.label);
 }

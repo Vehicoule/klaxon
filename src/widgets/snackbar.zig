@@ -30,6 +30,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
@@ -89,6 +90,10 @@ const SnackBarState = struct {
     ticker_registered: bool = false, // the ticker is on the timeline
     timeout_armed: bool = false, // a deadline is being counted (ticker)
     timeout_deadline: ?u64 = null,
+    /// The dismiss icon button — its a11y label re-resolves on a locale
+    /// switch (null when `opts.dismiss` is false).
+    dismiss_btn: ?*Node = null,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *SnackBarState {
@@ -262,8 +267,22 @@ fn snackDeinit(n: *Node) void {
         if (s.ticker_registered) tl.removeTicker(s.ticker);
     }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = snackSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = snackLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
+}
+
+/// The dismiss button's label (upstream dismissActionContentDescription)
+/// is tr()-resolved — the locale callback re-resolves it in place (the
+/// alert label is the app's text, verbatim).
+fn snackLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (s.dismiss_btn) |b| {
+        if (b.semantics) |sem| sem.label = i18n_mod.tr("Dismiss");
+    }
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const snack_vtable = ui.node.VTable{
@@ -447,6 +466,7 @@ pub fn snackBar(allocator: std.mem.Allocator, visible: *ui.state.Signal(bool), o
         node.add(btn);
     }
     // Optional dismiss icon button (24dp close icon, inverse_on_surface).
+    var dismiss_btn: ?*Node = null;
     if (opts.dismiss) {
         const on_press: Callback = .{ .fn_ptr = struct {
             fn cb(ud: ?*anyopaque) void {
@@ -460,7 +480,9 @@ pub fn snackBar(allocator: std.mem.Allocator, visible: *ui.state.Signal(bool), o
             .padding = ui.layout.EdgeInsets.all(12),
         });
         btn.add(try icon_w.icon(allocator, .close, .{ .size = 24, .color = t.colors.inverse_on_surface }));
+        if (btn.semantics) |sem| sem.label = i18n_mod.tr("Dismiss"); // upstream dismissActionContentDescription
         node.add(btn);
+        dismiss_btn = btn;
     }
     s.* = .{
         .sig = visible,
@@ -468,6 +490,7 @@ pub fn snackBar(allocator: std.mem.Allocator, visible: *ui.state.Signal(bool), o
         .on_action = on_action,
         .on_dismiss = on_dismiss,
         .bg = bg,
+        .dismiss_btn = dismiss_btn,
         // arm the auto-dismiss at construction too: subscribing does not
         // replay the signal's initial value (a visible=true document would
         // otherwise never time out)
@@ -477,6 +500,7 @@ pub fn snackBar(allocator: std.mem.Allocator, visible: *ui.state.Signal(bool), o
     // Auto-dismiss ticker (registered once, lazily — no-ops while disarmed).
     registerTicker(node, s);
     ui.semantics.attach(node, .{ .role = .alert, .label = opts.text }); // Phase 2c
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = snackLocaleCb, .userdata = node });
     visible.subscribe(.{ .callback = .{ .fn_ptr = snackSyncCb, .userdata = node } });
     return node;
 }
@@ -770,4 +794,23 @@ test "golden: snackbar with an action paints the inverse_primary action label" {
     // the container itself still fills most of its rect (the inverse_surface
     // background, minus the text/action ink and the AA edge)
     try std.testing.expect(@as(f32, @floatFromInt(f.countColorIn(cr, t.colors.inverse_surface))) > c.w * c.h / 2);
+}
+
+test "snackbar: i18n — the dismiss button's label localizes + re-resolves" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Dismiss\": \"Descartar\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const visible = try ui.state.Signal(bool).init(a, true);
+    defer visible.deinit();
+    const sb = try snackBar(a, visible, null, null, .{ .text = "Saved" });
+    defer sb.deinit();
+    const btn = stateOf(sb).dismiss_btn.?;
+    try std.testing.expectEqualStrings("Descartar", btn.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Dismiss", btn.semantics.?.label);
 }

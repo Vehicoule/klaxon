@@ -41,6 +41,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const icon_w = @import("icon.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
@@ -66,7 +67,9 @@ const item_min_icon_pad: f32 = 44; // NavigationBarItemToIconMinimumPadding
 pub const NavBarOptions = struct {
     theme: Theme = theme_mod.light,
     height: f32 = 80, // M3E tall container height
-    label: []const u8 = "Navigation bar", // semantic label (borrowed)
+    /// The semantics label — null resolves the localized "Navigation bar"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
 const NavBarState = struct {
@@ -79,6 +82,7 @@ const NavBarState = struct {
     cells: std.array_list.Managed(Rect),
     content_sizes: std.array_list.Managed(Size),
     semantics_attached: bool = false,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *NavBarState {
@@ -317,10 +321,21 @@ fn navBarSyncCb(userdata: ?*anyopaque) void {
 fn navBarDeinit(n: *Node) void {
     const s = stateOf(n);
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = navBarSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = navBarLocaleCb, .userdata = n });
     input.releaseNode(n);
     s.cells.deinit();
     s.content_sizes.deinit();
     n.allocator.destroy(s);
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the destination children carry app labels, verbatim).
+fn navBarLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Navigation bar") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const nav_bar_vtable = ui.node.VTable{
@@ -342,7 +357,8 @@ pub fn navBar(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), o
     errdefer allocator.destroy(s);
     s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator) };
     node.state = s;
-    ui.semantics.attach(node, .{ .role = .group, .label = opts.label }); // Phase 2c
+    navBarLocaleCb(node); // Phase 2c — the same path resolves the label
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = navBarLocaleCb, .userdata = node });
     selected.subscribe(.{ .callback = .{ .fn_ptr = navBarSyncCb, .userdata = node } });
     return node;
 }
@@ -647,4 +663,27 @@ test "golden: nav_bar paints a state layer on hover" {
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
     try std.testing.expect(f2.countColor(t.colors.secondary_container) < f1.countColor(t.colors.secondary_container)); // covered by the layer
+}
+
+test "nav_bar: i18n — the default label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Navigation bar\": \"Barra de navegación\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const sel = try ui.state.Signal(usize).init(a, 0);
+    defer sel.deinit();
+    const bar = try navBar(a, sel, .{});
+    defer bar.deinit();
+    try std.testing.expectEqualStrings("Barra de navegación", bar.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Navigation bar", bar.semantics.?.label);
+    // an app-supplied label is verbatim — a switch leaves it alone
+    const bar2 = try navBar(a, sel, .{ .label = "My nav" });
+    defer bar2.deinit();
+    try i18n.setLocale("es");
+    try std.testing.expectEqualStrings("My nav", bar2.semantics.?.label);
 }

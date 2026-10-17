@@ -27,6 +27,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
@@ -64,13 +65,15 @@ pub const ToolbarOptions = struct {
     /// the FAB 56→80 (HorizontalFloatingToolbarWithFabLayout).
     fab_icon: ?icon_w.IconName = null,
     on_fab_press: ?Callback = null,
-    /// The docked FAB's accessible name (an icon-only control).
-    fab_a11y_label: []const u8 = "Action",
+    /// The docked FAB's accessible name (an icon-only control) — null
+    /// resolves the localized "Action".
+    fab_a11y_label: ?[]const u8 = null,
     /// Live expanded state (null = always expanded). Collapsed = just the
     /// FAB (or an empty pill without one).
     expanded: ?*ui.state.Signal(bool) = null,
-    /// The group's accessible name.
-    a11y_label: []const u8 = "Toolbar",
+    /// The group's accessible name — null resolves the localized "Toolbar"
+    /// (an app string is verbatim).
+    a11y_label: ?[]const u8 = null,
     theme: Theme = theme_mod.light,
 };
 
@@ -121,6 +124,7 @@ const ToolbarState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    i18n: ?*i18n_mod.I18n = null,
     /// Expand/collapse (FloatingToolbarWithFabLayout): 1 = the bar is fully
     /// expanded (FAB at FabBaseline 56), 0 = collapsed (bar width 0, FAB at
     /// FabMedium 80). Animated with the FastSpatial-ish tween.
@@ -515,7 +519,30 @@ fn toolbarDeinit(n: *Node) void {
     s.items.deinit();
     s.sem_children.deinit();
     n.allocator.free(s.fab_label);
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = toolbarLocaleCb, .userdata = n });
     n.allocator.destroy(s);
+}
+
+/// The group label + a defaulted FAB name are tr()-resolved — the locale
+/// callback re-dupes the FAB label and re-attaches in the new locale (the
+/// item labels are app strings, verbatim).
+fn toolbarLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (hasFab(s) and s.opts.fab_a11y_label == null) {
+        n.allocator.free(s.fab_label);
+        s.fab_label = dupeZ(n.allocator, i18n_mod.tr("Action")) catch @panic("klaxon: out of memory");
+        s.sem_children.items[s.sem_children.items.len - 1].label = s.fab_label;
+    }
+    ui.semantics.attach(n, .{
+        .role = .group,
+        .label = s.opts.a11y_label orelse i18n_mod.tr("Toolbar"),
+        .focusable = s.active >= 0, // takes the keyboard focus when it has an action
+        .children = s.sem_children.items,
+        .child_bounds = slotChildBounds,
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 /// The interactive target: ≥ hit_target_min tall centered on the container
@@ -567,7 +594,7 @@ pub fn toolbar(allocator: std.mem.Allocator, items: []const ToolbarItem, opts: T
         // No catch-free here: on append failure the errdefer frees the copy.
         try s.items.append(.{ .label = label, .icon = item.icon, .on_press = item.on_press, .enabled = item.enabled, .divider = item.divider });
     }
-    s.fab_label = try dupeZ(allocator, opts.fab_a11y_label);
+    s.fab_label = try dupeZ(allocator, opts.fab_a11y_label orelse i18n_mod.tr("Action"));
     errdefer allocator.free(s.fab_label);
     s.active = nextPressable(s, -1, 1); // the keyboard focus starts on the first action
     if (opts.expanded) |sig| {
@@ -598,13 +625,8 @@ pub fn toolbar(allocator: std.mem.Allocator, items: []const ToolbarItem, opts: T
             .actions = ui.semantics.Actions.initOne(.activate),
         }) catch @panic("klaxon: out of memory");
     }
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = opts.a11y_label,
-        .focusable = s.active >= 0, // takes the keyboard focus when it has an action
-        .children = s.sem_children.items,
-        .child_bounds = slotChildBounds,
-    }); // Phase 2c
+    toolbarLocaleCb(node); // Phase 2c — the same path resolves the labels
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = toolbarLocaleCb, .userdata = node });
     return node;
 }
 
@@ -898,4 +920,25 @@ test "toolbar: RTL mirrors the row (the first item sits at the end side, the FAB
     input.requestFocus(n);
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
     try std.testing.expectEqual(@as(i32, 1), stateOf(n).active);
+}
+
+test "toolbar: i18n — the group + defaulted FAB labels localize and re-resolve" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Toolbar\": \"Barra de herramientas\", \"Action\": \"Acción\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try toolbar(a, &.{.{ .icon = .search } }, .{ .fab_icon = .check });
+    defer n.deinit();
+    const sem = n.semantics.?;
+    try std.testing.expectEqualStrings("Barra de herramientas", sem.label);
+    // the FAB is the last virtual child — its defaulted name localized
+    try std.testing.expectEqualStrings("Acción", sem.children[sem.children.len - 1].label);
+    try i18n.setLocale("en");
+    const sem2 = n.semantics.?;
+    try std.testing.expectEqualStrings("Toolbar", sem2.label);
+    try std.testing.expectEqualStrings("Action", sem2.children[sem2.children.len - 1].label);
 }

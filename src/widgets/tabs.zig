@@ -31,6 +31,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
@@ -55,7 +56,9 @@ pub const TabsOptions = struct {
     height: f32 = 64,
     indicator_height: f32 = 3, // ActiveIndicatorHeight
     divider_height: f32 = 1, // bottom divider (inside the container height)
-    label: []const u8 = "Tabs", // semantic label (borrowed)
+    /// The semantics label — null resolves the localized "Tabs"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
 const TabsState = struct {
@@ -75,6 +78,7 @@ const TabsState = struct {
     anim_to_w: f32 = 0,
     laid_out: bool = false,
     anim_channel: u8 = 0, // channel marker (stable address): one indicator animation
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *TabsState {
@@ -340,10 +344,21 @@ fn tabsDeinit(n: *Node) void {
     const s = stateOf(n);
     if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.anim_channel)); // the update cb points at this node
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = tabsSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tabsLocaleCb, .userdata = n });
     input.releaseNode(n);
     s.cells.deinit();
     s.content_sizes.deinit();
     n.allocator.destroy(s);
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale (the tab children carry app labels, verbatim).
+fn tabsLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Tabs") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const tabs_vtable = ui.node.VTable{
@@ -366,7 +381,8 @@ pub fn tabs(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), opt
     errdefer allocator.destroy(s);
     s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator) };
     node.state = s;
-    ui.semantics.attach(node, .{ .role = .group, .label = opts.label }); // Phase 2c
+    tabsLocaleCb(node); // Phase 2c — the same path resolves the label
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = tabsLocaleCb, .userdata = node });
     selected.subscribe(.{ .callback = .{ .fn_ptr = tabsSyncCb, .userdata = node } });
     return node;
 }
@@ -531,4 +547,22 @@ test "golden: tabs paint the surface, the divider and the primary indicator" {
     defer f2.deinit();
     try std.testing.expect(f2.countColorIn(.{ .x = 0, .y = 0, .w = 200, .h = 64 }, t.colors.primary) == 0);
     try std.testing.expect(f2.countColorIn(.{ .x = 200, .y = 0, .w = 200, .h = 64 }, t.colors.primary) > 40);
+}
+
+test "tabs: i18n — the default label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Tabs\": \"Pestañas\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const sel = try ui.state.Signal(usize).init(a, 0);
+    defer sel.deinit();
+    const row = try tabs(a, sel, .{});
+    defer row.deinit();
+    try std.testing.expectEqualStrings("Pestañas", row.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Tabs", row.semantics.?.label);
 }

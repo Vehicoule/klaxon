@@ -66,6 +66,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -97,8 +98,9 @@ pub const SearchViewOptions = struct {
     /// The initial query text (used when no live signal is given).
     initial: []const u8 = "",
     theme: Theme = theme_mod.light,
-    /// The accessible name of the search region (the dialog role's label).
-    label: []const u8 = "Search",
+    /// The accessible name of the search region (the dialog role's label)
+    /// — null resolves the localized "Search" (an app string is verbatim).
+    label: ?[]const u8 = null,
     /// The collapsed search bar's rect in THIS NODE'S parent space — the
     /// anchor the surface expands from (upstream collapsedCoords → the
     /// SearchBarLayout interpolates it toward the full-screen bounds).
@@ -192,6 +194,7 @@ const SearchViewState = struct {
     /// Stable channel addresses for the timeline (the switch idiom).
     progress_channel: u8 = 0,
     field_channel: u8 = 0,
+    i18n: ?*i18n_mod.I18n = null,
     fn text(s: *SearchViewState) [:0]const u8 {
         return s.edit.text();
     }
@@ -899,7 +902,31 @@ fn searchViewDeinit(n: *Node) void {
     n.allocator.free(s.placeholder);
     n.allocator.free(s.label_z);
     s.edit.deinit(); // the blink ticker + both buffers
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = svLocaleCb, .userdata = n });
     n.allocator.destroy(s);
+}
+
+/// A defaulted region label is tr()-resolved — the locale callback
+/// re-dupes it and re-attaches in the new locale (the hint, value and
+/// suggestion rows are app/live strings, verbatim).
+fn svLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (s.opts.label == null) {
+        n.allocator.free(s.label_z);
+        s.label_z = dupeZ(n.allocator, i18n_mod.tr("Search")) catch @panic("klaxon: out of memory");
+    }
+    ui.semantics.attach(n, .{
+        .role = .dialog, // the search region (a full-screen dialog)
+        .label = s.label_z,
+        .hint = s.placeholder,
+        .value = s.text(),
+        .focusable = true,
+        .children = s.sem_children.items,
+        .child_bounds = suggestionChildBounds,
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 /// The damage extent: the surface paints anywhere inside the
@@ -975,7 +1002,7 @@ pub fn searchView(
     errdefer allocator.destroy(node); // no state yet; children list is empty
     const placeholder = try dupeZ(allocator, opts.placeholder);
     errdefer allocator.free(placeholder);
-    const label_z = try dupeZ(allocator, opts.label);
+    const label_z = try dupeZ(allocator, opts.label orelse i18n_mod.tr("Search"));
     errdefer allocator.free(label_z);
     const s = try allocator.create(SearchViewState);
     errdefer allocator.destroy(s);
@@ -1027,15 +1054,8 @@ pub fn searchView(
     s.edit.sel_anchor = s.edit.caret;
     node.state = s;
     if (!open.peek()) node.setVisible(false); // hidden until the signal opens it
-    ui.semantics.attach(node, .{
-        .role = .dialog, // the search region (a full-screen dialog)
-        .label = s.label_z,
-        .hint = s.placeholder,
-        .value = s.text(),
-        .focusable = true,
-        .children = s.sem_children.items,
-        .child_bounds = suggestionChildBounds,
-    }); // Phase 2c
+    svLocaleCb(node); // Phase 2c — the same path resolves the labels
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = svLocaleCb, .userdata = node });
     open.subscribe(.{ .callback = .{ .fn_ptr = svOpenSyncCb, .userdata = node } });
     if (query) |q| {
         q.subscribe(.{ .callback = .{ .fn_ptr = svQuerySyncCb, .userdata = node } }); // external edits land in the buffer
@@ -1445,4 +1465,22 @@ test "golden: mid-expansion the surface paints rounded inside the animated clip"
     // the suggestion row background stays surface (between the icon box
     // and the label — no state layer on an idle row)
     try std.testing.expectEqual(t.colors.surface, f.pixelAt(48, 100));
+}
+
+test "search_view: i18n — the defaulted region label localizes + re-resolves" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Search\": \"Buscar\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const open = try ui.state.Signal(bool).init(a, false);
+    defer open.deinit();
+    const v = try searchView(a, &SuggestionList.items, open, null, null, null, null, null, .{});
+    defer v.deinit();
+    try std.testing.expectEqualStrings("Buscar", v.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Search", v.semantics.?.label);
 }

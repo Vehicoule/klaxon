@@ -46,6 +46,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
@@ -70,8 +71,9 @@ pub const SplitButtonOptions = struct {
     leading_icon: ?icon_w.IconName = null,
     trailing_icon: icon_w.IconName = .arrow_down,
     /// The trailing half's a11y label (upstream contentDescription — the
-    /// trailing button is its own semantic node).
-    trailing_label: []const u8 = "Expand",
+    /// trailing button is its own semantic node) — null resolves the
+    /// localized "Expand" (an app string is verbatim).
+    trailing_label: ?[]const u8 = null,
     /// The trailing half's initial checked state (upstream `checked` —
     /// the app drives it as its menu opens/closes via
     /// splitSetTrailingChecked; checked morphs the half to a circle and
@@ -138,6 +140,7 @@ const SplitState = struct {
     /// composables — TalkBack/VoiceOver focus each half separately).
     /// Fixed-size: the halves never change count; the slice is borrowed.
     sem_children: [2]ui.semantics.Semantics = undefined,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *SplitState {
@@ -510,6 +513,7 @@ fn splitDeinit(n: *Node) void {
         tl.cancelChannel(@ptrCast(&s.lead_chan)); // the update cbs point at this node
         tl.cancelChannel(@ptrCast(&s.trail_chan));
     }
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = splitLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.free(s.label);
     n.allocator.destroy(s);
@@ -527,6 +531,26 @@ fn splitHitBounds(n: *Node) Rect {
         .w = b.w,
         .h = h,
     };
+}
+
+/// A defaulted trailing label is tr()-resolved — the locale callback
+/// re-attaches in the new locale (the leading half is the app's label,
+/// verbatim).
+fn splitLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.sem_children[1].label = s.opts.trailing_label orelse i18n_mod.tr("Expand");
+    ui.semantics.attach(n, .{
+        .role = .button,
+        .label = s.label,
+        .focusable = s.opts.enabled,
+        .disabled = !s.opts.enabled,
+        .actions = ui.semantics.Actions.initOne(.activate),
+        .children = &s.sem_children,
+        .child_bounds = splitChildBounds,
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const split_vtable = ui.node.VTable{
@@ -566,17 +590,10 @@ pub fn splitButton(allocator: std.mem.Allocator, on_press: ?Callback, on_trailin
     // activate lands in its zone (resolved by the pointer path).
     s.sem_children = .{
         .{ .role = .button, .label = s.label, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
-        .{ .role = .button, .label = s.opts.trailing_label, .checked = s.trailing_checked, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
+        .{ .role = .button, .label = s.opts.trailing_label orelse i18n_mod.tr("Expand"), .checked = s.trailing_checked, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
     };
-    ui.semantics.attach(node, .{
-        .role = .button,
-        .label = s.label,
-        .focusable = opts.enabled,
-        .disabled = !opts.enabled,
-        .actions = ui.semantics.Actions.initOne(.activate),
-        .children = &s.sem_children,
-        .child_bounds = splitChildBounds,
-    }); // Phase 2c
+    splitLocaleCb(node); // Phase 2c — the same path resolves the labels
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = splitLocaleCb, .userdata = node });
     return node;
 }
 
@@ -895,4 +912,25 @@ test "split_button: checked trailing morphs to a circle + paints the contentColo
     f.deinit();
     f = try r.readback(a);
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(@intFromFloat(tx + tw - 8), 40));
+}
+
+test "split_button: i18n — the defaulted trailing label localizes + re-resolves" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Expand\": \"Expandir\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try splitButton(a, null, null, .{ .label = "Save" });
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Expandir", n.semantics.?.children[1].label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Expand", n.semantics.?.children[1].label);
+    // an app-supplied trailing label is verbatim — a switch leaves it alone
+    const n2 = try splitButton(a, null, null, .{ .label = "Save", .trailing_label = "More" });
+    defer n2.deinit();
+    try i18n.setLocale("es");
+    try std.testing.expectEqualStrings("More", n2.semantics.?.children[1].label);
 }

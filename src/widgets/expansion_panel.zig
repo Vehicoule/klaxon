@@ -21,6 +21,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
 
@@ -34,8 +35,9 @@ const Theme = theme_mod.Theme;
 
 pub const ExpansionPanelOptions = struct {
     theme: Theme = theme_mod.light,
-    /// The header title.
-    title: []const u8 = "Panel",
+    /// The header title — null resolves the localized "Panel" (an app
+    /// string is verbatim).
+    title: ?[]const u8 = null,
 };
 
 // --- M3E tokens ---
@@ -64,6 +66,7 @@ const EPState = struct {
     title: [:0]const u8,
     pressed: bool = false,
     hovered: bool = false,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *EPState {
@@ -90,7 +93,7 @@ fn syncExpanded(n: *Node, s: *EPState) void {
     }
     // Update a11y value.
     if (n.semantics) |sem| {
-        sem.value = if (expanded) "expanded" else "collapsed";
+        sem.value = if (expanded) i18n_mod.tr("expanded") else i18n_mod.tr("collapsed");
     }
     n.markDirty();
     n.markLayoutDirty();
@@ -274,12 +277,28 @@ fn epSyncCb(userdata: ?*anyopaque) void {
 fn epDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = epSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = epLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.free(s.title);
     n.allocator.destroy(s);
 }
 
 // --- VTable ---
+
+/// The state value localizes — the locale callback re-attaches in the new
+/// locale (the label is the app's title, verbatim).
+fn epLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .button,
+        .label = s.title,
+        .value = if (isExpanded(s)) i18n_mod.tr("expanded") else i18n_mod.tr("collapsed"),
+        .focusable = true,
+    });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
 
 const ep_vtable = ui.node.VTable{
     .measure = epMeasure,
@@ -308,7 +327,7 @@ pub fn expansionPanel(
     errdefer allocator.destroy(node);
     const s = try allocator.create(EPState);
     errdefer allocator.destroy(s);
-    const title = try dupeZ(allocator, opts.title); // any length — no cap
+    const title = try dupeZ(allocator, opts.title orelse i18n_mod.tr("Panel")); // any length — no cap
     errdefer allocator.free(title);
 
     s.* = .{ .opts = opts, .sig = expanded, .title = title };
@@ -326,12 +345,8 @@ pub fn expansionPanel(
     }
     syncExpanded(node, s);
 
-    ui.semantics.attach(node, .{
-        .role = .button,
-        .label = s.title,
-        .value = if (isExpanded(s)) "expanded" else "collapsed",
-        .focusable = true,
-    });
+    epLocaleCb(node); // the same path resolves the value
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = epLocaleCb, .userdata = node });
 
     return node;
 }
@@ -441,4 +456,20 @@ test "golden: the expanded panel paints the child body; the collapsed panel does
     defer f2.deinit();
     try std.testing.expectEqual(@as(u64, 268 * 20), f2.countColor(0x336699FF));
     try std.testing.expectEqual(@as(Color, 0x336699FF), f2.pixelAt(100, 95));
+}
+
+test "expansion_panel: i18n — the state value + default title localize and re-resolve" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Panel\": \"Panel\", \"expanded\": \"expandido\", \"collapsed\": \"contraído\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const n = try expansionPanel(a, null, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("contraído", n.semantics.?.value);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("collapsed", n.semantics.?.value);
 }

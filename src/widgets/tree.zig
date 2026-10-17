@@ -32,6 +32,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const icon_w = @import("icon.zig");
 const golden = @import("../golden.zig");
@@ -73,8 +74,9 @@ pub const TreeOptions = struct {
     tappable: bool = false,
     /// The lazy-children provider — expanding a `lazy` node calls it once.
     children_provider: ?ChildrenProvider = null,
-    /// The accessible name.
-    a11y_label: []const u8 = "Tree",
+    /// The accessible name — null resolves the localized "Tree" (an app
+    /// string is verbatim).
+    a11y_label: ?[]const u8 = null,
 };
 
 // --- Tokens ---
@@ -106,6 +108,7 @@ const TreeState = struct {
     /// Backing for the virtual a11y children (Semantics.children borrows
     /// the slice — resynced by syncSemantics on every change).
     sem_children: std.array_list.Managed(ui.semantics.Semantics),
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const TreeNodeDef = struct {
@@ -522,7 +525,7 @@ fn syncSemantics(n: *Node, s: *TreeState) void {
             .role = .list_item,
             .label = item.node.label,
             .value = if (expandable(item.node))
-                (if (item.node.expanded) "expanded" else "collapsed")
+                (if (item.node.expanded) i18n_mod.tr("expanded") else i18n_mod.tr("collapsed"))
             else
                 "",
             .checked = s.selected == @as(i32, @intCast(i)),
@@ -558,6 +561,7 @@ fn freeNode(allocator: std.mem.Allocator, node: *TreeNodeDef) void {
 
 fn treeDeinit(n: *Node) void {
     const s = stateOf(n);
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = treeLocaleCb, .userdata = n });
     input.releaseNode(n); // the router may hold a capture/focus on us
     s.sem_children.deinit();
     freeNode(n.allocator, &s.root);
@@ -565,6 +569,24 @@ fn treeDeinit(n: *Node) void {
 }
 
 // --- VTable ---
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale and resyncs the virtual rows (their expanded/collapsed
+/// values localize too; the row labels are app strings, verbatim).
+fn treeLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{
+        .role = .group,
+        .label = s.opts.a11y_label orelse i18n_mod.tr("Tree"),
+        .focusable = true, // takes the keyboard focus (arrows/enter nav)
+        .children = s.sem_children.items,
+        .child_bounds = rowChildBounds,
+    });
+    syncSemantics(n, s);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
 
 const tree_vtable = ui.node.VTable{
     .measure = treeMeasure,
@@ -623,14 +645,8 @@ pub fn tree(
     errdefer freeNode(allocator, &s.root);
     node.state = @ptrCast(s);
 
-    ui.semantics.attach(node, .{
-        .role = .group,
-        .label = opts.a11y_label,
-        .focusable = true, // takes the keyboard focus (arrows/enter nav)
-        .children = s.sem_children.items,
-        .child_bounds = rowChildBounds,
-    });
-    syncSemantics(node, s); // first fill of the virtual rows + the value
+    treeLocaleCb(node); // attach + first fill of the virtual rows
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = treeLocaleCb, .userdata = node });
 
     return node;
 }
@@ -958,4 +974,29 @@ test "golden: a node icon paints in the leading slot before the label" {
     // The icon slot: x0 + chevron + pad = 10 + 24 + 8, vertically centered.
     const icon_rect: Rect = .{ .x = 42, .y = 10 + (row_h - icon_size) / 2, .w = icon_size, .h = icon_size };
     try std.testing.expect(f.countColorIn(icon_rect, t.colors.on_surface_variant) > 0);
+}
+
+test "tree: i18n — the group label + expanded values localize and re-resolve" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Tree\": \"Árbol\", \"expanded\": \"expandido\", \"collapsed\": \"contraído\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const root = TreeNode{
+        .label = "Root",
+        .children = &.{.{ .label = "Child" }},
+    };
+    const n = try tree(a, &root, null, .{});
+    defer n.deinit();
+    const sem = n.semantics.?;
+    try std.testing.expectEqualStrings("Árbol", sem.label);
+    // the expandable row's state value localizes too (the root starts open)
+    try std.testing.expectEqualStrings("expandido", sem.children[0].value);
+    try i18n.setLocale("en");
+    const sem2 = n.semantics.?; // re-attached by the locale callback
+    try std.testing.expectEqualStrings("Tree", sem2.label);
+    try std.testing.expectEqualStrings("expanded", sem2.children[0].value);
 }

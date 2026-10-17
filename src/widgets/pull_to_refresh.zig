@@ -56,6 +56,7 @@ const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const anim = ui.anim;
 const node_mod = ui.node;
 const theme_mod = @import("../theme.zig");
@@ -72,7 +73,9 @@ const Theme = theme_mod.Theme;
 
 pub const PullToRefreshOptions = struct {
     theme: Theme = theme_mod.light,
-    label: []const u8 = "Pull to refresh",
+    /// The semantics label — null resolves the localized "Pull to refresh"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
 /// M3E measurement tokens (PullToRefreshDefaults + the private vals).
@@ -113,6 +116,7 @@ const PtrState = struct {
     last_phase: f32 = 0,
     spin_channel: u8 = 0, // channel marker (stable address)
     spin_running: bool = false,
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 const Callback = ui.state.Callback;
@@ -426,8 +430,19 @@ fn ptrDeinit(n: *Node) void {
         tl.cancelChannel(@ptrCast(&s.spin_channel));
     }
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = ptrSyncCb, .userdata = n } });
+    i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = ptrLocaleCb, .userdata = n });
     input.releaseNode(n);
     n.allocator.destroy(s);
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn ptrLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Pull to refresh") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const ptr_vtable = ui.node.VTable{
@@ -515,7 +530,8 @@ pub fn pullToRefresh(allocator: std.mem.Allocator, refreshing: *ui.state.Signal(
     errdefer allocator.destroy(s);
     s.* = .{ .sig = refreshing, .opts = opts, .on_refresh = on_refresh };
     node.state = s;
-    ui.semantics.attach(node, .{ .role = .group, .label = opts.label }); // Phase 2c
+    ptrLocaleCb(node); // Phase 2c — the same path resolves the label
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = ptrLocaleCb, .userdata = node });
     refreshing.subscribe(.{ .callback = .{ .fn_ptr = ptrSyncCb, .userdata = node } });
     return node;
 }
@@ -803,4 +819,22 @@ test "pull_to_refresh: a fresh gesture cancels the in-flight snap-back spring" {
     try std.testing.expectEqual(@as(f32, 100), adjusted(ptr));
     router.dispatchPointer(ptr, .{ .phase = .up, .x = 50, .y = 330, .raw_x = 50, .raw_y = 330 });
     try std.testing.expect(refreshing.peek()); // adjusted 100 > 80 → triggered
+}
+
+test "pull_to_refresh: i18n — the default label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Pull to refresh\": \"Desliza para actualizar\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const refreshing = try ui.state.Signal(bool).init(a, false);
+    defer refreshing.deinit();
+    const n = try pullToRefresh(a, refreshing, null, .{});
+    defer n.deinit();
+    try std.testing.expectEqualStrings("Desliza para actualizar", n.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Pull to refresh", n.semantics.?.label);
 }

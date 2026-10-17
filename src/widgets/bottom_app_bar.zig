@@ -22,6 +22,7 @@
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const theme_mod = @import("../theme.zig");
 const golden = @import("../golden.zig"); // tests
 
@@ -46,10 +47,12 @@ pub const BottomAppBarOptions = struct {
     height: f32 = 80, // M3E bottom app bar container height
     actions: ?*Node = null, // start slot — typically a row of icon buttons
     fab: ?*Node = null, // floating action button docked at the end edge
-    label: []const u8 = "Bottom app bar", // semantic label (borrowed)
+    /// The semantics label — null resolves the localized "Bottom app bar"
+    /// (an app string is verbatim).
+    label: ?[]const u8 = null,
 };
 
-const BottomAppBarState = struct { opts: BottomAppBarOptions };
+const BottomAppBarState = struct { opts: BottomAppBarOptions, i18n: ?*i18n_mod.I18n = null };
 
 fn stateOf(n: *Node) *BottomAppBarState {
     return @ptrCast(@alignCast(n.state.?));
@@ -101,7 +104,18 @@ fn bottomAppBarPaint(n: *Node, ctx: *kx.Ctx) void {
 }
 
 fn bottomAppBarDeinit(n: *Node) void {
+    i18n_mod.unsubscribeLocale(stateOf(n).i18n, .{ .fn_ptr = babLocaleCb, .userdata = n });
     n.allocator.destroy(stateOf(n));
+}
+
+/// The group label is tr()-resolved — the locale callback re-attaches in
+/// the new locale.
+fn babLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Bottom app bar") });
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
 }
 
 const bottom_app_bar_vtable = ui.node.VTable{
@@ -123,7 +137,8 @@ pub fn bottomAppBar(allocator: std.mem.Allocator, opts: BottomAppBarOptions) !*N
     node.state = s;
     if (opts.actions) |actions| node.add(actions);
     if (opts.fab) |fab| node.add(fab);
-    ui.semantics.attach(node, .{ .role = .group, .label = opts.label });
+    babLocaleCb(node);
+    s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = babLocaleCb, .userdata = node });
     return node;
 }
 
@@ -250,4 +265,20 @@ test "golden: bottom_app_bar RTL docks the FAB at the left edge" {
     defer fr.deinit();
     try std.testing.expect(fr.countColorIn(.{ .x = 16, .y = 12, .w = 56, .h = 56 }, t.colors.primary_container) > 1500);
     try std.testing.expectEqual(@as(u32, 0), fr.countColorIn(.{ .x = 400 - 72, .y = 12, .w = 56, .h = 56 }, t.colors.primary_container));
+}
+
+test "bottom_app_bar: i18n — the default label localizes + re-resolves on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es", "{\"@@locale\": \"es\", \"Bottom app bar\": \"Barra inferior\"}", .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const bar = try bottomAppBar(a, .{});
+    defer bar.deinit();
+    try std.testing.expectEqualStrings("Barra inferior", bar.semantics.?.label);
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Bottom app bar", bar.semantics.?.label);
 }
