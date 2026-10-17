@@ -93,9 +93,12 @@ Each widget's header carries the same list; these are the tracked ones
   error texts, AM/PM halves, Cancel/OK and the a11y strings localize via
   `i18n.tr()` (English literals as msgid keys — the app's ARB overrides)
   plus CLDR `am_label`/`pm_label` locale data; a locale switch re-resolves
-  and rebuilds the semantics tree. Remaining: the classic (non-vibrant)
-  `TimeInput` only — no 100x120 CornerFull style; supporting texts
-  hand-wrapped (no real text wrap, no liveRegion on the error text); the
+  and rebuilds the semantics tree. The supporting texts wrap through the
+  paragraph ABI at the field width — one tr() sentence key each (upstream
+  `TimePicker24HourError`/`HourError`/`MinuteError`). Remaining: the
+  classic (non-vibrant)
+  `TimeInput` only — no 100x120 CornerFull style; no liveRegion announce
+  on the error text; the
   auto-advance always runs
   (upstream suppresses it while an a11y service is enabled — no
   equivalent query here); Tab walks the fields only in tests — the host

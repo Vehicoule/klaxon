@@ -76,8 +76,9 @@
 //   - The input variant ports the CLASSIC TimeInput (shapes == null): the
 //     vibrant/uncontained styles (100x120 CornerFull fields, the side
 //     control column) are not.
-//   - The supporting texts are hand-wrapped fixed strings; no real text
-//     wrap, and no liveRegion announce on the error text.
+//   - The supporting texts wrap through the paragraph ABI at the field
+//     width (upstream minLines = 2 reserves the box); no liveRegion
+//     announce on the error text.
 //   - Upstream suppresses the auto-advance while an a11y service is
 //     enabled (a11yServicesEnabled); we have no equivalent query, so the
 //     advance always runs.
@@ -861,26 +862,18 @@ fn paintFooter(n: *Node, ctx: *kx.Ctx) void {
     paintTextButton(n, ctx, fr.ok, i18n_mod.tr("OK"), .ok);
 }
 
-/// The supporting text's line strings — "Hour"/"Minute" normally, the
-/// upstream error text when the field's input is invalid (hand-wrapped to
-/// the 96dp box; upstream minLines = 2). Localized through tr() — the
-/// English literal is the key (the app's ARB overrides per locale).
-fn supportLine(s: *TpState, which: DialMode, line: usize) ?[]const u8 {
+/// The supporting text — "Hour"/"Minute" normally, the upstream error
+/// message when the field's input is invalid (upstream's
+/// TimePicker24HourError/HourError/MinuteError strings, one tr() key per
+/// sentence so locales can re-order words; wrapped at the 96dp field
+/// width at paint — upstream minLines = 2 reserves the box).
+fn supportText(s: *TpState, which: DialMode) []const u8 {
     if (!fieldInvalid(s, which)) {
-        if (line != 0) return null;
         return i18n_mod.tr(if (which == .hour) "Hour" else "Minute");
     }
     return switch (which) {
-        .hour => switch (line) {
-            0 => i18n_mod.tr("Hour must be"),
-            1 => i18n_mod.tr(if (s.opts.is_24h) "between 0 and 23" else "between 1 and 12"),
-            else => null,
-        },
-        .minute => switch (line) {
-            0 => i18n_mod.tr("Minutes must be"),
-            1 => i18n_mod.tr("between 0 and 59"),
-            else => null,
-        },
+        .hour => i18n_mod.tr(if (s.opts.is_24h) "Hour must be between 0 and 23" else "Hour must be between 1 and 12"),
+        .minute => i18n_mod.tr("Minutes must be between 0 and 59"),
     };
 }
 
@@ -976,15 +969,21 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
         ui.paint.text(ctx, str, tx, baseline, dm.size, dm_bold, fg);
     }
     // The supporting text: "Hour"/"Minute" (or the error text), BodySmall
-    // in the field's x band.
+    // in the field's x band — laid out through the paragraph ABI at the
+    // 96dp field width so long translations wrap (upstream minLines = 2).
     const bs = t.type_scale.body_small;
-    const bs_bold = bs.weight >= 500;
     const ink: Color = if (invalid) cs.@"error" else cs.on_surface_variant;
-    var line: usize = 0;
-    while (supportLine(s, which, line)) |lbl| : (line += 1) {
-        const sup = supportRect(n.bounds, which, s.opts.is_24h, line, t);
-        const lm = ui.paint.measureTextLen(lbl, bs.size, bs_bold);
-        ui.paint.textSlice(ctx, lbl, sup.x, sup.y + lm.ascent, bs.size, bs_bold, ink);
+    const sup = supportRect(n.bounds, which, s.opts.is_24h, 0, t);
+    var buf: [256]u8 = undefined;
+    const msg = supportText(s, which);
+    if (msg.len < buf.len) blk: {
+        @memcpy(buf[0..msg.len], msg);
+        buf[msg.len] = 0;
+        const z: [:0]const u8 = buf[0..msg.len :0];
+        const l = ui.paint.textLayoutBegin(sup.w) orelse break :blk;
+        defer ui.paint.textLayoutDestroy(l);
+        ui.paint.textLayoutSpan(l, z, ui.paint.textStyle(bs.size, @intCast(bs.weight), 0, bs.letter_spacing, ink));
+        ui.paint.textLayoutPaint(ctx, l, sup.x, sup.y + ui.paint.textLayoutBaseline(l));
     }
 }
 
@@ -2273,7 +2272,7 @@ test "time_picker: i18n — labels, the period toggle and the a11y value localiz
     // the a11y value's day-period literal localizes too
     try std.testing.expectEqualStrings("01:30 p.m.", sem.value);
     // support strings resolve in the active locale (untranslated → the en literal)
-    try std.testing.expectEqualStrings("Hour", supportLine(s, .hour, 0).?);
+    try std.testing.expectEqualStrings("Hour", supportText(s, .hour));
     // a locale switch re-resolves: the children + the a11y value rebuild
     try i18n.setLocale("en");
     const sem2 = n.semantics.?; // re-attached by the locale callback
@@ -2358,4 +2357,39 @@ test "golden: the input variant's error state (ErrorContainer + error supporting
     // the hour field is untouched: SurfaceContainerHighest, no error text
     const hs = supportRect(n.bounds, .hour, false, 0, t);
     try std.testing.expect(f2.countColorApproxIn(hs, t.colors.on_surface_variant) > 0);
+}
+
+test "time_picker: the supporting error text wraps through the paragraph ABI" {
+    const a = std.testing.allocator;
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const sig = try ui.state.Signal(i32).init(a, 630);
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .mode = .input });
+    defer n.deinit();
+    const s = stateOf(n);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
+    // Focus the minute field and type an out-of-range value.
+    const mr = inputFieldRect(n.bounds, .minute, s.opts.is_24h);
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = mr.x + 10, .y = mr.y + 10 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = mr.x + 10, .y = mr.y + 10 });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" });
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" });
+    try std.testing.expect(fieldInvalid(s, .minute));
+    // The error is ONE sentence-level msgid (locales re-order words), and
+    // it wraps to multiple lines inside the 96dp field's band.
+    const msg = supportText(s, .minute);
+    try std.testing.expectEqualStrings("Minutes must be between 0 and 59", msg);
+    const sup = supportRect(n.bounds, .minute, s.opts.is_24h, 0, s.opts.theme);
+    const bs = s.opts.theme.type_scale.body_small;
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..msg.len], msg);
+    buf[msg.len] = 0;
+    const z: [:0]const u8 = buf[0..msg.len :0];
+    const l = ui.paint.textLayoutBegin(sup.w).?;
+    defer ui.paint.textLayoutDestroy(l);
+    ui.paint.textLayoutSpan(l, z, ui.paint.textStyle(bs.size, @intCast(bs.weight), 0, bs.letter_spacing, 0xFF000000));
+    try std.testing.expect(ui.paint.textLayoutWidth(l) <= sup.w);
+    try std.testing.expect(ui.paint.textLayoutHeight(l) > bs.line_height * 1.5);
 }
