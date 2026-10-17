@@ -52,8 +52,9 @@ Each widget's header carries the same list; these are the tracked ones
   squeezed segment clips its label (upstream wraps) and the
   multi-choice row (`segmentedButtonMulti`) is a u64 bitmask capped at
   64 segments.
-- `icon_button.zig` — no elevation shadows. (Shape morphs now spring via
-  the timeline — AnimatedShape parity.)
+- `icon_button.zig` — no deviations: upstream IconButton.kt carries no
+  elevation/shadow either (the variants are flat); shape morphs spring
+  via the timeline (AnimatedShape parity).
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
 - `slider.zig` — the value indicator now morphs on the timeline (150ms
@@ -140,8 +141,10 @@ Each widget's header carries the same list; these are the tracked ones
   The hex field rides the shared `text_edit.zig` core — real caret,
   selection, clipboard and IME session via `wants_text_input` — and
   commits on Enter, reverts on blur/Escape.)
-- `kx_skia_android.cpp` — font family/fallback hardcode Roboto/Droid Sans;
-  the directory-scan manager covers devices without them.
+- `kx_skia_android.cpp` — the default/fallback families are resolved
+  from the device at first use (Roboto → first Latin-covering family;
+  Droid Sans → a second Latin family), never the clock face that sorts
+  first in /system/fonts.
 - `kx_skia_android_fontmgr_stub.cpp` — `GetSystemFontFamilies` clears the
   vector to satisfy a prebuilt-Skia symbol (bypassed in production; a
   latent trap if the NDK parser path is ever consulted).

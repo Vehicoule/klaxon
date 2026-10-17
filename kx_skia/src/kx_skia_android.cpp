@@ -34,6 +34,8 @@
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkData.h"                   // SkData::MakeWithCopy (deferred-upload pixel ownership)
 #include "include/core/SkFontScanner.h"           // complete type for SkFontMgr_New_AndroidNDK's unique_ptr param
+#include "include/core/SkFontStyle.h"
+#include "include/core/SkTypeface.h"              // unicharToGlyph (family coverage check)
 #include "include/core/SkImageInfo.h"
 #include "include/core/SkSurface.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"    // GrBackendRenderTarget (complete type; GrGLBackendSurface.h only fwd-declares it)
@@ -53,6 +55,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 
 namespace kx {
 
@@ -214,22 +218,59 @@ sk_sp<SkFontMgr> platform_font_mgr() {
     // SkFontMgr_Android_Parser::GetSystemFontFamilies which is stubbed out
     // (the parser source is not in the prebuilt Skia libs) — calling it
     // crashes with a null pointer dereference. Skip it and use FreeType
-    // over the system font directory directly.
-    if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Directory("/system/fonts")) {
-        return mgr;
-    }
-    // Last resort: metrics work, no glyphs.
-    return SkFontMgr_New_Custom_Empty();
+    // over the system font directory directly. Cached: one directory scan
+    // serves the wrapped manager AND the family resolution below.
+    static sk_sp<SkFontMgr> mgr = [] {
+        if (sk_sp<SkFontMgr> m = SkFontMgr_New_Custom_Directory("/system/fonts")) {
+            return m;
+        }
+        // Last resort: metrics work, no glyphs.
+        return sk_sp<SkFontMgr>(SkFontMgr_New_Custom_Empty());
+    }();
+    return mgr;
 }
 
-// Never return nullptr for the family: the custom directory manager falls
-// back to the first font in /system/fonts, which sorts AndroidClock.ttf first
-// — a digits-only clock face (labels silently vanish). "Roboto" ships on
-// every Android; "Droid Sans" is the legacy name still present on all
-// versions for API < 21 skins that alias Roboto.
-const char* platform_font_family() { return "Roboto"; }
+static bool familyCovers(SkFontMgr* mgr, const char* family, SkUnichar c) {
+    sk_sp<SkTypeface> tf = mgr->legacyMakeTypeface(family, SkFontStyle());
+    return tf && tf->unicharToGlyph(c) != 0;
+}
 
-const char* platform_fallback_font_family() { return "Droid Sans"; }
+// Resolve the default + fallback families FROM THE DEVICE instead of
+// assuming them: prefer "Roboto" (ships on every Android) for the default
+// and "Droid Sans" (the legacy alias, API < 21 skins) for the fallback,
+// else the first family covering Latin letters. Symbol-only faces are
+// skipped by the coverage check — /system/fonts sorts AndroidClock.ttf
+// first and a digits-only clock face makes labels silently vanish.
+static const char* resolveFamily(bool fallback) {
+    static char primary[128] = "Roboto";
+    static char secondary[128] = "";
+    static bool done = false;
+    if (!done) {
+        done = true;
+        if (sk_sp<SkFontMgr> mgr = platform_font_mgr()) {
+            SkString name;
+            bool roboto = false, droid = false;
+            char latin[128] = "";
+            for (int i = 0, n = mgr->countFamilies(); i < n; i++) {
+                mgr->getFamilyName(i, &name);
+                if (name.equals("Roboto")) roboto = true;
+                else if (name.equals("Droid Sans")) droid = true;
+                else if (latin[0] == '\0' && familyCovers(mgr.get(), name.c_str(), 'a')) {
+                    snprintf(latin, sizeof(latin), "%s", name.c_str());
+                }
+            }
+            if (!roboto && latin[0]) snprintf(primary, sizeof(primary), "%s", latin);
+            if (droid) snprintf(secondary, sizeof(secondary), "%s", "Droid Sans");
+            else if (latin[0] && strcmp(latin, primary)) snprintf(secondary, sizeof(secondary), "%s", latin);
+        }
+    }
+    return fallback ? (secondary[0] ? secondary : nullptr)
+                    : (primary[0] ? primary : nullptr);
+}
+
+const char* platform_font_family() { return resolveFamily(false); }
+
+const char* platform_fallback_font_family() { return resolveFamily(true); }
 
 } // namespace kx
 
