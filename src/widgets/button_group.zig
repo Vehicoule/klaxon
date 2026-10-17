@@ -16,9 +16,14 @@
 //     PressedInnerCornerCornerSize = CornerValueExtraSmall (4dp) — outer
 //     corners stay (upstream connectedLeading/TrailingButtonPressShape; a
 //     pressed middle item morphs all four corners)
-//   - states: same as button — hover 0.08 / focus 0.10 / pressed 0.12 state
-//     layer of the on-color over the container; disabled = OnSurface @ 0.38
-//     content over OnSurface @ 0.10 container
+//   - indication (ButtonGroup.kt's connected buttons → Surface's
+//     clickable + `ripple()`): every item is its own Tracker + animated
+//     StateLayer (hover/focus alphas — presses go to the ripple only,
+//     Ripple.kt:209-212) + bounded Ripples set, clipped to the item's
+//     per-corner shape (the morphing inner corners — a `.path` clip).
+//     The ink is the variant's on-color; Enter/Space on the arrow-focused
+//     item presses at its center. Disabled = OnSurface @ 0.38 content over
+//     OnSurface @ 0.10 container
 //   - sizing: items size to content (the same dims as button.zig — 24dp
 //     h-padding, icon + 8dp gap + label for medium); a constrained group
 //     shrinks items proportionally (each keeps its share of the content
@@ -110,6 +115,17 @@ const ItemDef = struct {
     on_press: ?Callback,
     enabled: bool,
     anim: PressAnim,
+    /// Per-item upstream interaction machinery — each connected Button is
+    /// its own clickable → its own interactionSource (ButtonGroup.kt).
+    /// items.items never re-allocs after init (same guarantee the PressAnim
+    /// channels + the a11y children rely on) — the ticker/channel userdata
+    /// pointers stay stable.
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs tracker.release
+    /// and ripples.release for this item.
+    press_id: u32 = 0,
 };
 
 const GroupState = struct {
@@ -301,7 +317,7 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
     const bold = ls.weight >= 500;
     const focused = input.isFocused(n);
     for (0..count) |i| {
-        const def = s.items.items[i];
+        const def = &s.items.items[i]; // the machinery mutates through this
         const idx: i32 = @intCast(i);
         var r = itemRectLtr(s, b, i);
         if (ui.i18n.direction() == .rtl) r = mirrorX(b, r);
@@ -311,26 +327,22 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
         if (container & 0xFF != 0) {
             ui.paint.fillRRectCorners(ctx, r.x, r.y, r.w, r.h, cor.tl, cor.tr, cor.br, cor.bl, container);
         }
-        // state layer (enabled only): the on-color blended over the
-        // container; over a transparent container the layer is the
-        // on-color AT the state alpha (lerping from transparent black
-        // would scale the RGB by the alpha twice in the src-over blend).
+        // The indication (enabled only — upstream's enabled=false drops
+        // the whole interaction set): the animated state layer + the
+        // bounded ink ripple, clipped to the item's per-corner shape (the
+        // morphing inner corners included — the clip rides anim.a). Over
+        // a transparent container the alpha fill is identical to the old
+        // stateLayer() pre-blend.
         if (def.enabled) {
-            const alpha: f32 = if (s.pressed == idx)
-                t.state.pressed
-            else if (focused and s.focus_idx == idx)
-                t.state.focus
-            else if (s.hovered == idx)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                const layer = if (container & 0xFF == 0)
-                    ui.paint.withAlphaScaled(vc.on, alpha)
-                else
-                    theme_mod.stateLayer(container, vc.on, alpha);
-                ui.paint.fillRRectCorners(ctx, r.x, r.y, r.w, r.h, cor.tl, cor.tr, cor.br, cor.bl, layer);
+            def.inter.setFocused(focused and s.focus_idx == idx);
+            def.layer.sync(&def.inter, vc.on);
+            if (def.layer.paintColor()) |lc| {
+                ui.paint.fillRRectCorners(ctx, r.x, r.y, r.w, r.h, cor.tl, cor.tr, cor.br, cor.bl, lc);
             }
+            var xs: [24]f32 = undefined;
+            var ys: [24]f32 = undefined;
+            def.ripples.color = vc.on;
+            def.ripples.paintIn(ctx, r, ui.ripple.cornersClip(r, cor.tl, cor.tr, cor.br, cor.bl, &xs, &ys));
         }
         // content: [icon, gap, label] centered
         const fg: Color = if (def.enabled) vc.on else vc.disabled_on;
@@ -402,6 +414,32 @@ fn releasePress(s: *GroupState, i: i32) void {
     }
 }
 
+/// End an item's live press (release = up, cancel = drag-off/outside) —
+/// the tracker entry and its ripple pair on `press_id`, plus the width
+/// expansion's deferred release.
+fn groupEndPress(s: *GroupState, i: i32, now_ms: u64, cancel: bool) void {
+    if (i < 0) return;
+    const def = &s.items.items[@intCast(i)];
+    if (def.press_id != 0) {
+        if (cancel) def.inter.cancel(def.press_id) else def.inter.release(def.press_id);
+        def.ripples.release(def.press_id, now_ms);
+        def.press_id = 0;
+    }
+    releasePress(s, i);
+}
+
+/// Move the hover interaction to a new item (-1 = none). A disabled item
+/// gets no tracker entry (upstream: enabled=false drops the whole
+/// interaction set); `hovered` still records the index.
+fn groupSetHover(s: *GroupState, idx: i32) void {
+    if (idx == s.hovered) return;
+    if (s.hovered >= 0) s.items.items[@intCast(s.hovered)].inter.endHover();
+    s.hovered = idx;
+    if (idx >= 0 and s.items.items[@intCast(idx)].enabled) {
+        _ = s.items.items[@intCast(idx)].inter.hoverEnter();
+    }
+}
+
 fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     const b = n.bounds;
@@ -410,20 +448,23 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
             const hit = itemAt(s, b, ev.x); // rects and events are window-space
             if (hit < 0) return false;
             if (!s.items.items[@intCast(hit)].enabled) return true; // claim, don't press
+            // a second pointer supersedes the live press
+            if (s.pressed >= 0) groupEndPress(s, s.pressed, ev.time_ms, true);
+            const def = &s.items.items[@intCast(hit)];
+            def.press_id = def.inter.pressDown(ev.x, ev.y);
+            def.ripples.spawn(def.press_id, ev.x, ev.y, ev.time_ms);
             s.pressed = hit;
             retargetPress(s, @intCast(hit), 1);
             s.focus_idx = hit;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
             // Click = down + up on the same item (the router captured us).
             const was = s.pressed;
             s.pressed = -1;
-            releasePress(s, was);
-            n.markDirty();
+            groupEndPress(s, was, ev.time_ms, false);
             if (was >= 0 and itemAt(s, b, ev.x) == was) {
                 const def = s.items.items[@intCast(was)];
                 if (def.on_press) |cb| cb.fn_ptr(cb.userdata);
@@ -437,34 +478,28 @@ fn groupOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    releasePress(s, s.pressed);
+                    groupEndPress(s, s.pressed, ev.time_ms, true);
                     s.pressed = -1;
-                    n.markDirty();
                 }
             }
             // hover follows the item under the pointer (hover_move re-enters)
-            const hit = itemAt(s, b, ev.x);
-            if (hit != s.hovered) {
-                s.hovered = hit;
-                n.markDirty();
-            }
+            groupSetHover(s, itemAt(s, b, ev.x));
             return s.pressed >= 0;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            releasePress(s, s.pressed);
-            s.pressed = -1;
-            n.markDirty();
+            if (s.pressed >= 0) {
+                groupEndPress(s, s.pressed, ev.time_ms, true);
+                s.pressed = -1;
+            }
             return true;
         },
         .enter => {
-            s.hovered = itemAt(s, b, ev.x);
-            n.markDirty();
+            groupSetHover(s, itemAt(s, b, ev.x));
             return true;
         },
         .leave => {
-            s.hovered = -1;
-            n.markDirty();
+            groupSetHover(s, -1);
             return true;
         },
         else => {},
@@ -501,8 +536,19 @@ fn groupOnKey(n: *Node, ev: input.KeyEvent) bool {
         },
         .enter, .space => {
             if (s.focus_idx >= 0) {
-                const def = s.items.items[@intCast(s.focus_idx)];
+                const def = &s.items.items[@intCast(s.focus_idx)];
                 if (def.enabled) {
+                    // upstream's keyPress emits Press+Release on the item's
+                    // interactionSource — a centered bounded ripple that
+                    // still runs its full expand + fade-out.
+                    var r = itemRectLtr(s, n.bounds, @intCast(s.focus_idx));
+                    if (ui.i18n.direction() == .rtl) r = mirrorX(n.bounds, r);
+                    const cx = r.x + r.w / 2;
+                    const cy = r.y + r.h / 2;
+                    const pid = def.inter.pressDown(cx, cy);
+                    def.ripples.spawn(pid, cx, cy, 0);
+                    def.inter.release(pid);
+                    def.ripples.release(pid, 0);
                     if (def.on_press) |cb| cb.fn_ptr(cb.userdata);
                     return true;
                 }
@@ -519,7 +565,11 @@ fn groupDeinit(n: *Node) void {
     if (ui.anim.timeline()) |tl| {
         for (s.items.items) |*def| tl.cancelChannel(@ptrCast(&def.anim.chan));
     }
-    for (s.items.items) |*def| n.allocator.free(def.label);
+    for (s.items.items) |*def| {
+        def.layer.deinit(); // the in-flight tween's userdata is `l`
+        def.ripples.deinit(); // the live ticker's userdata is `r`
+        n.allocator.free(def.label);
+    }
     s.items.deinit();
     s.widths.deinit();
     s.adj_widths.deinit();
@@ -601,6 +651,15 @@ pub fn buttonGroup(allocator: std.mem.Allocator, items: []const ButtonGroupItem,
         try s.adj_widths.append(0);
     }
     node.state = s;
+    // The per-item indication set (each connected Button is its own
+    // clickable upstream): mutations + ticks damage the group node; the
+    // layer alphas + the pressed ink come from the theme state table.
+    for (s.items.items) |*def| {
+        def.inter.node = node;
+        def.layer.node = node;
+        def.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+        def.ripples = .{ .bounded = true, .node = node, .pressed_alpha = opts.theme.state.pressed };
+    }
     // Per-item virtual a11y children — VoiceOver reads/activates each
     // button, not just an opaque group.
     for (s.items.items) |*def| {

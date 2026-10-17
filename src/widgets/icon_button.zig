@@ -27,8 +27,19 @@
 //     transparent + OutlineVariant -> checked InverseSurface/InverseOnSurface
 //   - disabled: container OnSurface@0.10 (filled variants), icon
 //     OnSurface@0.38, outlined border OutlineVariant@0.38
-//   - state layers: the state's icon color @ hover 0.08 / focus 0.10 /
-//     pressed 0.12 over the container (at alpha over a transparent container)
+//   - indication: BOUNDED ripple on every variant — the pin's standard
+//     IconButtonImpl uses `.clip(shape).clickable(indication =
+//     ripple(focusRingShape = shape))` (IconButton.kt:256 — `bounded`
+//     defaults to true, so the ink stays inside the shape; focusRingShape
+//     is the M3E ring, not an unbounded circle) and the filled/tonal/
+//     outlined variants delegate to SurfaceIconButton → Surface, whose
+//     clickable indication is the same bounded ripple (Surface.kt:253).
+//     Wired via ui.interactions.Tracker + ui.state_layer.StateLayer +
+//     ui.ripple.Ripples: the animated layer carries the state's icon color
+//     @ hover 0.08 / focus 0.10 (at alpha over a transparent container —
+//     lerping from transparent black would double-scale the RGB), the
+//     pressed state is the expanding ripple ink @ 0.12, and the ripple
+//     clip is the LIVE morphing corner (press + toggle morphs included).
 //
 // Ported from Compose IconButton.kt + *IconButtonTokens: dimsFor carries
 // the per-size ContainerHeight/IconSize/LeadingSpace (per width family) /
@@ -150,8 +161,18 @@ const IconButtonState = struct {
     /// checked state drives the colors + shape, the click flips it).
     sig: ?*ui.state.Signal(bool),
     on_pressed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The Compose interaction set (press/hover/focus, last-wins) — feeds
+    /// the corner-morph target (pressed outranks checked) and the animated
+    /// state layer; `node` marks dirty on every mutation.
+    inter: ui.interactions.Tracker = .{},
+    /// The animated hover/focus layer; the pressed state is the ripple's.
+    layer: ui.state_layer.StateLayer = .{},
+    /// Bounded ripples clipped to the live morphing corner (upstream's
+    /// `ripple(focusRingShape = shape)`, bounded by default).
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs release/cancel
+    /// with the exact pressDown.
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates — drag deltas are
     /// physical finger motion, immune to the content scrolling under the
     /// finger (PointerEvent.raw_x/raw_y doc).
@@ -184,7 +205,7 @@ fn currentColors(s: *IconButtonState, vc: IBColors) CurrentColors {
 /// toward this value (upstream's AnimatedShape: every state change morphs).
 fn cornerTarget(s: *IconButtonState, height: f32) f32 {
     const d = dimsFor(s.opts.size);
-    if (s.pressed) return d.pressed_corner;
+    if (s.inter.isPressed()) return d.pressed_corner;
     if (isChecked(s)) {
         // toggle morph: selected round -> the square corner, selected square
         // -> CornerFull (the unselected/checked shapes swap)
@@ -262,33 +283,17 @@ fn iconButtonPaint(n: *Node, ctx: *kx.Ctx) void {
     const d = dimsFor(s.opts.size);
     const vc = variantColors(t, s.opts.variant, s.sig != null);
     const cc = currentColors(s, vc);
+    // No focus-gained vtable hook — poll the router; icon buttons never
+    // requestFocus on pointer down, so focus entries are keyboard-visible.
+    s.inter.setFocused(input.isFocused(n));
     if (s.corner < 0) s.corner = cornerTarget(s, b.h); // lazy snap (pre-anim)
     const radius = s.corner;
     // container
     if (cc.container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, cc.container);
     }
-    // state layer (enabled only): the state's icon color blended over the
-    // container — AT the state alpha over a transparent container (lerping
-    // from transparent black would double-scale the RGB in src-over)
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const layer = if (cc.container & 0xFF == 0)
-                ui.paint.withAlphaScaled(cc.on, alpha)
-            else
-                theme_mod.stateLayer(cc.container, cc.on, alpha);
-            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
-        }
-    }
-    // outline (outlined variant) — painted over the state layer. Upstream
+    // outline (outlined variant) — Surface draws the border before the
+    // indication composites over it. Upstream
     // outlinedIconToggleButtonBorder returns null while CHECKED (the
     // InverseSurface pill is the selected marker, no border); the plain
     // outlined button always strokes.
@@ -298,6 +303,20 @@ fn iconButtonPaint(n: *Node, ctx: *kx.Ctx) void {
         const oc = if (s.opts.enabled) vc.outline else vc.disabled_outline;
         ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, radius, d.outline_width, oc);
     }
+    if (s.opts.enabled) {
+        // The animated state layer: the state's icon color @ hover 0.08 /
+        // focus 0.10 over the container (at alpha over a transparent
+        // container — lerping from transparent black would double-scale
+        // the RGB); the pressed state is the ripple's ink.
+        s.layer.sync(&s.inter, cc.on);
+        if (s.layer.paintColor()) |layer| {
+            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
+        }
+        // Bounded ripple clipped to the LIVE morphing corner.
+        s.ripples.color = cc.on;
+        s.ripples.pressed_alpha = t.state.pressed;
+        s.ripples.paint(ctx, n, .{ .rrect = radius });
+    }
 }
 
 fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -305,21 +324,27 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            // A second finger down replaces the press (spawn finishes any
+            // live ripple; the tracker ends the stale press entry).
+            s.inter.endPress();
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             retargetCorner(n, s); // the press morph springs (AnimatedShape)
-            n.markDirty();
             return true;
         },
         .up => {
             // Click = down + up on the same node (the router captured us).
             // A cancelled press (outside_down, or a drag past the touch
             // slop) must not fire on a later up.
-            const was_pressed = s.pressed;
-            s.pressed = false;
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) {
+                s.inter.release(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             retargetCorner(n, s); // release → morph back
-            n.markDirty();
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.sig) |sig| sig.set(!sig.peek());
                 if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
@@ -328,34 +353,37 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .move => {
             // A drag beyond the touch slop is a scroll, not a press: cancel
-            // the pressed state. The move is NOT claimed (return false) so
-            // it keeps bubbling to scrollable ancestors (scroll_util.zig).
-            if (s.pressed) {
+            // the press interaction + finish its ripple. The move is NOT
+            // claimed (return false) so it keeps bubbling to scrollable
+            // ancestors (scroll_util.zig).
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms); // upstream: Cancel == Release
+                    s.press_id = 0;
                     retargetCorner(n, s);
-                    n.markDirty();
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = false;
-            retargetCorner(n, s);
-            n.markDirty();
+            if (s.press_id != 0) {
+                s.inter.cancel(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+                retargetCorner(n, s);
+            }
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -364,12 +392,22 @@ fn iconButtonOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space press the focused control.
+/// The keyPress mints a press interaction + a CENTERED bounded ripple
+/// (released immediately — there are no key-up events; the ripple still
+/// expands + fades on its own timeline).
 fn iconButtonOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const cx = b.x + b.w / 2;
+            const cy = b.y + b.h / 2;
+            const pid = s.inter.pressDown(cx, cy);
+            s.ripples.spawn(pid, cx, cy, 0); // 0 = the timeline clock's now
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             if (s.sig) |sig| sig.set(!sig.peek());
             if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -396,6 +434,8 @@ fn iconButtonDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = iconButtonSyncCb, .userdata = n } });
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.corner_channel));
+    s.layer.deinit();
+    s.ripples.deinit(); // drops the ticker before the state frees
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -423,6 +463,15 @@ pub fn iconButton(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_pressed = on_pressed };
     node.state = s;
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{
+        .hover = opts.theme.state.hover,
+        .focus = opts.theme.state.focus,
+        .pressed = opts.theme.state.pressed,
+        .drag = opts.theme.state.drag,
+    };
+    s.ripples.node = node;
     const vc = variantColors(opts.theme, opts.variant, sig != null);
     const cc = currentColors(s, vc);
     const ic = try icon_w.icon(allocator, opts.icon, .{

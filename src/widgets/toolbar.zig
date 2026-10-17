@@ -98,12 +98,42 @@ const fab_elevation_hover: f32 = 6; // Level3
 // upstream MotionScheme FastSpatial ~300ms).
 const shadow_spill: f32 = 16; // paint/damage overflow covering the shadows
 
+/// Per-slot indication machinery — upstream's toolbar children are ordinary
+/// composables: each icon slot is an IconButton carrying its own
+/// interactionSource + clickable ripple, and the docked FAB is a
+/// FloatingActionButton with the same set. items.items never re-allocs
+/// after init (same guarantee the a11y children rely on) — the
+/// ticker/channel userdata pointers stay stable.
+const ItemFx = struct {
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's tracker id (0 = none) — pairs tracker.release and
+    /// ripples.release for this slot.
+    press_id: u32 = 0,
+
+    fn wire(fx: *ItemFx, n: *Node, t: Theme) void {
+        fx.inter.node = n;
+        fx.layer.node = n;
+        fx.layer.alphas = .{ .hover = t.state.hover, .focus = t.state.focus, .pressed = t.state.pressed, .drag = t.state.drag };
+        fx.ripples = .{ .bounded = true, .node = n, .pressed_alpha = t.state.pressed };
+    }
+
+    fn unwire(fx: *ItemFx) void {
+        fx.layer.deinit(); // the in-flight tween's userdata is `l`
+        fx.ripples.deinit(); // the live ticker's userdata is `r`
+    }
+};
+
 const ItemDef = struct {
     label: [:0]const u8, // owned
     icon: icon_w.IconName,
     on_press: ?Callback,
     enabled: bool,
     divider: bool,
+    /// The slot's own interaction set (wired in toolbar() once the list
+    /// is final; a divider's sits unused — it gets no interactions).
+    fx: ItemFx = .{},
 };
 
 const ToolbarState = struct {
@@ -120,6 +150,9 @@ const ToolbarState = struct {
     /// The keyboard-active slot (arrows move it; Enter/Space activates it;
     /// the focus state layer paints on it while the group is focused).
     active: i32 = -1,
+    /// The docked FAB's own interaction set (a FloatingActionButton
+    /// upstream — its own clickable + ripple).
+    fab_fx: ItemFx = .{},
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
@@ -349,21 +382,20 @@ fn toolbarPaint(n: *Node, ctx: *kx.Ctx) void {
                 continue;
             }
             const enabled = pressable(s, idx);
-            // the state layer (enabled slots only): the on-color blended
-            // over the container — an opaque lerp, the container is always opaque
+            // the indication (enabled slots only — upstream's enabled=false
+            // drops the whole interaction set): the animated state layer +
+            // the bounded ink, clipped to the cell's full circle (the slot
+            // is an IconButton upstream — IconButton.kt's indication clips
+            // to the CornerFull container)
             if (enabled) {
-                const alpha: f32 = if (s.pressed == idx)
-                    t.state.pressed
-                else if (focused and s.active == idx)
-                    t.state.focus
-                else if (s.hovered == idx)
-                    t.state.hover
-                else
-                    0;
-                if (alpha > 0) {
-                    const layer = theme_mod.stateLayer(container, on, alpha);
-                    ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, r.h / 2, layer);
+                const fx = &s.items.items[i].fx;
+                fx.inter.setFocused(focused and s.active == idx);
+                fx.layer.sync(&fx.inter, on);
+                if (fx.layer.paintColor()) |lc| {
+                    ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, r.h / 2, lc);
                 }
+                fx.ripples.color = on;
+                fx.ripples.paintIn(ctx, r, .{ .rrect = r.h / 2 });
             }
             // the icon (centered in the cell; disabled = OnSurface @ 0.38)
             const fg: Color = if (enabled) on else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
@@ -372,19 +404,52 @@ fn toolbarPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.clipReset(ctx);
     }
     // the beside-FAB paints OUTSIDE the pill clip (Level2 squircle, Level3
-    // hovered — upstream FloatingActionButtonDefaults elevation)
+    // hovered — upstream FloatingActionButtonDefaults elevation; the hover
+    // read is the tracker's, like FloatingActionButton.kt's elevation)
     if (hasFab(s)) {
         const idx: i32 = @intCast(count);
         const r = slotRect(s, b, count);
-        const elev = if (s.hovered == idx) fab_elevation_hover else fab_elevation;
+        const fx = &s.fab_fx;
+        const elev = if (fx.inter.isHovered()) fab_elevation_hover else fab_elevation;
         ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, fab_corner, elev, cs.shadow);
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, fab_bg);
-        if (s.pressed == idx or s.hovered == idx or (focused and s.active == idx)) {
-            const alpha: f32 = if (s.pressed == idx) t.state.pressed else if (focused and s.active == idx) t.state.focus else t.state.hover;
-            ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, theme_mod.stateLayer(fab_bg, fab_fg, alpha));
+        // the FAB's own indication: animated layer + bounded ink clipped
+        // to the squircle, in the FAB's content color
+        fx.inter.setFocused(focused and s.active == idx);
+        fx.layer.sync(&fx.inter, fab_fg);
+        if (fx.layer.paintColor()) |lc| {
+            ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, fab_corner, lc);
         }
+        fx.ripples.color = fab_fg;
+        fx.ripples.paintIn(ctx, r, .{ .rrect = fab_corner });
         paintIcon(ctx, s.opts.fab_icon.?, r.x + (r.w - fab_icon_size) / 2, r.y + (r.h - fab_icon_size) / 2, fab_icon_size, fab_fg);
     }
+}
+
+/// The interaction set of slot `idx` — items.len is the docked FAB's.
+fn slotFx(s: *ToolbarState, idx: i32) *ItemFx {
+    const i: usize = @intCast(idx);
+    return if (i == s.items.items.len) &s.fab_fx else &s.items.items[i].fx;
+}
+
+/// End a slot's live press (release = up, cancel = drag-off/outside) — the
+/// tracker entry and its ripple pair on `press_id`.
+fn toolbarEndPress(s: *ToolbarState, idx: i32, now_ms: u64, cancel: bool) void {
+    const fx = slotFx(s, idx);
+    if (fx.press_id == 0) return;
+    if (cancel) fx.inter.cancel(fx.press_id) else fx.inter.release(fx.press_id);
+    fx.ripples.release(fx.press_id, now_ms);
+    fx.press_id = 0;
+}
+
+/// Move the hover interaction to a new slot (-1 = none). Inert slots get
+/// no tracker entry (upstream: enabled=false drops the interaction set);
+/// `hovered` still records the index.
+fn toolbarSetHover(s: *ToolbarState, idx: i32) void {
+    if (idx == s.hovered) return;
+    if (s.hovered >= 0) slotFx(s, s.hovered).inter.endHover();
+    s.hovered = idx;
+    if (pressable(s, idx)) _ = slotFx(s, idx).inter.hoverEnter();
 }
 
 fn toolbarOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -393,58 +458,59 @@ fn toolbarOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             if (!pressable(s, idx)) return false;
+            // a second pointer supersedes the live press
+            if (s.pressed >= 0) toolbarEndPress(s, s.pressed, ev.time_ms, true);
+            const fx = slotFx(s, idx);
+            fx.press_id = fx.inter.pressDown(ev.x, ev.y);
+            fx.ripples.spawn(fx.press_id, ev.x, ev.y, ev.time_ms);
             s.pressed = idx;
             s.active = idx;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             input.requestFocus(n); // a pressed slot takes the keyboard focus
-            n.markDirty();
             return true;
         },
         .up => {
             const was = s.pressed;
             s.pressed = -1;
-            n.markDirty();
+            if (was >= 0) toolbarEndPress(s, was, ev.time_ms, false);
             if (was >= 0 and idx == was) slotActivate(n, @intCast(was));
             return true;
         },
         .move => {
             // A drag beyond the touch slop is a scroll, not a press: cancel
-            // the pressed state. The move is NOT claimed (return false) so
-            // it keeps bubbling to scrollable ancestors.
+            // the press. The move is NOT claimed (return false) so it keeps
+            // bubbling to scrollable ancestors.
             if (s.pressed >= 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    toolbarEndPress(s, s.pressed, ev.time_ms, true);
                     s.pressed = -1;
-                    n.markDirty();
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = -1;
-            n.markDirty();
+            if (s.pressed >= 0) {
+                toolbarEndPress(s, s.pressed, ev.time_ms, true);
+                s.pressed = -1;
+            }
             return true;
         },
         .enter => {
-            s.hovered = idx;
-            n.markDirty();
+            toolbarSetHover(s, idx);
             return true;
         },
         // moving across slots within the leaf emits hover_move (not
         // enter/leave): re-resolve the slot under the pointer
         .hover_move => {
-            if (idx != s.hovered) {
-                s.hovered = idx;
-                n.markDirty();
-            }
+            toolbarSetHover(s, idx);
             return true;
         },
         .leave => {
-            s.hovered = -1;
-            n.markDirty();
+            toolbarSetHover(s, -1);
             return true;
         },
     }
@@ -470,6 +536,18 @@ fn toolbarOnKey(n: *Node, ev: input.KeyEvent) bool {
         },
         .enter, .space => {
             if (s.active < 0) return false;
+            // upstream's keyPress emits Press+Release on the slot's
+            // interactionSource — a centered bounded ripple over its zone
+            // (the icon cell's circle / the FAB's squircle) that still
+            // runs its full expand + fade-out.
+            const fx = slotFx(s, s.active);
+            const r = slotRect(s, n.bounds, @intCast(s.active));
+            const cx = r.x + r.w / 2;
+            const cy = r.y + r.h / 2;
+            const pid = fx.inter.pressDown(cx, cy);
+            fx.ripples.spawn(pid, cx, cy, 0);
+            fx.inter.release(pid);
+            fx.ripples.release(pid, 0);
             slotActivate(n, @intCast(s.active));
             return true;
         },
@@ -515,7 +593,11 @@ fn toolbarDeinit(n: *Node) void {
     if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.expand_channel));
     if (s.opts.expanded) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = expandSyncCb, .userdata = n } });
     input.releaseNode(n);
-    for (s.items.items) |*def| n.allocator.free(def.label);
+    for (s.items.items) |*def| {
+        def.fx.unwire(); // ticker + tween userdata die before the state
+        n.allocator.free(def.label);
+    }
+    s.fab_fx.unwire();
     s.items.deinit();
     s.sem_children.deinit();
     n.allocator.free(s.fab_label);
@@ -603,6 +685,11 @@ pub fn toolbar(allocator: std.mem.Allocator, items: []const ToolbarItem, opts: T
         sig.subscribe(.{ .callback = .{ .fn_ptr = expandSyncCb, .userdata = node } });
     }
     node.state = s;
+    // The per-slot indication sets (items fixed at construction → stable
+    // addresses): mutations + ticks damage the toolbar node; the layer
+    // alphas + the pressed ink come from the theme state table.
+    for (s.items.items) |*def| def.fx.wire(node, opts.theme);
+    s.fab_fx.wire(node, opts.theme);
     // the pill/fab shadows paint past the bounds — declare the spill so the
     // paint/damage rect contract covers them
     node.damage_overflow = .{ .left = shadow_spill, .top = shadow_spill, .right = shadow_spill, .bottom = shadow_spill };
@@ -801,7 +888,11 @@ test "golden: the pill paints SurfaceContainer + on_surface_variant icons; the d
     try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 20, .y = 20, .w = 8, .h = 8 }, t.colors.surface_container));
 }
 
-test "golden: a pressed item paints the on-color state layer circle over the container" {
+test "golden: a pressed item's ripple inks the on-color circle over the container" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try toolbar(a, &.{ .{ .icon = .search }, .{ .icon = .star } }, .{ .theme = t });
@@ -809,14 +900,17 @@ test "golden: a pressed item paints the on-color state layer circle over the con
     var r = try golden.Renderer.init(std.testing.allocator, 200, 96);
     defer r.deinit();
     n.layout(.{ .x = 20, .y = 20, .w = 112, .h = 64 }); // 8 + 96 + 8
-    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 52, .y = 52, .raw_x = 52, .raw_y = 52 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 52, .y = 52, .raw_x = 52, .raw_y = 52 }); // time_ms 0 = the clock's now
+    tl.tick(300); // past fadeIn (75ms) + the 225ms radius expansion
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // inside the state-layer circle, clear of the icon ink (cell 0 at
-    // x = 28..76, center 52): the left interior edge shows the blend
-    const layer = theme_mod.stateLayer(t.colors.surface_container, t.colors.on_surface_variant, t.state.pressed);
-    try golden.expectPixelApprox(f, 32, 52, layer);
+    // upstream's pressed state is the ripple ink (Ripple.kt), not a static
+    // layer: fully open it's on_surface_variant @ pressed over the
+    // container, clipped to the cell's circle — (32,52) is inside cell 0's
+    // circle (center 52, r = 24), clear of the icon ink
+    const ink = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface_variant, t.state.pressed), t.colors.surface_container);
+    try golden.expectPixelApprox(f, 32, 52, ink);
     // the unpressed second cell still shows the bare container (past the
     // icon's ink box at x = 88..112)
     try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(118, 52));

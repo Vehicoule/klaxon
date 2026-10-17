@@ -140,6 +140,46 @@ pub const Clip = union(enum) {
     pub const Path = struct { xs: []const f32, ys: []const f32 };
 };
 
+/// A per-corner-rounded rect as a `.path` clip — for containers whose
+/// shape isn't a uniform rrect (segmented rows' itemShape, connected
+/// button groups' morphing inner corners). Each rounded corner becomes a
+/// 5-chord quarter-arc (an h/2 radius → ≈4dp chords — AA-fine at 40dp);
+/// square corners emit their vertex once. `xs`/`ys` are caller scratch —
+/// paint is synchronous, the slices only live for the call.
+pub fn cornersClip(r: Rect, tl: f32, tr: f32, br: f32, bl: f32, xs: *[24]f32, ys: *[24]f32) Clip {
+    // (corner center, radius) in clockwise order — y-down screen space,
+    // where clockwise = the arc angle increasing.
+    const corners = [4]struct { cx: f32, cy: f32, r: f32 }{
+        .{ .cx = r.x + tl, .cy = r.y + tl, .r = tl },
+        .{ .cx = r.x + r.w - tr, .cy = r.y + tr, .r = tr },
+        .{ .cx = r.x + r.w - br, .cy = r.y + r.h - br, .r = br },
+        .{ .cx = r.x + bl, .cy = r.y + r.h - bl, .r = bl },
+    };
+    const pi = std.math.pi;
+    const arcs = [4][2]f32{
+        .{ pi, pi * 1.5 }, // tl: left-edge tangent → top-edge tangent
+        .{ pi * 1.5, pi * 2.0 }, // tr: top → right
+        .{ 0.0, pi / 2.0 }, // br: right → bottom
+        .{ pi / 2.0, pi }, // bl: bottom → left
+    };
+    var n: usize = 0;
+    for (corners, arcs) |c, a| {
+        if (c.r <= 0) {
+            xs[n] = c.cx;
+            ys[n] = c.cy;
+            n += 1;
+            continue;
+        }
+        for (0..6) |k| {
+            const ang = a[0] + (a[1] - a[0]) * (@as(f32, @floatFromInt(k)) / 5.0);
+            xs[n] = c.cx + c.r * @cos(ang);
+            ys[n] = c.cy + c.r * @sin(ang);
+            n += 1;
+        }
+    }
+    return .{ .path = .{ .xs = xs[0..n], .ys = ys[0..n] } };
+}
+
 /// FastOutSlowInEasing = CubicBezierEasing(0.4, 0.0, 0.2, 1.0) — Compose's
 /// standard "material" curve (androidx.compose.animation.core.Easing).
 fn fastOutSlowIn(t: f32) f32 {
@@ -322,7 +362,8 @@ pub const Ripples = struct {
     /// bounds when they aren't the node's: Switch's `.indication` sits on
     /// the thumb's LayoutNode (Switch.kt:191-199 — the ripple anchors to
     /// the animated thumb rect, not the track), and row widgets
-    /// (segmented button, tabs) carry one indication per cell rect.
+    /// (segmented button, tabs, toolbar slots, button-group items) carry
+    /// one indication per cell rect.
     /// `b` is in the node's parent space, same as n.bounds.
     pub fn paintIn(r: *const Ripples, ctx: *kx.Ctx, b: Rect, clip: Clip) void {
         // `if (alpha != 0f)` (:96-97): pressedAlpha zero → nothing to draw.

@@ -71,20 +71,32 @@ Each widget's header carries the same list; these are the tracked ones
 - `ui/interactions.zig` + `ui/state_layer.zig` + `ui/ripple.zig` — the
   Compose indication machinery (InteractionSource semantics, the animated
   StateLayer, and RippleAnimation/CommonRipple) is wired into the
-  navigation/surface widgets — `nav_bar`, `navigation_rail`, `list_item`,
-  `menu` and `card` run a per-item/per-node Tracker → animated layer →
-  bounded ripple (the pill/row-clipped indication upstream's
-  `indication(offsetInteractionSource, ripple)` produces); `app_bar`,
-  `bottom_app_bar` and `drawer` carry no indication upstream and own
-  none here — and into the selection widgets: `checkbox`, `radio`,
-  `switch`, `slider`, `chip`, `segmented_button` and `tabs` run a
-  Tracker → animated layer → ripple pipeline (unbounded centered ink for
-  checkbox/radio/switch's thumb, bounded cell/shape-clipped ink for
-  segmented_button's per-corner itemShape — a `.path` clip — and tabs'
-  primary-colored cell ripple, Tab.kt:166). The action widgets still
-  paint fixed-alpha interaction overlays (button's hand-rolled
-  pressed/focused/hovered precedence) — migration is deliberately
-  batched. Deliberate port deltas inside  the machinery itself: concurrent ripples capped at 4 (upstream's
+  interactive catalog:
+
+  - actions: `button`, `icon_button`, `button_group`, `split_button`,
+    `fab`, `fab_menu`, `toolbar` — per-element Tracker/StateLayer/Ripples
+    sets (per segment / per half / per slot / per docked FAB);
+  - selection: `checkbox`, `radio`, `switch`, `slider`, `chip`,
+    `segmented_button`, `tabs` — unbounded centered ink for the
+    thumb/selection controls (Switch.kt:191-199 anchors the indication
+    on the animated thumb rect), bounded per-segment ink clipped to the
+    per-corner itemShape for segmented_button (a `.path` clip),
+    primary-colored cell ripple for tabs (Tab.kt:166); slider press
+    graduates to drag;
+  - navigation/surfaces: `nav_bar`, `navigation_rail`, `list_item`,
+    `menu`, `card` run a per-item/per-node Tracker → animated layer →
+    bounded ripple (the pill/row-clipped indication upstream's
+    `indication(offsetInteractionSource, ripple)` produces); `app_bar`,
+    `bottom_app_bar` and `drawer` carry no indication upstream and own
+    none here.
+
+  A held press no longer paints a static overlay anywhere in the
+  migrated set — it's the expanding ink (Ripple.kt), and keyboard
+  activation mints centered bounded ripples. The remaining widgets
+  (pickers, snackbar, text fields, tooltip…) still paint fixed-alpha
+  interaction overlays; their migration lands in follow-up batches.
+  Deliberate port deltas inside the machinery itself: concurrent ripples
+  capped at 4 (upstream's
   scatter map is unbounded, though every `addRipple` finishes all live
   ripples anyway — overflow retires the oldest instantly); active
   interactions capped at 8 = InputRouter's pointer slots (upstream's list

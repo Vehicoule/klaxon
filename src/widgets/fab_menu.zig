@@ -26,8 +26,18 @@
 //     casts no item shadow). The rows stack upward: item[0] at the top,
 //     the last row 8dp (CloseButtonBetweenSpace) above the FAB;
 //     4dp between rows (ListItemBetweenSpace)
-//   - state layers: the item content color over the container at hover
-//     0.08 / focus 0.10 / pressed 0.12; disabled items = OnSurface@0.38
+//   - indication: BOUNDED ripples per surface. The menu FAB is upstream's
+//     ToggleFloatingActionButton — `toggleable(indication =
+//     ripple(radius = fabRippleRadius, focusRingShape = shape))`
+//     (FloatingActionButtonMenu.kt:552), a bounded ripple with an explicit
+//     radius = the resting size's half-diagonal, clipped to the morphing
+//     graphicsLayer shape; each menu item is its own Surface
+//     (FloatingActionButtonMenuItem → Surface.kt:253's bounded ripple).
+//     Wired via ui.interactions.Tracker (the FAB's press/hover/focus +
+//     press-id mint) + per-item StateLayer/Ripples on the defs: the
+//     animated layers carry the content color @ hover 0.08 / focus 0.10,
+//     the pressed states are the expanding ripple ink @ 0.12 clipped to
+//     each pill's CornerFull shape; disabled items = OnSurface@0.38
 //     content over OnSurface@0.12 container (chip included)
 //   - behavior: the FAB click/Enter/Space toggles; an open menu registers
 //     as the router's open popup (like menu.zig — item hit-testing works
@@ -125,6 +135,16 @@ const ItemDef = struct {
     label: [:0]const u8, // owned
     on_press: ?Callback,
     enabled: bool,
+    /// Each upstream menu item is its own Surface — its own animated layer
+    /// (driven directly by `set` since `highlight` already resolves
+    /// hover-vs-focus) + bounded ripple pair. Stored inline: the items
+    /// list is capacity-allocated once at init, so the def addresses (and
+    /// the layer channel/ripple ticker pointers) never move.
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none), minted from the shared
+    /// tracker — pairs the ripple release with the press.
+    press_id: u32 = 0,
 };
 
 const FabMenuState = struct {
@@ -136,14 +156,19 @@ const FabMenuState = struct {
     opts: FabMenuOptions,
     sig: ?*ui.state.Signal(bool) = null,
     open: bool = false,
-    /// The pressed / hovered item index (-1 = none). The FAB tracks its
-    /// own flags — a press on it is not an item press.
+    /// The pressed item index (-1 = none). The FAB tracks its own press
+    /// (fab_press_id) — a press on it is not an item press.
     pressed_item: i32 = -1,
-    fab_pressed: bool = false,
+    /// The FAB's interaction set + animated layer + bounded ripples (its
+    /// own interactionSource upstream — the items' presses mint ids here
+    /// too; press entries never reach the FAB's layerKind).
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    fab_ripples: ui.ripple.Ripples = .{},
+    fab_press_id: u32 = 0,
     /// Pointer hover AND the keyboard highlight share this (menu.zig's
     /// convention): hover enter sets it, arrows move it, Enter activates.
     highlight: i32 = -1,
-    fab_hovered: bool = false,
     /// The last activated item (pub accessor `selectedIndex`).
     selected: usize = 0,
     /// The down position in raw (window) coordinates — drag deltas are
@@ -244,7 +269,13 @@ fn applyOpen(n: *Node, s: *FabMenuState, open: bool) void {
     if (s.open == open) return;
     s.open = open;
     s.pressed_item = -1;
-    s.fab_pressed = false;
+    s.inter.endPress(); // a live press can't complete across the transition
+    s.fab_press_id = 0;
+    s.fab_ripples.releaseAll(0);
+    for (s.items.items) |*def| {
+        def.press_id = 0;
+        def.ripples.releaseAll(0);
+    }
     s.highlight = -1;
     if (n.semantics) |sem| {
         sem.checked = open;
@@ -348,12 +379,26 @@ fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, size: f32, col
     icon_w.drawIcon(ctx, name, x, y, size / 24.0, color);
 }
 
+/// Ripples.paint centers + clips on `n.bounds`; the menu's painted
+/// surfaces are sub-rects (the centered FAB square, each item's pill), so
+/// the ripple pass sees the painted rect — n.bounds restored right after.
+fn paintRipplesIn(n: *Node, r: *const ui.ripple.Ripples, ctx: *kx.Ctx, rect: Rect, clip: ui.ripple.Clip) void {
+    const saved = n.bounds;
+    n.bounds = rect;
+    r.paint(ctx, n, clip);
+    n.bounds = saved;
+}
+
 fn fabMenuPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cs = t.colors;
     const b = n.bounds;
     const fr = fabRect(b);
+    // No focus-gained vtable hook — poll the router. The open transition
+    // requestFocus()es the menu for keyboard nav: program focus (the .key
+    // default provenance), never pointer-provenance.
+    s.inter.setFocused(input.isFocused(n));
     // The optional scrim (v1: over the widget's own extent, behind the
     // controls — the FAB/items repaint above it).
     if (s.opts.scrim and s.open) {
@@ -381,17 +426,18 @@ fn fabMenuPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.elevationShadow(ctx, fr.x, fr.y, fr.w, fr.h, radius, 6, cs.shadow);
     }
     if (container & 0xFF != 0) ui.paint.fillRRect(ctx, fr.x, fr.y, fr.w, fr.h, radius, container);
-    // the state layer (enabled only): the content color over the container
     if (s.opts.enabled) {
-        const alpha: f32 = if (s.fab_pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.fab_hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) ui.paint.fillRRect(ctx, fr.x, fr.y, fr.w, fr.h, radius, theme_mod.stateLayer(container, content, alpha));
+        // The animated hover/focus layer (press lives in the ripple), then
+        // the bounded ripple — upstream pins its radius to the resting
+        // size's half-diagonal (fabRippleRadius, FloatingActionButtonMenu.
+        // kt:520-552) and clips it to the morphing graphicsLayer shape.
+        s.layer.sync(&s.inter, content);
+        if (s.layer.paintColor()) |layer| {
+            ui.paint.fillRRect(ctx, fr.x, fr.y, fr.w, fr.h, radius, layer);
+        }
+        s.fab_ripples.color = content;
+        s.fab_ripples.pressed_alpha = t.state.pressed;
+        paintRipplesIn(n, &s.fab_ripples, ctx, fr, .{ .rrect = radius });
     }
     // the icon: 24dp closed / the close icon at the 20dp close-button size
     const iname = if (open) (s.opts.close_icon orelse s.opts.fab_icon) else s.opts.fab_icon;
@@ -413,23 +459,29 @@ fn fabMenuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     const ts = t.type_scale.title_medium;
     const bold = ts.weight >= 500;
     const focused = input.isFocused(n);
-    for (s.items.items, 0..) |def, i| {
+    for (s.items.items, 0..) |*def, i| {
         const idx: i32 = @intCast(i);
         const pr = itemRect(s, t, b, i);
         const radius = pr.h / 2; // ListItemContainerShape = CornerFull
         const container: Color = if (def.enabled) cs.primary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.12);
         const content: Color = if (def.enabled) cs.on_primary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
         ui.paint.fillRRect(ctx, pr.x, pr.y, pr.w, pr.h, radius, container);
-        // state layer (enabled only): pressed > highlight — focus when the
-        // menu holds the keyboard focus, hover otherwise (menu.zig's rule)
         if (def.enabled) {
-            const alpha: f32 = if (s.pressed_item == idx)
-                t.state.pressed
-            else if (s.highlight == idx)
-                if (focused) t.state.focus else t.state.hover
+            // The item's animated layer: the highlight shows focus when the
+            // menu holds the keyboard focus, hover otherwise (menu.zig's
+            // rule); the pressed state's ink is the item's own ripple —
+            // upstream each item is a separate Surface, so the press does
+            // not suppress the highlight layer beneath it.
+            def.layer.set(if (s.highlight == idx)
+                (if (focused) .focus else .hover)
             else
-                0;
-            if (alpha > 0) ui.paint.fillRRect(ctx, pr.x, pr.y, pr.w, pr.h, radius, theme_mod.stateLayer(container, content, alpha));
+                null, content);
+            if (def.layer.paintColor()) |layer| {
+                ui.paint.fillRRect(ctx, pr.x, pr.y, pr.w, pr.h, radius, layer);
+            }
+            def.ripples.color = content;
+            def.ripples.pressed_alpha = t.state.pressed;
+            paintRipplesIn(n, &def.ripples, ctx, pr, .{ .rrect = radius });
         }
         // the pill content: [icon 24, gap 8, label] centered (upstream
         // Arrangement.spacedBy(ListItemIconLabelSpace, CenterHorizontally))
@@ -454,18 +506,22 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 // a press on a disabled item is consumed (inside the menu —
                 // an outside click dismisses, an inside one doesn't)
                 if (s.items.items[@intCast(idx)].enabled) {
+                    const def = &s.items.items[@intCast(idx)];
+                    s.inter.endPress(); // one live press at a time
+                    def.press_id = s.inter.pressDown(ev.x, ev.y);
+                    def.ripples.spawn(def.press_id, ev.x, ev.y, ev.time_ms);
                     s.pressed_item = idx;
-                    n.markDirty();
                 }
                 s.down_raw_x = ev.raw_x;
                 s.down_raw_y = ev.raw_y;
                 return true;
             }
             if (fabHitRect(t, b).contains(ev.x, ev.y)) {
-                s.fab_pressed = true;
+                s.inter.endPress();
+                s.fab_press_id = s.inter.pressDown(ev.x, ev.y);
+                s.fab_ripples.spawn(s.fab_press_id, ev.x, ev.y, ev.time_ms);
                 s.down_raw_x = ev.raw_x;
                 s.down_raw_y = ev.raw_y;
-                n.markDirty();
                 return true;
             }
             // inside the open column's box but on a gap: consume (it is not
@@ -474,10 +530,19 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .up => {
             const item_was = s.pressed_item;
-            const fab_was = s.fab_pressed;
+            const fab_was = s.fab_press_id != 0;
             s.pressed_item = -1;
-            s.fab_pressed = false;
-            n.markDirty();
+            if (item_was >= 0) {
+                const def = &s.items.items[@intCast(item_was)];
+                s.inter.release(def.press_id);
+                def.ripples.release(def.press_id, ev.time_ms);
+                def.press_id = 0;
+            }
+            if (fab_was) {
+                s.inter.release(s.fab_press_id);
+                s.fab_ripples.release(s.fab_press_id, ev.time_ms);
+                s.fab_press_id = 0;
+            }
             if (fab_was and fabHitRect(t, b).contains(ev.x, ev.y)) {
                 toggleOpen(n, !s.open);
             } else if (item_was >= 0 and itemAt(s, t, b, ev.x, ev.y) == item_was) {
@@ -489,13 +554,22 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // A drag past the touch slop is a scroll, not a press: cancel
             // both presses. The move is NOT claimed so it keeps bubbling
             // to scrollable ancestors.
-            if (s.pressed_item >= 0 or s.fab_pressed) {
+            if (s.pressed_item >= 0 or s.fab_press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed_item = -1;
-                    s.fab_pressed = false;
-                    n.markDirty();
+                    if (s.pressed_item >= 0) {
+                        const def = &s.items.items[@intCast(s.pressed_item)];
+                        s.inter.cancel(def.press_id);
+                        def.ripples.release(def.press_id, ev.time_ms);
+                        def.press_id = 0;
+                        s.pressed_item = -1;
+                    }
+                    if (s.fab_press_id != 0) {
+                        s.inter.cancel(s.fab_press_id);
+                        s.fab_ripples.release(s.fab_press_id, ev.time_ms);
+                        s.fab_press_id = 0;
+                    }
                 }
             }
             return false;
@@ -503,16 +577,29 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
         // the pointer went down outside while we held the capture or the
         // popup is open: cancel + dismiss (the router's barrier sends this)
         .outside_down => {
+            if (s.pressed_item >= 0) {
+                const def = &s.items.items[@intCast(s.pressed_item)];
+                s.inter.cancel(def.press_id);
+                def.ripples.release(def.press_id, ev.time_ms);
+                def.press_id = 0;
+            }
+            if (s.fab_press_id != 0) {
+                s.inter.cancel(s.fab_press_id);
+                s.fab_ripples.release(s.fab_press_id, ev.time_ms);
+                s.fab_press_id = 0;
+            }
             s.pressed_item = -1;
-            s.fab_pressed = false;
             if (s.open) toggleOpen(n, false);
             markMenuDirty(n);
             return true;
         },
         .enter => {
             s.highlight = itemAt(s, t, b, ev.x, ev.y);
-            s.fab_hovered = fabHitRect(t, b).contains(ev.x, ev.y);
-            n.markDirty();
+            const fh = fabHitRect(t, b).contains(ev.x, ev.y);
+            if (fh) {
+                if (!s.inter.isHovered()) _ = s.inter.hoverEnter();
+            } else s.inter.endHover();
+            n.markDirty(); // the item highlight lives outside the tracker
             return true;
         },
         // moving across the leaf's cells emits hover_move (not enter/leave):
@@ -520,16 +607,17 @@ fn fabMenuOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .hover_move => {
             const h = itemAt(s, t, b, ev.x, ev.y);
             const fh = fabHitRect(t, b).contains(ev.x, ev.y);
-            if (h != s.highlight or fh != s.fab_hovered) {
-                s.highlight = h;
-                s.fab_hovered = fh;
-                n.markDirty();
-            }
+            const dirty = h != s.highlight or fh != s.inter.isHovered();
+            s.highlight = h;
+            if (fh) {
+                if (!s.inter.isHovered()) _ = s.inter.hoverEnter();
+            } else s.inter.endHover();
+            if (dirty) n.markDirty();
             return true;
         },
         .leave => {
             s.highlight = -1;
-            s.fab_hovered = false;
+            s.inter.endHover();
             n.markDirty();
             return true;
         },
@@ -547,9 +635,26 @@ fn fabMenuOnKey(n: *Node, ev: input.KeyEvent) bool {
     const count: i32 = @intCast(s.items.items.len);
     switch (ev.key) {
         .enter, .space => {
+            // Upstream's keyPress mints a press + a CENTERED bounded ripple
+            // on the activated surface (released immediately — no key-ups).
             if (s.open and s.highlight >= 0) {
+                const def = &s.items.items[@intCast(s.highlight)];
+                const pr = itemRect(s, s.opts.theme, n.bounds, @intCast(s.highlight));
+                const cx = pr.x + pr.w / 2;
+                const cy = pr.y + pr.h / 2;
+                const pid = s.inter.pressDown(cx, cy);
+                def.ripples.spawn(pid, cx, cy, 0);
+                s.inter.release(pid);
+                def.ripples.release(pid, 0);
                 itemSelect(n, @intCast(s.highlight));
             } else {
+                const fr = fabRect(n.bounds);
+                const cx = fr.x + fr.w / 2;
+                const cy = fr.y + fr.h / 2;
+                const pid = s.inter.pressDown(cx, cy);
+                s.fab_ripples.spawn(pid, cx, cy, 0);
+                s.inter.release(pid);
+                s.fab_ripples.release(pid, 0);
                 toggleOpen(n, !s.open);
             }
             return true;
@@ -591,6 +696,12 @@ fn fabMenuChildBounds(n: *Node, index: usize) Rect {
 fn fabMenuDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = fabMenuSyncCb, .userdata = n } });
+    s.layer.deinit();
+    s.fab_ripples.deinit(); // drops the tickers before the state frees
+    for (s.items.items) |*def| {
+        def.layer.deinit();
+        def.ripples.deinit();
+    }
     // Node.deinit's releaseNode clears the router's open_popup only when it
     // still points to THIS node — no unconditional setOpenPopup(null) here
     // (a rebuild may have already registered the replacement menu).
@@ -656,6 +767,26 @@ pub fn fabMenu(allocator: std.mem.Allocator, items: []const FabMenuItem, opts: F
         });
     }
     node.state = s;
+    // Interaction machinery: the tracker + layers + ripples damage this
+    // node on mutation/tick (paint_bounds covers the item column while
+    // open). The menu FAB's ripple radius is pinned to the resting size's
+    // half-diagonal — upstream's explicit fabRippleRadius
+    // (FloatingActionButtonMenu.kt:520-524).
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{
+        .hover = opts.theme.state.hover,
+        .focus = opts.theme.state.focus,
+        .pressed = opts.theme.state.pressed,
+        .drag = opts.theme.state.drag,
+    };
+    s.fab_ripples.node = node;
+    s.fab_ripples.radius = @sqrt(2.0) * (fab_size / 2.0);
+    for (s.items.items) |*def| {
+        def.layer.node = node;
+        def.layer.alphas = s.layer.alphas;
+        def.ripples.node = node;
+    }
     ui.semantics.attach(node, .{
         .role = .toggle, // the toggle FAB; checked = the menu's open state
         .label = opts.a11y_label,
@@ -985,7 +1116,11 @@ test "golden: open menu items paint ABOVE a later sibling (the overlay pass)" {
     try std.testing.expectEqual(@as(Color, 0xFF00FFFF), f.pixelAt(20, 290));
 }
 
-test "golden: a pressed item paints the on_primary_container state layer" {
+test "golden: a pressed item's bounded ripple inks the CornerFull pill" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try fabMenu(a, &two_items, .{ .theme = t });
@@ -999,10 +1134,14 @@ test "golden: a pressed item paints the on_primary_container state layer" {
     const x = pr0.x + 4; // off the icon/label ink at the pill's left edge
     const y = pr0.y + pr0.h / 2;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x, .y = y, .raw_x = x, .raw_y = y });
+    tl.tick(300); // past fadeIn (75ms) + the 225ms radius expansion
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
+    // fully open: on_primary_container @ 0.12 over the pill, clipped to it
     try golden.expectPixelApprox(f, @intFromFloat(x), @intFromFloat(y), golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_primary_container, t.state.pressed), t.colors.primary_container));
+    // the pill's top-left corner is clipped by the 28px CornerFull radius
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(@intFromFloat(pr0.x + 1), @intFromFloat(pr0.y + 1)));
 }
 
 test "golden: a disabled item paints the OnSurface@0.12 pill + @0.38 content" {

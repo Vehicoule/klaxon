@@ -22,8 +22,15 @@
 //   - colors: container Primary/Secondary/TertiaryContainer +
 //     SurfaceContainerHigh, icon On*Container (surface: Primary)
 //   - disabled: container OnSurface@0.12, content OnSurface@0.38
-//   - state layers: the content color @ hover 0.08 / focus 0.10 /
-//     pressed 0.12 over the container
+//   - indication: BOUNDED ripple on the container — the FAB delegates to
+//     Surface's clickable indication (FloatingActionButton.kt:171-179 →
+//     Surface.kt:253's `ripple(focusRingShape = shape)`, bounded by
+//     default). Wired via ui.interactions.Tracker +
+//     ui.state_layer.StateLayer + ui.ripple.Ripples: the animated layer
+//     carries the content color @ hover 0.08 / focus 0.10 over the
+//     container, the pressed state is the expanding ripple ink @ 0.12,
+//     and the ripple clips to the CURRENT container rect/corner (the
+//     checked toggle's 56dp morph paints a sub-rect — the ink follows it).
 //   - elevation level3 (hover level4): the real ambient+spot shadow —
 //     6dp rest/pressed/focused, 8dp hovered (a press while hovered holds
 //     level 3 — upstream's last-interaction rule)
@@ -165,8 +172,17 @@ const FabState = struct {
     /// 56dp full-circle solid-family FAB — the click flips it).
     sig: ?*ui.state.Signal(bool),
     on_pressed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The Compose interaction set (press/hover/focus, last-wins) — feeds
+    /// the elevation rule + the animated state layer; `node` marks dirty
+    /// on every mutation.
+    inter: ui.interactions.Tracker = .{},
+    /// The animated hover/focus layer; the pressed state is the ripple's.
+    layer: ui.state_layer.StateLayer = .{},
+    /// Bounded ripples clipped to the container's current shape.
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs release/cancel
+    /// with the exact pressDown.
+    press_id: u32 = 0,
     /// The checked-state icon child (only when checked_icon is set — its
     /// visibility follows the signal, like chip's filter check).
     checked_child: ?*Node = null,
@@ -249,17 +265,32 @@ fn fabContainerRect(n: *Node, s: *FabState) Rect {
     return .{ .x = b.x + (b.w - size) / 2, .y = b.y + (b.h - size) / 2, .w = size, .h = size };
 }
 
+/// Ripples.paint centers + clips on `n.bounds`; the FAB's morphing
+/// container is a centered sub-rect (checked → 56 inside the measured
+/// square), so the ripple pass must see the painted rect — n.bounds is
+/// restored immediately (the ticker's damage uses paintRect, which covers
+/// the whole node either way).
+fn paintRipplesIn(n: *Node, r: *const ui.ripple.Ripples, ctx: *kx.Ctx, rect: Rect, clip: ui.ripple.Clip) void {
+    const saved = n.bounds;
+    n.bounds = rect;
+    r.paint(ctx, n, clip);
+    n.bounds = saved;
+}
+
 fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cc = currentColors(s);
     const r = fabContainerRect(n, s);
     const radius = currentDims(s).radius;
+    // No focus-gained vtable hook — poll the router (FABs never
+    // requestFocus on pointer down → keyboard-provenance focus entries).
+    s.inter.setFocused(input.isFocused(n));
     // M3 elevation: level 3 rest/focus/press, level 4 hovered — upstream's
     // last-interaction rule means a press while hovered holds level 3 (the
     // press interaction is newer than the hover).
     if (s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius, if (s.hovered and !s.pressed) 8 else 6, t.colors.shadow);
+        ui.paint.elevationShadow(ctx, r.x, r.y, r.w, r.h, radius, if (s.inter.isHovered() and !s.inter.isPressed()) 8 else 6, t.colors.shadow);
     }
     // Upstream FloatingActionButton.kt:177 — Surface(color = containerColor,
     // tonalElevation = defaultElevation = Fab*ContainerTokens.ContainerElevation
@@ -271,24 +302,18 @@ fn fabPaint(n: *Node, ctx: *kx.Ctx) void {
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, container);
     }
-    // state layer (enabled only): the content color blended over the
-    // container — AT the state alpha over a transparent container.
     if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const layer = if (container & 0xFF == 0)
-                ui.paint.withAlphaScaled(cc.on, alpha)
-            else
-                theme_mod.stateLayer(container, cc.on, alpha);
+        // The animated state layer: content color @ hover 0.08 / focus
+        // 0.10; the pressed state is the ripple's ink.
+        s.layer.sync(&s.inter, cc.on);
+        if (s.layer.paintColor()) |layer| {
             ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, radius, layer);
         }
+        // Bounded ripple on the container rect at its CURRENT corner —
+        // the checked 56dp morph clips the ink to the painted circle.
+        s.ripples.color = cc.on;
+        s.ripples.pressed_alpha = t.state.pressed;
+        paintRipplesIn(n, &s.ripples, ctx, r, .{ .rrect = radius });
     }
 }
 
@@ -297,16 +322,22 @@ fn fabOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            // A second finger down replaces the press (spawn finishes any
+            // live ripple; the tracker ends the stale press entry).
+            s.inter.endPress();
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) {
+                s.inter.release(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             // the click lands in the 48dp hit target, not necessarily the
             // painted container (the a11y floor is the interactive area)
             if (was_pressed and fabHitBounds(n).contains(ev.x, ev.y)) {
@@ -318,29 +349,31 @@ fn fabOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms); // upstream: Cancel == Release
+                    s.press_id = 0;
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            if (s.press_id != 0) {
+                s.inter.cancel(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -348,13 +381,22 @@ fn fabOnPointer(n: *Node, ev: input.PointerEvent) bool {
     return false;
 }
 
-/// Keyboard activation (Phase 2c): Enter/Space press the focused FAB.
+/// Keyboard activation (Phase 2c): Enter/Space press the focused FAB — the
+/// keyPress mints a press interaction + a CENTERED bounded ripple on the
+/// container (released immediately; no key-up events exist).
 fn fabOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const r = fabContainerRect(n, s);
+            const cx = r.x + r.w / 2;
+            const cy = r.y + r.h / 2;
+            const pid = s.inter.pressDown(cx, cy);
+            s.ripples.spawn(pid, cx, cy, 0); // 0 = the timeline clock's now
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             if (s.sig) |sig| sig.set(!sig.peek());
             if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -391,6 +433,8 @@ fn fabSyncCb(userdata: ?*anyopaque) void {
 fn fabDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = fabSyncCb, .userdata = n } });
+    s.layer.deinit();
+    s.ripples.deinit(); // drops the ticker before the state frees
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -418,6 +462,15 @@ pub fn fab(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_presse
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .sig = sig, .on_pressed = on_pressed };
     node.state = s;
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{
+        .hover = opts.theme.state.hover,
+        .focus = opts.theme.state.focus,
+        .pressed = opts.theme.state.pressed,
+        .drag = opts.theme.state.drag,
+    };
+    s.ripples.node = node;
     const cc = currentColors(s);
     const d = currentDims(s);
     const ic = try icon_w.icon(allocator, opts.icon, .{
@@ -468,8 +521,12 @@ pub fn fab(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_presse
 const ExtFabState = struct {
     opts: ExtendedFabOptions,
     on_pressed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The Compose interaction set + animated layer + bounded ripples —
+    /// same wiring as the square FAB (the ext container is n.bounds).
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0,
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
 };
@@ -574,8 +631,9 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
     const d = extDims(t, s.opts.size);
     const cc = extCurrentColors(s);
     const b = n.bounds;
+    s.inter.setFocused(input.isFocused(n)); // no focus hook — poll
     if (s.opts.enabled) {
-        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius, if (s.hovered) 8 else 6, t.colors.shadow);
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, d.radius, if (s.inter.isHovered() and !s.inter.isPressed()) 8 else 6, t.colors.shadow);
     }
     // Same gate as fabPaint (upstream FloatingActionButton.kt:177, shared by
     // the extended FAB — Surface tonalElevation = Level3 6dp; no-op for the
@@ -585,21 +643,13 @@ fn extFabPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, container);
     }
     if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const layer = if (container & 0xFF == 0)
-                ui.paint.withAlphaScaled(cc.on, alpha)
-            else
-                theme_mod.stateLayer(container, cc.on, alpha);
+        s.layer.sync(&s.inter, cc.on);
+        if (s.layer.paintColor()) |layer| {
             ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, d.radius, layer);
         }
+        s.ripples.color = cc.on;
+        s.ripples.pressed_alpha = t.state.pressed;
+        s.ripples.paint(ctx, n, .{ .rrect = d.radius });
     }
 }
 
@@ -608,45 +658,51 @@ fn extFabOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            s.inter.endPress(); // a second finger down replaces the press
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) {
+                s.inter.release(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             if (was_pressed and extFabHitBounds(n).contains(ev.x, ev.y)) {
                 if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             }
             return true;
         },
         .move => {
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms); // upstream: Cancel == Release
+                    s.press_id = 0;
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            if (s.press_id != 0) {
+                s.inter.cancel(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -660,6 +716,13 @@ fn extFabOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const cx = b.x + b.w / 2;
+            const cy = b.y + b.h / 2;
+            const pid = s.inter.pressDown(cx, cy);
+            s.ripples.spawn(pid, cx, cy, 0); // centered bounded ripple (keyPress)
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -670,6 +733,8 @@ fn extFabOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 fn extFabDeinit(n: *Node) void {
     const s = extStateOf(n);
+    s.layer.deinit();
+    s.ripples.deinit(); // drops the ticker before the state frees
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -699,6 +764,15 @@ pub fn extendedFab(allocator: std.mem.Allocator, on_pressed: ?Callback, opts: Ex
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .on_pressed = on_pressed };
     node.state = s;
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{
+        .hover = opts.theme.state.hover,
+        .focus = opts.theme.state.focus,
+        .pressed = opts.theme.state.pressed,
+        .drag = opts.theme.state.drag,
+    };
+    s.ripples.node = node;
     const cc = extCurrentColors(s);
     const d = extDims(opts.theme, opts.size);
     const ic = if (opts.icon) |iname| try icon_w.icon(allocator, iname, .{ .size = d.icon, .color = cc.icon }) else null;

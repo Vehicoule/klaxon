@@ -25,8 +25,14 @@
 //   - colors: filled = Primary container + OnPrimary content; disabled =
 //     container OnSurface @ 0.10, content OnSurfaceVariant @ 0.38 (same as
 //     the M3E filled button)
-//   - state layer: OnPrimary @ hover 0.08 / focus 0.10 / pressed 0.12 over
-//     the container, per half
+//   - indication (SplitButton.kt's LeadingButton/TrailingButton → Surface's
+//     clickable + `ripple()`): each half is its own interactive element →
+//     its own Tracker + animated StateLayer (hover/focus — presses go to
+//     the ripple only, Ripple.kt:209-212) + bounded Ripples set, clipped to
+//     the half's live per-corner shape (the morphing inner corner rides
+//     the clip — a `.path` polygon rebuilt per paint). The ink is the
+//     content color (OnPrimary); Enter/Space presses the leading half's
+//     center, ArrowDown the trailing's.
 //   - input: each half is its own press zone (a drag past the touch slop is
 //     a scroll, not a press); Enter/Space fires the LEADING action,
 //     ArrowDown the trailing (ARIA menu-button); a11y exposes the two
@@ -137,11 +143,40 @@ const SplitState = struct {
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The halves' interaction machinery — each is its own clickable
+    /// composable upstream → its own interactionSource + ripple. Embedded
+    /// by value in the heap state: the ticker/channel userdata pointers
+    /// stay stable for the node's lifetime.
+    lead_fx: HalfFx = .{},
+    trail_fx: HalfFx = .{},
     /// The two halves as virtual a11y children (upstream: two sibling
     /// composables — TalkBack/VoiceOver focus each half separately).
     /// Fixed-size: the halves never change count; the slice is borrowed.
     sem_children: [2]ui.semantics.Semantics = undefined,
     i18n: ?*i18n_mod.I18n = null,
+};
+
+/// A half's indication set — the upstream per-Button MutableInteractionSource
+/// + the Surface's bounded ripple.
+const HalfFx = struct {
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's tracker id (0 = none) — pairs tracker.release and
+    /// ripples.release for this half.
+    press_id: u32 = 0,
+
+    fn wire(fx: *HalfFx, n: *Node, t: Theme) void {
+        fx.inter.node = n;
+        fx.layer.node = n;
+        fx.layer.alphas = .{ .hover = t.state.hover, .focus = t.state.focus, .pressed = t.state.pressed, .drag = t.state.drag };
+        fx.ripples = .{ .bounded = true, .node = n, .pressed_alpha = t.state.pressed };
+    }
+
+    fn unwire(fx: *HalfFx) void {
+        fx.layer.deinit(); // the in-flight tween's userdata is `l`
+        fx.ripples.deinit(); // the live ticker's userdata is `r`
+    }
 };
 
 fn stateOf(n: *Node) *SplitState {
@@ -315,18 +350,19 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         ui.paint.clipRect(ctx, lx, b.y, lead_w, b.h); // saves
         if (container & 0xFF != 0) ui.paint.fillRRectCorners(ctx, lx, b.y, lead_w, b.h, tl, tr, br, bl, container);
+        // the half's indication: animated layer + bounded ink clipped to
+        // the live per-corner shape (the morphing inner corner included)
         if (s.opts.enabled) {
-            const alpha: f32 = if (s.pressed == 1)
-                t.state.pressed
-            else if (focused)
-                t.state.focus
-            else if (s.hovered == 1)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                ui.paint.fillRRectCorners(ctx, lx, b.y, lead_w, b.h, tl, tr, br, bl, theme_mod.stateLayer(container, cs.on_primary, alpha));
+            const fx = &s.lead_fx;
+            fx.inter.setFocused(focused);
+            fx.layer.sync(&fx.inter, cs.on_primary);
+            if (fx.layer.paintColor()) |lc| {
+                ui.paint.fillRRectCorners(ctx, lx, b.y, lead_w, b.h, tl, tr, br, bl, lc);
             }
+            var xs: [24]f32 = undefined;
+            var ys: [24]f32 = undefined;
+            fx.ripples.color = cs.on_primary;
+            fx.ripples.paintIn(ctx, .{ .x = lx, .y = b.y, .w = lead_w, .h = b.h }, ui.ripple.cornersClip(.{ .x = lx, .y = b.y, .w = lead_w, .h = b.h }, tl, tr, br, bl, &xs, &ys));
         }
         // content: [icon, gap, label] centered (mirrored in RTL: the leading
         // icon moves to the end side)
@@ -368,18 +404,19 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         ui.paint.clipRect(ctx, tx, b.y, tclip_w, b.h); // saves
         if (container & 0xFF != 0) ui.paint.fillRRectCorners(ctx, tx, b.y, tw, b.h, tl, tr, br, bl, container);
+        // the half's indication: animated layer + bounded ink clipped to
+        // the live per-corner shape (the checked morph's circle included)
         if (s.opts.enabled) {
-            const alpha: f32 = if (s.pressed == 2)
-                t.state.pressed
-            else if (focused)
-                t.state.focus
-            else if (s.hovered == 2)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                ui.paint.fillRRectCorners(ctx, tx, b.y, tw, b.h, tl, tr, br, bl, theme_mod.stateLayer(container, cs.on_primary, alpha));
+            const fx = &s.trail_fx;
+            fx.inter.setFocused(focused);
+            fx.layer.sync(&fx.inter, cs.on_primary);
+            if (fx.layer.paintColor()) |lc| {
+                ui.paint.fillRRectCorners(ctx, tx, b.y, tw, b.h, tl, tr, br, bl, lc);
             }
+            var xs: [24]f32 = undefined;
+            var ys: [24]f32 = undefined;
+            fx.ripples.color = cs.on_primary;
+            fx.ripples.paintIn(ctx, .{ .x = tx, .y = b.y, .w = tw, .h = b.h }, ui.ripple.cornersClip(.{ .x = tx, .y = b.y, .w = tw, .h = b.h }, tl, tr, br, bl, &xs, &ys));
         }
         // Upstream's horizontalCenterOptically: the icon shifts by
         // 0.11 * (avgStart − avgEnd) corners — toward the small inner
@@ -400,6 +437,35 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+/// A half's interaction set by zone (1 = leading, 2 = trailing).
+fn splitFx(s: *SplitState, zone: u8) *HalfFx {
+    return if (zone == 2) &s.trail_fx else &s.lead_fx;
+}
+
+/// End the live press (release = up, cancel = drag-off/outside) — the
+/// tracker entry and its ripple pair on `press_id`, plus the inner-corner
+/// morph back (upstream's shapeByInteraction retargets on Release/Cancel).
+fn splitEndPress(n: *Node, s: *SplitState, now_ms: u64, cancel: bool) void {
+    if (s.pressed == 0) return;
+    const fx = splitFx(s, s.pressed);
+    if (fx.press_id != 0) {
+        if (cancel) fx.inter.cancel(fx.press_id) else fx.inter.release(fx.press_id);
+        fx.ripples.release(fx.press_id, now_ms);
+        fx.press_id = 0;
+    }
+    s.pressed = 0;
+    morphInner(n, s, true);
+    morphInner(n, s, false);
+}
+
+/// Move the hover interaction to a new zone (0 = none / the gap).
+fn splitSetHover(s: *SplitState, zone: u8) void {
+    if (zone == s.hovered) return;
+    if (s.hovered != 0) splitFx(s, s.hovered).inter.endHover();
+    s.hovered = zone;
+    if (zone != 0) _ = splitFx(s, zone).inter.hoverEnter();
+}
+
 fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
@@ -407,20 +473,21 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             if (zone == 0) return false;
+            // a second pointer supersedes the live press
+            splitEndPress(n, s, ev.time_ms, true);
+            const fx = splitFx(s, zone);
+            fx.press_id = fx.inter.pressDown(ev.x, ev.y);
+            fx.ripples.spawn(fx.press_id, ev.x, ev.y, ev.time_ms);
             s.pressed = zone;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
             morphInner(n, s, true); // the pressed half morphs (both, a
             morphInner(n, s, false); // direct 1→2 switch unmorphs the other)
-            n.markDirty();
             return true;
         },
         .up => {
             const was = s.pressed;
-            s.pressed = 0;
-            morphInner(n, s, true);
-            morphInner(n, s, false);
-            n.markDirty();
+            splitEndPress(n, s, ev.time_ms, false);
             if (was != 0 and zone == was) {
                 if (was == 1) {
                     if (s.on_press) |cb| cb.fn_ptr(cb.userdata);
@@ -432,46 +499,35 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .move => {
             // A drag beyond the touch slop is a scroll, not a press: cancel
-            // the pressed state. The move is NOT claimed (return false) so
-            // it keeps bubbling to scrollable ancestors.
+            // the press (the ripple still fades out — upstream's Cancel
+            // removes it the same way). The move is NOT claimed (return
+            // false) so it keeps bubbling to scrollable ancestors.
             if (s.pressed != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = 0;
-                    morphInner(n, s, true);
-                    morphInner(n, s, false);
-                    n.markDirty();
+                    splitEndPress(n, s, ev.time_ms, true);
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = 0;
-            morphInner(n, s, true);
-            morphInner(n, s, false);
-            n.markDirty();
+            splitEndPress(n, s, ev.time_ms, true);
             return true;
         },
         .enter => {
-            s.hovered = zone;
-            n.markDirty();
+            splitSetHover(s, zone);
             return true;
         },
         // moving across the halves within the leaf emits hover_move (not
         // enter/leave): re-resolve the zone under the pointer
         .hover_move => {
-            const z = zoneAt(s, n.bounds, ev.x, ev.y);
-            if (z != s.hovered) {
-                s.hovered = z;
-                n.markDirty();
-            }
+            splitSetHover(s, zoneAt(s, n.bounds, ev.x, ev.y));
             return true;
         },
         .leave => {
-            s.hovered = 0;
-            n.markDirty();
+            splitSetHover(s, 0);
             return true;
         },
     }
@@ -504,10 +560,33 @@ fn splitOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            // upstream's keyPress emits Press+Release on the half's
+            // interactionSource — a centered bounded ripple that still
+            // runs its full expand + fade-out. The leading half presses.
+            const fx = &s.lead_fx;
+            var r = splitChildBounds(n, 0);
+            r.x += n.bounds.x; // child_bounds are node-local; the paint
+            r.y += n.bounds.y; // space is the parent's
+            const cx = r.x + r.w / 2;
+            const cy = r.y + r.h / 2;
+            const pid = fx.inter.pressDown(cx, cy);
+            fx.ripples.spawn(pid, cx, cy, 0);
+            fx.inter.release(pid);
+            fx.ripples.release(pid, 0);
             if (s.on_press) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
         .down => {
+            const fx = &s.trail_fx;
+            var r = splitChildBounds(n, 1);
+            r.x += n.bounds.x;
+            r.y += n.bounds.y;
+            const cx = r.x + r.w / 2;
+            const cy = r.y + r.h / 2;
+            const pid = fx.inter.pressDown(cx, cy);
+            fx.ripples.spawn(pid, cx, cy, 0);
+            fx.inter.release(pid);
+            fx.ripples.release(pid, 0);
             if (s.on_trailing) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -524,6 +603,8 @@ fn splitDeinit(n: *Node) void {
     }
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = splitLocaleCb, .userdata = n });
     input.releaseNode(n);
+    s.lead_fx.unwire(); // ticker + tween userdata die before the state
+    s.trail_fx.unwire();
     n.allocator.free(s.label);
     n.allocator.destroy(s);
 }
@@ -591,6 +672,11 @@ pub fn splitButton(allocator: std.mem.Allocator, on_press: ?Callback, on_trailin
         .trailing_checked = opts.trailing_checked,
     };
     node.state = s;
+    // The halves' indication sets (each is its own clickable upstream):
+    // mutations + ticks damage the node; the layer alphas + the pressed
+    // ink come from the theme state table.
+    s.lead_fx.wire(node, opts.theme);
+    s.trail_fx.wire(node, opts.theme);
     // the initial corners are settled — no construction animation
     s.lead_inner = leadInnerTarget(s);
     s.trail_inner = trailInnerTarget(s);

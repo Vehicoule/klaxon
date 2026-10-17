@@ -30,14 +30,24 @@
 //     wired to the composable default)
 //   - elevation: elevated = Level1 rest/press/focus, Level2 hovered;
 //     filled + tonal cast a Level1 shadow on hover only; a press overrides
-//     the hover (upstream's last-interaction rule)
-//   - state layers: the on-color blended over the container at hover 0.08 /
-//     focus 0.10 / pressed 0.12 (theme.state); over a transparent container
-//     (outlined/text) the layer is the on-color AT that alpha (lerping from
-//     transparent black would double-scale the RGB in the src-over blend)
+//     the hover (upstream's last-interaction rule — Button.kt:155 asks the
+//     interaction source for its LAST entry, presses included, so
+//     isPressed() wins over isHovered() in the elev switch below)
+//   - indication: upstream delegates to Surface's clickable indication —
+//     `ripple(focusRingShape = shape)` (Surface.kt:253-259), BOUNDED and
+//     clipped to the current shape — wired via ui.interactions.Tracker +
+//     ui.state_layer.StateLayer + ui.ripple.Ripples. The animated layer
+//     carries hover 0.08 / focus 0.10 (theme.state); the pressed state is
+//     the expanding ripple ink (pressed alpha 0.12), NOT a static layer —
+//     over a transparent container (outlined/text) the layer is the
+//     on-color AT that alpha (lerping from transparent black would
+//     double-scale the RGB in the src-over blend). The ripple clip uses
+//     the LIVE pressed/rest corner so the ink follows the shape morph.
 //   - input: a drag past the touch slop (ui/gestures.SLOP, raw coords) is a
-//     scroll, not a press — the pressed state is cancelled and the move keeps
-//     bubbling to scrollable ancestors; outside_down cancels too
+//     scroll, not a press — the press interaction + ripple are cancelled
+//     and the move keeps bubbling to scrollable ancestors; outside_down
+//     cancels too. Enter/Space mint a synthetic key press and spawn a
+//     CENTERED bounded ripple (upstream's keyPress path).
 //   - layout: the content row mirrors in RTL (the leading icon moves to the
 //     end side); the children paint clipped to the button's bounds (a
 //     constrained button never lets label ink cross the container edge)
@@ -207,8 +217,20 @@ pub fn contentPadding(opts: ButtonOptions) EdgeInsets {
 const ButtonState = struct {
     opts: ButtonOptions,
     on_pressed: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The Compose interaction set (press/hover/focus entries, last-wins) —
+    /// drives the corner morph + elevation rule + state layer via
+    /// isPressed()/isHovered()/layerKind(); `node` marks dirty on every
+    /// mutation (replaces the old pressed/hovered bools + markDirty).
+    inter: ui.interactions.Tracker = .{},
+    /// The animated state layer (hover/focus ink; the pressed state is the
+    /// ripple's, per upstream's RippleAnimation owning it).
+    layer: ui.state_layer.StateLayer = .{},
+    /// Bounded ripples clipped to the current shape (upstream's
+    /// `ripple(focusRingShape = shape)` through Surface).
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's interaction id (0 = none) — pairs release/cancel
+    /// with the exact pressDown, so the matching ripple finishes.
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates — drag deltas are
     /// physical finger motion, immune to the content scrolling under the
     /// finger (PointerEvent.raw_x/raw_y doc).
@@ -307,8 +329,13 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
     const b = n.bounds;
     const d = dimsFor(s.opts.size);
     const vc = variantColors(t, s.opts.variant);
+    // No focus-gained vtable hook — poll the router (Tracker contract).
+    // The button never requestFocus()es on pointer down, so every focus
+    // entry is keyboard-provenance and visible to the state layer.
+    s.inter.setFocused(input.isFocused(n));
+    const pressed = s.inter.isPressed();
     // shape morph: pressed = the pressed corner (round and square alike)
-    const radius: f32 = if (s.pressed)
+    const radius: f32 = if (pressed)
         d.pressed_corner
     else if (s.opts.shape == .round)
         b.h / 2 // CornerFull = pill
@@ -317,13 +344,14 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
     // Elevation (upstream ButtonElevation state tables): filled/tonal are
     // flat except a Level-1 hover shadow (Hovered/HoverContainerElevation);
     // elevated rests at Level 1, lifts to Level 2 hovered, Level 1
-    // pressed/focused, 0 disabled. A press overrides the hover (upstream's
-    // last-interaction rule). Painted under the container so the state
-    // layer composites on top of it.
+    // pressed/focused, 0 disabled. Upstream reads the LAST interaction
+    // (presses included — Button.kt:155's interactions.lastOrNull()): a
+    // press always wins over an older hover, matching `!pressed` here.
+    // Painted under the container so the state layer composites on top of it.
     if (s.opts.enabled) {
         const elev: f32 = switch (s.opts.variant) {
-            .filled, .filled_tonal => if (s.hovered and !s.pressed) 1 else 0,
-            .elevated => if (s.hovered and !s.pressed) 3 else 1,
+            .filled, .filled_tonal => if (s.inter.isHovered() and !pressed) 1 else 0,
+            .elevated => if (s.inter.isHovered() and !pressed) 3 else 1,
             else => 0,
         };
         if (elev > 0) ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, radius, elev, t.colors.shadow);
@@ -333,31 +361,26 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, container);
     }
-    // state layer (enabled only): the on-color blended over the container.
-    // Over a transparent container (outlined/text) the layer is the on-color
-    // AT the state alpha — lerping from transparent black would scale the
-    // RGB by the alpha twice in the src-over blend.
-    if (s.opts.enabled) {
-        const alpha: f32 = if (s.pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            const layer = if (container & 0xFF == 0)
-                ui.paint.withAlphaScaled(vc.on, alpha)
-            else
-                theme_mod.stateLayer(container, vc.on, alpha);
-            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
-        }
-    }
-    // outline (outlined variant) — painted over the state layer
+    // outline (outlined variant) — upstream Surface draws the border into
+    // the surface, then the indication composites OVER it (Surface.kt:
+    // .surface(...) then .clickable(indication = ripple(...)))
     if (s.opts.variant == .outlined) {
         const oc = if (s.opts.enabled) vc.outline else vc.disabled_outline;
         ui.paint.strokeRRect(ctx, b.x, b.y, b.w, b.h, radius, d.outline_width, oc);
+    }
+    if (s.opts.enabled) {
+        // The animated state layer: hover 0.08 / focus 0.10 over the
+        // container AND the border; the pressed state is the ripple's ink,
+        // not a static layer (RippleAnimation owns it upstream).
+        s.layer.sync(&s.inter, vc.on);
+        if (s.layer.paintColor()) |layer| {
+            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, radius, layer);
+        }
+        // Bounded ripple at the pressed alpha, clipped to the CURRENT
+        // corner so the ink follows the pressed-shape morph.
+        s.ripples.color = vc.on;
+        s.ripples.pressed_alpha = t.state.pressed;
+        s.ripples.paint(ctx, n, .{ .rrect = radius });
     }
 }
 
@@ -366,19 +389,27 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
     if (!s.opts.enabled) return false;
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            // A second finger down replaces the press (the router could
+            // deliver one while a press is still captured): upstream's
+            // spawn finishes any live ripple; the tracker ends the stale
+            // press entry the same way.
+            s.inter.endPress();
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
             // Click = down + up on the same node (the router captured us).
             // A cancelled press (outside_down, or a drag past the touch
             // slop) must not fire on a later up.
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) {
+                s.inter.release(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             }
@@ -386,32 +417,35 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .move => {
             // A drag beyond the touch slop is a scroll, not a press: cancel
-            // the pressed state. The move is NOT claimed (return false) so
-            // it keeps bubbling to scrollable ancestors (scroll_util.zig).
-            if (s.pressed) {
+            // the press interaction + finish its ripple. The move is NOT
+            // claimed (return false) so it keeps bubbling to scrollable
+            // ancestors (scroll_util.zig).
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    s.inter.cancel(s.press_id);
+                    s.ripples.release(s.press_id, ev.time_ms); // upstream treats Cancel like Release
+                    s.press_id = 0;
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            if (s.press_id != 0) {
+                s.inter.cancel(s.press_id);
+                s.ripples.release(s.press_id, ev.time_ms);
+                s.press_id = 0;
+            }
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
@@ -420,12 +454,22 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
 }
 
 /// Keyboard activation (Phase 2c): Enter/Space press the focused button.
+/// Upstream's keyPress mints a press interaction + a CENTERED bounded
+/// ripple; Klaxon has no key-up events, so the press releases immediately
+/// (the ripple still expands + fades out on its own timeline).
 fn buttonOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            const b = n.bounds;
+            const cx = b.x + b.w / 2;
+            const cy = b.y + b.h / 2;
+            const pid = s.inter.pressDown(cx, cy);
+            s.ripples.spawn(pid, cx, cy, 0); // 0 = the timeline clock's now
+            s.inter.release(pid);
+            s.ripples.release(pid, 0);
             if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -435,6 +479,9 @@ fn buttonOnKey(n: *Node, ev: input.KeyEvent) bool {
 }
 
 fn buttonDeinit(n: *Node) void {
+    const s = stateOf(n);
+    s.layer.deinit();
+    s.ripples.deinit(); // drops the timeline ticker before the state frees
     input.releaseNode(n);
     n.allocator.destroy(stateOf(n));
 }
@@ -478,6 +525,17 @@ pub fn button(allocator: std.mem.Allocator, on_pressed: ?Callback, opts: ButtonO
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .on_pressed = on_pressed };
     node.state = s;
+    // Interaction machinery: the tracker + layer + ripples damage this node
+    // on every mutation/tick (init-time wiring per the integration contract).
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{
+        .hover = opts.theme.state.hover,
+        .focus = opts.theme.state.focus,
+        .pressed = opts.theme.state.pressed,
+        .drag = opts.theme.state.drag,
+    };
+    s.ripples.node = node;
     const t = opts.theme;
     const d = dimsFor(opts.size);
     const vc = variantColors(t, opts.variant);
@@ -577,10 +635,10 @@ test "button: press fires the callback; release outside does not; outside_down c
     const on_pointer = b.vtable.on_pointer.?;
     // down + up inside → fired
     _ = on_pointer(b, .{ .phase = .down, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
-    try std.testing.expect(stateOf(b).pressed);
+    try std.testing.expect(stateOf(b).inter.isPressed());
     _ = on_pointer(b, .{ .phase = .up, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     try std.testing.expectEqual(@as(u32, 1), count);
-    try std.testing.expect(!stateOf(b).pressed);
+    try std.testing.expect(!stateOf(b).inter.isPressed());
     // down inside, up outside → not fired
     _ = on_pointer(b, .{ .phase = .down, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     _ = on_pointer(b, .{ .phase = .up, .x = 500, .y = 20, .raw_x = 500, .raw_y = 20 });
@@ -588,30 +646,30 @@ test "button: press fires the callback; release outside does not; outside_down c
     // down, then the pointer goes down outside (capture held): the press is
     // cancelled and a later up must not fire
     _ = on_pointer(b, .{ .phase = .down, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
-    try std.testing.expect(stateOf(b).pressed);
+    try std.testing.expect(stateOf(b).inter.isPressed());
     _ = on_pointer(b, .{ .phase = .outside_down, .x = 500, .y = 20, .raw_x = 500, .raw_y = 20 });
-    try std.testing.expect(!stateOf(b).pressed);
+    try std.testing.expect(!stateOf(b).inter.isPressed());
     _ = on_pointer(b, .{ .phase = .up, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     try std.testing.expectEqual(@as(u32, 1), count);
     // a drag past the touch slop is a scroll: the press is cancelled and the
     // move is NOT claimed (bubbles to scrollable ancestors)
     _ = on_pointer(b, .{ .phase = .down, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
-    try std.testing.expect(stateOf(b).pressed);
+    try std.testing.expect(stateOf(b).inter.isPressed());
     try std.testing.expect(!on_pointer(b, .{ .phase = .move, .x = 50, .y = 40, .raw_x = 50, .raw_y = 40 })); // 20px > slop
-    try std.testing.expect(!stateOf(b).pressed);
+    try std.testing.expect(!stateOf(b).inter.isPressed());
     _ = on_pointer(b, .{ .phase = .up, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     try std.testing.expectEqual(@as(u32, 1), count);
     // a small move within the slop keeps the press
     _ = on_pointer(b, .{ .phase = .down, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     _ = on_pointer(b, .{ .phase = .move, .x = 53, .y = 23, .raw_x = 53, .raw_y = 23 }); // ~4px < slop
-    try std.testing.expect(stateOf(b).pressed);
+    try std.testing.expect(stateOf(b).inter.isPressed());
     _ = on_pointer(b, .{ .phase = .up, .x = 50, .y = 20, .raw_x = 50, .raw_y = 20 });
     try std.testing.expectEqual(@as(u32, 2), count);
     // hover notifications toggle the hovered state
     _ = on_pointer(b, .{ .phase = .enter, .x = 50, .y = 20 });
-    try std.testing.expect(stateOf(b).hovered);
+    try std.testing.expect(stateOf(b).inter.isHovered());
     _ = on_pointer(b, .{ .phase = .leave, .x = 50, .y = 20 });
-    try std.testing.expect(!stateOf(b).hovered);
+    try std.testing.expect(!stateOf(b).inter.isHovered());
 }
 
 test "button: icon-only buttons take their accessible name from a11y_label" {
@@ -658,8 +716,8 @@ test "button: disabled swallows pointer input and fires nothing" {
     try std.testing.expect(!on_pointer(b, .{ .phase = .up, .x = 50, .y = 20 }));
     try std.testing.expect(!on_pointer(b, .{ .phase = .enter, .x = 50, .y = 20 }));
     try std.testing.expectEqual(@as(u32, 0), count);
-    try std.testing.expect(!stateOf(b).pressed);
-    try std.testing.expect(!stateOf(b).hovered);
+    try std.testing.expect(!stateOf(b).inter.isPressed());
+    try std.testing.expect(!stateOf(b).inter.isHovered());
 }
 
 test "button: Enter/Space activate the focused button (keyboard)" {
@@ -735,10 +793,13 @@ test "golden: hover paints the 0.08 state layer over the container" {
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    try std.testing.expectEqual(
-        theme_mod.stateLayer(t.colors.primary, t.colors.on_primary, t.state.hover),
-        f.pixelAt(14, 30),
-    );
+    // the animated layer snaps to the full 0.08 without a timeline; the
+    // pixel is the on-color src-over'd at that alpha (≈ the stateLayer
+    // lerp, modulo rounding)
+    try golden.expectPixelApprox(f, 14, 30, golden.blendOver(
+        ui.paint.withAlphaScaled(t.colors.on_primary, t.state.hover),
+        t.colors.primary,
+    ));
 }
 
 test "golden: pressed morphs the round button to the pressed corner (8dp small)" {
@@ -753,15 +814,64 @@ test "golden: pressed morphs the round button to the pressed corner (8dp small)"
     var f1 = try r.readback(std.testing.allocator);
     try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f1.pixelAt(13, 13));
     f1.deinit();
-    // pressed (radius 8 + the 0.12 state layer): the corner is inside
+    // pressed (radius 8): the corner is inside. The pressed ink is the
+    // ripple, which only paints through the animation timeline — without
+    // one (ripple.zig's eval runs on the ticker) the press shows the
+    // morphed shape + bare container here.
     _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 50, .y = 30 });
     r.paint(b, 0xFFFFFFFF);
     var f2 = try r.readback(std.testing.allocator);
     defer f2.deinit();
-    try std.testing.expectEqual(
-        theme_mod.stateLayer(t.colors.primary, t.colors.on_primary, t.state.pressed),
-        f2.pixelAt(13, 13),
-    );
+    try std.testing.expectEqual(t.colors.primary, f2.pixelAt(13, 13));
+}
+
+test "golden: the press ripple expands from the touch point, clipped to the live corner" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const t = theme_mod.light;
+    const b = try button(std.testing.allocator, null, .{ .label = "OK", .theme = t });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 120, 60);
+    defer r.deinit();
+    b.layout(.{ .x = 10, .y = 10, .w = 100, .h = 40 });
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 50, .y = 30 }); // time_ms 0 = the clock's now
+    tl.tick(300); // past fadeIn (75ms) + the 225ms radius expansion
+    r.paint(b, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // fully open: on_primary @ 0.12 over primary, clipped to the PRESSED
+    // corner (8) — (15,15) sits deep inside it, (11,11) outside both
+    // corners (points ~1px off an AA edge are avoided intentionally)
+    const ink = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_primary, t.state.pressed), t.colors.primary);
+    try golden.expectPixelApprox(f, 14, 30, ink);
+    try golden.expectPixelApprox(f, 15, 15, ink);
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(11, 11));
+}
+
+test "golden: Enter mints a centered bounded ripple (keyPress)" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const t = theme_mod.light;
+    const b = try button(std.testing.allocator, null, .{ .label = "OK", .theme = t });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 120, 60);
+    defer r.deinit();
+    b.layout(.{ .x = 10, .y = 10, .w = 100, .h = 40 });
+    _ = b.vtable.on_key.?(b, .{ .kind = .key_down, .key = .enter });
+    tl.tick(225); // expanded + still fully inked (release waits out fadeIn)
+    r.paint(b, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // no press is held → the clip is the RESTING 20px corner; the ink is
+    // centered on the bounds and covers the whole pill
+    const ink = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_primary, t.state.pressed), t.colors.primary);
+    try golden.expectPixelApprox(f, 14, 30, ink);
+    try golden.expectPixelApprox(f, 96, 44, ink);
+    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(11, 11)); // outside the corner
 }
 
 test "golden: disabled filled button paints the OnSurface@0.10 container" {
