@@ -139,6 +139,8 @@ struct KxA11yNode {
     int checked = 0;                // 0 = null, 1 = false, 2 = true
     bool focusable = false;
     int x = 0, y = 0, w = 0, h = 0; // rect in window space (mapRectToRoot)
+    bool has_vrange = false;
+    double vmin = 0.0, vmax = 100.0, vnow = 0.0;
     std::string role;
     std::string label;
     std::string value;
@@ -187,6 +189,14 @@ static int parseCoord(const char* s, size_t len) {
     return (int)lroundf(strtof(buf, nullptr));
 }
 
+static double parseF64(const char* s, size_t len) {
+    char buf[48];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    return strtod(buf, nullptr);
+}
+
 // Parse the flat dump into a fresh snapshot (not yet installed). One line
 // per visible semantic node; parent links resolve with a depth stack, and
 // each parent records its children for navigation.
@@ -197,11 +207,11 @@ static std::vector<KxA11yNode> parseDump(const char* dump) {
     while (p && *p) {
         const char* eol = p;
         while (*eol && *eol != '\n') eol++;
-        const char* fields[11];
-        size_t lens[11];
+        const char* fields[14];
+        size_t lens[14];
         int nfields = 0;
         const char* s = p;
-        while (s < eol && nfields < 11) {
+        while (s < eol && nfields < 14) {
             const char* bar = s;
             while (bar < eol && *bar != '|') bar++;
             fields[nfields] = s;
@@ -223,6 +233,12 @@ static std::vector<KxA11yNode> parseDump(const char* dump) {
                 node.y = parseCoord(fields[8], lens[8]);
                 node.w = parseCoord(fields[9], lens[9]);
                 node.h = parseCoord(fields[10], lens[10]);
+            }
+            if (nfields >= 14 && lens[11] > 0 && lens[12] > 0 && lens[13] > 0) {
+                node.has_vrange = true;
+                node.vmin = parseF64(fields[11], lens[11]);
+                node.vmax = parseF64(fields[12], lens[12]);
+                node.vnow = parseF64(fields[13], lens[13]);
             }
             while ((int)stack.size() > node.depth) stack.pop_back();
             node.parent = stack.empty() ? -1 : stack.back();
@@ -295,6 +311,9 @@ static bool isToggleRole(const std::string& r) {
 }
 static bool isValueRole(const std::string& r) {
     return r == "text_field" || r == "slider" || r == "progress" || r == "scrollbar";
+}
+static bool isRangeValueRole(const std::string& r) {
+    return r == "slider" || r == "progress" || r == "scrollbar";
 }
 static bool isSelectionItemRole(const std::string& r) {
     return r == "radio" || r == "tab" || r == "list_item";
@@ -711,6 +730,7 @@ class KxUiaNodeProvider final : public IRawElementProviderSimple,
                                 public IInvokeProvider,
                                 public IToggleProvider,
                                 public IValueProvider,
+                                public IRangeValueProvider,
                                 public ISelectionItemProvider,
                                 public ITextProvider {
 public:
@@ -736,6 +756,8 @@ public:
             *ppv = static_cast<IToggleProvider*>(this);
         } else if (riid == __uuidof(IValueProvider) && hasRole(isValueRole)) {
             *ppv = static_cast<IValueProvider*>(this);
+        } else if (riid == __uuidof(IRangeValueProvider) && hasRole(isRangeValueRole)) {
+            *ppv = static_cast<IRangeValueProvider*>(this);
         } else if (riid == __uuidof(ISelectionItemProvider) && hasRole(isSelectionItemRole)) {
             *ppv = static_cast<ISelectionItemProvider*>(this);
         } else if (riid == __uuidof(ITextProvider) && hasRole(isTextRole)) {
@@ -770,6 +792,8 @@ public:
         else if (patternId == UIA_TogglePatternId && hasRole(isToggleRole))
             match = true;
         else if (patternId == UIA_ValuePatternId && hasRole(isValueRole))
+            match = true;
+        else if (patternId == UIA_RangeValuePatternId && hasRole(isRangeValueRole))
             match = true;
         else if (patternId == UIA_SelectionItemPatternId && hasRole(isSelectionItemRole))
             match = true;
@@ -961,6 +985,49 @@ public:
     HRESULT STDMETHODCALLTYPE get_IsReadOnly(BOOL* pRetVal) override {
         if (!pRetVal) return E_POINTER;
         *pRetVal = TRUE;
+        return S_OK;
+    }
+
+    // --- IRangeValueProvider ---
+    HRESULT STDMETHODCALLTYPE SetValue(double val) override {
+        (void)val;
+        return E_FAIL;
+    }
+    HRESULT STDMETHODCALLTYPE get_Value(double* pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        KxA11yNode n;
+        if (!snapshotCopy(m_ptr, &n)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *pRetVal = n.has_vrange ? n.vnow : strtod(n.value.c_str(), nullptr);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Maximum(double* pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        KxA11yNode n;
+        if (!snapshotCopy(m_ptr, &n)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *pRetVal = n.has_vrange ? n.vmax : 100.0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_Minimum(double* pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        KxA11yNode n;
+        if (!snapshotCopy(m_ptr, &n)) return UIA_E_ELEMENTNOTAVAILABLE;
+        *pRetVal = n.has_vrange ? n.vmin : 0.0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_LargeChange(double* pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        KxA11yNode n;
+        if (!snapshotCopy(m_ptr, &n)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const double span = n.has_vrange ? (n.vmax - n.vmin) : 100.0;
+        *pRetVal = span * 0.1;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_SmallChange(double* pRetVal) override {
+        if (!pRetVal) return E_POINTER;
+        KxA11yNode n;
+        if (!snapshotCopy(m_ptr, &n)) return UIA_E_ELEMENTNOTAVAILABLE;
+        const double span = n.has_vrange ? (n.vmax - n.vmin) : 100.0;
+        *pRetVal = span * 0.01;
         return S_OK;
     }
 

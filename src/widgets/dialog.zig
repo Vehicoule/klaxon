@@ -126,6 +126,8 @@ const DialogState = struct {
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
     i18n: ?*i18n_mod.I18n = null,
+    saved_focus: ?*Node = null,
+    focus_saved: bool = false,
 };
 
 const Callback = ui.state.Callback;
@@ -468,7 +470,9 @@ fn applyAlpha(n: *Node, s: *DialogState, alpha: f32, scrim_alpha: f32) void {
     s.alpha = alpha;
     scrimStateOf(s.scrim).alpha = scrim_alpha;
     s.scrim.setVisible(scrim_alpha > 0.001);
-    s.panel.setVisible(alpha > 0.001);
+    const open = alpha > 0.001;
+    s.panel.setVisible(open);
+    ui.semantics.syncModalFocus(s.panel, open, &s.saved_focus, &s.focus_saved);
     s.panel.markDirty();
     s.scrim.markDirty();
     _ = n;
@@ -646,7 +650,11 @@ fn attachDialogSemantics(n: *Node) void {
     const s = stateOf(n);
     ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close dialog"), .actions = ui.semantics.Actions.initOne(.activate) });
     // full-screen is a plain dialog (assertive alert is the basic variant's)
-    ui.semantics.attach(s.panel, .{ .role = if (s.opts.variant == .full_screen) .dialog else .alert, .label = s.opts.label orelse i18n_mod.tr("Dialog") });
+    ui.semantics.attach(s.panel, .{
+        .role = if (s.opts.variant == .full_screen) .dialog else .alert,
+        .label = s.opts.label orelse i18n_mod.tr("Dialog"),
+        .modal = true,
+    });
     if (s.close_btn) |b| {
         if (b.semantics) |sem| sem.label = i18n_mod.tr("Close dialog");
     }

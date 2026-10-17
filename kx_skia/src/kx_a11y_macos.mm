@@ -44,6 +44,19 @@ extern "C" {
     // (ptr = Node pointer in decimal, checked = 0/1/2; both ignored here).
     char* kx_a11y_dump_tree(void* root_node);
     void kx_a11y_free_string(char* s);
+    void kx_a11y_focus_node(void* root_node, uint64_t ptr);
+    void kx_a11y_activate_node(void* root_node, uint64_t ptr);
+}
+
+static uint64_t g_focused_ptr = 0;
+static void* g_zig_root_node = NULL;
+
+static NSWindow* activeWindow(void) {
+    NSWindow* win = [NSApp mainWindow];
+    if (!win && [[NSApp windows] count] > 0) {
+        win = [[NSApp windows] objectAtIndex:0];
+    }
+    return win;
 }
 
 // --- KXA11yElement: wraps a flat semantic node description ---
@@ -54,6 +67,8 @@ extern "C" {
     NSString* _label;
     NSString* _value;
     BOOL _focusable;
+    uint64_t _ptr;
+    int _checked;
     NSRect _frame;
     NSMutableArray<KXA11yElement*>* _children;
     KXA11yElement* _parent;
@@ -62,13 +77,15 @@ extern "C" {
                        label:(NSString*)label
                        value:(NSString*)value
                    focusable:(BOOL)focusable
+                         ptr:(uint64_t)ptr
+                     checked:(int)checked
                        frame:(NSRect)frame;
 @end
 
 @implementation KXA11yElement
 
 - (instancetype)initWithRole:(NSString*)role label:(NSString*)label value:(NSString*)value
-                   focusable:(BOOL)focusable frame:(NSRect)frame {
+                   focusable:(BOOL)focusable ptr:(uint64_t)ptr checked:(int)checked frame:(NSRect)frame {
     self = [super init];
     if (self) {
         // MRC (-fno-objc-arc): copy the strings + alloc the array — the
@@ -77,6 +94,8 @@ extern "C" {
         _label = [label copy];
         _value = [value copy];
         _focusable = focusable;
+        _ptr = ptr;
+        _checked = checked;
         _frame = frame;
         _children = [[NSMutableArray alloc] init];
     }
@@ -92,10 +111,46 @@ extern "C" {
 }
 
 - (BOOL)isAccessibilityElement { return YES; }
-- (NSRect)accessibilityFrame { return _frame; }
-- (id)accessibilityParent { return _parent ?: [NSApp mainWindow]; }
+
+- (NSRect)accessibilityFrame {
+    // Convert top-left window coordinates (_frame) into AppKit bottom-left
+    // screen coordinates when a window is attached.
+    NSWindow* win = activeWindow();
+    NSView* cv = win ? [win contentView] : nil;
+    if (win && cv) {
+        CGFloat vh = cv.bounds.size.height;
+        NSRect viewRect = NSMakeRect(
+            _frame.origin.x,
+            vh - _frame.origin.y - _frame.size.height,
+            _frame.size.width,
+            _frame.size.height
+        );
+        NSRect winRect = [cv convertRect:viewRect toView:nil];
+        return [win convertRectToScreen:winRect];
+    }
+    return _frame;
+}
+
+- (id)accessibilityParent {
+    if (_parent) return _parent;
+    NSWindow* win = activeWindow();
+    return (win && [win contentView]) ? (id)[win contentView] : (id)win;
+}
+
 - (NSArray*)accessibilityChildren { return _children; }
-- (BOOL)isAccessibilityFocused { return NO; } // v1: focus sync is logged only
+- (BOOL)isAccessibilityFocused { return _ptr != 0 && _ptr == g_focused_ptr; }
+
+- (void)setAccessibilityFocused:(BOOL)focused {
+    if (focused && g_zig_root_node && _ptr != 0) {
+        kx_a11y_focus_node(g_zig_root_node, _ptr);
+    }
+}
+
+- (BOOL)accessibilityPerformPress {
+    if (!g_zig_root_node || _ptr == 0) return NO;
+    kx_a11y_activate_node(g_zig_root_node, _ptr);
+    return YES;
+}
 
 - (NSString*)accessibilityRole {
     // Map Klaxon role → NSAccessibility role.
@@ -122,38 +177,62 @@ extern "C" {
 }
 
 - (NSString*)accessibilityLabel { return _label; }
-- (NSString*)accessibilityValue { return _value; }
+- (id)accessibilityValue {
+    if (_value && [_value length] > 0) return _value;
+    if (_checked != 0 &&
+        ([_role isEqualToString:@"toggle"] ||
+         [_role isEqualToString:@"checkbox"] ||
+         [_role isEqualToString:@"radio"] ||
+         [_role isEqualToString:@"tab"])) {
+        return @(_checked == 2 ? 1 : 0);
+    }
+    return _value;
+}
 
 @end
 
 // --- Bridge state ---
 static KXA11yElement* g_root = nil;
-static void* g_zig_root_node = NULL;
+
+static KXA11yElement* findElementByPtr(KXA11yElement* el, uint64_t ptr) {
+    if (!el || ptr == 0) return nil;
+    if (el->_ptr == ptr) return el;
+    for (KXA11yElement* child in el->_children) {
+        KXA11yElement* found = findElementByPtr(child, ptr);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void attachRootToWindow(void) {
+    NSWindow* win = activeWindow();
+    NSView* cv = win ? [win contentView] : nil;
+    if (cv) {
+        if (g_root) {
+            [cv setAccessibilityChildren:@[g_root]];
+        } else {
+            [cv setAccessibilityChildren:nil];
+        }
+    }
+}
 
 // Parse the flat tree dump and build the NSAccessibility hierarchy.
 static KXA11yElement* buildHierarchy(const char* dump) {
     if (!dump) return nil;
-    // v1: create a single root group (full hierarchy rebuild is a follow-up).
-    // The dump format is "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
-    // per line. ptr/checked are parsed for format compatibility and ignored
-    // — this bridge keys off the x/y/w/h rects.
+    // The dump format is "depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow\n"
     KXA11yElement* root = [[KXA11yElement alloc] initWithRole:@"group"
                                                         label:@"Klaxon"
                                                         value:nil
                                                     focusable:NO
+                                                          ptr:0
+                                                      checked:0
                                                         frame:NSMakeRect(0, 0, 800, 600)];
-    // Build the real hierarchy from the DFS dump: depth-stack — stack[d]
-    // is the element most recently seen at depth d, i.e. the parent of the
-    // next depth-(d+1) element. Manual split — sscanf's [^|] scansets
-    // reject EMPTY fields, so a control with no label used to vanish from
-    // VoiceOver entirely.
     KXA11yElement* stack[128];
     for (int i = 0; i < 128; i++) stack[i] = nil;
     const char* p = dump;
     while (*p) {
         const char* eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        // Fields are sanitized ≤512B each; 2K covers an 11-field line.
         char line[2048];
         if (len >= sizeof(line)) len = sizeof(line) - 1;
         memcpy(line, p, len);
@@ -174,6 +253,8 @@ static KXA11yElement* buildHierarchy(const char* dump) {
             NSString* label = fields[2][0] ? [NSString stringWithUTF8String:fields[2]] : nil;
             NSString* value = fields[3][0] ? [NSString stringWithUTF8String:fields[3]] : nil;
             const int focusable = atoi(fields[4]);
+            const uint64_t ptr = strtoull(fields[5], NULL, 10);
+            const int checked = atoi(fields[6]);
             const float x = strtof(fields[7], NULL);
             const float y = strtof(fields[8], NULL);
             const float w = strtof(fields[9], NULL);
@@ -182,6 +263,8 @@ static KXA11yElement* buildHierarchy(const char* dump) {
                                                                label:label
                                                                value:value
                                                           focusable:(BOOL)focusable
+                                                                 ptr:ptr
+                                                             checked:checked
                                                               frame:NSMakeRect(x, y, w, h)];
             // Parent = nearest element on the stack above this depth (the
             // dump's depth-0 root itself attaches under the synthetic root).
@@ -204,48 +287,70 @@ static KXA11yElement* buildHierarchy(const char* dump) {
     return root;
 }
 
+static void rebuildFromZig(void) {
+    if (!g_zig_root_node) return;
+    char* dump = kx_a11y_dump_tree(g_zig_root_node);
+    if (dump) {
+        @autoreleasepool {
+            KXA11yElement* new_root = buildHierarchy(dump);
+            if (new_root) {
+                [g_root release]; // MRC: drop the old hierarchy
+                g_root = new_root;
+                attachRootToWindow();
+            }
+        }
+        kx_a11y_free_string(dump);
+    }
+}
+
 // Bridge event callback (called from Zig via setBridgeC).
 static void a11y_bridge_callback(void* userdata, KxBridgeEventC event) {
     (void)userdata;
-    (void)event.node_id;
     switch (event.kind) {
         case KX_A11Y_TREE_DIRTY: {
-            // Rebuild the hierarchy from the semantic tree dump.
-            if (g_zig_root_node) {
-                char* dump = kx_a11y_dump_tree(g_zig_root_node);
-                if (dump) {
-                    @autoreleasepool {
-                        KXA11yElement* new_root = buildHierarchy(dump);
-                        if (new_root) {
-                            [g_root release]; // MRC: drop the old hierarchy
-                            g_root = new_root;
-                        }
-                    }
-                    kx_a11y_free_string(dump);
+            rebuildFromZig();
+            break;
+        }
+        case KX_A11Y_FOCUS_CHANGED: {
+            g_focused_ptr = event.node_id;
+            @autoreleasepool {
+                KXA11yElement* el = findElementByPtr(g_root, event.node_id);
+                id target = el ? (id)el : (id)activeWindow();
+                if (target) {
+                    NSAccessibilityPostNotification(target, NSAccessibilityFocusedUIElementChangedNotification);
                 }
             }
             break;
         }
-        case KX_A11Y_FOCUS_CHANGED:
-            // v1: logged only (NSAccessibility focus sync is a follow-up).
-            break;
         case KX_A11Y_ANNOUNCE: {
             if (event.text && event.text_len > 0) {
                 NSString* msg = [[NSString alloc] initWithBytes:event.text
                                                           length:event.text_len
                                                         encoding:NSUTF8StringEncoding];
                 if (msg) {
-                    NSDictionary* info = @{
-                        NSAccessibilityAnnouncementKey: msg,
-                        NSAccessibilityPriorityKey: @(event.region == 2 ? 10 : 5) // assertive=high
-                    };
-                    NSAccessibilityPostNotificationWithUserInfo([NSApp mainWindow], NSAccessibilityAnnouncementRequestedNotification, info);
+                    NSWindow* win = activeWindow();
+                    if (win) {
+                        NSDictionary* info = @{
+                            NSAccessibilityAnnouncementKey: msg,
+                            NSAccessibilityPriorityKey: @(event.region == 2 ? 10 : 5) // assertive=high
+                        };
+                        NSAccessibilityPostNotificationWithUserInfo(win, NSAccessibilityAnnouncementRequestedNotification, info);
+                    }
+                    [msg release]; // MRC: balance alloc/initWithBytes
                 }
             }
             break;
         }
-        case KX_A11Y_CONTROL_CHANGED:
+        case KX_A11Y_CONTROL_CHANGED: {
+            rebuildFromZig();
+            @autoreleasepool {
+                KXA11yElement* el = findElementByPtr(g_root, event.node_id);
+                if (el) {
+                    NSAccessibilityPostNotification(el, NSAccessibilityValueChangedNotification);
+                }
+            }
             break;
+        }
     }
 }
 
@@ -256,16 +361,20 @@ extern "C" {
 /// (used to dump the semantic tree on tree_dirty).
 void kx_a11y_init(void* root_node) {
     g_zig_root_node = root_node;
+    g_focused_ptr = 0;
     // Register the C bridge callback with the Zig semantics module.
     kx_a11y_set_bridge(a11y_bridge_callback, NULL);
-    // Register the app as an accessibility client.
+    // Register the app as an accessibility client and populate initial tree.
     [NSApplication sharedApplication];
+    rebuildFromZig();
 }
 
 /// Shut down the bridge.
 void kx_a11y_shutdown(void) {
     [g_root release];
     g_root = nil;
+    g_focused_ptr = 0;
+    attachRootToWindow();
     g_zig_root_node = NULL;
     kx_a11y_set_bridge(NULL, NULL);
 }

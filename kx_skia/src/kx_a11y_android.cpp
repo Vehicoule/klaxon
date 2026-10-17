@@ -78,10 +78,13 @@ void kx_a11y_activate_node(void* root, uint64_t ptr);
 struct KxA11yNode {
     int depth = 0;
     int parent = -1;   // index of the parent node, -1 = top level
+    std::vector<int> children; // indices of direct child nodes
     uint64_t ptr = 0;  // Node pointer — the provider's virtual-id key
     int checked = 0;   // 0 = null, 1 = false, 2 = true
     bool focusable = false;
     int x = 0, y = 0, w = 0, h = 0; // rect in window space (mapRectToRoot)
+    bool has_range = false;
+    float vmin = 0.0f, vmax = 100.0f, vnow = 0.0f;
     std::string role;
     std::string label;
     std::string value;
@@ -97,6 +100,12 @@ static jmethodID g_mid_announce = nullptr;
 static jmethodID g_mid_focus_changed = nullptr;
 
 static void* g_zig_root_node = nullptr;
+static uint32_t g_action_event_type = 0;
+
+enum {
+    AT_ACTION_FOCUS = 1,
+    AT_ACTION_ACTIVATE = 2,
+};
 
 // --- Dump parsing ---
 
@@ -115,6 +124,18 @@ static unsigned long long parseU64(const char* s, size_t len) {
     return v;
 }
 
+static float parseFloatField(const char* s, size_t len, bool* ok) {
+    if (len == 0) { *ok = false; return 0.0f; }
+    char buf[32];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    char* end = nullptr;
+    float v = strtof(buf, &end);
+    *ok = (end && end != buf);
+    return v;
+}
+
 // Bounds may be fractional: the dump carries mapRectToRoot's f32 rects in
 // decimal notation ("10.5"). Parse as float and round to nearest — the
 // digit-only parseInt would read the '.' as a digit and turn 10.5 into 985.
@@ -127,9 +148,8 @@ static int parseCoord(const char* s, size_t len) {
 }
 
 // Parse the flat dump — one line per visible semantic node:
-//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h\n"
-// Parent links are resolved with a depth stack, the same algorithm as the
-// wasm mirror (web/kx_a11y.js). The result replaces the node cache.
+//   "depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow\n"
+// Parent/child links are resolved with a depth stack.
 static void parseDump(const char* dump) {
     std::vector<KxA11yNode> nodes;
     std::vector<int> stack; // stack[d] = index of the node at depth d on the current path
@@ -137,11 +157,11 @@ static void parseDump(const char* dump) {
     while (p && *p) {
         const char* eol = p;
         while (*eol && *eol != '\n') eol++;
-        const char* fields[11];
-        size_t lens[11];
+        const char* fields[14];
+        size_t lens[14];
         int nfields = 0;
         const char* s = p;
-        while (s < eol && nfields < 11) {
+        while (s < eol && nfields < 14) {
             const char* bar = s;
             while (bar < eol && *bar != '|') bar++;
             fields[nfields] = s;
@@ -164,9 +184,25 @@ static void parseDump(const char* dump) {
                 node.w = parseCoord(fields[9], lens[9]);
                 node.h = parseCoord(fields[10], lens[10]);
             }
+            if (nfields >= 14) {
+                bool ok1 = false, ok2 = false, ok3 = false;
+                float fmin = parseFloatField(fields[11], lens[11], &ok1);
+                float fmax = parseFloatField(fields[12], lens[12], &ok2);
+                float fnow = parseFloatField(fields[13], lens[13], &ok3);
+                if (ok1 && ok2 && ok3) {
+                    node.has_range = true;
+                    node.vmin = fmin;
+                    node.vmax = fmax;
+                    node.vnow = fnow;
+                }
+            }
             while ((int)stack.size() > node.depth) stack.pop_back();
             node.parent = stack.empty() ? -1 : stack.back();
-            stack.push_back((int)nodes.size());
+            int my_idx = (int)nodes.size();
+            if (node.parent >= 0 && (size_t)node.parent < nodes.size()) {
+                nodes[(size_t)node.parent].children.push_back(my_idx);
+            }
+            stack.push_back(my_idx);
             nodes.push_back(std::move(node));
         }
         p = (*eol == '\n') ? eol + 1 : eol;
@@ -280,6 +316,10 @@ extern "C" {
 /// KxAccessibilityDelegate to SDLActivity.mSurface over JNI.
 void kx_a11y_init(void* root_node) {
     g_zig_root_node = root_node;
+    if (!g_action_event_type) {
+        const Uint32 t = SDL_RegisterEvents(1);
+        if (t != (Uint32)-1) g_action_event_type = t;
+    }
     // Register the C bridge callback with the Zig semantics module.
     kx_a11y_set_bridge(a11yBridgeCallback, nullptr);
     if (g_delegate) return; // already initialized
@@ -333,6 +373,14 @@ void kx_a11y_init(void* root_node) {
     env->DeleteLocalRef(delegate);
     env->DeleteLocalRef(delegate_class);
     env->DeleteLocalRef(activity);
+    if (g_zig_root_node) {
+        char* dump = kx_a11y_dump_tree(g_zig_root_node);
+        if (dump) {
+            parseDump(dump);
+            kx_a11y_free_string(dump);
+        }
+        if (g_mid_tree_dirty) env->CallVoidMethod(g_delegate, g_mid_tree_dirty);
+    }
     clearException(env, "init");
     KX_LOGI("kx_a11y_init: TalkBack delegate attached");
 }
@@ -375,7 +423,22 @@ void* kx_a11y_root_element(void) {
     return g_delegate;
 }
 
+uint32_t kx_a11y_action_event_type(void) {
+    return g_action_event_type;
+}
+
 } // extern "C"
+
+static void pushAtAction(int32_t code, uint64_t ptr) {
+    if (!g_action_event_type || !g_zig_root_node || !ptr) return;
+    SDL_Event ev;
+    SDL_zero(ev);
+    ev.type = g_action_event_type;
+    ev.user.code = code;
+    ev.user.data1 = g_zig_root_node;
+    ev.user.data2 = reinterpret_cast<void*>((uintptr_t)ptr);
+    SDL_PushEvent(&ev);
+}
 
 // --- Node cache pull API (Java -> native, called by KxAccessibilityDelegate
 // on the UI thread; virtualDescendantId = the dump index) ---
@@ -402,6 +465,20 @@ JNIEXPORT jint JNICALL KX_JNI(nativeGetNodeParent)(JNIEnv*, jclass, jint index) 
     std::lock_guard<std::mutex> lock(g_nodes_mutex);
     if (index < 0 || (size_t)index >= g_nodes.size()) return -1;
     return g_nodes[(size_t)index].parent;
+}
+
+JNIEXPORT jint JNICALL KX_JNI(nativeGetNodeChildCount)(JNIEnv*, jclass, jint index) {
+    std::lock_guard<std::mutex> lock(g_nodes_mutex);
+    if (index < 0 || (size_t)index >= g_nodes.size()) return 0;
+    return (jint)g_nodes[(size_t)index].children.size();
+}
+
+JNIEXPORT jint JNICALL KX_JNI(nativeGetNodeChildAt)(JNIEnv*, jclass, jint index, jint child_idx) {
+    std::lock_guard<std::mutex> lock(g_nodes_mutex);
+    if (index < 0 || (size_t)index >= g_nodes.size()) return -1;
+    const auto& kids = g_nodes[(size_t)index].children;
+    if (child_idx < 0 || (size_t)child_idx >= kids.size()) return -1;
+    return (jint)kids[(size_t)child_idx];
 }
 
 JNIEXPORT jlong JNICALL KX_JNI(nativeGetNodePtr)(JNIEnv*, jclass, jint index) {
@@ -452,18 +529,31 @@ JNIEXPORT jboolean JNICALL KX_JNI(nativeGetNodeBounds)(JNIEnv* env, jclass, jint
     return JNI_TRUE;
 }
 
-// TalkBack double-tap: activate the node in Zig — a real click through the
-// input router at the node's visual center (kx_a11y_activate_node, shared
-// with the iOS bridge). v1 calls straight into Zig from the UI thread —
-// see the file header.
-JNIEXPORT void JNICALL KX_JNI(nativeActivate)(JNIEnv*, jclass, jlong ptr) {
-    if (ptr && g_zig_root_node) kx_a11y_activate_node(g_zig_root_node, (uint64_t)ptr);
+// Numeric value range: out[0..2] = vmin, vmax, vnow.
+JNIEXPORT jboolean JNICALL KX_JNI(nativeGetNodeRange)(JNIEnv* env, jclass, jint index, jfloatArray out) {
+    if (!out || env->GetArrayLength(out) < 3) return JNI_FALSE;
+    jfloat vals[3] = { 0.0f, 100.0f, 0.0f };
+    {
+        std::lock_guard<std::mutex> lock(g_nodes_mutex);
+        if (index < 0 || (size_t)index >= g_nodes.size()) return JNI_FALSE;
+        const KxA11yNode& node = g_nodes[(size_t)index];
+        if (!node.has_range) return JNI_FALSE;
+        vals[0] = node.vmin;
+        vals[1] = node.vmax;
+        vals[2] = node.vnow;
+    }
+    env->SetFloatArrayRegion(out, 0, 3, vals);
+    return JNI_TRUE;
 }
 
-// TalkBack focus action: move the Zig keyboard focus to the node
-// (kx_a11y_focus_node, shared with the iOS bridge).
+// TalkBack double-tap: marshal activation to the SDL render thread.
+JNIEXPORT void JNICALL KX_JNI(nativeActivate)(JNIEnv*, jclass, jlong ptr) {
+    pushAtAction(AT_ACTION_ACTIVATE, (uint64_t)ptr);
+}
+
+// TalkBack focus action: marshal focus change to the SDL render thread.
 JNIEXPORT void JNICALL KX_JNI(nativeFocus)(JNIEnv*, jclass, jlong ptr) {
-    if (ptr && g_zig_root_node) kx_a11y_focus_node(g_zig_root_node, (uint64_t)ptr);
+    pushAtAction(AT_ACTION_FOCUS, (uint64_t)ptr);
 }
 
 } // extern "C"

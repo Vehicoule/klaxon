@@ -92,6 +92,8 @@ const SideSheetState = struct {
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
     i18n: ?*i18n_mod.I18n = null,
+    saved_focus: ?*Node = null,
+    focus_saved: bool = false,
 };
 
 const Callback = ui.state.Callback;
@@ -196,8 +198,7 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
         const bl: f32 = if (right_anchored) corner else 0;
         // Modal side sheet = 1dp — corner radii are one-sided but the rrect
         // shadow approximation is indistinguishable at this elevation.
-        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 1,
-            t.colors.shadow);
+        ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner, 1, t.colors.shadow);
         ui.paint.fillRRectCorners(ctx, b.x, b.y, b.w, b.h, tl, tr, br, bl, t.colors.surface_container_low);
     } else {
         // standard: Surface, CornerNone (flush to the edge)
@@ -440,7 +441,11 @@ fn sheetDeinit(n: *Node) void {
 fn attachSheetSemantics(n: *Node) void {
     const s = stateOf(n);
     ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close sheet"), .actions = ui.semantics.Actions.initOne(.activate) });
-    ui.semantics.attach(s.panel, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Side sheet") });
+    ui.semantics.attach(s.panel, .{
+        .role = .group,
+        .label = s.opts.label orelse i18n_mod.tr("Side sheet"),
+        .modal = s.opts.modal,
+    });
 }
 
 fn sheetLocaleCb(userdata: ?*anyopaque) void {
@@ -488,7 +493,11 @@ fn applyProgress(n: *Node, s: *SideSheetState, progress: f32, scrim_alpha: f32) 
     // over sibling content). Hide the subtree outright: a closed sheet
     // paints nothing.
     panelStateOf(s.panel).offset_x = hideSign(s.opts) * (s.panel_w * (1 - progress));
-    s.panel.setVisible(progress > 0.001);
+    const open = progress > 0.001;
+    s.panel.setVisible(open);
+    if (s.opts.modal) {
+        ui.semantics.syncModalFocus(s.panel, open, &s.saved_focus, &s.focus_saved);
+    }
     markInternalsDirty(n, s);
 }
 

@@ -154,15 +154,18 @@ static NSMutableArray* g_elements = nil; // KXUIAccessibilityElement (flat list)
     else if ([_role isEqualToString:@"radio"]) t = UIAccessibilityTraitButton;
     else if ([_role isEqualToString:@"slider"]) t = UIAccessibilityTraitAdjustable;
     else if ([_role isEqualToString:@"progress"]) t = UIAccessibilityTraitUpdatesFrequently;
-    else if ([_role isEqualToString:@"list"]) t = UIAccessibilityTraitButton;
     else if ([_role isEqualToString:@"list_item"]) t = UIAccessibilityTraitButton;
-    else if ([_role isEqualToString:@"menu"]) t = UIAccessibilityTraitButton;
     else if ([_role isEqualToString:@"menu_item"]) t = UIAccessibilityTraitButton;
     else if ([_role isEqualToString:@"tab"]) t = UIAccessibilityTraitButton;
-    // text_field: no dedicated trait — the label + value carry it.
-    // Selected state (list items, checked = 2).
+    // list, menu, group, dialog, text_field: no button trait on containers.
+    // Selected state when checked == 2.
     if (_checked == 2 &&
-        ([_role isEqualToString:@"list"] || [_role isEqualToString:@"list_item"])) {
+        ([_role isEqualToString:@"list_item"] ||
+         [_role isEqualToString:@"menu_item"] ||
+         [_role isEqualToString:@"tab"] ||
+         [_role isEqualToString:@"toggle"] ||
+         [_role isEqualToString:@"checkbox"] ||
+         [_role isEqualToString:@"radio"])) {
         t |= UIAccessibilityTraitSelected;
     }
     return t;
@@ -235,19 +238,29 @@ static void rebuildElements(const char* dump) {
         copyField(fields[8], lens[8], f_y, sizeof f_y);
         copyField(fields[9], lens[9], f_w, sizeof f_w);
         copyField(fields[10], lens[10], f_h, sizeof f_h);
-        (void)f_depth; // depth: the iOS bridge keeps a flat list (v1)
-        KXUIAccessibilityElement* el = [[KXUIAccessibilityElement alloc]
-            initWithRole:[NSString stringWithUTF8String:role]
-                   label:[NSString stringWithUTF8String:label]
-                   value:[NSString stringWithUTF8String:value]
-               focusable:(BOOL)atoi(f_focusable)
-                     ptr:strtoull(f_ptr, NULL, 10)
-                 checked:atoi(f_checked)
-                   frame:CGRectMake(strtof(f_x, NULL), strtof(f_y, NULL),
-                                 strtof(f_w, NULL), strtof(f_h, NULL))
-               container:g_root_view];
-        [g_elements addObject:el];
-        [el release]; // the array owns it now (MRC)
+        (void)f_depth;
+        const int is_focusable = atoi(f_focusable);
+        // Skip unlabelled non-focusable container wrappers (such as the
+        // synthetic root group) so their full-screen frame does not intercept
+        // VoiceOver touch exploration over interactive child elements.
+        const bool is_unlabelled_container =
+            !is_focusable && label[0] == '\0' && value[0] == '\0' &&
+            (strcmp(role, "group") == 0 || strcmp(role, "list") == 0 ||
+             strcmp(role, "menu") == 0 || strcmp(role, "tab_panel") == 0);
+        if (!is_unlabelled_container) {
+            KXUIAccessibilityElement* el = [[KXUIAccessibilityElement alloc]
+                initWithRole:[NSString stringWithUTF8String:role]
+                       label:[NSString stringWithUTF8String:label]
+                       value:[NSString stringWithUTF8String:value]
+                   focusable:(BOOL)is_focusable
+                         ptr:strtoull(f_ptr, NULL, 10)
+                     checked:atoi(f_checked)
+                       frame:CGRectMake(strtof(f_x, NULL), strtof(f_y, NULL),
+                                     strtof(f_w, NULL), strtof(f_h, NULL))
+                   container:g_root_view];
+            [g_elements addObject:el];
+            [el release]; // the array owns it now (MRC)
+        }
         // Advance past this line.
         while (*p && *p != '\n') p++;
         if (*p == '\n') p++;
@@ -310,7 +323,17 @@ static void a11y_bridge_callback(void* userdata, KxBridgeEventC ev) {
             break;
         }
         case KX_A11Y_CONTROL_CHANGED: {
-            // A control's value/checked changed — refresh that element.
+            // A control's value/checked/label changed — re-dump the semantic
+            // tree so the element carries the fresh state before notifying.
+            if (g_zig_root_node) {
+                char* dump = kx_a11y_dump_tree(g_zig_root_node);
+                if (dump) {
+                    @autoreleasepool {
+                        rebuildElements(dump);
+                    }
+                    kx_a11y_free_string(dump);
+                }
+            }
             KXUIAccessibilityElement* el = findElementByPtr(ev.node_id);
             if (el) {
                 UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, el);

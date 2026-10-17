@@ -84,6 +84,10 @@ pub const Semantics = struct {
     checked: ?bool = null,
     disabled: bool = false,
     focusable: bool = false,
+    /// True when this node is a modal container (dialog, modal drawer, modal
+    /// bottom/side sheet). While visible, buildSemanticTree and FocusManager
+    /// trap assistive traversal and Tab/Shift+Tab focus within this modal.
+    modal: bool = false,
     actions: Actions = .{},
     live: LiveRegion = .off,
     /// Virtual per-item children for compound widgets (segmented buttons,
@@ -118,6 +122,7 @@ pub const SemanticNode = struct {
     checked: ?bool,
     disabled: bool,
     focusable: bool,
+    modal: bool = false,
     actions: Actions,
     live: LiveRegion,
     children: []SemanticNode, // owned (flat builds: a sub-slice of `backing`)
@@ -182,6 +187,42 @@ fn countEmitted(n: *Node) usize {
     return s;
 }
 
+/// Return the last (topmost in paint order) non-skipped node in `n`'s
+/// subtree whose semantics descriptor sets `.modal = true`.
+pub fn findActiveModal(n: *Node) ?*Node {
+    if (semanticSkipped(n)) return null;
+    var found: ?*Node = null;
+    if (n.semantics) |sem| {
+        if (sem.modal) found = n;
+    }
+    for (n.children.items) |c| {
+        if (findActiveModal(c)) |m| found = m;
+    }
+    return found;
+}
+
+/// Find the visible scrim sibling immediately preceding `modal_node` in its
+/// parent (dialog/drawer/bottom_sheet/side_sheet attach a non-focusable
+/// activate button on `s.scrim`).
+fn findModalScrim(modal_node: *Node) ?*Node {
+    const parent = modal_node.parent orelse return null;
+    var scrim: ?*Node = null;
+    for (parent.children.items) |sib| {
+        if (sib == modal_node) break;
+        if (semanticSkipped(sib)) continue;
+        if (sib.semantics) |sem| {
+            if (sem.role == .button and !sem.focusable and sem.actions.contains(.activate) and sib.children.items.len == 0) {
+                scrim = sib;
+            }
+        }
+    }
+    return scrim;
+}
+
+fn countModalEmitted(scrim_opt: ?*Node, modal_node: *Node) usize {
+    return (if (scrim_opt) |sc| countEmitted(sc) else 0) + countEmitted(modal_node);
+}
+
 /// The SemanticNode value for `n` (children are patched in by the fill
 /// pass once their buffer range is known). inline: the ~100-byte return
 /// does NOT get inlined under ReleaseSmall — an sret call + memcpy per
@@ -197,6 +238,7 @@ inline fn semanticValue(n: *Node, sem: *const Semantics) SemanticNode {
         .checked = sem.checked,
         .disabled = sem.disabled,
         .focusable = sem.focusable,
+        .modal = sem.modal,
         .actions = sem.actions,
         .live = sem.live,
         .children = &.{},
@@ -224,6 +266,7 @@ fn virtualValue(parent: *Node, vc: *const Semantics, index: usize, bounds_cb: ?*
         .checked = vc.checked,
         .disabled = vc.disabled,
         .focusable = vc.focusable,
+        .modal = vc.modal,
         .actions = vc.actions,
         .live = vc.live,
         .children = &.{},
@@ -257,6 +300,37 @@ fn emitFrontier(n: *Node, buf: []SemanticNode, w: *usize) error{Overflow}!void {
 }
 
 const FillResult = struct { top: usize, total: usize };
+
+/// Modal-scoped breadth fill: emits only the active modal (and its optional
+/// scrim barrier) so background siblings/cousins are excluded from both
+/// assistive technology dumps and FocusManager.focusOrder.
+fn fillModalTree(scrim_opt: ?*Node, modal_node: *Node, buf: []SemanticNode) error{Overflow}!FillResult {
+    var w: usize = 0;
+    if (scrim_opt) |sc| {
+        if (sc.semantics) |sem| {
+            if (w == buf.len) return error.Overflow;
+            buf[w] = semanticValue(sc, sem);
+            w += 1;
+        }
+    }
+    if (modal_node.semantics) |sem| {
+        if (w == buf.len) return error.Overflow;
+        buf[w] = semanticValue(modal_node, sem);
+        w += 1;
+    }
+    const top = w;
+    var r: usize = 0;
+    while (r < w) : (r += 1) {
+        if (buf[r].virtual_index != null) {
+            buf[r].children = &.{};
+            continue;
+        }
+        const start = w;
+        try emitFrontier(buf[r].node, buf, &w);
+        buf[r].children = buf[start..w];
+    }
+    return .{ .top = top, .total = w };
+}
 
 /// The breadth fill: `root`'s frontier first, then parents in buffer
 /// order claiming the next contiguous range for their own frontier —
@@ -299,18 +373,27 @@ var sem_size_hint: usize = 0;
 /// caller owns the tree (deinit the root once — it frees the flat
 /// backing buffer the whole tree is cut from).
 pub fn buildSemanticTree(allocator: std.mem.Allocator, root: *Node) !SemanticNode {
+    const active_modal = findActiveModal(root);
+    const modal_scrim = if (active_modal) |m| findModalScrim(m) else null;
     // One allocation for the whole tree (per-node ArrayLists + their
     // growth/frees dominated the per-frame rebuild cost). The buffer is
     // sized by the previous build's count first; on overflow the subtree
     // is counted exactly and the fill restarts.
     var buf = try allocator.alloc(SemanticNode, @max(sem_size_hint, 8));
     errdefer allocator.free(buf);
-    const res = fillTree(root, buf) catch |err| switch (err) {
+    const res = (if (active_modal) |m|
+        fillModalTree(modal_scrim, m, buf)
+    else
+        fillTree(root, buf)) catch |err| switch (err) {
         error.Overflow => blk: {
             allocator.free(buf);
             buf = &.{}; // released — keep errdefer from freeing it twice
-            buf = try allocator.alloc(SemanticNode, countEmitted(root));
-            break :blk fillTree(root, buf) catch unreachable; // exact size cannot overflow
+            const exact = if (active_modal) |m| countModalEmitted(modal_scrim, m) else countEmitted(root);
+            buf = try allocator.alloc(SemanticNode, exact);
+            break :blk (if (active_modal) |m|
+                fillModalTree(modal_scrim, m, buf)
+            else
+                fillTree(root, buf)) catch unreachable; // exact size cannot overflow
         },
     };
     sem_size_hint = res.total;
@@ -667,6 +750,70 @@ pub fn focusNodeDestroyed(node: *Node) void {
 /// The router's focus moved (pointer) — sync the process-global focus manager.
 pub fn routerFocusChanged(node: ?*Node) void {
     if (current_focus) |fm| fm.onRouterFocusChanged(node);
+}
+
+/// First focusable node in `n`'s subtree (depth-first, skipping invisible
+/// or semantics-excluded subtrees).
+pub fn firstFocusableIn(n: *Node) ?*Node {
+    if (semanticSkipped(n)) return null;
+    if (n.semantics) |sem| {
+        if (sem.focusable and !sem.disabled) return n;
+    }
+    for (n.children.items) |c| {
+        if (firstFocusableIn(c)) |f| return f;
+    }
+    return null;
+}
+
+fn nodeContains(root: *Node, target: *Node) bool {
+    if (root == target) return true;
+    for (root.children.items) |c| {
+        if (nodeContains(c, target)) return true;
+    }
+    return false;
+}
+
+/// Move keyboard focus into `panel` when a modal opens (saving the prior
+/// focus), and restore the prior focus when the modal closes.
+pub fn syncModalFocus(panel: *Node, is_open: bool, saved_focus: *?*Node, focus_saved: *bool) void {
+    if (is_open) {
+        if (!focus_saved.*) {
+            const fm_opt = currentFocus();
+            const cur = if (fm_opt) |fm| fm.focused else if (input_mod.current()) |r| r.focused else null;
+            saved_focus.* = cur;
+            focus_saved.* = true;
+            const target = firstFocusableIn(panel);
+            if (target != null or (cur != null and !nodeContains(panel, cur.?))) {
+                if (fm_opt) |fm| {
+                    fm.focusNode(target);
+                } else {
+                    input_mod.requestFocus(target);
+                }
+            }
+            notifyTreeDirty();
+        }
+    } else {
+        if (focus_saved.*) {
+            focus_saved.* = false;
+            const prev = saved_focus.*;
+            saved_focus.* = null;
+            const valid_prev: ?*Node = if (prev) |p| blk: {
+                if (p.zombie) break :blk null;
+                if (currentFocus()) |fm| {
+                    if (fm.root) |r| {
+                        if (!nodeContains(r, p)) break :blk null;
+                    }
+                }
+                break :blk p;
+            } else null;
+            if (currentFocus()) |fm| {
+                fm.focusNode(valid_prev);
+            } else {
+                input_mod.requestFocus(valid_prev);
+            }
+            notifyTreeDirty();
+        }
+    }
 }
 
 // --- tests ---
@@ -1074,4 +1221,45 @@ test "semantic tree: virtual children emit as leaves with mapped bounds" {
     const t1 = grp.children[1];
     try std.testing.expect(t1.disabled);
     try std.testing.expectEqual(@as(f32, 50), t1.bounds_override.?.x);
+}
+
+test "modal semantics: active modal scopes semantic tree + focusOrder and restores focus on close" {
+    const a = std.testing.allocator;
+    const fm = try FocusManager.init(a);
+    defer fm.deinit();
+    setCurrentFocus(fm);
+    defer setCurrentFocus(null);
+
+    const root = try clickNode(a);
+    defer root.deinit();
+    fm.setRoot(root);
+    const bg_btn = try clickNode(a);
+    attach(bg_btn, .{ .role = .button, .label = "Background", .focusable = true });
+    root.add(bg_btn);
+
+    const modal_panel = try clickNode(a);
+    attach(modal_panel, .{ .role = .dialog, .label = "Confirm", .modal = true });
+    modal_panel.visible = false;
+    const modal_btn = try clickNode(a);
+    attach(modal_btn, .{ .role = .button, .label = "OK", .focusable = true });
+    modal_panel.add(modal_btn);
+    root.add(modal_panel);
+
+    fm.focusNode(bg_btn);
+    try std.testing.expect(fm.focused == bg_btn);
+
+    var saved: ?*Node = null;
+    var is_saved: bool = false;
+    modal_panel.visible = true;
+    syncModalFocus(modal_panel, true, &saved, &is_saved);
+    try std.testing.expect(fm.focused == modal_btn);
+
+    const order = try fm.focusOrder(a);
+    defer a.free(order);
+    try std.testing.expectEqual(@as(usize, 1), order.len);
+    try std.testing.expect(order[0] == modal_btn);
+
+    modal_panel.visible = false;
+    syncModalFocus(modal_panel, false, &saved, &is_saved);
+    try std.testing.expect(fm.focused == bg_btn);
 }

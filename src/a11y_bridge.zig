@@ -49,15 +49,13 @@ export fn kx_a11y_dump_tree(root_node: ?*anyopaque) callconv(.c) ?[*]u8 {
         buf.deinit();
         return null;
     };
-    // Null-terminate. On success the buffer's ownership transfers to the
-    // caller (kx_a11y_free_string) — it must NOT be deinited here (the
-    // returned pointer would dangle: use-after-free on the bridge side).
-    buf.append(0) catch {
+    // Null-terminate and shrink-fit to exact length + sentinel so that
+    // kx_a11y_free_string(ptr[0..len :0]) frees the exact allocated slice.
+    const slice = buf.toOwnedSliceSentinel(0) catch {
         buf.deinit();
         return null;
     };
-    const result: [*]u8 = buf.items.ptr;
-    return result;
+    return slice.ptr;
 }
 
 /// Free a string allocated by kx_a11y_dump_tree.

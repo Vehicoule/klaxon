@@ -85,6 +85,8 @@ const SheetState = struct {
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
     i18n: ?*i18n_mod.I18n = null,
+    saved_focus: ?*Node = null,
+    focus_saved: bool = false,
 };
 
 const Callback = ui.state.Callback;
@@ -168,8 +170,7 @@ fn panelBgPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(panelBgStateOf(n).sheet);
     const b = n.bounds;
     // CornerExtraLargeTop: 28dp on the top corners only; modal sheet = 1dp.
-    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner_top, 1,
-        s.opts.theme.colors.shadow);
+    ui.paint.elevationShadow(ctx, b.x, b.y, b.w, b.h, corner_top, 1, s.opts.theme.colors.shadow);
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, corner_top, s.opts.theme.colors.surface_container_low);
 }
 
@@ -473,7 +474,11 @@ fn sheetDeinit(n: *Node) void {
 fn attachSheetSemantics(n: *Node) void {
     const s = stateOf(n);
     ui.semantics.attach(s.scrim, .{ .role = .button, .label = i18n_mod.tr("Close sheet"), .actions = ui.semantics.Actions.initOne(.activate) });
-    ui.semantics.attach(s.panel, .{ .role = .group, .label = s.opts.label orelse i18n_mod.tr("Bottom sheet") });
+    ui.semantics.attach(s.panel, .{
+        .role = .group,
+        .label = s.opts.label orelse i18n_mod.tr("Bottom sheet"),
+        .modal = true,
+    });
 }
 
 fn sheetLocaleCb(userdata: ?*anyopaque) void {
@@ -520,7 +525,9 @@ fn applyProgress(n: *Node, s: *SheetState, progress: f32, scrim_alpha: f32) void
     // follows the sheet in the layout). Hide the subtree outright: a closed
     // sheet paints nothing.
     panelStateOf(s.panel).offset_y = s.panel_h * (1 - progress);
-    s.panel.setVisible(progress > 0.001);
+    const open = progress > 0.001;
+    s.panel.setVisible(open);
+    ui.semantics.syncModalFocus(s.panel, open, &s.saved_focus, &s.focus_saved);
     markInternalsDirty(n, s);
 }
 

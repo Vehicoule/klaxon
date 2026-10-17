@@ -348,25 +348,45 @@ static void kx_atk_object_class_init(KxAtkObjectClass* klass) {
 
 // --- AtkComponent ---
 
+static void windowScreenOffset(AtkCoordType coord_type, gint* ox, gint* oy) {
+    *ox = 0;
+    *oy = 0;
+    if (coord_type != ATK_XY_SCREEN) return;
+    SDL_Window* win = SDL_GetKeyboardFocus();
+    if (!win) {
+        int count = 0;
+        SDL_Window** wins = SDL_GetWindows(&count);
+        if (wins && count > 0) win = wins[0];
+        if (wins) SDL_free(wins);
+    }
+    if (win) {
+        int wx = 0, wy = 0;
+        if (SDL_GetWindowPosition(win, &wx, &wy)) {
+            *ox = (gint)wx;
+            *oy = (gint)wy;
+        }
+    }
+}
+
 static gboolean kx_atk_component_contains(AtkComponent* component, gint x, gint y,
                                           AtkCoordType coord_type) {
-    (void)coord_type; // window coords only — see the extents caveat
+    gint ox = 0, oy = 0;
+    windowScreenOffset(coord_type, &ox, &oy);
     KxAtkObject* self = KX_ATK_OBJECT(component);
-    return x >= self->x && y >= self->y && x < self->x + self->w && y < self->y + self->h;
+    const gint sx = self->x + ox;
+    const gint sy = self->y + oy;
+    return x >= sx && y >= sy && x < sx + self->w && y < sy + self->h;
 }
 
 static void kx_atk_component_get_extents(AtkComponent* component, gint* x, gint* y,
                                          gint* width, gint* height, AtkCoordType coord_type) {
-    // The dump carries window-space rects (mapRectToRoot). ATK_XY_SCREEN
-    // requests get the same numbers: the ABI doesn't expose the window's
-    // screen position (a documented v1 caveat — same as the macOS bridge
-    // reporting window frames).
-    (void)coord_type;
+    gint ox = 0, oy = 0;
+    windowScreenOffset(coord_type, &ox, &oy);
     KxAtkObject* self = KX_ATK_OBJECT(component);
-    *x = self->x;
-    *y = self->y;
-    *width = self->w;
-    *height = self->h;
+    if (x) *x = self->x + ox;
+    if (y) *y = self->y + oy;
+    if (width) *width = self->w;
+    if (height) *height = self->h;
 }
 
 static void kx_atk_component_get_position(AtkComponent* component, gint* x, gint* y,
@@ -454,21 +474,29 @@ static void kx_atk_component_iface_init(AtkComponentIface* iface) {
 
 // --- AtkAction ("click" -> synthesized pointer at the node center) ---
 
+static bool isActionableRole(const char* r) {
+    if (!r) return false;
+    return !strcmp(r, "button") || !strcmp(r, "link") || !strcmp(r, "toggle") ||
+           !strcmp(r, "checkbox") || !strcmp(r, "radio") || !strcmp(r, "tab") ||
+           !strcmp(r, "menu_item") || !strcmp(r, "list_item");
+}
+
 static gboolean kx_atk_action_do_action(AtkAction* action, gint i) {
-    if (i != 0) return FALSE;
-    return pushAtAction(KX_A11Y_ACT_ACTIVATE, KX_ATK_OBJECT(action)->node_ptr)
+    KxAtkObject* self = KX_ATK_OBJECT(action);
+    if (i != 0 || !self->node_ptr || !isActionableRole(self->klaxon_role)) return FALSE;
+    return pushAtAction(KX_A11Y_ACT_ACTIVATE, self->node_ptr)
                ? TRUE
                : FALSE;
 }
 
 static gint kx_atk_action_get_n_actions(AtkAction* action) {
-    // The application root wraps no node — no action.
-    return KX_ATK_OBJECT(action)->node_ptr ? 1 : 0;
+    KxAtkObject* self = KX_ATK_OBJECT(action);
+    return (self->node_ptr && isActionableRole(self->klaxon_role)) ? 1 : 0;
 }
 
 static const gchar* kx_atk_action_get_name(AtkAction* action, gint i) {
     KxAtkObject* self = KX_ATK_OBJECT(action);
-    return (i == 0 && self->node_ptr) ? "click" : nullptr;
+    return (i == 0 && self->node_ptr && isActionableRole(self->klaxon_role)) ? "click" : nullptr;
 }
 
 static void kx_atk_action_iface_init(AtkActionIface* iface) {
@@ -682,6 +710,7 @@ static void linkChildren(KxAtkObject* parent, const std::vector<KxAtkObject*>& k
 }
 
 static void updateNode(KxAtkObject* o, const KxA11yNode& n, bool created) {
+    const bool role_changed = !created && (!o->klaxon_role || strcmp(o->klaxon_role, n.role.c_str()) != 0);
     const bool label_changed = !created && (!o->label || strcmp(o->label, n.label.c_str()) != 0);
     const bool value_changed = !created && (!o->value || strcmp(o->value, n.value.c_str()) != 0);
     const bool checked_changed = !created && o->checked != n.checked;
@@ -691,6 +720,11 @@ static void updateNode(KxAtkObject* o, const KxA11yNode& n, bool created) {
     const bool vnow_changed = !created &&
         (o->has_vrange != n.has_vrange || o->vnow != n.vnow);
 
+    if (role_changed) {
+        g_free(o->klaxon_role);
+        o->klaxon_role = g_strdup(n.role.c_str());
+        o->role = mapRole(n.role, n.depth == 0);
+    }
     g_free(o->label);
     o->label = g_strdup(n.label.c_str());
     g_free(o->value);
@@ -707,6 +741,7 @@ static void updateNode(KxAtkObject* o, const KxA11yNode& n, bool created) {
     o->vnow = n.vnow;
 
     if (created) return; // fresh objects are read whole — no deltas to report
+    if (role_changed) emitPropertyChange(o, "accessible-role");
     if (label_changed) emitPropertyChange(o, "accessible-name");
     if (value_changed) emitPropertyChange(o, "accessible-description");
     // AT-SPI Value.CurrentValue changes surface as accessible-value (the

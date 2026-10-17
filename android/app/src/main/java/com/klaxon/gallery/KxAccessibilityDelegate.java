@@ -85,6 +85,8 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
 
     private static native int nativeGetNodeCount();
     private static native int nativeGetNodeParent(int index);
+    private static native int nativeGetNodeChildCount(int index);
+    private static native int nativeGetNodeChildAt(int index, int childIndex);
     private static native long nativeGetNodePtr(int index);
     private static native String nativeGetNodeRole(int index);
     private static native String nativeGetNodeLabel(int index);
@@ -93,6 +95,8 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
     private static native int nativeGetNodeChecked(int index);
     /** Fills out[0..3] = x, y, w, h (window space). False when out of range. */
     private static native boolean nativeGetNodeBounds(int index, int[] out);
+    /** Fills out[0..2] = vmin, vmax, vnow. False when node has no numeric range. */
+    private static native boolean nativeGetNodeRange(int index, float[] out);
     private static native void nativeActivate(long ptr);
     private static native void nativeFocus(long ptr);
 
@@ -164,14 +168,14 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
             if (virtualDescendantId == AccessibilityNodeProvider.HOST_VIEW_ID) {
                 // Host node: the surface itself. Populate it through the
                 // delegate's onInitializeAccessibilityNodeInfo and advertise
-                // every virtual node as a child — without the addChild calls
-                // TalkBack swipes on the surface but finds nothing to descend
-                // into.
+                // top-level virtual nodes (parent < 0) as direct children.
                 AccessibilityNodeInfo info = AccessibilityNodeInfo.obtain(mHost);
                 KxAccessibilityDelegate.this.onInitializeAccessibilityNodeInfo(mHost, info);
-                int childCount = nativeGetNodeCount();
-                for (int i = 0; i < childCount; i++) {
-                    info.addChild(mHost, i);
+                int nodeCount = nativeGetNodeCount();
+                for (int i = 0; i < nodeCount; i++) {
+                    if (nativeGetNodeParent(i) < 0) {
+                        info.addChild(mHost, i);
+                    }
                 }
                 return info;
             }
@@ -194,19 +198,34 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
             } else {
                 info.setParent(mHost);
             }
-            // The dump carries window-space rects (mapRectToRoot): absolute
-            // for boundsInScreen, relative to the parent's rect for
-            // boundsInParent — TalkBack positions the highlight from these.
+            int childCount = nativeGetNodeChildCount(virtualDescendantId);
+            for (int c = 0; c < childCount; c++) {
+                int childId = nativeGetNodeChildAt(virtualDescendantId, c);
+                if (childId >= 0) {
+                    info.addChild(mHost, childId);
+                }
+            }
+            // The dump carries logical window-space rects (mapRectToRoot).
+            // Convert to physical screen pixels by scaling by display density
+            // and offsetting by mHost.getLocationOnScreen.
             int[] rect = new int[4];
             if (nativeGetNodeBounds(virtualDescendantId, rect)) {
-                info.setBoundsInScreen(new Rect(rect[0], rect[1],
-                        rect[0] + rect[2], rect[1] + rect[3]));
+                float density = mHost.getResources().getDisplayMetrics().density;
+                if (density <= 0f) density = 1f;
+                int[] location = new int[2];
+                mHost.getLocationOnScreen(location);
+                int sx = location[0] + Math.round(rect[0] * density);
+                int sy = location[1] + Math.round(rect[1] * density);
+                int sw = Math.round(rect[2] * density);
+                int sh = Math.round(rect[3] * density);
+                info.setBoundsInScreen(new Rect(sx, sy, sx + sw, sy + sh));
                 int[] parentRect = new int[4];
                 boolean hasParentRect = parent >= 0 && nativeGetNodeBounds(parent, parentRect);
-                int ox = hasParentRect ? parentRect[0] : 0;
-                int oy = hasParentRect ? parentRect[1] : 0;
-                info.setBoundsInParent(new Rect(rect[0] - ox, rect[1] - oy,
-                        rect[0] - ox + rect[2], rect[1] - oy + rect[3]));
+                int ox = hasParentRect ? Math.round(parentRect[0] * density) : 0;
+                int oy = hasParentRect ? Math.round(parentRect[1] * density) : 0;
+                int px = Math.round(rect[0] * density) - ox;
+                int py = Math.round(rect[1] * density) - oy;
+                info.setBoundsInParent(new Rect(px, py, px + sw, py + sh));
             } else {
                 // No geometry (older dump): every node reports the host rect.
                 int width = mHost.getWidth();
@@ -222,10 +241,17 @@ public class KxAccessibilityDelegate extends View.AccessibilityDelegate {
                 info.setText(label);
             }
             if ("slider".equals(role) || "progress".equals(role) || "scrollbar".equals(role)) {
-                float now = parseFloat(value);
-                if (!Float.isNaN(now)) {
+                float[] range = new float[3];
+                if (nativeGetNodeRange(virtualDescendantId, range)) {
                     info.setRangeInfo(AccessibilityNodeInfo.RangeInfo.obtain(
-                            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT, 0f, 100f, now));
+                            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT,
+                            range[0], range[1], range[2]));
+                } else {
+                    float now = parseFloat(value);
+                    if (!Float.isNaN(now)) {
+                        info.setRangeInfo(AccessibilityNodeInfo.RangeInfo.obtain(
+                                AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT, 0f, 100f, now));
+                    }
                 }
             } else if ("toggle".equals(role) || "checkbox".equals(role) || "radio".equals(role)) {
                 info.setCheckable(true);

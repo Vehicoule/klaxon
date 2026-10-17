@@ -117,21 +117,35 @@ mergeInto(LibraryManager.library, {
         var line = lines[i];
         if (!line) continue;
         var parts = line.split('|');
-        // depth|role|label|value|focusable|ptr|checked|x|y|w|h
+        // depth|role|label|value|focusable|ptr|checked|x|y|w|h|vmin|vmax|vnow
         if (parts.length < 7) continue;
         var depth = parseInt(parts[0], 10);
         if (isNaN(depth)) continue;
         var role = parts[1];
-        var ptr = parseInt(parts[5], 10);
+        // Keep ptr as string so 64-bit VIRTUAL_PTR_BIT IDs (1 << 63) are never
+        // rounded by IEEE-754 double precision (> Number.MAX_SAFE_INTEGER).
+        var ptrStr = parts[5];
         var checked = parseInt(parts[6], 10);
-        var el = KX_A11Y.buildElement(role, parts[2], parts[3], parts[4] === '1', checked);
+        var bounds = parts.length >= 11 ? {
+          x: parseFloat(parts[7]),
+          y: parseFloat(parts[8]),
+          w: parseFloat(parts[9]),
+          h: parseFloat(parts[10])
+        } : null;
+        var vrange = (parts.length >= 14 && parts[11] !== '' && parts[12] !== '' && parts[13] !== '') ? {
+          min: parseFloat(parts[11]),
+          max: parseFloat(parts[12]),
+          now: parseFloat(parts[13])
+        } : null;
+        var el = KX_A11Y.buildElement(role, parts[2], parts[3], parts[4] === '1', checked, bounds, vrange, ptrStr);
         while (stack.length > depth) stack.pop();
         var parent = stack.length > 0 ? stack[stack.length - 1] : root;
         parent.appendChild(el);
         stack.push(el);
         el.setAttribute('data-kx-index', String(nodes.length));
-        nodes.push({ el: el, role: role, ptr: ptr });
-        KX_A11Y.ptrToIndex[ptr] = nodes.length - 1;
+        el.setAttribute('data-kx-ptr', ptrStr);
+        nodes.push({ el: el, role: role, ptr: ptrStr });
+        KX_A11Y.ptrToIndex[ptrStr] = nodes.length - 1;
       }
       KX_A11Y.nodes = nodes;
       if (KX_A11Y.focusedIndex >= 0 && KX_A11Y.focusedIndex < nodes.length) {
@@ -159,24 +173,72 @@ mergeInto(LibraryManager.library, {
         case 'menu': return 'menu';
         case 'menu_item': return 'menuitem';
         case 'tab': return 'tab';
+        case 'tab_panel': return 'tabpanel';
+        case 'separator': return 'separator';
         case 'group': return 'group';
         default: return null;
       }
     },
 
-    buildElement: function (role, label, value, focusable, checked) {
+    activatePtr: function (ptrStr) {
+      if (!KX_A11Y.rootNodePtr || !ptrStr) return;
+      try {
+        if (typeof Module !== 'undefined' && typeof Module._kx_a11y_activate_node === 'function') {
+          if (typeof BigInt !== 'undefined') {
+            Module._kx_a11y_activate_node(KX_A11Y.rootNodePtr, BigInt(ptrStr));
+          } else {
+            var n = Number(ptrStr);
+            Module._kx_a11y_activate_node(KX_A11Y.rootNodePtr, n >>> 0, Math.floor(n / 4294967296) >>> 0);
+          }
+        }
+      } catch (e) { }
+    },
+
+    focusPtr: function (ptrStr) {
+      if (!KX_A11Y.rootNodePtr || !ptrStr) return;
+      try {
+        if (typeof Module !== 'undefined' && typeof Module._kx_a11y_focus_node === 'function') {
+          if (typeof BigInt !== 'undefined') {
+            Module._kx_a11y_focus_node(KX_A11Y.rootNodePtr, BigInt(ptrStr));
+          } else {
+            var n = Number(ptrStr);
+            Module._kx_a11y_focus_node(KX_A11Y.rootNodePtr, n >>> 0, Math.floor(n / 4294967296) >>> 0);
+          }
+        }
+      } catch (e) { }
+    },
+
+    buildElement: function (role, label, value, focusable, checked, bounds, vrange, ptrStr) {
       var el = document.createElement('div');
       el.setAttribute('data-kx-role', role);
       var aria = KX_A11Y.ariaRole(role);
       if (aria) el.setAttribute('role', aria);
+      if (bounds && !isNaN(bounds.x) && !isNaN(bounds.y) && !isNaN(bounds.w) && !isNaN(bounds.h)) {
+        el.style.position = 'absolute';
+        el.style.left = bounds.x + 'px';
+        el.style.top = bounds.y + 'px';
+        el.style.width = Math.max(1, bounds.w) + 'px';
+        el.style.height = Math.max(1, bounds.h) + 'px';
+      }
       if (role === 'text' || role === 'none') {
         el.textContent = label;
       } else if (label) {
         el.setAttribute('aria-label', label);
       }
       if (role === 'slider' || role === 'progress' || role === 'scrollbar') {
-        var n = parseFloat(value);
-        if (!isNaN(n)) el.setAttribute('aria-valuenow', String(n));
+        if (vrange && !isNaN(vrange.min) && !isNaN(vrange.max) && !isNaN(vrange.now)) {
+          el.setAttribute('aria-valuemin', String(vrange.min));
+          el.setAttribute('aria-valuemax', String(vrange.max));
+          el.setAttribute('aria-valuenow', String(vrange.now));
+          if (value) el.setAttribute('aria-valuetext', value);
+        } else {
+          var n = parseFloat(value);
+          if (!isNaN(n)) {
+            el.setAttribute('aria-valuemin', '0');
+            el.setAttribute('aria-valuemax', '100');
+            el.setAttribute('aria-valuenow', String(n));
+          }
+        }
       } else if (role === 'text_field') {
         el.textContent = value;
         // Editable so the mobile virtual keyboard / IME engages on focus.
@@ -193,15 +255,28 @@ mergeInto(LibraryManager.library, {
       if (role === 'toggle' || role === 'checkbox' || role === 'radio') {
         if (checked === 2) el.setAttribute('aria-checked', 'true');
         else if (checked === 1) el.setAttribute('aria-checked', 'false');
+      } else if (role === 'tab' || role === 'list_item') {
+        if (checked === 2) el.setAttribute('aria-selected', 'true');
+        else if (checked === 1) el.setAttribute('aria-selected', 'false');
       }
       if (focusable) {
         el.setAttribute('tabindex', '0');
         el.setAttribute('data-kx-a11y', '1');
+        el.addEventListener('focus', function (ev) {
+          ev.stopPropagation();
+          KX_A11Y.focusPtr(ptrStr);
+        });
+      }
+      if (ptrStr) {
+        el.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          KX_A11Y.activatePtr(ptrStr);
+        });
       }
       return el;
     },
 
-    dispatch: function (kind, nodeId, textPtr, textLen, region) {
+    dispatch: function (kind, nodeIdStr, textPtr, textLen, region) {
       KX_A11Y.initDom();
       if (!KX_A11Y.rootEl) return;
       switch (kind) {
@@ -211,8 +286,8 @@ mergeInto(LibraryManager.library, {
           break;
         }
         case 1: {
-          // nodeId is a Node pointer, not a dump index — resolve via ptrToIndex.
-          var idx = KX_A11Y.ptrToIndex[nodeId];
+          // nodeIdStr is a Node pointer string, not a dump index — resolve via ptrToIndex.
+          var idx = KX_A11Y.ptrToIndex[String(nodeIdStr)];
           if (idx !== undefined && idx >= 0 && idx < KX_A11Y.nodes.length) {
             KX_A11Y.focusedIndex = idx;
             try { KX_A11Y.nodes[idx].el.focus({ preventScroll: true }); } catch (e) { }
@@ -310,28 +385,47 @@ mergeInto(LibraryManager.library, {
   kx_a11y_event__sig: 'vijiii',
   kx_a11y_event__deps: ['$KX_A11Y'],
   kx_a11y_event: function (kind, nodeId, textPtr, textLen, region) {
-    if (typeof nodeId !== 'bigint' && arguments.length === 6) {
+    var nodeIdStr;
+    if (typeof nodeId === 'bigint') {
+      nodeIdStr = (nodeId >= 0n ? nodeId : (nodeId + 18446744073709551616n)).toString(10);
+    } else if (arguments.length === 6) {
       region = arguments[5];
       textLen = arguments[4];
       textPtr = arguments[3];
-      nodeId = arguments[1] + arguments[2] * 4294967296;
+      var lo = arguments[1] >>> 0;
+      var hi = arguments[2] >>> 0;
+      if (typeof BigInt !== 'undefined') {
+        nodeIdStr = ((BigInt(hi) << 32n) | BigInt(lo)).toString(10);
+      } else {
+        nodeIdStr = String(lo + hi * 4294967296);
+      }
+    } else {
+      nodeIdStr = String(nodeId >>> 0);
     }
-    KX_A11Y.dispatch(kind | 0, Number(nodeId), textPtr | 0, textLen | 0, region | 0);
+    KX_A11Y.dispatch(kind | 0, nodeIdStr, textPtr | 0, textLen | 0, region | 0);
   },
 
   kx_js_a11y_event__sig: 'vijiii',
   kx_js_a11y_event__deps: ['$KX_A11Y'],
   kx_js_a11y_event: function (kind, nodeId, textPtr, textLen, region) {
-    // Standalone copy of kx_a11y_event's i64-splitting dispatch: emscripten
-    // emits the alias as _kx_js_a11y_event but does not emit a callable
-    // `kx_a11y_event` global, so delegating via apply() throws ReferenceError.
-    if (typeof nodeId !== 'bigint' && arguments.length === 6) {
+    var nodeIdStr;
+    if (typeof nodeId === 'bigint') {
+      nodeIdStr = (nodeId >= 0n ? nodeId : (nodeId + 18446744073709551616n)).toString(10);
+    } else if (arguments.length === 6) {
       region = arguments[5];
       textLen = arguments[4];
       textPtr = arguments[3];
-      nodeId = arguments[1] + arguments[2] * 4294967296;
+      var lo = arguments[1] >>> 0;
+      var hi = arguments[2] >>> 0;
+      if (typeof BigInt !== 'undefined') {
+        nodeIdStr = ((BigInt(hi) << 32n) | BigInt(lo)).toString(10);
+      } else {
+        nodeIdStr = String(lo + hi * 4294967296);
+      }
+    } else {
+      nodeIdStr = String(nodeId >>> 0);
     }
-    KX_A11Y.dispatch(kind | 0, Number(nodeId), textPtr | 0, textLen | 0, region | 0);
+    KX_A11Y.dispatch(kind | 0, nodeIdStr, textPtr | 0, textLen | 0, region | 0);
   },
 
   kx_a11y_set_root__sig: 'vi',
