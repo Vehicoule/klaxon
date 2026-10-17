@@ -874,12 +874,23 @@ static bool kx_shape_simple(const char* text, size_t len, float size, bool bold,
     return true;
 }
 
-uint64_t kx_text_key_hash(const char* text, size_t len, float size, bool bold) {
-    uint64_t h = 14695981039346656037ull; // FNV-1a over the UTF-8 bytes
-    for (size_t i = 0; i < len; i++) {
-        h ^= static_cast<uint8_t>(text[i]);
-        h *= 1099511628211ull;
+/// FNV-1a over a byte span, a word at a time — text runs and float coord
+/// streams hash byte-per-byte otherwise (8 multiply rounds per point/char).
+static uint64_t kx_fnv_bytes(uint64_t h, const void* p, size_t bytes) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    while (bytes >= 8) {
+        uint64_t w;
+        std::memcpy(&w, b, 8);
+        h ^= w; h *= 1099511628211ull;
+        b += 8; bytes -= 8;
     }
+    while (bytes--) { h ^= *b++; h *= 1099511628211ull; }
+    return h;
+}
+
+uint64_t kx_text_key_hash(const char* text, size_t len, float size, bool bold) {
+    // FNV-1a over the UTF-8 bytes
+    uint64_t h = kx_fnv_bytes(14695981039346656037ull, text, len);
     uint32_t size_bits;
     std::memcpy(&size_bits, &size, sizeof(size_bits));
     h ^= size_bits;
@@ -2655,10 +2666,8 @@ void kx_stroke_rrect_corners(kx_ctx* ctx, float x, float y, float w, float h, fl
 /// coords, verify by memcmp, build on miss, evict stale entries past 256.
 static const SkPath& kx_cached_path(kx_ctx* ctx, const float* xs, const float* ys, int count, bool closed) {
     uint64_t h = 1469598103934665603ull; // FNV-1a
-    for (int i = 0; i < count * 4; i++) {
-        h ^= reinterpret_cast<const uint8_t*>(xs)[i]; h *= 1099511628211ull;
-        h ^= reinterpret_cast<const uint8_t*>(ys)[i]; h *= 1099511628211ull;
-    }
+    h = kx_fnv_bytes(h, xs, (size_t)count * 4);
+    h = kx_fnv_bytes(h, ys, (size_t)count * 4);
     h ^= (uint64_t)count * 0x9E3779B97F4A7C15ull + (closed ? 1 : 0);
     auto& ent = ctx->path_cache[h];
     ent.tick = ++ctx->path_tick;
@@ -2692,10 +2701,8 @@ static const SkPath& kx_cached_path(kx_ctx* ctx, const float* xs, const float* y
 static const SkPath& kx_cached_stroke(kx_ctx* ctx, const float* xs, const float* ys,
                                       int count, float stroke_w, bool round_cap) {
     uint64_t h = 1469598103934665603ull;
-    for (int i = 0; i < count * 4; i++) {
-        h ^= reinterpret_cast<const uint8_t*>(xs)[i]; h *= 1099511628211ull;
-        h ^= reinterpret_cast<const uint8_t*>(ys)[i]; h *= 1099511628211ull;
-    }
+    h = kx_fnv_bytes(h, xs, (size_t)count * 4);
+    h = kx_fnv_bytes(h, ys, (size_t)count * 4);
     h ^= (uint64_t)count * 0x9E3779B97F4A7C15ull;
     uint32_t wbits;
     std::memcpy(&wbits, &stroke_w, 4);

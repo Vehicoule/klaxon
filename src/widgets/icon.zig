@@ -252,11 +252,14 @@ fn drawIconMirrored(ctx: *kx.Ctx, name: IconName, ox: f32, oy: f32, k: f32, colo
     };
     const gen = ui.paint.atlasGen(ctx);
     const serial = ui.paint.ctxSerial(ctx);
-    for (icon_cache[0..icon_cache_len]) |*e| {
+    for (icon_cache[0..icon_cache_len], 0..) |*e, i| {
         if (e.serial == serial and std.meta.eql(e.key, key) and
             (!e.atlas or e.atlas_gen == gen))
         {
-            iconBlit(e, ctx, tx, ty);
+            // Move-to-front: the probe list is a linear scan, so recurring
+            // icons (the common case is a handful of names) park at index 0.
+            if (i > 0) std.mem.swap(IconEntry, e, &icon_cache[0]);
+            iconBlit(&icon_cache[0], ctx, tx, ty);
             return;
         }
     }

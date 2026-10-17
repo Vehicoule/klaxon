@@ -163,6 +163,10 @@ pub const VTable = struct {
     /// Map a rect from this node's child space into its parent space — the
     /// inverse of the paint transform (pre_children_paint). Dirty marks
     /// under a transformed ancestor land at the child's VISIBLE position.
+    /// CONTRACT: the map must be rect-affine (translate / uniform scale —
+    /// every current impl is); the paint traversal's childSpaceAffine probes
+    /// the composed chain on the unit rect, so a shear/rotation here would
+    /// silently mis-cull children.
     map_paint_rect: ?*const fn (node: *Node, rect: Rect) Rect = null,
     /// The rect the children are clipped to (in this node's parent space) —
     /// matching the clipRect pre_children_paint pushes, e.g. a scroll view's
@@ -779,6 +783,14 @@ pub const Node = struct {
     /// same ops after their (expensive) issue. A culled node keeps its dirty
     /// flag — like an invisible one, it repaints when it becomes visible.
     pub fn paint(node: *Node, ctx: *kx.Ctx, visible: Rect) void {
+        // Entry points (frame root, popup overlay, one-off paints) probe the
+        // ancestor chain once; the recursion then passes the composed affine
+        // down instead of re-walking ancestors per node.
+        paintInner(node, ctx, visible, node.mapRectToRoot(.{ .x = 0, .y = 0, .w = 1, .h = 1 }));
+    }
+
+    /// paint with the strict-ancestors' affine already composed.
+    fn paintInner(node: *Node, ctx: *kx.Ctx, visible: Rect, aff: PaintAff) void {
         if (!node.visible or node.zombie) return;
         clearingPassEnter();
         defer clearingPassExit();
@@ -786,9 +798,9 @@ pub const Node = struct {
         // node's children clip (viewport) when it declares one.
         var child_region = visible;
         if (node.vtable.child_clip) |cc| {
-            child_region = rectIntersect(visible, node.mapRectToRoot(cc(node)));
+            child_region = rectIntersect(visible, affApply(aff, cc(node)));
         }
-        const own_hit = rectOverlaps(node.mapRectToRoot(node.paintRect()), visible);
+        const own_hit = rectOverlaps(affApply(aff, node.paintRect()), visible);
         const children_hit = child_region.w > 0 and child_region.h > 0;
         if (!own_hit and !children_hit) return; // the whole subtree is off-region
         // Clear BEFORE painting: a markDirty raised while this subtree paints
@@ -804,18 +816,18 @@ pub const Node = struct {
         // paint-extent contract — the image holds exactly what the subtree
         // draws, so a cached blit is indistinguishable from a repaint.
         if (node.retained) {
-            if (node.paintRetained(ctx, subtree_dirty, false)) return;
+            if (node.paintRetained(ctx, subtree_dirty, false, aff)) return;
         } else if ((node.vtable.auto_retain or node.auto_retain) and !node.backdrop_subtree) {
             if (subtree_dirty) {
                 node.retained_blocked = false; // re-evaluate on the next clean pass
                 node.clearRetained(); // the stale image can never blit again
             } else if (!node.retained_blocked and !autoRetainOffscreenExpensive(ctx) and
-                node.paintRetained(ctx, false, true))
+                node.paintRetained(ctx, false, true, aff))
             {
                 return;
             }
         }
-        node.paintContent(ctx, own_hit, child_region, children_hit);
+        node.paintContent(ctx, own_hit, child_region, children_hit, aff);
     }
 
     /// Backend cost model for AUTO-retain (not the explicit `retained` flag —
@@ -848,9 +860,43 @@ pub const Node = struct {
         return dbg_retained.?;
     }
 
+    /// A rect-affine map packed as a Rect (x=dx, y=dy, w=sx, h=sy). Every
+    /// map_paint_rect impl is rect-affine — translate or uniform scale — so
+    /// the composed map applied to the unit rect IS the affine.
+    /// The paint traversal propagates one composed affine down the tree —
+    /// replacing the per-node ancestors walk (mapRectToRoot) with an O(1)
+    /// rect transform while keeping every visit/hook semantic identical.
+    const PaintAff = Rect;
+
+    /// Probe a node's OWN map_paint_rect as an affine (identity when none).
+    fn ownAffine(node: *Node) PaintAff {
+        const unit = Rect{ .x = 0, .y = 0, .w = 1, .h = 1 };
+        return if (node.vtable.map_paint_rect) |m| rectNormalize(m(node, unit)) else unit;
+    }
+
+    /// outer ∘ inner — apply `inner` first (child space → parent space).
+    fn affCompose(outer: PaintAff, inner: PaintAff) PaintAff {
+        return .{
+            .x = outer.x + inner.x * outer.w,
+            .y = outer.y + inner.y * outer.h,
+            .w = inner.w * outer.w,
+            .h = inner.h * outer.h,
+        };
+    }
+
+    /// Apply a probed affine to a rect.
+    fn affApply(aff: PaintAff, r: Rect) Rect {
+        return rectNormalize(.{
+            .x = aff.x + r.x * aff.w,
+            .y = aff.y + r.y * aff.h,
+            .w = r.w * aff.w,
+            .h = r.h * aff.h,
+        });
+    }
+
     /// The draw pass: own paint + the children pass (pre/loop/post hooks) —
     /// shared by the direct path and the retained rasterization.
-    fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool) void {
+    fn paintContent(node: *Node, ctx: *kx.Ctx, own_hit: bool, child_region: Rect, children_hit: bool, aff: PaintAff) void {
         const dbg = dbgPaintChild();
         if (own_hit) {
             if (dbg) {
@@ -875,16 +921,17 @@ pub const Node = struct {
             // running a subscriber may add/remove children (the traversal
             // freeze only defers deinit); a captured slice would dangle on
             // an append-realloc or skip/double on a remove-shift.
+            const kids_aff = affCompose(aff, ownAffine(node));
             var ci: usize = 0;
             while (ci < node.children.items.len) : (ci += 1) {
                 const child = node.children.items[ci];
                 if (child.defer_paint or child.zombie) continue; // defer_paint → popup overlay; zombie → swept
                 if (dbg) {
                     const t0 = sdl.c.SDL_GetTicksNS();
-                    child.paint(ctx, child_region);
+                    paintInner(child, ctx, child_region, kids_aff);
                     const us = (sdl.c.SDL_GetTicksNS() - t0) / 1000;
                     if (us > 5) std.debug.print("    child {*} {d}x{d} = {d}us\n", .{ child, child.bounds.w, child.bounds.h, us });
-                } else child.paint(ctx, child_region);
+                } else paintInner(child, ctx, child_region, kids_aff);
             }
             if (node.vtable.post_children_paint) |post| post(node, ctx);
         }
@@ -897,7 +944,7 @@ pub const Node = struct {
     /// Returns false when the node must paint directly instead (zero-size
     /// image, over-cap auto extent, or the offscreen pass is unavailable —
     /// e.g. nested inside another retained rasterization).
-    fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool, auto: bool) bool {
+    fn paintRetained(node: *Node, ctx: *kx.Ctx, subtree_dirty: bool, auto: bool, aff: PaintAff) bool {
         const pr = node.paintRect(); // parent space — the damage-contract rect
         if (node.retained_serial != 0 and node.retained_serial != paint_mod.ctxSerial(ctx) and
             (node.retained_image != 0 or node.retained_atlas))
@@ -1001,8 +1048,8 @@ pub const Node = struct {
         kx.c.kx_translate(ctx, -ix, -iy);
         // The cache must hold EVERYTHING the subtree draws: cull only
         // against the mapped paint extent (the damage-contract bound).
-        const mapped = node.mapRectToRoot(ext);
-        node.paintContent(ctx, true, mapped, true);
+        const mapped = affApply(aff, ext);
+        node.paintContent(ctx, true, mapped, true, aff);
         if (use_atlas) {
             paint_mod.atlasEnd(ctx);
             node.retained_atlas = true;
