@@ -18,8 +18,10 @@
 //   - shapes: both CornerFull (pill = h/2) on the OUTER corners; the inner
 //     corners (leading's end / trailing's start) = InnerCornerCornerSize —
 //     4/4/4/8/12 (XS/S/M/L/XL). The PRESSED half morphs its inner corners
-//     to InnerPressedCornerCornerSize — 8/12/12/20/20 (upstream's
-//     per-half pressedShape; instant until the animation system lands).
+//     to InnerPressedCornerCornerSize — 8/12/12/20/20 — on the effects
+//     spring (upstream's rememberAnimatedShape). The CHECKED trailing
+//     half morphs to CircleShape and fills it with contentColor@0.12
+//     (upstream's drawWithContent scrim over the content).
 //   - colors: filled = Primary container + OnPrimary content; disabled =
 //     container OnSurface @ 0.10, content OnSurfaceVariant @ 0.38 (same as
 //     the M3E filled button)
@@ -31,18 +33,15 @@
 //     halves as virtual button children whose activation taps land in the
 //     half's zone
 //
-// v1 deviations (documented, fixed later):
+// v1 deviations (documented):
 //   - Filled style only (tonal / elevated / outlined variants are
 //     follow-ups — same structure, different colors).
-//   - No checked trailing state (upstream's CircleShape morph for the
-//     open-menu toggle has no signal in this API yet).
 //   - The trailing icon sits at the geometric center — upstream nudges it
 //     toward the gap via an optical-centering modifier we can't reproduce
 //     without its private source.
-//   - The pressed corner morph is instant (upstream animates the radius —
-//     Phase 3).
 //   - No embedded menu: the trailing button fires `on_trailing` and the app
-//     opens a menu (the M3E menu widget, PR D2).
+//     opens a menu and drives `trailing_checked` (the M3E menu widget,
+//     PR D2).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -73,6 +72,11 @@ pub const SplitButtonOptions = struct {
     /// The trailing half's a11y label (upstream contentDescription — the
     /// trailing button is its own semantic node).
     trailing_label: []const u8 = "Expand",
+    /// The trailing half's initial checked state (upstream `checked` —
+    /// the app drives it as its menu opens/closes via
+    /// splitSetTrailingChecked; checked morphs the half to a circle and
+    /// paints the content-color state layer).
+    trailing_checked: bool = false,
     theme: Theme = theme_mod.light,
 };
 
@@ -114,6 +118,18 @@ const SplitState = struct {
     /// The pressed half: 0 = none, 1 = leading, 2 = trailing.
     pressed: u8 = 0,
     hovered: u8 = 0,
+    /// The trailing half's checked state (upstream `checked` on the
+    /// TrailingButton — morphs to CircleShape + the contentColor@0.12
+    /// overlay). splitSetTrailingChecked drives it.
+    trailing_checked: bool = false,
+    /// The halves' CURRENT inner corner radii — upstream's
+    /// rememberAnimatedShape morphs the corner SIZE between rest /
+    /// pressed / checked(circle) via the effects spring; these carry the
+    /// live value (snapped when no timeline exists).
+    lead_inner: f32 = 0,
+    trail_inner: f32 = 0,
+    lead_chan: u8 = 0, // channel markers (stable addresses)
+    trail_chan: u8 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — gestures.SLOP).
     down_raw_x: f32 = 0,
@@ -174,6 +190,74 @@ fn splitLayout(n: *Node, bounds: Rect) void {
     _ = bounds; // leaf: the halves are computed from the bounds at paint/hit
 }
 
+/// The leading half's inner-corner target (upstream shapeByInteraction —
+/// pressed wins; the leading button has no checkedShape).
+fn leadInnerTarget(s: *SplitState) f32 {
+    const d = dimsFor(s.opts.size);
+    return if (s.pressed == 1) d.inner_pressed else d.inner_rest;
+}
+
+/// The trailing half's inner-corner target: pressed wins, else the
+/// checked state morphs to CircleShape (h/2), else InnerCornerSize.
+fn trailInnerTarget(s: *SplitState) f32 {
+    const d = dimsFor(s.opts.size);
+    if (s.pressed == 2) return d.inner_pressed;
+    if (s.trailing_checked) return d.height / 2;
+    return d.inner_rest;
+}
+
+fn leadInnerCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).lead_inner = v[0];
+    n.markDirty();
+}
+
+fn trailInnerCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).trail_inner = v[0];
+    n.markDirty();
+}
+
+/// Retarget a half's inner corner on the effects spring (upstream's
+/// rememberAnimatedShape). Mid-flight retargets carry the channel
+/// velocity; no timeline → snap.
+fn morphInner(n: *Node, s: *SplitState, trailing: bool) void {
+    const target = if (trailing) trailInnerTarget(s) else leadInnerTarget(s);
+    const val = if (trailing) &s.trail_inner else &s.lead_inner;
+    const chan = if (trailing) &s.trail_chan else &s.lead_chan;
+    if (val.* == target) return;
+    if (ui.anim.timeline()) |tl| {
+        const from: ui.anim.Vec4 = .{ val.*, 0, 0, 0 };
+        _ = tl.play(.{
+            .kind = ui.anim.Animation.springAnim(from, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.effects_spring, tl.channelVelocity(@ptrCast(chan))),
+            .from = from,
+            .channel = @ptrCast(chan),
+            .on_update = .{ .fn_ptr = if (trailing) trailInnerCb else leadInnerCb, .userdata = n },
+        });
+    } else {
+        val.* = target;
+        n.markDirty();
+    }
+}
+
+/// Drive the trailing half's checked state (upstream `checked` — the app
+/// calls this when its menu opens/closes): morphs to CircleShape and
+/// syncs the a11y child's `checked`.
+pub fn splitSetTrailingChecked(n: *Node, checked: bool) void {
+    const s = stateOf(n);
+    if (s.trailing_checked == checked) return;
+    s.trailing_checked = checked;
+    morphInner(n, s, true);
+    s.sem_children[1].checked = checked;
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
+
+/// The trailing half's checked state (pub accessor).
+pub fn splitTrailingChecked(n: *Node) bool {
+    return stateOf(n).trailing_checked;
+}
+
 /// Paint an icon centered in a size x size box — vector geometry (icon.zig),
 /// not a font glyph (emoji-capable codepoints bypass the theme ink).
 fn paintIcon(ctx: *kx.Ctx, name: icon_w.IconName, x: f32, y: f32, size: f32, color: Color) void {
@@ -207,11 +291,11 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
     // --- the leading half: pill on the start side, the size's inner corner
-    // on the end (inner_rest, morphing to inner_pressed while THIS half is
-    // pressed — upstream's per-half pressedShape). Its content is clipped
+    // on the end (s.lead_inner morphs rest ↔ pressed on the effects
+    // spring — upstream's rememberAnimatedShape). Its content is clipped
     // to the half (a constrained width never bleeds into the trailing half
     // or outside the node).
-    const lead_inner: f32 = if (s.pressed == 1) d.inner_pressed else d.inner_rest;
+    const lead_inner: f32 = s.lead_inner;
     if (lead_w > 0) {
         var tl: f32 = half;
         var tr: f32 = lead_inner;
@@ -260,10 +344,10 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         ui.paint.clipReset(ctx); // restores
     }
     // --- the trailing half: the size's inner corner on the start side
-    // (morphing to inner_pressed while THIS half is pressed), pill on the
-    // end, clipped to the node's right edge (a width below the halves'
-    // minimum never paints outside the node)
-    const trail_inner: f32 = if (s.pressed == 2) d.inner_pressed else d.inner_rest;
+    // (s.trail_inner morphs rest ↔ pressed ↔ checked-circle on the
+    // effects spring), pill on the end, clipped to the node's right edge
+    // (a width below the halves' minimum never paints outside the node)
+    const trail_inner: f32 = s.trail_inner;
     const tclip_w = @max(@min(tw, b.x + b.w - tx), 0);
     if (tclip_w > 0) {
         var tl: f32 = trail_inner;
@@ -294,6 +378,12 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
             }
         }
         paintIcon(ctx, s.opts.trailing_icon, tx + (tw - d.trail_icon) / 2, b.y + (b.h - d.trail_icon) / 2, d.trail_icon, fg);
+        // upstream drawWithContent: the checked trailing button fills its
+        // (circle) shape with contentColor @ pressed opacity — a scrim
+        // over the half, content included
+        if (s.opts.enabled and s.trailing_checked) {
+            ui.paint.fillRRectCorners(ctx, tx, b.y, tw, b.h, tl, tr, br, bl, ui.paint.withAlphaScaled(cs.on_primary, t.state.pressed));
+        }
         ui.paint.clipReset(ctx); // restores
     }
 }
@@ -308,12 +398,16 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.pressed = zone;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
+            morphInner(n, s, true); // the pressed half morphs (both, a
+            morphInner(n, s, false); // direct 1→2 switch unmorphs the other)
             n.markDirty();
             return true;
         },
         .up => {
             const was = s.pressed;
             s.pressed = 0;
+            morphInner(n, s, true);
+            morphInner(n, s, false);
             n.markDirty();
             if (was != 0 and zone == was) {
                 if (was == 1) {
@@ -333,6 +427,8 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
                     s.pressed = 0;
+                    morphInner(n, s, true);
+                    morphInner(n, s, false);
                     n.markDirty();
                 }
             }
@@ -341,6 +437,8 @@ fn splitOnPointer(n: *Node, ev: input.PointerEvent) bool {
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
             s.pressed = 0;
+            morphInner(n, s, true);
+            morphInner(n, s, false);
             n.markDirty();
             return true;
         },
@@ -408,6 +506,10 @@ fn splitOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 fn splitDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| {
+        tl.cancelChannel(@ptrCast(&s.lead_chan)); // the update cbs point at this node
+        tl.cancelChannel(@ptrCast(&s.trail_chan));
+    }
     input.releaseNode(n);
     n.allocator.free(s.label);
     n.allocator.destroy(s);
@@ -453,14 +555,18 @@ pub fn splitButton(allocator: std.mem.Allocator, on_press: ?Callback, on_trailin
         .opts = opts,
         .on_press = on_press,
         .on_trailing = on_trailing,
+        .trailing_checked = opts.trailing_checked,
     };
     node.state = s;
+    // the initial corners are settled — no construction animation
+    s.lead_inner = leadInnerTarget(s);
+    s.trail_inner = trailInnerTarget(s);
     // The two halves as a11y children — TalkBack/VoiceOver expose the
     // trailing button separately like upstream's two composables, and an
     // activate lands in its zone (resolved by the pointer path).
     s.sem_children = .{
         .{ .role = .button, .label = s.label, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
-        .{ .role = .button, .label = s.opts.trailing_label, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
+        .{ .role = .button, .label = s.opts.trailing_label, .checked = s.trailing_checked, .disabled = !opts.enabled, .actions = ui.semantics.Actions.initOne(.activate) },
     };
     ui.semantics.attach(node, .{
         .role = .button,
@@ -728,4 +834,65 @@ test "golden: a disabled split button paints the OnSurface@0.10 container + @0.3
     // so no single-pixel assertion)
     const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface_variant, 0.38), cont);
     try std.testing.expect(f.countColorApproxIn(.{ .x = 24, .y = 30, .w = lead_w, .h = 20 }, dis) > 4);
+}
+
+test "split_button: the pressed half's inner corner morphs on the effects spring" {
+    var tl = ui.anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    ui.anim.setCurrent(&tl);
+    defer ui.anim.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try splitButton(a, null, null, .{ .label = "Save" });
+    defer n.deinit();
+    const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    n.layout(.{ .x = 0, .y = 0, .w = sz.w, .h = sz.h });
+    const s = stateOf(n);
+    const d = dimsFor(.small);
+    try std.testing.expectEqual(d.inner_rest, s.lead_inner);
+    // press the leading half → its inner corner springs toward pressed
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = 20, .y = 20, .raw_x = 20, .raw_y = 20 });
+    tl.tick(0); // lazy start
+    tl.tick(60); // mid-flight
+    try std.testing.expect(s.lead_inner > d.inner_rest and s.lead_inner < d.inner_pressed);
+    tl.tick(600); // effects_spring (1600/1.0) settles fast
+    try std.testing.expectApproxEqAbs(d.inner_pressed, s.lead_inner, 0.01);
+    // release → back to rest (the retarget starts lazily at the next tick)
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = 20, .y = 20, .raw_x = 20, .raw_y = 20 });
+    tl.tick(1200); // lazy start
+    tl.tick(2000);
+    try std.testing.expectApproxEqAbs(d.inner_rest, s.lead_inner, 0.01);
+}
+
+test "split_button: checked trailing morphs to a circle + paints the contentColor scrim + a11y checked" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const n = try splitButton(a, null, null, .{ .label = "Save", .trailing_checked = true, .theme = t });
+    defer n.deinit();
+    const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    n.layout(.{ .x = 20, .y = 20, .w = sz.w, .h = sz.h });
+    const s = stateOf(n);
+    // the trailing inner corners settled at h/2 (CircleShape)
+    try std.testing.expectEqual(sz.h / 2, s.trail_inner);
+    try std.testing.expect(splitTrailingChecked(n));
+    try std.testing.expect(n.semantics.?.children[1].checked.?);
+    var r = try golden.Renderer.init(std.testing.allocator, 260, 80);
+    defer r.deinit();
+    r.paint(n, 0xFFFFFFFF);
+    var f = try r.readback(a);
+    defer f.deinit();
+    const tw = trailWidth(s);
+    const tx = 20 + sz.w - tw;
+    // the checked scrim: primary + on_primary@0.12 over it (the trailing
+    // half's edge near its start side, above the icon's y band)
+    const checked_fill = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_primary, t.state.pressed), t.colors.primary);
+    try golden.expectPixelApprox(f, @intFromFloat(tx + tw - 8), 40, checked_fill); // inside the circle, right of the icon
+    // unchecking: the circle morphs back (no timeline → snap) and the
+    // scrim lifts
+    splitSetTrailingChecked(n, false);
+    try std.testing.expectEqual(dimsFor(.small).inner_rest, s.trail_inner);
+    try std.testing.expect(!n.semantics.?.children[1].checked.?);
+    r.paint(n, 0xFFFFFFFF);
+    f.deinit();
+    f = try r.readback(a);
+    try std.testing.expectEqual(t.colors.primary, f.pixelAt(@intFromFloat(tx + tw - 8), 40));
 }
