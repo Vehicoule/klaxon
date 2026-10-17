@@ -8,11 +8,13 @@
 //   - Interpolation: ARB placeholders `{name}` are filled from a comptime
 //     args struct (`trArgs(i18n, alloc, key, .{ .name = "Léa" })`).
 //   - Pluralization: ARB plural blocks `{count, plural, =0 {...} one {...}
-//     other {...}}` with CLDR category rules (en/fr/ja/ar built in; the
-//     default rule is one/other). `#` and `{count}` expand to the count.
-//   - Number/date formatting: per-locale tables (separators, date patterns,
-//     month names) for en/fr/ja/ar. Pure Zig — the ICU binding (full CLDR
-//     tables, native digits) is the documented upgrade path.
+//     other {...}}` with CLDR category rules (en/fr/ja/ar/zh/ko/hi/pt/ru/
+//     tr built in; the default rule is one/other). `#` and `{count}`
+//     expand to the count.
+//   - Number/date formatting: per-locale tables (separators, grouping —
+//     incl. the Indian 3/2 system — date patterns, month names, native
+//     digits) for en/fr/ja/ar/es/de/zh/hi/pt/ru/ko/it/nl/tr. Pure Zig —
+//     the ICU binding (full CLDR tables) is the documented upgrade path.
 //   - Resolution chain: `tr(key)`/`setLocale(tag)` resolve a tag exact →
 //     base language (fr-CA → fr) → the fallback locale → the key itself.
 //     A regional request never fails while a base-language catalog exists.
@@ -57,6 +59,11 @@ pub const Locale = struct {
     decimal_sep: []const u8 = ".",
     group_sep: []const u8 = ",",
     percent_sign: []const u8 = "%",
+    /// Integer grouping: the first (rightmost) group is `group_first`
+    /// digits, every group above is `group_rest` — most locales are 3/3;
+    /// hi groups the Indian way (12,34,567 → 3 then 2).
+    group_first: u8 = 3,
+    group_rest: u8 = 3,
     /// Native digits (CLDR numbering system): when set, ASCII 0-9 in the
     /// formatted output map to these UTF-8 strings — ar uses Arabic-Indic
     /// ٠–٩ (its CLDR default); latn locales leave null.
@@ -153,17 +160,17 @@ pub const Locale = struct {
             int_part = all[0..dot];
             frac_part = all[dot + 1 ..];
         }
-        // Group the integer part (groups of 3, from the right).
-        if (opts.grouping and int_part.len > 3) {
-            const len = int_part.len;
-            const rem = len % 3;
-            const first_n = if (rem == 0) 3 else rem;
-            try buf.appendSlice(int_part[0..first_n]);
-            var pos = first_n;
-            while (pos < len) {
-                try buf.appendSlice(loc.group_sep);
-                try buf.appendSlice(int_part[pos .. pos + 3]);
-                pos += 3;
+        // Group the integer part: a digit starts a new group when the
+        // count remaining to its right equals `group_first`, or exceeds it
+        // by a multiple of `group_rest` (3/3 for most locales, 3/2 for the
+        // Indian system — 12,34,567).
+        if (opts.grouping and int_part.len > loc.group_first) {
+            for (int_part, 0..) |ch, i| {
+                const p = int_part.len - i; // digits at/after this one
+                if (i > 0 and (p == loc.group_first or
+                    (p > loc.group_first and (p - loc.group_first) % loc.group_rest == 0)))
+                    try buf.appendSlice(loc.group_sep);
+                try buf.append(ch);
             }
         } else {
             try buf.appendSlice(int_part);
@@ -280,7 +287,8 @@ fn shapeDigits(loc: *const Locale, allocator: std.mem.Allocator, ascii: []u8) ![
     return out.toOwnedSlice();
 }
 
-// --- Per-locale format data (en/fr/ja/ar/es built in; ICU is the upgrade path) ---
+// --- Per-locale format data (en/fr/ja/ar/es/de/zh/hi/pt/ru/ko/it/nl/tr
+// --- built in; ICU is the upgrade path for the long tail) ---
 
 /// Apply the built-in format data (separators, date patterns, month names)
 /// for a known locale tag. Unknown tags keep the English defaults.
@@ -437,6 +445,327 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "dom", "lun", "mar", "mié", "jue", "vie", "sáb" };
         loc.weekday_letter = .{ "D", "L", "M", "X", "J", "V", "S" };
+    } else if (std.mem.eql(u8, base, "de")) {
+        // CLDR de: 1.234,56 — medium date is fully numeric.
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "dd.MM.y";
+        loc.date_medium = "dd.MM.y";
+        loc.date_long = "d. MMMM y";
+        setMonths(loc, &.{
+            "Januar",
+            "Februar",
+            "März",
+            "April",
+            "Mai",
+            "Juni",
+            "Juli",
+            "August",
+            "September",
+            "Oktober",
+            "November",
+            "Dezember",
+        }, &.{
+            "Jan.",
+            "Feb.",
+            "März",
+            "Apr.",
+            "Mai",
+            "Juni",
+            "Juli",
+            "Aug.",
+            "Sept.",
+            "Okt.",
+            "Nov.",
+            "Dez.",
+        });
+        loc.weekday_short = .{ "So.", "Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa." };
+        loc.weekday_letter = .{ "S", "M", "D", "M", "D", "F", "S" };
+    } else if (std.mem.eql(u8, base, "zh")) {
+        // CLDR zh-Hans: 1,234.56 — dates lead with the year.
+        loc.date_short = "y/M/d";
+        loc.date_medium = "y年M月d日";
+        loc.date_long = "y年M月d日";
+        setMonths(loc, &.{
+            "一月",
+            "二月",
+            "三月",
+            "四月",
+            "五月",
+            "六月",
+            "七月",
+            "八月",
+            "九月",
+            "十月",
+            "十一月",
+            "十二月",
+        }, &.{
+            "1月",
+            "2月",
+            "3月",
+            "4月",
+            "5月",
+            "6月",
+            "7月",
+            "8月",
+            "9月",
+            "10月",
+            "11月",
+            "12月",
+        });
+        loc.weekday_short = .{ "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
+        loc.weekday_letter = .{ "日", "一", "二", "三", "四", "五", "六" };
+    } else if (std.mem.eql(u8, base, "hi")) {
+        // CLDR hi: Devanagari digits and Indian grouping (12,34,567).
+        loc.group_first = 3;
+        loc.group_rest = 2;
+        loc.digits = .{ "०", "१", "२", "३", "४", "५", "६", "७", "८", "९" };
+        loc.date_short = "d/M/yy";
+        loc.date_medium = "d MMM y";
+        loc.date_long = "d MMMM y";
+        setMonths(loc, &.{
+            "जनवरी",
+            "फ़रवरी",
+            "मार्च",
+            "अप्रैल",
+            "मई",
+            "जून",
+            "जुलाई",
+            "अगस्त",
+            "सितंबर",
+            "अक्तूबर",
+            "नवंबर",
+            "दिसंबर",
+        }, &.{
+            "जन॰",
+            "फ़र॰",
+            "मार्च",
+            "अप्रैल",
+            "मई",
+            "जून",
+            "जुल॰",
+            "अग॰",
+            "सित॰",
+            "अक्तू॰",
+            "नव॰",
+            "दिस॰",
+        });
+        loc.weekday_short = .{ "रवि", "सोम", "मंगल", "बुध", "गुरु", "शुक्र", "शनि" };
+        loc.weekday_letter = .{ "र", "सो", "म", "बु", "गु", "शु", "श" };
+    } else if (std.mem.eql(u8, base, "pt")) {
+        // CLDR pt: 1.234,56 — 'de' literal like es.
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "dd/MM/y";
+        loc.date_medium = "d 'de' MMM 'de' y";
+        loc.date_long = "d 'de' MMMM 'de' y";
+        setMonths(loc, &.{
+            "janeiro",
+            "fevereiro",
+            "março",
+            "abril",
+            "maio",
+            "junho",
+            "julho",
+            "agosto",
+            "setembro",
+            "outubro",
+            "novembro",
+            "dezembro",
+        }, &.{
+            "jan.",
+            "fev.",
+            "mar.",
+            "abr.",
+            "mai.",
+            "jun.",
+            "jul.",
+            "ago.",
+            "set.",
+            "out.",
+            "nov.",
+            "dez.",
+        });
+        loc.weekday_short = .{ "dom.", "seg.", "ter.", "qua.", "qui.", "sex.", "sáb." };
+        loc.weekday_letter = .{ "D", "S", "T", "Q", "Q", "S", "S" };
+    } else if (std.mem.eql(u8, base, "ru")) {
+        // CLDR ru: 1 234,56 — months decline (genitive) in date context.
+        loc.decimal_sep = ",";
+        loc.group_sep = " ";
+        loc.date_short = "dd.MM.y";
+        loc.date_medium = "d MMM y 'г'.";
+        loc.date_long = "d MMMM y 'г'.";
+        setMonths(loc, &.{
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        }, &.{
+            "янв.",
+            "февр.",
+            "мар.",
+            "апр.",
+            "мая",
+            "июн.",
+            "июл.",
+            "авг.",
+            "сент.",
+            "окт.",
+            "нояб.",
+            "дек.",
+        });
+        loc.weekday_short = .{ "вс", "пн", "вт", "ср", "чт", "пт", "сб" };
+        loc.weekday_letter = .{ "В", "П", "В", "С", "Ч", "П", "С" };
+    } else if (std.mem.eql(u8, base, "ko")) {
+        // CLDR ko: 1,234.56 — all date widths are numeric except long.
+        loc.date_short = "y. M. d.";
+        loc.date_medium = "y. M. d.";
+        loc.date_long = "y년 M월 d일";
+        setMonths(loc, &.{
+            "1월",
+            "2월",
+            "3월",
+            "4월",
+            "5월",
+            "6월",
+            "7월",
+            "8월",
+            "9월",
+            "10월",
+            "11월",
+            "12월",
+        }, &.{
+            "1월",
+            "2월",
+            "3월",
+            "4월",
+            "5월",
+            "6월",
+            "7월",
+            "8월",
+            "9월",
+            "10월",
+            "11월",
+            "12월",
+        });
+        loc.weekday_short = .{ "일", "월", "화", "수", "목", "금", "토" };
+        loc.weekday_letter = .{ "일", "월", "화", "수", "목", "금", "토" };
+    } else if (std.mem.eql(u8, base, "it")) {
+        // CLDR it: 1.234,56.
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "dd/MM/y";
+        loc.date_medium = "d MMM y";
+        loc.date_long = "d MMMM y";
+        setMonths(loc, &.{
+            "gennaio",
+            "febbraio",
+            "marzo",
+            "aprile",
+            "maggio",
+            "giugno",
+            "luglio",
+            "agosto",
+            "settembre",
+            "ottobre",
+            "novembre",
+            "dicembre",
+        }, &.{
+            "gen",
+            "feb",
+            "mar",
+            "apr",
+            "mag",
+            "giu",
+            "lug",
+            "ago",
+            "set",
+            "ott",
+            "nov",
+            "dic",
+        });
+        loc.weekday_short = .{ "dom", "lun", "mar", "mer", "gio", "ven", "sab" };
+        loc.weekday_letter = .{ "D", "L", "M", "M", "G", "V", "S" };
+    } else if (std.mem.eql(u8, base, "nl")) {
+        // CLDR nl: 1.234,56 — short date is dash-separated.
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "dd-MM-y";
+        loc.date_medium = "d MMM y";
+        loc.date_long = "d MMMM y";
+        setMonths(loc, &.{
+            "januari",
+            "februari",
+            "maart",
+            "april",
+            "mei",
+            "juni",
+            "juli",
+            "augustus",
+            "september",
+            "oktober",
+            "november",
+            "december",
+        }, &.{
+            "jan.",
+            "feb.",
+            "mrt.",
+            "apr.",
+            "mei",
+            "jun.",
+            "jul.",
+            "aug.",
+            "sep.",
+            "okt.",
+            "nov.",
+            "dec.",
+        });
+        loc.weekday_short = .{ "zo", "ma", "di", "wo", "do", "vr", "za" };
+        loc.weekday_letter = .{ "Z", "M", "D", "W", "D", "V", "Z" };
+    } else if (std.mem.eql(u8, base, "tr")) {
+        // CLDR tr: 1.234,56.
+        loc.decimal_sep = ",";
+        loc.group_sep = ".";
+        loc.date_short = "d.MM.y";
+        loc.date_medium = "d MMM y";
+        loc.date_long = "d MMMM y";
+        setMonths(loc, &.{
+            "Ocak",
+            "Şubat",
+            "Mart",
+            "Nisan",
+            "Mayıs",
+            "Haziran",
+            "Temmuz",
+            "Ağustos",
+            "Eylül",
+            "Ekim",
+            "Kasım",
+            "Aralık",
+        }, &.{
+            "Oca",
+            "Şub",
+            "Mar",
+            "Nis",
+            "May",
+            "Haz",
+            "Tem",
+            "Ağu",
+            "Eyl",
+            "Eki",
+            "Kas",
+            "Ara",
+        });
+        loc.weekday_short = .{ "Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt" };
+        loc.weekday_letter = .{ "P", "P", "S", "Ç", "P", "C", "C" };
     }
     // en: defaults
 }
@@ -474,10 +803,12 @@ fn defaultRtl(base: []const u8) bool {
 
 pub const PluralCategory = enum { zero, one, two, few, many, other };
 
-/// CLDR plural category for a locale tag and count (en/fr/ja/ar built in;
-/// the default rule is one/other like English — es, de, it, pt and most
-/// European languages share it). CLDR operands run on |n| — a negative
-/// count resolves exactly like its positive.
+/// CLDR plural category for a locale tag and count. Built-in rules cover
+/// en/fr/ja/ar/es-like defaults plus hi/pt (one covers 0..1), tr (one at
+/// 1, no plural contrast in the noun), zh/ko (always other) and ru's
+/// three-way one/few/many. The default rule is one/other like English —
+/// de, it, nl, es and most European languages share it. CLDR operands
+/// run on |n| — a negative count resolves exactly like its positive.
 pub fn pluralCategory(tag: []const u8, n: i64) PluralCategory {
     const base = if (std.mem.indexOfScalar(u8, tag, '-')) |i| tag[0..i] else tag;
     const u: u64 = @intCast(@abs(n));
@@ -485,7 +816,12 @@ pub fn pluralCategory(tag: []const u8, n: i64) PluralCategory {
         // fr: one covers 0 and 1
         return if (u < 2) .one else .other;
     }
-    if (std.mem.eql(u8, base, "ja")) return .other;
+    if (std.mem.eql(u8, base, "hi") or std.mem.eql(u8, base, "pt")) {
+        // CLDR hi: i = 0 or n = 1 → one. CLDR pt: i in 0..1 → one.
+        return if (u <= 1) .one else .other;
+    }
+    if (std.mem.eql(u8, base, "ja") or std.mem.eql(u8, base, "zh") or
+        std.mem.eql(u8, base, "ko")) return .other;
     if (std.mem.eql(u8, base, "ar")) {
         if (u == 0) return .zero;
         if (u == 1) return .one;
@@ -493,6 +829,16 @@ pub fn pluralCategory(tag: []const u8, n: i64) PluralCategory {
         const m100 = u % 100;
         if (m100 >= 3 and m100 <= 10) return .few;
         if (m100 >= 11 and m100 <= 99) return .many;
+        return .other;
+    }
+    if (std.mem.eql(u8, base, "ru")) {
+        // CLDR ru (integer counts): one at *1 but not *11, few at *2-*4
+        // but not *12-*14, many at *0, *5-*9 and *11-*14.
+        const m10 = u % 10;
+        const m100 = u % 100;
+        if (m10 == 1 and m100 != 11) return .one;
+        if (m10 >= 2 and m10 <= 4 and (m100 < 12 or m100 > 14)) return .few;
+        if (m10 == 0 or (m10 >= 5 and m10 <= 9) or (m100 >= 11 and m100 <= 14)) return .many;
         return .other;
     }
     // en + default: one is exactly 1
@@ -1199,6 +1545,73 @@ test "formatDate: patterns per locale and kind" {
     try expectDate(en, date, .long, "October 7, 2026");
     try expectDate(fr, date, .medium, "7 oct. 2026");
     try expectDate(ja, date, .long, "2026年10月7日");
+}
+
+test "formatNumber: CLDR tables for the expanded built-in locales" {
+    const i18n = try testI18n();
+    defer i18n.deinit();
+    for ([_][]const u8{ "de", "zh", "hi", "pt", "ru", "ko", "it", "nl", "tr" }) |tag|
+        try i18n.addArb(tag, "{\"x\": \"y\"}", .ltr);
+    const expectNum = struct {
+        fn run(loc: *Locale, v: f64, expected: []const u8) !void {
+            const s = try loc.formatNumber(std.testing.allocator, v, .{});
+            defer std.testing.allocator.free(s);
+            try std.testing.expectEqualStrings(expected, s);
+        }
+    }.run;
+    try expectNum(i18n.locales.get("de").?, 1234567.891, "1.234.567,891");
+    try expectNum(i18n.locales.get("zh").?, 1234567.891, "1,234,567.891");
+    // hi: Devanagari digits + Indian grouping (3 then 2).
+    try expectNum(i18n.locales.get("hi").?, 1234567.891, "१२,३४,५६७.८९१");
+    try expectNum(i18n.locales.get("hi").?, 12345, "१२,३४५");
+    try expectNum(i18n.locales.get("pt").?, 1234567.891, "1.234.567,891");
+    try expectNum(i18n.locales.get("ru").?, 1234567.891, "1 234 567,891");
+    try expectNum(i18n.locales.get("ko").?, 1234567.891, "1,234,567.891");
+    try expectNum(i18n.locales.get("it").?, 1234567.891, "1.234.567,891");
+    try expectNum(i18n.locales.get("nl").?, 1234567.891, "1.234.567,891");
+    try expectNum(i18n.locales.get("tr").?, 1234567.891, "1.234.567,891");
+}
+
+test "formatDate: CLDR tables for the expanded built-in locales" {
+    const i18n = try testI18n();
+    defer i18n.deinit();
+    for ([_][]const u8{ "de", "zh", "hi", "pt", "ru", "ko", "it", "nl", "tr" }) |tag|
+        try i18n.addArb(tag, "{\"x\": \"y\"}", .ltr);
+    const date = Date{ .year = 2026, .month = 10, .day = 7 };
+    try expectDate(i18n.locales.get("de").?, date, .short, "07.10.2026");
+    try expectDate(i18n.locales.get("de").?, date, .long, "7. Oktober 2026");
+    try expectDate(i18n.locales.get("zh").?, date, .short, "2026/10/7");
+    try expectDate(i18n.locales.get("zh").?, date, .long, "2026年10月7日");
+    try expectDate(i18n.locales.get("hi").?, date, .short, "७/१०/२६");
+    try expectDate(i18n.locales.get("hi").?, date, .long, "७ अक्तूबर २०२६");
+    try expectDate(i18n.locales.get("pt").?, date, .long, "7 de outubro de 2026");
+    try expectDate(i18n.locales.get("ru").?, date, .long, "7 октября 2026 г.");
+    try expectDate(i18n.locales.get("ko").?, date, .short, "2026. 10. 7.");
+    try expectDate(i18n.locales.get("it").?, date, .medium, "7 ott 2026");
+    try expectDate(i18n.locales.get("nl").?, date, .short, "07-10-2026");
+    try expectDate(i18n.locales.get("tr").?, date, .medium, "7 Eki 2026");
+}
+
+test "plural: CLDR categories for ru (one/few/many), hi/pt/zh/ko" {
+    // ru: one at *1-but-not-*11, few at *2-*4-but-not-*12-*14, many else.
+    try std.testing.expectEqual(PluralCategory.one, pluralCategory("ru", 1));
+    try std.testing.expectEqual(PluralCategory.few, pluralCategory("ru", 3));
+    try std.testing.expectEqual(PluralCategory.many, pluralCategory("ru", 5));
+    try std.testing.expectEqual(PluralCategory.many, pluralCategory("ru", 11));
+    try std.testing.expectEqual(PluralCategory.one, pluralCategory("ru", 21));
+    try std.testing.expectEqual(PluralCategory.few, pluralCategory("ru", 22));
+    try std.testing.expectEqual(PluralCategory.many, pluralCategory("ru", 112));
+    try std.testing.expectEqual(PluralCategory.few, pluralCategory("ru", 122));
+    // hi/pt: one covers 0 and 1 (not the English exactly-1 rule).
+    try std.testing.expectEqual(PluralCategory.one, pluralCategory("hi", 0));
+    try std.testing.expectEqual(PluralCategory.one, pluralCategory("pt", 0));
+    try std.testing.expectEqual(PluralCategory.other, pluralCategory("hi", 2));
+    // zh/ko: no plural contrast at all.
+    try std.testing.expectEqual(PluralCategory.other, pluralCategory("zh", 1));
+    try std.testing.expectEqual(PluralCategory.other, pluralCategory("ko", 1));
+    // de/it/nl/tr share the English one/other rule.
+    try std.testing.expectEqual(PluralCategory.one, pluralCategory("tr", 1));
+    try std.testing.expectEqual(PluralCategory.other, pluralCategory("de", 0));
 }
 
 test "formatNumber: ar renders Arabic-Indic digits and separators" {

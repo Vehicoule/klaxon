@@ -120,9 +120,11 @@ Each widget's header carries the same list; these are the tracked ones
   `hasPendingTimeWork` wakes the host); in headless no-timeline tests it
   fires on the next event. (Slop is pointer-type aware; a tap holds for
   the double-tap window when `on_double_tap` exists.)
-- `i18n.zig` — number/date tables cover en/fr/ja/ar/es; ar renders CLDR
-  Arabic-Indic digits/separators (other native digit sets need the ICU
-  upgrade path). (The paragraph bidi base direction follows the locale —
+- `i18n.zig` — number/date tables cover en/fr/ja/ar/es/de/zh/hi/pt/ru/ko/
+  it/nl/tr, with CLDR plural rules (incl. ru's one/few/many and hi/pt's
+  0-or-1 `one`), Arabic-Indic and Devanagari digit sets and the Indian
+  3/2 grouping. The long tail of locales stays on the documented ICU
+  upgrade path. (The paragraph bidi base direction follows the locale —
   fixed audit row above.)
 - `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
   shipped: checkerboard + gradient bar feeding the Signal's alpha byte.)
