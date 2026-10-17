@@ -103,7 +103,67 @@ pub const Edit = struct {
     bidi_key_set: bool = false,
     bidi_rtl: bool = false,
 
-    /// Whether the buffer holds any strong-RTL codepoint or bidi control
+    /// The multiline (wrap_width > 0) layout table: ONE SkParagraph per
+    /// hard line ('\n'-delimited), incrementally reconciled against the
+    /// buffer so a keystroke rebuilds only the touched line instead of a
+    /// monolithic O(text) paragraph. Geometry is identical either way —
+    /// a hard break unconditionally ends a SkParagraph line and bounds
+    /// its bidi/wrap state, so a paragraph over one line's bytes (the
+    /// '\n' excluded — inside a span it would fabricate a second empty
+    /// line) wraps to the same rows it occupies in the whole-buffer
+    /// layout. Reconciled on (content hash, size, wrap, direction, baked
+    /// span style) — the same key hitLayout uses.
+    line_paras: std.ArrayListUnmanaged(LinePara) = .empty,
+    /// Reconcile scratch: the current hard-line split + content hashes.
+    line_spans: std.ArrayListUnmanaged(LineSpan) = .empty,
+    /// Reconcile scratch: the next line table (kept paras move into it).
+    line_next: std.ArrayListUnmanaged(LinePara) = .empty,
+    /// Shared paragraph for empty lines, built over a single space — an
+    /// empty line's height is the span's line metrics (SkParagraph gives
+    /// in-text empty lines the run metrics too; an empty PARAGRAPH would
+    /// fall back to the 14px paragraph default). One per table, not one
+    /// per line — empty lines have no ink to distinguish them.
+    empty_para: ?*ui.paint.TextLayout = null,
+    lines_built: bool = false,
+    lines_ok: bool = false,
+    lines_key: u64 = 0,
+    lines_size: f32 = 0,
+    lines_wrap: f32 = 0,
+    lines_rtl: bool = false,
+    lines_style: struct { weight: i32 = 400, spacing: f32 = 0, ink: u32 = 0xFF0000FF } = .{},
+    lines_total_h: f32 = 0,
+    lines_max_w: f32 = 0,
+    /// Test/diagnostic counter — one increment per paragraph build. An
+    /// edit inside one line must not bump this for untouched lines.
+    para_builds: u64 = 0,
+
+    /// One hard line's incremental layout record. `para` is the line's
+    /// own paragraph over buf[start..content_end]; null only for empty
+    /// lines, which answer geometry through `empty_para` instead.
+    pub const LinePara = struct {
+        /// [start, end) byte range in buf — `end` sits past the '\n' when
+        /// the line has one; `content_end` is `end` minus that '\n' (the
+        /// bytes the paragraph actually shaped).
+        start: usize = 0,
+        end: usize = 0,
+        content_end: usize = 0,
+        /// Wyhash of buf[start..content_end] — the reconcile identity.
+        key: u64 = 0,
+        para: ?*ui.paint.TextLayout = null,
+        /// Layout-space top of the line's first soft row.
+        y: f32 = 0,
+        /// Laid-out height — every soft row of the line summed.
+        h: f32 = 0,
+        /// The line's longest soft-line width (0 for empty lines).
+        w: f32 = 0,
+        /// First soft row's baseline — the uniform style makes it every
+        /// row's baseline offset, so it also positions the comp overlay.
+        base: f32 = 0,
+    };
+
+    /// The reconcile split record — range + content hash per hard line.
+    const LineSpan = struct { start: usize, end: usize, content_end: usize, key: u64 };
+
     /// (Unicode Bidi_Class R/AL blocks + the isolates/controls that can
     /// reorder). Memoized on the content hash — the scan is a UTF-8 decode
     /// + range check, ~2 orders cheaper than a paragraph build.
@@ -126,12 +186,22 @@ pub const Edit = struct {
         };
     }
 
-    /// Remove the blink ticker and free both buffers.
+    /// Remove the blink ticker, free both buffers, and destroy every
+    /// cached paragraph — the monolithic hit layout plus the per-line
+    /// table and its shared empty-line paragraph.
     pub fn deinit(e: *Edit) void {
         if (e.ticker) |t| {
             if (ui.anim.timeline()) |tl| tl.removeTicker(t);
         }
         if (e.hit_layout) |l| ui.paint.textLayoutDestroy(l);
+        for (e.line_paras.items) |lp| {
+            if (lp.para) |p| ui.paint.textLayoutDestroy(p);
+        }
+        const a = e.buf.allocator;
+        e.line_paras.deinit(a);
+        e.line_spans.deinit(a);
+        e.line_next.deinit(a);
+        if (e.empty_para) |p| ui.paint.textLayoutDestroy(p);
         e.buf.deinit();
         e.comp.deinit();
     }
@@ -572,18 +642,16 @@ pub const Edit = struct {
         return false;
     }
 
-    /// The memoized hit-test/motion layout: a single-span unconstrained
-    /// paragraph in the GLOBAL text direction — the same direction the
-    /// paint path builds its run — so hit-testing, caret geometry and
-    /// arrow stepping all agree with what is on screen (a mirrored RTL
-    /// run hit-tests its glyphs where they are painted). Keyed on
-    /// (content hash, size, direction); drags and arrows reuse it.
-    /// The shared text layout — memoized on (content, size, wrap,
-    /// direction, and the baked span style). Widgets set hit_weight /
-    /// hit_spacing / hit_ink from their paint style so the SAME layout
-    /// object can be painted verbatim (text_field's multiline path does —
-    /// one SkParagraph build per edit, not one per query) AND hit-tested
-    /// at paint accuracy (the span carries the real letter spacing).
+    /// The memoized hit-test/motion layout for the SINGLE-LINE path
+    /// (wrap_width == 0): a single-span paragraph in the GLOBAL text
+    /// direction — the same direction the paint path builds its run — so
+    /// hit-testing, caret geometry and arrow stepping all agree with what
+    /// is on screen (a mirrored RTL run hit-tests its glyphs where they
+    /// are painted). Keyed on (content hash, size, direction); drags and
+    /// arrows reuse it. The baked span style (hit_weight / hit_spacing /
+    /// hit_ink) makes hit-testing paint-accurate.
+    /// Multiline (wrap_width > 0) geometry instead comes from the
+    /// per-hard-line paragraph table — see syncLines.
     pub fn hitLayout(e: *Edit, size: f32) ?*ui.paint.TextLayout {
         const str = e.text();
         if (str.len == 0) return null;
@@ -610,6 +678,220 @@ pub const Edit = struct {
         return e.hit_layout;
     }
 
+    /// Drop every cached line paragraph + the shared empty line's — a
+    /// style/wrap/direction/size change invalidates the whole table.
+    fn clearLines(e: *Edit) void {
+        for (e.line_paras.items) |lp| {
+            if (lp.para) |p| ui.paint.textLayoutDestroy(p);
+        }
+        e.line_paras.clearRetainingCapacity();
+        if (e.empty_para) |p| ui.paint.textLayoutDestroy(p);
+        e.empty_para = null;
+        e.lines_built = false;
+        e.lines_total_h = 0;
+        e.lines_max_w = 0;
+    }
+
+    /// Build one hard line's paragraph over `content` — a '\n'-free slice;
+    /// the span takes a sentinel-terminated string so the line's bytes are
+    /// copied for the call (the builder keeps its own copy afterwards).
+    /// Same style and same process-global direction hitLayout bakes —
+    /// textLayoutBegin applies kx_paragraph_dir internally.
+    fn buildLinePara(e: *Edit, content: []const u8, size: f32) ?*ui.paint.TextLayout {
+        const l = ui.paint.textLayoutBegin(e.wrap_width) orelse return null;
+        const z = dupeZ(e.buf.allocator, content) catch @panic("klaxon: out of memory");
+        defer e.buf.allocator.free(z.ptr[0 .. z.len + 1]);
+        ui.paint.textLayoutSpan(l, z, ui.paint.textStyle(size, e.hit_weight, 0, e.hit_spacing, e.hit_ink));
+        e.para_builds += 1;
+        return l;
+    }
+
+    /// The per-line layout table for the multiline path (wrap_width > 0):
+    /// reconciles the stored table against the buffer — a mid-buffer edit
+    /// rebuilds only the lines whose content changed (unchanged lines
+    /// keep their paragraph pointer; matching is content-keyed so a
+    /// shifted line survives). Returns false for an empty buffer or a
+    /// missing paragraph backend — the same "no layout" signal hitLayout
+    /// gives, so callers take identical fallbacks.
+    pub fn syncLines(e: *Edit, size: f32) bool {
+        const str = e.text();
+        if (str.len == 0 or e.wrap_width <= 0) {
+            if (e.line_paras.items.len != 0 or e.empty_para != null) e.clearLines();
+            e.lines_built = false; // a stale lines_key must not short-circuit
+            e.lines_ok = false;
+            return false;
+        }
+        const rtl = ui.paint.textDirectionRtl();
+        const geom = e.lines_size == size and e.lines_wrap == e.wrap_width and e.lines_rtl == rtl and
+            e.lines_style.weight == e.hit_weight and e.lines_style.spacing == e.hit_spacing and
+            e.lines_style.ink == e.hit_ink;
+        const key = std.hash.Wyhash.hash(0, str);
+        if (e.lines_built and geom and e.lines_key == key) return e.lines_ok;
+        if (!geom) e.clearLines();
+        e.lines_built = true;
+        e.lines_key = key;
+        e.lines_size = size;
+        e.lines_wrap = e.wrap_width;
+        e.lines_rtl = rtl;
+        e.lines_style = .{ .weight = e.hit_weight, .spacing = e.hit_spacing, .ink = e.hit_ink };
+        e.lines_ok = e.reconcileLines(str, size);
+        return e.lines_ok;
+    }
+
+    /// Re-split the buffer into hard lines and reconcile against the
+    /// stored table: kept lines' paragraphs survive, changed/added lines
+    /// build, dropped lines' paragraphs are destroyed. Then the pass
+    /// recomputes every line's layout-space y plus the totals.
+    fn reconcileLines(e: *Edit, str: [:0]const u8, size: f32) bool {
+        const a = e.buf.allocator;
+        // The split — an O(text) byte scan, ~2 orders cheaper than shaping.
+        // A '\n' ends its line; the buffer end ends the last one, so a
+        // trailing '\n' yields a final empty line (the monolithic layout
+        // carries one too — its height counts).
+        e.line_spans.clearRetainingCapacity();
+        var s: usize = 0;
+        for (str, 0..) |c, i| {
+            if (c == '\n') {
+                e.line_spans.append(a, .{ .start = s, .end = i + 1, .content_end = i, .key = std.hash.Wyhash.hash(0, str[s..i]) }) catch @panic("klaxon: out of memory");
+                s = i + 1;
+            }
+        }
+        e.line_spans.append(a, .{ .start = s, .end = str.len, .content_end = str.len, .key = std.hash.Wyhash.hash(0, str[s..str.len]) }) catch @panic("klaxon: out of memory");
+        const spans = e.line_spans.items;
+        const old = e.line_paras.items;
+        // Prefix pass — leading lines keep their paragraph when position
+        // AND content match (the '\n' may come or go without touching the
+        // shaped bytes — it lives outside the paragraph).
+        var head: usize = 0;
+        while (head < old.len and head < spans.len) {
+            const o = &old[head];
+            const n = &spans[head];
+            if (o.start != n.start or o.content_end - o.start != n.content_end - n.start or
+                o.key != n.key or (o.para != null) != (n.content_end > n.start)) break;
+            head += 1;
+        }
+        // Suffix pass — content-identical trailing lines keep their
+        // paragraph even when a mid-buffer edit shifted their offsets
+        // (an insert in line 1 of 3 doesn't rebuild lines 2 and 3).
+        var tail: usize = 0;
+        while (tail < old.len - head and tail < spans.len - head) {
+            const o = &old[old.len - 1 - tail];
+            const n = &spans[spans.len - 1 - tail];
+            if (o.content_end - o.start != n.content_end - n.start or o.key != n.key or
+                (o.para != null) != (n.content_end > n.start)) break;
+            tail += 1;
+        }
+        // Assemble the next table: kept head + fresh middle + kept tail.
+        e.line_next.clearRetainingCapacity();
+        e.line_next.ensureTotalCapacity(a, spans.len) catch @panic("klaxon: out of memory");
+        e.line_next.appendSlice(a, old[0..head]) catch @panic("klaxon: out of memory");
+        for (spans[head .. spans.len - tail]) |n| {
+            e.line_next.append(a, .{ .start = n.start, .end = n.end, .content_end = n.content_end, .key = n.key }) catch @panic("klaxon: out of memory");
+        }
+        e.line_next.appendSlice(a, old[old.len - tail ..]) catch @panic("klaxon: out of memory");
+        // Refresh every entry's range from the new split — kept tail
+        // entries shifted, and a kept line's `end` tracks a gained or
+        // lost '\n' without its paragraph moving.
+        for (e.line_next.items, 0..) |*lp, i| {
+            lp.start = spans[i].start;
+            lp.end = spans[i].end;
+            lp.content_end = spans[i].content_end;
+            lp.key = spans[i].key;
+        }
+        // Free the dropped middle lines' paragraphs, then swap tables.
+        for (old[head .. old.len - tail]) |o| {
+            if (o.para) |p| ui.paint.textLayoutDestroy(p);
+        }
+        e.line_paras.deinit(a);
+        e.line_paras = e.line_next;
+        e.line_next = .empty;
+        // Measure: build paragraphs only for fresh lines — kept lines
+        // reuse their cached h/w/base (same content + same style, wrap,
+        // size, direction ⇒ same geometry). y accumulates over all of
+        // them, so a kept line's band slides with the lines above.
+        var y: f32 = 0;
+        var maxw: f32 = 0;
+        var ok = true;
+        for (e.line_paras.items) |*lp| {
+            lp.y = y;
+            if (lp.content_end == lp.start) {
+                // Empty line — the shared " " paragraph supplies the
+                // line-metrics height SkParagraph's own empty lines get;
+                // it contributes no width and paints nothing.
+                if (e.empty_para == null) {
+                    e.empty_para = e.buildLinePara(" ", size);
+                    ok = ok and e.empty_para != null;
+                }
+                lp.h = if (e.empty_para) |p| ui.paint.textLayoutHeight(p) else ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+                lp.base = if (e.empty_para) |p| ui.paint.textLayoutBaseline(p) else 0;
+                lp.w = 0;
+            } else if (lp.para == null) {
+                lp.para = e.buildLinePara(str[lp.start..lp.content_end], size);
+                if (lp.para) |p| {
+                    lp.h = ui.paint.textLayoutHeight(p);
+                    lp.w = ui.paint.textLayoutWidth(p);
+                    lp.base = ui.paint.textLayoutBaseline(p);
+                } else {
+                    ok = false;
+                    lp.h = ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+                    lp.w = 0;
+                    lp.base = 0;
+                }
+            }
+            y += lp.h;
+            maxw = @max(maxw, lp.w);
+        }
+        e.lines_total_h = y;
+        e.lines_max_w = maxw;
+        return ok;
+    }
+
+    /// The reconciled line table — meaningful only after syncLines.
+    pub fn lineParas(e: *Edit) []const LinePara {
+        return e.line_paras.items;
+    }
+
+    /// Total laid-out height across all hard lines (post-syncLines).
+    pub fn linesHeight(e: *Edit) f32 {
+        return e.lines_total_h;
+    }
+
+    /// The widest soft line across the table (post-syncLines) — the
+    /// measure path's replacement for textLayoutWidth.
+    pub fn linesWidth(e: *Edit) f32 {
+        return e.lines_max_w;
+    }
+
+    /// The line index for a byte offset — a caret slot equal to a
+    /// '\n'-terminated line's end already belongs to the NEXT line; the
+    /// buffer end lands on the last. Post-syncLines only.
+    pub fn lineIndexOf(e: *Edit, off: usize) ?usize {
+        const items = e.line_paras.items;
+        if (items.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = items.len - 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].end > off) hi = mid else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    /// The line index for a layout-space y — the line whose [y, y+h) band
+    /// holds it; a y outside the table clamps to the nearest edge line,
+    /// the same answer SkParagraph's clamping position query gives.
+    fn lineIndexOfY(e: *Edit, py: f32) ?usize {
+        const items = e.line_paras.items;
+        if (items.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = items.len - 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].y + items[mid].h > py) hi = mid else lo = mid + 1;
+        }
+        return lo;
+    }
+
     /// The byte offset of the grapheme boundary nearest a point in the
     /// run's own space (`px/py` are already relative to the run's painted
     /// left/top) — SkParagraph's getGlyphPositionAtCoordinate, Compose's
@@ -620,6 +902,18 @@ pub const Edit = struct {
         const str = e.text();
         if (str.len == 0) return 0;
         const near: usize = if (ui.paint.textDirectionRtl()) str.len else 0;
+        if (e.wrap_width > 0) {
+            // Pick the line by y-band, then hit-test inside its own
+            // paragraph at the line-local y — a y outside the table
+            // clamps to the edge line like the monolithic query clamps.
+            if (!e.syncLines(size)) return if (px <= 0) near else str.len - near;
+            const i = e.lineIndexOfY(py) orelse return if (px <= 0) near else str.len - near;
+            const lp = &e.line_paras.items[i];
+            const para = lp.para orelse (e.empty_para orelse return if (px <= 0) near else str.len - near);
+            const pos = ui.paint.textLayoutPositionAt(para, px, py - lp.y);
+            if (pos < 0) return if (px <= 0) near else str.len - near;
+            return lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
+        }
         const l = e.hitLayout(size) orelse return if (px <= 0) near else str.len - near;
         const pos = ui.paint.textLayoutPositionAt(l, px, py);
         if (pos < 0) return if (px <= 0) near else str.len - near;
@@ -629,7 +923,26 @@ pub const Edit = struct {
     /// The caret's rect for `byte_off` in layout space — {x, top, 0, h}
     /// where top/h bound the caret's LINE (the paragraph's caret rect),
     /// direction-aware under RTL. null when the paragraph can't build.
+    /// The multiline path queries the owning line's paragraph at the
+    /// line-local offset and shifts the top by the line's y.
     pub fn caretRect(e: *Edit, byte_off: usize, size: f32) ?[4]f32 {
+        if (e.wrap_width > 0) {
+            const str = e.text();
+            if (str.len == 0 or !e.syncLines(size)) return null;
+            const off = @min(byte_off, str.len);
+            var i = e.lineIndexOf(off) orelse return null;
+            // The buffer-end caret behind a trailing '\n': the monolithic
+            // paragraph answers with the '\n' glyph's bounds — the
+            // terminated line's trailing edge, not the empty last line.
+            if (off == str.len and str[off - 1] == '\n' and i > 0) i -= 1;
+            const lp = &e.line_paras.items[i];
+            const para = lp.para orelse (e.empty_para orelse return null);
+            const local = @min(off - lp.start, lp.content_end - lp.start);
+            var r: [4]f32 = undefined;
+            if (!ui.paint.textLayoutCaretRect(para, byteToUtf16Index(str[lp.start..lp.content_end], local), &r)) return null;
+            r[1] += lp.y;
+            return r;
+        }
         const l = e.hitLayout(size) orelse return null;
         var r: [4]f32 = undefined;
         if (!ui.paint.textLayoutCaretRect(l, byteToUtf16Index(e.text(), byte_off), &r)) return null;
@@ -661,6 +974,43 @@ pub const Edit = struct {
     /// gets {x,y,w,h} quads; null when the paragraph can't build.
     pub fn caretBoxes(e: *Edit, lo: usize, hi: usize, size: f32, out: [][4]f32) ?usize {
         const str = e.text();
+        if (e.wrap_width > 0) {
+            // Each affected hard line contributes its own local-range
+            // boxes (a wrapped line yields one per soft row; a bidi run
+            // one per run) shifted by the line's y — a cross-hard-line
+            // selection is naturally one or more boxes per line.
+            if (str.len == 0 or !e.syncLines(size)) return null;
+            const items = e.line_paras.items;
+            var i = e.lineIndexOf(@min(lo, str.len)) orelse return null;
+            var total: usize = 0;
+            while (i < items.len) : (i += 1) {
+                const lp = &items[i];
+                if (lp.start >= hi) break;
+                const s = @max(lo, lp.start);
+                const t = @min(hi, lp.content_end);
+                const para = lp.para orelse (e.empty_para orelse continue);
+                if (s < t) {
+                    const content = str[lp.start..lp.content_end];
+                    const lo16 = byteToUtf16Index(content, s - lp.start);
+                    const hi16 = byteToUtf16Index(content, t - lp.start);
+                    const cnt = ui.paint.textLayoutRectsForRange(para, lo16, hi16, &.{}) orelse return null;
+                    if (total + cnt <= out.len) {
+                        _ = ui.paint.textLayoutRectsForRange(para, lo16, hi16, out[total .. total + cnt]);
+                        for (out[total .. total + cnt]) |*b| b[1] += lp.y;
+                    }
+                    total += cnt;
+                } else if (lo < lp.end and hi > lp.content_end) {
+                    // Only the '\n' is covered — the monolithic paragraph
+                    // emits a zero-width box at the terminated edge; keep
+                    // the same count so the caller's buffer sizing agrees
+                    // (a 0-width box paints no pixels either way).
+                    const g = e.caretRect(@min(lp.content_end, str.len), size) orelse [4]f32{ 0, lp.y, 0, lp.h };
+                    if (total < out.len) out[total] = .{ g[0], g[1], 0, g[3] };
+                    total += 1;
+                }
+            }
+            return total;
+        }
         const l = e.hitLayout(size) orelse return null;
         return ui.paint.textLayoutRectsForRange(l, byteToUtf16Index(str, lo), byteToUtf16Index(str, hi), out);
     }
@@ -709,18 +1059,32 @@ pub const Edit = struct {
             return if (dir < 0) 0 else e.buf.items.len;
         };
         const aim = e.v_motion_x orelse r[0];
-        const l = e.hitLayout(size) orelse return e.caret;
+        const str = e.text();
         // One pixel past the line box lands on the neighbour line.
         const y = if (dir < 0) r[1] - 1 else r[1] + r[3] + 1;
-        const pos = ui.paint.textLayoutPositionAt(l, aim, y);
-        if (pos < 0) return e.caret;
-        const next = utf16ToByteIndex(e.text(), @intCast(pos));
+        var next: usize = undefined;
+        if (e.wrap_width > 0 and e.syncLines(size)) {
+            // The target y-band picks the line — more soft rows of the
+            // same hard line or the next/prev hard line — and its own
+            // paragraph hit-tests the sticky column at a line-local y.
+            const i = e.lineIndexOfY(y) orelse return if (dir < 0) 0 else str.len;
+            const lp = &e.line_paras.items[i];
+            const para = lp.para orelse (e.empty_para orelse return e.caret);
+            const pos = ui.paint.textLayoutPositionAt(para, aim, y - lp.y);
+            if (pos < 0) return e.caret;
+            next = lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
+        } else {
+            const l = e.hitLayout(size) orelse return e.caret;
+            const pos = ui.paint.textLayoutPositionAt(l, aim, y);
+            if (pos < 0) return e.caret;
+            next = utf16ToByteIndex(str, @intCast(pos));
+        }
         e.v_motion_x = aim;
         // The position query clamps onto the nearest line — landing on
         // the caret's OWN line means there's no line in `dir`, so the
         // caret goes to the document edge (Compose semantics).
         if (e.caretRect(next, size)) |nr| {
-            if (nr[1] == r[1]) return if (dir < 0) 0 else e.buf.items.len;
+            if (nr[1] == r[1]) return if (dir < 0) 0 else str.len;
         }
         return next;
     }
@@ -734,14 +1098,26 @@ pub const Edit = struct {
     /// the document edges.
     fn lineEdge(e: *Edit, dir: i32, size: f32) usize {
         const r = e.caretRect(e.caret, size) orelse return if (dir < 0) 0 else e.buf.items.len;
-        const l = e.hitLayout(size) orelse return if (dir < 0) 0 else e.buf.items.len;
+        const str = e.text();
         // The query clamps dx into the line, so an x past the far edge
         // lands on the boundary — 1e9 stands in for "the end edge" under
         // both constrained and unconstrained layouts.
         const edge_x: f32 = if ((dir < 0) == ui.paint.textDirectionRtl()) 1e9 else 0;
+        if (e.wrap_width > 0 and e.syncLines(size)) {
+            // The caret rect's own mid-height picks the row's hard line —
+            // for the trailing-'\n' end caret that's the terminated line
+            // above, matching where the caret was answered.
+            const i = e.lineIndexOfY(r[1] + r[3] / 2) orelse return if (dir < 0) 0 else str.len;
+            const lp = &e.line_paras.items[i];
+            const para = lp.para orelse (e.empty_para orelse return if (dir < 0) 0 else str.len);
+            const pos = ui.paint.textLayoutPositionAt(para, edge_x, r[1] + r[3] / 2 - lp.y);
+            if (pos < 0) return if (dir < 0) 0 else str.len;
+            return lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
+        }
+        const l = e.hitLayout(size) orelse return if (dir < 0) 0 else str.len;
         const pos = ui.paint.textLayoutPositionAt(l, edge_x, r[1] + r[3] / 2);
-        if (pos < 0) return if (dir < 0) 0 else e.buf.items.len;
-        return utf16ToByteIndex(e.text(), @intCast(pos));
+        if (pos < 0) return if (dir < 0) 0 else str.len;
+        return utf16ToByteIndex(str, @intCast(pos));
     }
 };
 
@@ -969,4 +1345,113 @@ test "edit: caretRect reports the line box (top/height) on later lines" {
     const rl = w.e.caretRect(0, 16) orelse return error.TestUnexpectedResult;
     const rr = w.e.caretRect(19, 16) orelse return error.TestUnexpectedResult;
     try std.testing.expect(rr[1] > rl[1]); // the end caret sits on a later line
+}
+
+// "aa\nbb\ncc": line 1 = [0,3), line 2 = [3,6), line 3 = [6,8).
+test "edit: an edit in one line rebuilds only that line's paragraph" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "aa\nbb\ncc", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expectEqual(@as(usize, 3), e.lineParas().len);
+    const p0 = e.lineParas()[0].para orelse return error.TestUnexpectedResult;
+    const p2 = e.lineParas()[2].para orelse return error.TestUnexpectedResult;
+    const builds = e.para_builds; // 3 paragraphs built so far
+    // Insert inside line 2 — "bb" → "bXb": only its paragraph rebuilds;
+    // lines 1 and 3 keep their pointers even though line 3's offsets moved.
+    e.moveCaret(4, false);
+    _ = e.insert("X");
+    try std.testing.expectEqualStrings("aa\nbXb\ncc", e.text());
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expectEqual(@as(usize, 3), e.lineParas().len);
+    try std.testing.expectEqual(p0, e.lineParas()[0].para.?);
+    try std.testing.expectEqual(p2, e.lineParas()[2].para.?);
+    try std.testing.expectEqual(builds + 1, e.para_builds);
+    // A '\n' insertion splits a line: two fresh paragraphs, the rest kept.
+    e.moveCaret(0, false);
+    _ = e.insert("\n"); // "" line + "aa\n" + "bXb\n" + "cc"
+    try std.testing.expectEqualStrings("\naa\nbXb\ncc", e.text());
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expectEqual(@as(usize, 4), e.lineParas().len);
+    try std.testing.expectEqual(p0, e.lineParas()[1].para.?);
+    try std.testing.expectEqual(p2, e.lineParas()[3].para.?);
+}
+
+test "edit: line-table geometry — caret tops, hit-testing, selection boxes" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "aa\nbb\ncc", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    const r0 = e.caretRect(0, size) orelse return error.TestUnexpectedResult;
+    const r1 = e.caretRect(3, size) orelse return error.TestUnexpectedResult;
+    const r2 = e.caretRect(6, size) orelse return error.TestUnexpectedResult;
+    // Line starts stack at x = 0, each one line-height below the previous.
+    try std.testing.expectEqual(@as(f32, 0), r0[0]);
+    try std.testing.expectEqual(@as(f32, 0), r1[0]);
+    try std.testing.expectEqual(@as(f32, 0), r2[0]);
+    try std.testing.expectEqual(r0[1] + r0[3], r1[1]);
+    try std.testing.expectEqual(r1[1] + r1[3], r2[1]);
+    // The line-end caret is at the line's laid-out width on its own row.
+    const re = e.caretRect(2, size) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(r0[1], re[1]);
+    try std.testing.expect(re[0] > 0);
+    // Hit-test: a point inside line 2's band maps to its start at x=0.
+    try std.testing.expectEqual(@as(usize, 3), e.caretAt(0.5, r1[1] + 1, size));
+    try std.testing.expectEqual(@as(usize, 6), e.caretAt(0.5, r2[1] + 1, size));
+    // Below the table the last line answers (the clamped-edge query).
+    const below = e.caretAt(0.5, r2[1] + r2[3] + 50, size);
+    try std.testing.expect(below >= 6 and below <= 8);
+    // Cross-line selection [1, 8): one box per line.
+    var boxes: [8][4]f32 = undefined;
+    const nb = e.caretBoxes(1, 8, size, &boxes) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 3), nb);
+    try std.testing.expectEqual(r0[1], boxes[0][1]);
+    try std.testing.expectEqual(r1[1], boxes[1][1]);
+    try std.testing.expectEqual(r2[1], boxes[2][1]);
+    // A mid-line insertion shifts later lines' bands, not their heights.
+    e.moveCaret(4, false);
+    _ = e.insert("XXXXX XXXXX XXXXX XXXXX XXXXX XXXXX XXXXX XXXXX"); // wraps line 2
+    const r1w = e.caretRect(4, size) orelse return error.TestUnexpectedResult;
+    const r2w = e.caretRect(e.buf.items.len, size) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r2w[1] > r1w[1]); // the last line moved down
+    try std.testing.expectEqual(r0[3], r2w[3]); // its own row height unchanged
+}
+
+test "edit: a trailing newline yields a counted empty last line" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "aa\n", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expect(e.syncLines(size));
+    const items = e.lineParas();
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    // The trailing empty line has no paragraph of its own but a real
+    // height — SkParagraph's in-text empty lines carry the style's
+    // metrics; the shared " " paragraph supplies the same.
+    try std.testing.expect(items[1].para == null);
+    try std.testing.expect(items[1].h > 0);
+    try std.testing.expectEqual(items[0].h, items[1].h); // the uniform style
+    try std.testing.expectEqual(items[0].h + items[1].h, e.linesHeight());
+    // The buffer-end caret behind a trailing '\n' renders at the
+    // terminated line's trailing edge — the monolithic paragraph answers
+    // the '\n' glyph's bounds (line 1's end), not the empty line.
+    const r = e.caretRect(3, size) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(f32, 0), r[1]);
+    try std.testing.expect(r[0] > 0);
+    // …but a click INTO the empty last line still resolves to offset 3.
+    try std.testing.expectEqual(@as(usize, 3), e.caretAt(1, items[1].y + 1, size));
+    // Consecutive newlines: "a\n\nb" — the empty middle line counts.
+    const m = try testEdit(a, "a\n\nb", 200);
+    defer freeTestEdit(a, m.n, m.e);
+    try std.testing.expect(m.e.syncLines(size));
+    const mi = m.e.lineParas();
+    try std.testing.expectEqual(@as(usize, 3), mi.len);
+    try std.testing.expect(mi[1].para == null and mi[1].h > 0);
+    const rm = m.e.caretRect(2, size) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(mi[0].h, rm[1]); // the empty line's row
+    try std.testing.expectEqual(@as(f32, 0), rm[0]);
 }

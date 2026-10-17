@@ -195,9 +195,10 @@ const TextFieldState = struct {
     /// (content = its laid-out height, viewport = the text region's
     /// clamped height). Untouched single-line.
     scroll: ui.scroll.ScrollState = .{},
-    // The painted paragraph IS the Edit's shared hit layout (one
-    // SkParagraph build per edit — see paragraph()): memo fields there,
-    // nothing per-widget here.
+    // The painted paragraphs ARE the Edit's shared hit layouts (the
+    // per-hard-line table — one SkParagraph build per touched line, see
+    // syncLineParas/Edit.syncLines): memo fields there, nothing per-widget
+    // here.
     /// Scroll-to-caret arm: set by every caret-moving path (edits, key
     /// motion, taps/drags, a wrap change) and consumed by
     /// paintMultilineText. Wheel scrolling alone leaves it clear — the
@@ -389,32 +390,29 @@ fn syncWrap(n: *Node, s: *TextFieldState) void {
     s.edit.wrap_width = wrap;
 }
 
-/// The painted paragraph (multiline): one single-span layout of the
-/// whole buffer wrapped at edit.wrap_width. Memoized on (content hash,
-/// wrap, size, ink) — the ink bakes into the span, so `ink = null` is a
-/// metrics-only probe that reuses whatever ink is cached while a real
-/// draw rebuilds on a color change (wrappedLabel's pattern). null when
-/// the paragraph backend is missing — callers fall back to plain text.
-/// The wrapped paragraph — the Edit's shared hit layout. The span bakes
-/// the bodyLarge style + ink; `ink = null` is a metrics probe (shaping is
-/// ink-independent — reuses whatever ink is cached). One layout per
-/// content/wrap/state change serves measure, paint AND hit-testing.
-fn paragraph(s: *TextFieldState, ink: ?Color) ?*ui.paint.TextLayout {
+/// Sync the multiline line-paragraph table: one SkParagraph per hard
+/// line, reconciled incrementally so edits rebuild only the touched
+/// line (Edit.syncLines — see text_edit). The span style + ink bake into
+/// each line's paragraph, so `ink = null` is a metrics-only probe that
+/// reuses whatever ink is cached while a real draw passes the live
+/// color (wrappedLabel's pattern). False when the paragraph backend is
+/// missing or the buffer is empty — callers fall back to plain text.
+fn syncLineParas(s: *TextFieldState, ink: ?Color) bool {
     const style = bodyLarge(s.opts.theme);
     if (ink) |i| s.edit.hit_ink = i;
-    return s.edit.hitLayout(style.size);
+    return s.edit.syncLines(style.size);
 }
 
 /// The visible text height under lineLimits — the wrapped line count
 /// clamped to [min_lines, max_lines] × the bodyLarge line height; an
-/// empty (or paragraph-less) buffer claims min_lines. The paragraph
+/// empty (or paragraph-less) buffer claims min_lines. The line table
 /// must already be at the current wrap: callers syncWrap / set the
 /// measure budget first.
 fn visibleTextHeight(s: *TextFieldState) f32 {
     const line_h = ui.paint.measureText(" ", bodyLarge(s.opts.theme).size, false).height;
     var lines: f32 = @floatFromInt(@max(1, s.opts.min_lines));
-    if (paragraph(s, null)) |l|
-        lines = @round(ui.paint.textLayoutHeight(l) / line_h);
+    if (syncLineParas(s, null))
+        lines = @round(s.edit.linesHeight() / line_h);
     const min_l: f32 = @floatFromInt(@max(1, s.opts.min_lines));
     const max_l: f32 = if (s.opts.max_lines > 0) @floatFromInt(s.opts.max_lines) else std.math.inf(f32);
     return std.math.clamp(lines, min_l, max_l) * line_h;
@@ -767,8 +765,8 @@ fn textFieldMeasure(n: *Node, c: Constraints) Size {
         if (!std.math.isFinite(wrap) or wrap < 1)
             wrap = @max(1, min_w - leftOffset(s) - rightOffset(s)); // a sane floor for unbounded/degenerate max_w
         s.edit.wrap_width = wrap;
-        if (s.edit.buf.items.len > 0) {
-            if (paragraph(s, null)) |l| text_w = ui.paint.textLayoutWidth(l) + pad_l + pad_r;
+        if (s.edit.buf.items.len > 0 and syncLineParas(s, null)) {
+            text_w = s.edit.linesWidth() + pad_l + pad_r;
         }
         vis_h = visibleTextHeight(s);
     }
@@ -1018,7 +1016,7 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         }
         return;
     }
-    const l = paragraph(s, fc.input) orelse {
+    if (!syncLineParas(s, fc.input)) {
         // Paragraph-less fallback (backend missing, or an empty buffer
         // carrying an open composition): an unwrapped single-line draw
         // at the region's top — the same degradation the single-line
@@ -1040,9 +1038,9 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         if (focused and s.edit.caret_on)
             ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         return;
-    };
-    // The scroll window: laid-out paragraph height vs the region's.
-    s.scroll.content = ui.paint.textLayoutHeight(l);
+    }
+    // The scroll window: the summed per-line heights vs the region's.
+    s.scroll.content = s.edit.linesHeight();
     s.scroll.viewport = region.h;
     _ = s.scroll.setOffset(s.scroll.offset); // re-clamp on content shrink
     // The caret's line box in layout space — then the caret-follow
@@ -1090,18 +1088,28 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         for (boxes[0..@min(nb, boxes.len)]) |bx|
             ui.paint.fillRect(ctx, region.x + bx[0], region.y + bx[1] - s.scroll.offset, bx[2], bx[3], ui.paint.withAlphaScaled(fc.caret, 0.4));
     }
-    // The paragraph — origin at the region's start edge; it wraps at
-    // clip_w and self-aligns kStart, so LTR and RTL both land right.
-    ui.paint.textLayoutPaint(ctx, l, region.x, region.y + ui.paint.textLayoutBaseline(l) - s.scroll.offset);
+    // One paragraph per hard line — each constrained at the region's
+    // wrap width so its kStart alignment lands identically to the
+    // monolithic paragraph (LTR left edge, RTL right edge). Lines fully
+    // outside the scroll window skip the draw — the clip would discard
+    // them anyway. Empty lines carry no ink — nothing to paint.
+    for (s.edit.lineParas()) |lp| {
+        const p = lp.para orelse continue;
+        if (lp.y + lp.h <= s.scroll.offset or lp.y >= s.scroll.offset + region.h) continue;
+        ui.paint.textLayoutPaint(ctx, p, region.x, region.y + lp.y + lp.base - s.scroll.offset);
+    }
     if (has_comp) {
         // Preedit: appended after the committed text ON THE CARET'S LINE
-        // — the paragraph carries committed text only, so the composition
+        // — the paragraphs carry committed text only, so the composition
         // draws inline at the caret's spot, underlined (the platform-
         // conventional mark). Deviation: upstream reflows the comp
         // inside the paragraph; here it overlays the caret's line.
         const comp = s.edit.composition();
         const comp_m = ui.paint.measureText(comp, style.size, false);
-        const comp_base = caret_y + ui.paint.textLayoutBaseline(l);
+        // The caret line's baseline — the uniform style makes every row's
+        // baseline offset equal, so the caret row's top + base is the
+        // caret row's baseline.
+        const comp_base = caret_y + if (s.edit.lineIndexOf(s.edit.caret)) |ci| s.edit.lineParas()[ci].base else 0;
         ui.paint.text(ctx, comp, caret_x, comp_base, style.size, false, fc.input);
         ui.paint.fillRect(ctx, caret_x, comp_base + 1, comp_m.width, 1, fc.input);
         const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
@@ -2314,4 +2322,37 @@ test "text_field: multiline wheel scrolls the capped viewport; edits re-follow t
     const before = ts.scroll.offset;
     router.dispatchScroll(tall, .{ .x = 130, .y = 60, .delta_y = -1 });
     try std.testing.expectEqual(before, ts.scroll.offset);
+}
+
+test "golden: multiline paints each hard line's paragraph at its own offset" {
+    const b = try textField(std.testing.allocator, null, null, null, .{ .variant = .filled, .multiline = true, .min_lines = 3, .initial = "ab\ncd", .theme = theme_mod.light });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 300, 140);
+    defer r.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 110 });
+    r.paint(b, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    const s = stateOf(b);
+    const region = textRegion(b);
+    const container = theme_mod.light.colors.surface_container_highest; // the filled box's flat ink
+    // The line table must hold one record per hard line, laid out in
+    // cumulative bands — the paint loop iterates it.
+    const items = s.edit.lineParas();
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(@as(f32, 0), items[0].y);
+    try std.testing.expectEqual(items[0].h, items[1].y);
+    try std.testing.expect(items[1].h > 0);
+    // Each line's glyph band carries ink (band = the line's table entry
+    // inset by 2px — a paint that lands the second paragraph at the
+    // wrong y leaves its band empty).
+    const band0: Rect = .{ .x = region.x + 1, .y = region.y + items[0].y + 2, .w = 44, .h = items[0].h - 4 };
+    const band1: Rect = .{ .x = region.x + 1, .y = region.y + items[1].y + 2, .w = 44, .h = items[1].h - 4 };
+    try std.testing.expect(f.countNotIn(band0, container) > 8); // "ab" inks line 1
+    try std.testing.expect(f.countNotIn(band1, container) > 8); // "cd" inks line 2
+    // The min_lines=3 spare band below the laid-out lines — inside the
+    // clip — must stay flat container (no spill, no stale paint).
+    const tail: Rect = .{ .x = region.x + 1, .y = region.y + items[1].y + items[1].h + 2, .w = 44, .h = 8 };
+    try std.testing.expect(tail.y + tail.h <= region.y + region.h); // probe inside the clip
+    try std.testing.expectEqual(@as(u64, 0), f.countNotIn(tail, container));
 }
