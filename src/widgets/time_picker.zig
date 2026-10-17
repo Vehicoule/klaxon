@@ -77,8 +77,8 @@
 //     vibrant/uncontained styles (100x120 CornerFull fields, the side
 //     control column) are not.
 //   - The supporting texts wrap through the paragraph ABI at the field
-//     width (upstream minLines = 2 reserves the box); no liveRegion
-//     announce on the error text.
+//     width (upstream minLines = 2 reserves the box); a field turning
+//     invalid announces its error text politely (upstream liveRegion).
 //   - Upstream suppresses the auto-advance while an a11y service is
 //     enabled (a11yServicesEnabled); we have no equivalent query, so the
 //     advance always runs.
@@ -434,6 +434,7 @@ fn fieldSemValue(n: *Node, which: DialMode) [:0]const u8 {
 /// upstream revertAllChanges + errorHandler.onError) restore it.
 fn transformAfterEdit(n: *Node, which: DialMode) void {
     const s = stateOf(n);
+    const was_invalid = fieldInvalid(s, which);
     const prev = &s.snap;
     const ed = editOf(s, which);
     const items = ed.buf.items;
@@ -494,6 +495,12 @@ fn transformAfterEdit(n: *Node, which: DialMode) void {
     }
     refreshSemanticsChildren(n);
     ui.semantics.notifyControlChanged(n);
+    // Upstream's error supporting text is a liveRegion=Polite node —
+    // a fresh error announces itself (the message is one fixed string
+    // per field, so an already-invalid field re-announces nothing).
+    if (!was_invalid and fieldInvalid(s, which)) {
+        ui.semantics.announce(supportText(s, which), .polite);
+    }
     n.markDirty();
 }
 
@@ -2020,6 +2027,42 @@ test "time_picker: the input variant rejects non-digits, keeps out-of-range as a
     _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" });
     try std.testing.expectEqualStrings("7", s.minute_edit.text());
     try std.testing.expect(!fieldInvalid(s, .minute));
+}
+
+test "time_picker: a field turning invalid announces its error politely (liveRegion)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const lb = try ui.semantics.LogBridge.init(a);
+    defer lb.deinit();
+    ui.semantics.setBridge(lb.bridge());
+    defer ui.semantics.setBridge(null);
+    const sig = try ui.state.Signal(i32).init(a, 630);
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .mode = .input });
+    defer n.deinit();
+    const s = stateOf(n);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
+    selectField(n, s, .minute);
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" }); // "30" → "7"
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" }); // "77" — invalid
+    var announces: u32 = 0;
+    for (lb.events.items) |e| {
+        if (e.kind != .announce) continue;
+        announces += 1;
+        try std.testing.expectEqualStrings(i18n_mod.tr("Minutes must be between 0 and 59"), e.text);
+        try std.testing.expectEqual(ui.semantics.LiveRegion.polite, e.region);
+    }
+    try std.testing.expectEqual(@as(u32, 1), announces);
+    // Rolling back to a valid :07 announces nothing more.
+    _ = n.vtable.on_key.?(n, .{ .kind = .text_input, .text = "7" });
+    try std.testing.expect(!fieldInvalid(s, .minute));
+    var after: u32 = 0;
+    for (lb.events.items) |e| {
+        if (e.kind == .announce) after += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), after);
 }
 
 test "time_picker: the mode toggle swaps variants + reseeds the fields" {

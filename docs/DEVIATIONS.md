@@ -99,10 +99,11 @@ Each widget's header carries the same list; these are the tracked ones
   plus CLDR `am_label`/`pm_label` locale data; a locale switch re-resolves
   and rebuilds the semantics tree. The supporting texts wrap through the
   paragraph ABI at the field width — one tr() sentence key each (upstream
-  `TimePicker24HourError`/`HourError`/`MinuteError`). Remaining: the
+  `TimePicker24HourError`/`HourError`/`MinuteError`). A field turning
+  invalid announces its error politely (`semantics.announce`, upstream
+  liveRegion). Remaining: the
   classic (non-vibrant)
-  `TimeInput` only — no 100x120 CornerFull style; no liveRegion announce
-  on the error text; the
+  `TimeInput` only — no 100x120 CornerFull style; the
   auto-advance always runs
   (upstream suppresses it while an a11y service is enabled — no
   equivalent query here); Tab walks the fields only in tests — the host
