@@ -114,9 +114,12 @@ Each widget's header carries the same list; these are the tracked ones
   select-all with the tristate dash), and a wheel/drag body scroll under a
   pinned header are real, and the sort arrow's rotation rides the
   default spring (upstream's animateFloatAsState — a same-column flip
-  animates 0↔180, a column switch snaps); remaining: text-only cells
-  (`cell_paint` takes over a cell's draw — no child widgets in cells),
-  no column resizing, no virtualization.
+  animates 0↔180, a column switch snaps); column resizing is real too
+  (`resizable` + `on_col_resize` — a ±4dp grab zone on each data
+  column's trailing header border drags the width, clamped to the
+  column minimum, persisted in the widget and reported live + on
+  settle); remaining: text-only cells (`cell_paint` takes over a
+  cell's draw — no child widgets in cells), no virtualization.
 - `tree.zig` — drag-and-drop reordering landed (`draggable` +
   `on_move`): slop-promoted pointer drags, primary insertion-gap
   indicator, self-subtree drops rejected, in-place model move reported by

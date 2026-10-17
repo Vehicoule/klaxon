@@ -31,9 +31,14 @@
 //     the table reports its natural height and the parent scrolls — the
 //     header then scrolls away with the page, like upstream.
 //
+// Column resizing (`resizable` + `on_col_resize`): a press inside ±4dp
+// of a data column's trailing header border grabs a drag that rewrites
+// the column's user width (clamped to the 80dp minimum) — a faint
+// divider marks the hovered border, a primary bar tracks the drag.
+//
 // Remaining deviations: text-only cells (`cell_paint` takes over a cell's
-// draw — real child widgets in cells stay out of scope), no column
-// resizing, no virtualization (every row paints; the body clip culls them).
+// draw — real child widgets in cells stay out of scope), no
+// virtualization (every row paints; the body clip culls them).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -70,6 +75,14 @@ pub const TableOptions = struct {
     /// the cell (the default text draw is skipped). The cell text still
     /// drives the column width.
     cell_paint: ?CellPaintCallback = null,
+    /// Header-border drags resize columns — the grab zone sits ±4dp on
+    /// each data column's trailing edge inside the header row. Resized
+    /// widths persist in the widget (auto columns still fit content).
+    resizable: bool = false,
+    /// Fires on each width change while a header-border drag runs and
+    /// once more when it settles (col index + width in dp, already
+    /// applied to the layout).
+    on_col_resize: ?ColResizeCallback = null,
     /// px scrolled per wheel click.
     wheel_speed: f32 = 48,
 };
@@ -86,6 +99,7 @@ const checkbox_box: f32 = 18; // checkbox.zig's box_size
 const checkbox_radius: f32 = 2; // its box_radius
 const sort_arrow_w: f32 = 16; // upstream's sort icon slot
 const sort_arrow_gap: f32 = 4;
+const resize_zone: f32 = 8; // ±4dp grab strip on a column's trailing edge
 
 // --- State ---
 
@@ -131,6 +145,16 @@ fn cellPaintDeclined(_: ?*anyopaque, _: *kx.Ctx, _: CellPaintArgs) bool {
     return false;
 }
 
+/// Column-resize callback (TableOptions.on_col_resize): the resized
+/// column index + the width the drag settled at. The defaults are a
+/// no-op — optionsFromValue can instantiate the field.
+pub const ColResizeCallback = struct {
+    fn_ptr: *const fn (userdata: ?*anyopaque, col: usize, width: f32) void = colResizeNoop,
+    userdata: ?*anyopaque = null,
+};
+
+fn colResizeNoop(_: ?*anyopaque, _: usize, _: f32) void {}
+
 const Row = struct {
     cells: [][:0]u8, // owned, null-terminated
     selected: bool = false,
@@ -169,6 +193,17 @@ const TableState = struct {
     /// Column widths — computed in measure, reused by paint (was: a heap
     /// ArrayList rebuilt per frame). clearRetainingCapacity on mutation.
     col_ws: std.array_list.Managed(f32),
+    /// Per-column user width overrides (0 = content-auto) — a header-
+    /// border drag writes the dragged column. Sized to `columns` at init.
+    user_ws: std.array_list.Managed(f32),
+    /// The header-border drag in progress (-1 = idle): the grabbed
+    /// column, the grab x and the column's width at grab.
+    resizing_col: i32 = -1,
+    resize_grab_x: f32 = 0,
+    resize_start_w: f32 = 0,
+    /// The header border under the pointer — the resize affordance
+    /// (-1 = none).
+    hover_border: i32 = -1,
     i18n: ?*i18n_mod.I18n = null,
 };
 
@@ -197,6 +232,11 @@ fn computeColWidths(s: *TableState) void {
             const w = ui.paint.measureText(cell, bs.size, false).width + cell_pad_x * 2;
             if (w > s.col_ws.items[ci]) s.col_ws.items[ci] = w;
         }
+    }
+    // User-resized columns hold their dragged width.
+    for (s.user_ws.items, 0..) |uw, ci| {
+        if (ci >= s.col_ws.items.len) break;
+        if (uw > 0) s.col_ws.items[ci] = uw;
     }
 }
 
@@ -250,6 +290,21 @@ fn headerColAt(s: *TableState, b: Rect, x: f32) ?usize {
         const w = s.col_ws.items[ci];
         if (x >= cx and x < cx + w) return ci;
         cx += w;
+    }
+    return null;
+}
+
+/// The data column whose TRAILING border sits within the resize grab
+/// zone of (x, y) — header row only. null outside the header/zone.
+fn borderColAt(s: *TableState, n: *Node, x: f32, y: f32) ?usize {
+    const b = n.bounds;
+    if (y < b.y or y >= b.y + header_h) return null;
+    if (s.col_ws.items.len == 0) computeColWidths(s);
+    var cx = dataOriginX(s, b);
+    for (s.columns.items, 0..) |_, ci| {
+        if (ci >= s.col_ws.items.len) break;
+        cx += s.col_ws.items[ci];
+        if (@abs(x - cx) <= resize_zone / 2) return ci;
     }
     return null;
 }
@@ -509,6 +564,20 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         cx += w;
     }
+
+    // The resize affordance: a faint divider under the hovered border,
+    // a primary bar while the drag is live (Finder/Excel convention).
+    if (s.opts.resizable) {
+        const hot: i32 = if (s.resizing_col >= 0) s.resizing_col else s.hover_border;
+        if (hot >= 0) {
+            var bx = dataOriginX(s, b);
+            for (0..@intCast(hot + 1)) |i| {
+                if (i < s.col_ws.items.len) bx += s.col_ws.items[i];
+            }
+            const live = s.resizing_col >= 0;
+            ui.paint.fillRect(ctx, bx - (if (live) @as(f32, 1) else 0.5), b.y, if (live) @as(f32, 2) else 1, header_h, if (live) t.colors.primary else t.colors.outline_variant);
+        }
+    }
 }
 
 // --- Input ---
@@ -519,6 +588,19 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
 
     switch (ev.phase) {
         .down => {
+            // A header-border grab starts a column resize and owns the
+            // gesture outright — the scroll tracker stays disarmed (a
+            // border press is never a scroll intent).
+            if (s.opts.resizable) {
+                if (borderColAt(s, n, ev.x, ev.y)) |ci| {
+                    s.resizing_col = @intCast(ci);
+                    s.resize_grab_x = ev.raw_x;
+                    s.resize_start_w = s.col_ws.items[ci];
+                    s.press = null;
+                    n.markDirty(); // the divider affordance lights up
+                    return true;
+                }
+            }
             // Register the drag track + stop a fling; the down still
             // bubbles so a parent scroller tracks the same gesture
             // (ListView's nested-scroll idiom).
@@ -529,6 +611,15 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
             return false;
         },
         .up => {
+            // A resize ends with the dragged width committed; the
+            // callback reports the settled width.
+            if (s.resizing_col >= 0) {
+                const ci: usize = @intCast(s.resizing_col);
+                s.resizing_col = -1;
+                n.markDirty();
+                if (s.opts.on_col_resize) |cb| cb.fn_ptr(cb.userdata, ci, s.user_ws.items[ci]);
+                return true;
+            }
             _ = s.input.onPointer(ev, &s.scroll, setScrollOffset, n); // a fast release flings
             const press = s.press orelse return false;
             s.press = null;
@@ -543,6 +634,19 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
             return true;
         },
         .move => {
+            // An active resize owns the pointer: the grabbed column's
+            // user width tracks the drag (clamped to the column minimum),
+            // re-measuring the table on each change.
+            if (s.resizing_col >= 0) {
+                const ci: usize = @intCast(s.resizing_col);
+                const w = @max(col_min_w, s.resize_start_w + ev.raw_x - s.resize_grab_x);
+                if (ci < s.user_ws.items.len and s.user_ws.items[ci] != w) {
+                    s.user_ws.items[ci] = w;
+                    n.markLayoutDirty(); // the width feeds measure
+                    if (s.opts.on_col_resize) |cb| cb.fn_ptr(cb.userdata, ci, w);
+                }
+                return true;
+            }
             // A drag past the tap slop cancels the press (the scroll owns
             // the gesture); moves that scroll are claimed, the rest bubble.
             if (s.press != null) {
@@ -554,6 +658,7 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .outside_down => {
             s.press = null;
+            s.resizing_col = -1;
             _ = s.input.onPointer(ev, &s.scroll, setScrollOffset, n);
             return false;
         },
@@ -561,6 +666,14 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
         // own moves go to the scroll gesture, so row tracking lives on the
         // hover phases.
         .hover_move => {
+            // The resize affordance lights the border under the pointer.
+            if (s.opts.resizable) {
+                const hb: i32 = if (borderColAt(s, n, ev.x, ev.y)) |ci| @intCast(ci) else -1;
+                if (hb != s.hover_border) {
+                    s.hover_border = hb;
+                    n.markDirty();
+                }
+            }
             if (s.opts.tappable) {
                 const ri: i32 = if (rowAt(s, b, ev.y)) |r| @intCast(r) else -1;
                 if (ri != s.hovered_row) {
@@ -583,9 +696,10 @@ fn tblPointer(n: *Node, ev: input.PointerEvent) bool {
             return false;
         },
         .leave => {
-            if (s.hovered_row != -1 or s.hovered_header_col != -1) {
+            if (s.hovered_row != -1 or s.hovered_header_col != -1 or s.hover_border != -1) {
                 s.hovered_row = -1;
                 s.hovered_header_col = -1;
+                s.hover_border = -1;
                 n.markDirty();
             }
             return false;
@@ -621,6 +735,7 @@ fn tblDeinit(n: *Node) void {
     }
     s.rows.deinit();
     s.col_ws.deinit();
+    s.user_ws.deinit();
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = tblLocaleCb, .userdata = n });
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.arrow_chan)); // the cb points into this state
     n.allocator.destroy(s);
@@ -663,7 +778,7 @@ const tbl_vtable = ui.node.VTable{
 /// `on_selection_change` — fired on any selection change (a row's
 /// checkbox toggle or the header's select-all).
 /// `opts` — theme, tappable, sortable/sort_cmp, selectable, cell_paint,
-/// wheel_speed.
+/// resizable/on_col_resize, wheel_speed.
 pub fn table(
     allocator: std.mem.Allocator,
     columns: []const []const u8,
@@ -684,6 +799,7 @@ pub fn table(
         .on_row_tap = on_row_tap,
         .on_selection_change = on_selection_change,
         .col_ws = std.array_list.Managed(f32).init(allocator),
+        .user_ws = std.array_list.Managed(f32).init(allocator),
     };
 
     // Copy columns.
@@ -693,6 +809,7 @@ pub fn table(
         buf[col.len] = 0;
         try s.columns.append(buf[0..col.len :0]);
     }
+    try s.user_ws.appendNTimes(0, s.columns.items.len); // 0 = auto width
 
     // Copy rows.
     for (rows) |row| {
@@ -1104,4 +1221,77 @@ test "table: the sort arrow springs 0→180 on a direction flip and snaps on a c
     try std.testing.expectEqual(@as(f32, 180), s.arrow_rot);
     setSort(n, 1, true); // a new column's arrow starts asc — no unwind
     try std.testing.expectEqual(@as(f32, 0), s.arrow_rot);
+}
+
+fn resizeCb(userdata: ?*anyopaque, col: usize, w: f32) void {
+    const c: *struct { col: *usize, w: *f32, calls: *u32 } = @ptrCast(@alignCast(userdata.?));
+    c.col.* = col;
+    c.w.* = w;
+    c.calls.* += 1;
+}
+
+test "table: header-border drags resize the column (min clamp, callback)" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    var last_col: usize = 99;
+    var last_w: f32 = 0;
+    var calls: u32 = 0;
+    var cb_ctx = .{ .col = &last_col, .w = &last_w, .calls = &calls };
+    const a = std.testing.allocator;
+    const n = try table(a, &.{ "Alpha", "Beta" }, &.{&.{ "1", "x" }}, null, null, .{ .resizable = true, .sortable = &.{ true, true }, .on_col_resize = .{ .fn_ptr = resizeCb, .userdata = &cb_ctx } });
+    defer n.deinit();
+    const m = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    n.layout(.{ .x = 0, .y = 0, .w = m.w, .h = m.h });
+    const s = stateOf(n);
+    const w0 = s.col_ws.items[0];
+    // Column 0's trailing border sits at x = w0 (no select column).
+    router.dispatchPointer(n, .{ .phase = .down, .x = w0, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(i32, 0), s.resizing_col);
+    router.dispatchPointer(n, .{ .phase = .move, .x = w0 + 40, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(f32, w0 + 40), s.user_ws.items[0]);
+    try std.testing.expectEqual(@as(i32, 0), s.resizing_col);
+    router.dispatchPointer(n, .{ .phase = .up, .x = w0 + 40, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(i32, -1), s.resizing_col);
+    try std.testing.expectEqual(@as(usize, 0), last_col);
+    try std.testing.expectEqual(@as(f32, w0 + 40), last_w);
+    try std.testing.expect(calls >= 2); // each change + the settle
+    // The resized width feeds the next measure.
+    _ = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    try std.testing.expectEqual(@as(f32, w0 + 40), s.col_ws.items[0]);
+    // Dragging way left clamps to the column minimum.
+    router.dispatchPointer(n, .{ .phase = .down, .x = w0 + 40, .y = header_h / 2 });
+    router.dispatchPointer(n, .{ .phase = .move, .x = w0 - 400, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(f32, col_min_w), s.user_ws.items[0]);
+    router.dispatchPointer(n, .{ .phase = .up, .x = w0 - 400, .y = header_h / 2 });
+}
+
+test "table: without resizable a header-border tap still sorts" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try table(a, &.{ "Alpha", "Beta" }, &.{ &.{ "2", "y" }, &.{ "1", "x" } }, null, null, .{ .sortable = &.{ true, true } });
+    defer n.deinit();
+    const m = n.measure(.{ .max_w = 2000, .max_h = 2000 });
+    n.layout(.{ .x = 0, .y = 0, .w = m.w, .h = m.h });
+    const s = stateOf(n);
+    // A tap just inside column 0's trailing border sorts — the grab
+    // zone is only live under `resizable` (x = w0-1: inside col0's cell
+    // AND inside the ±4dp border zone).
+    const w0 = s.col_ws.items[0];
+    router.dispatchPointer(n, .{ .phase = .down, .x = w0 - 1, .y = header_h / 2 });
+    router.dispatchPointer(n, .{ .phase = .up, .x = w0 - 1, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(i32, 0), s.sort_col);
+    try std.testing.expectEqualStrings("1", s.rows.items[0].cells[0]);
+    // And a resizable table's border tap does NOT sort (it grabbed a resize).
+    const n2 = try table(a, &.{ "Alpha", "Beta" }, &.{ &.{ "2", "y" }, &.{ "1", "x" } }, null, null, .{ .resizable = true, .sortable = &.{ true, true } });
+    defer n2.deinit();
+    const m2 = n2.measure(.{ .max_w = 2000, .max_h = 2000 });
+    n2.layout(.{ .x = 0, .y = 0, .w = m2.w, .h = m2.h });
+    const s2 = stateOf(n2);
+    router.dispatchPointer(n2, .{ .phase = .down, .x = s2.col_ws.items[0] - 1, .y = header_h / 2 });
+    router.dispatchPointer(n2, .{ .phase = .up, .x = s2.col_ws.items[0] - 1, .y = header_h / 2 });
+    try std.testing.expectEqual(@as(i32, -1), s2.sort_col); // no sort fired
+    try std.testing.expectEqual(@as(f32, 0), s2.user_ws.items[0]); // no drag = no resize
 }
