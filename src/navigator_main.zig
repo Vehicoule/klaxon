@@ -231,7 +231,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const opts = try optsFromArgs(init.args);
 
     var debug_alloc = std.heap.DebugAllocator(.{}){};
-    defer _ = debug_alloc.deinit();
+    // Leak gate: registered first so it runs LAST (defers are LIFO) — the
+    // view, the app ctxs, the navigator and the host have already deinit'd
+    // when the check fires; .leak exits non-zero for the headless smokes.
+    defer {
+        if (debug_alloc.deinit() == .leak) {
+            std.debug.print("klaxon: memory leak detected\n", .{});
+            std.process.exit(1);
+        }
+    }
     const allocator = debug_alloc.allocator();
 
     var host = try host_mod.Host.init(allocator, width, height, opts.backend, null);

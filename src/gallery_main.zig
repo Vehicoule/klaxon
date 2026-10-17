@@ -141,7 +141,16 @@ fn galleryMain(opts: Options) !void {
     // into Android's libmain.so. Use c_allocator (bionic malloc) on Android.
     const is_android = builtin.os.tag == .linux and builtin.abi == .android;
     var debug_alloc = std.heap.DebugAllocator(.{}){};
-    defer _ = debug_alloc.deinit();
+    // Leak gate: registered first so it runs LAST (defers are LIFO) — the
+    // gallery and the host have already deinit'd when the check fires. On
+    // Android nothing allocates through debug_alloc, so the check is a
+    // no-op there; elsewhere .leak exits non-zero for the headless smokes.
+    defer {
+        if (debug_alloc.deinit() == .leak) {
+            std.debug.print("klaxon: memory leak detected\n", .{});
+            std.process.exit(1);
+        }
+    }
     const allocator: std.mem.Allocator = if (is_android)
         std.heap.c_allocator
     else

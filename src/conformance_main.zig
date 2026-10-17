@@ -47,7 +47,18 @@ const DomainScore = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    // The arena keeps its batch-free ownership model; backing it with the
+    // DebugAllocator turns the runner into a leak detector — anything still
+    // live after arena.deinit (i.e. that bypassed the arena) trips the gate.
+    // The check defer is registered first so it runs LAST (defers are LIFO).
+    var debug_alloc = std.heap.DebugAllocator(.{}){};
+    defer {
+        if (debug_alloc.deinit() == .leak) {
+            std.debug.print("klaxon: memory leak detected\n", .{});
+            std.process.exit(1);
+        }
+    }
+    var arena = std.heap.ArenaAllocator.init(debug_alloc.allocator());
     defer arena.deinit();
     const allocator = arena.allocator();
 

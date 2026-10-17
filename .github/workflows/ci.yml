@@ -76,6 +76,15 @@ jobs:
       - name: Golden tests
         run: zig build test-golden
 
+      # ReleaseSafe pass: runtime-safety builds are where the allocators'
+      # leak/double-free detection is active (testing.SafeAllocator +
+      # DebugAllocator deinit gates).
+      - name: Test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Golden tests (ReleaseSafe)
+        run: zig build test-golden -Doptimize=ReleaseSafe
+
       - name: Conformance suite
         run: zig build conformance
 
