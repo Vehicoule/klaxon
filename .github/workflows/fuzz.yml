@@ -1,0 +1,78 @@
+name: Fuzz
+
+# Native memory-safety fuzzing (src/fuzz/ + `zig build fuzz`, driven by
+# Zig 0.17's --fuzz mode). PRs get a short smoke pass over every target;
+# the nightly cron gives each target several minutes. Linux x64 only —
+# --fuzz is unimplemented on Windows and macOS runner time is precious.
+# The harnesses link the real Skia/SDL runtime, so deps/setup matches ci.yml.
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * *' # nightly
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: github.event_name != 'schedule'
+    name: fuzz smoke (PR)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-deps
+        with:
+          cache-key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          apt-packages: >-
+            libc++-dev libc++abi-dev
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev libxtst-dev
+            libwayland-dev wayland-protocols libxkbcommon-dev
+            libegl1-mesa-dev libgles2-mesa-dev
+            libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
+            libatk1.0-dev libatk-bridge2.0-dev libatspi2.0-dev
+
+      # ~60s of fuzzing across all four targets (build time dominates).
+      - name: Fuzz text_edit (15s)
+        run: scripts/fuzz.sh --target text_edit --seconds 15
+
+      - name: Fuzz tree_json (15s)
+        run: scripts/fuzz.sh --target tree_json --seconds 15
+
+      - name: Fuzz arb (15s)
+        run: scripts/fuzz.sh --target arb --seconds 15
+
+      - name: Fuzz input (15s)
+        run: scripts/fuzz.sh --target input --seconds 15
+
+  nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: fuzz nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-deps
+        with:
+          cache-key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-deps.sh', 'scripts/patches/**') }}
+          apt-packages: >-
+            libc++-dev libc++abi-dev
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxinerama-dev libxss-dev libxtst-dev
+            libwayland-dev wayland-protocols libxkbcommon-dev
+            libegl1-mesa-dev libgles2-mesa-dev
+            libasound2-dev libdbus-1-dev libudev-dev libusb-1.0-0-dev libibus-1.0-dev
+            libatk1.0-dev libatk-bridge2.0-dev libatspi2.0-dev
+
+      # 5 minutes per target, sequential — a crash fails the job and the
+      # build runner prints the saved reproducer path (.zig-cache/f/crash).
+      - name: Fuzz all targets (300s each)
+        run: scripts/fuzz.sh --target all --seconds 300

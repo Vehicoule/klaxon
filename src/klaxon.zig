@@ -23,3 +23,4 @@ pub const host = @import("host.zig");
 pub const platform = @import("platform.zig");
 pub const c_abi = @import("c_abi.zig");
 pub const ios_io = @import("ios_io.zig");
+pub const registry = @import("registry.zig");

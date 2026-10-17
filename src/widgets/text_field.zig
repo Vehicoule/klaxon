@@ -517,12 +517,20 @@ fn lastCpBefore(str: []const u8, cut: usize) u21 {
     var i = cut;
     while (i > 0 and (str[i - 1] & 0xC0) == 0x80) i -= 1;
     if (i == 0) return 0;
-    return std.unicode.utf8Decode(str[i - 1 .. cut]) catch 0xFFFD;
+    // Decode by the LEAD's implied length, not the remaining slice length:
+    // a truncated/garbage sequence (the buffer is untrusted UTF-8) would
+    // otherwise dispatch utf8Decode on a mismatched class and hit its
+    // assert — panic in Debug, UB in release.
+    const start = i - 1;
+    const l = std.unicode.utf8ByteSequenceLength(str[start]) catch return 0xFFFD;
+    if (cut - start < l) return 0xFFFD;
+    return std.unicode.utf8Decode(str[start .. start + l]) catch 0xFFFD;
 }
 fn firstCpAt(str: []const u8, i: usize) u21 {
     if (i >= str.len) return 0;
     const l = std.unicode.utf8ByteSequenceLength(str[i]) catch return 0xFFFD;
-    return std.unicode.utf8Decode(str[i..@min(str.len, i + l)]) catch 0xFFFD;
+    if (str.len - i < l) return 0xFFFD; // truncated tail — never decode short
+    return std.unicode.utf8Decode(str[i .. i + l]) catch 0xFFFD;
 }
 /// A segment boundary must never sit where shaping could join across it:
 /// combining marks, joiners, emoji modifiers/pairers and Hangul jamo reject

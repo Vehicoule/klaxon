@@ -215,6 +215,9 @@ fn chipLayout(n: *Node, bounds: Rect) void {
     var count: usize = 0;
     for (n.children.items) |child| {
         if (!child.visible) continue; // the hidden filter check takes no space
+        // Fixed chrome slots (avatar/icon + label + trailing): grafted
+        // extras are ignored, never written past `sizes`.
+        if (count == sizes.len) break;
         const cs = child.measure(.{ .max_w = bounds.w, .max_h = bounds.h });
         sizes[count] = cs;
         content_w += cs.w;
@@ -227,6 +230,7 @@ fn chipLayout(n: *Node, bounds: Rect) void {
     var i: usize = 0;
     for (n.children.items) |child| {
         if (!child.visible) continue;
+        if (i >= sizes.len) break;
         const cs = sizes[i];
         child.layout(.{
             .x = x,

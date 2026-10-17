@@ -376,6 +376,10 @@ pub const Edit = struct {
                 e.comp.clearRetainingCapacity();
                 if (ev.text.len <= ui.state.TextSignal.max_len) {
                     e.comp.appendSlice(ev.text) catch @panic("klaxon: out of memory");
+                    // The sentinel must land BEFORE apply_edit can run:
+                    // syncScroll→composition() reads it, and appendSlice
+                    // leaves stale capacity bytes in the slot.
+                    setSentinel(&e.comp);
                     // A fresh composition over an open selection commits the
                     // deletion (the IME owns the range; the text changed).
                     const sel = e.selRange();

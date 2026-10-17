@@ -822,7 +822,9 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
         if (v < s.items.items.len) s.selected = v; // the signal wins
         snapChecks(s);
         if (node.semantics) |sem| {
-            sem.value = s.items.items[s.selected].label;
+            // An empty row is legal (registry/JSON paths build one) — the
+            // clamped selected==0 is still out of bounds then.
+            sem.value = if (s.items.items.len > 0) s.items.items[s.selected].label else "";
             for (s.sem_children.items, 0..) |*c, i| c.checked = (i == s.selected);
         }
     }

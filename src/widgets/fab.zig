@@ -504,6 +504,9 @@ fn extFabLayout(n: *Node, bounds: Rect) void {
     var content_w: f32 = 0;
     var count: usize = 0;
     for (n.children.items) |child| {
+        // Fixed chrome slots (icon + label): grafted extras are ignored,
+        // never written past `sizes`.
+        if (count == sizes.len) break;
         const cs = child.measure(.{ .max_w = bounds.w, .max_h = bounds.h });
         sizes[count] = cs;
         content_w += cs.w;
@@ -515,6 +518,7 @@ fn extFabLayout(n: *Node, bounds: Rect) void {
     var x = inner_x + @max(0, (inner_w - content_w) / 2);
     var i: usize = 0;
     for (n.children.items) |child| {
+        if (i >= sizes.len) break;
         const cs = sizes[i];
         child.layout(.{
             .x = x,

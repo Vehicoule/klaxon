@@ -258,6 +258,9 @@ fn buttonLayout(n: *Node, bounds: Rect) void {
     var content_h: f32 = 0;
     var count: usize = 0;
     for (n.children.items) |child| {
+        // The chrome is fixed (icon + label) — a child grafted on by
+        // add()/treeFromJson gets no slot, never an OOB write.
+        if (count == sizes.len) break;
         const cs = child.measure(.{ .max_w = inner.w, .max_h = inner.h });
         sizes[count] = cs;
         content_w += cs.w;
@@ -267,6 +270,7 @@ fn buttonLayout(n: *Node, bounds: Rect) void {
     if (count > 1) content_w += d.icon_gap;
     var x = inner.x + (inner.w - content_w) / 2;
     for (n.children.items, 0..) |child, i| {
+        if (i >= sizes.len) break;
         const cs = sizes[i];
         child.layout(.{
             .x = x,
