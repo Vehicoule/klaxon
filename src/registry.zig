@@ -1072,7 +1072,7 @@ fn buildTable(allocator: std.mem.Allocator, opts: Value, ctx: *BuildCtx) anyerro
         },
         else => {},
     };
-    const n = try table_w.table(allocator, cols.items, rows.items, null, topts);
+    const n = try table_w.table(allocator, cols.items, rows.items, null, null, topts);
     return .{ .node = n, .skip_children = true };
 }
 

@@ -1278,7 +1278,7 @@ fn buildTableSection(g: *Gallery, theme: Theme) !*Node {
     const row1 = [_][]const u8{ "Bob", "Design", "UI" };
     const row2 = [_][]const u8{ "Carol", "PM", "Core" };
     const rows = [_][]const []const u8{ &row0, &row1, &row2 };
-    return table_w.table(a, &cols, &rows, null, .{ .theme = theme });
+    return table_w.table(a, &cols, &rows, null, null, .{ .theme = theme });
 }
 
 /// Tree (M3E P2): a small expandable tree.

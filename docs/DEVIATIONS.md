@@ -71,7 +71,12 @@ Each widget's header carries the same list; these are the tracked ones
   on the platform clipboard.
   The legacy `input.zig` textField (conformance-only) still end-caret.
 - `time_picker.zig` — no text-input variant; en-only strings.
-- `table.zig` — no sorting/selection/scroll/sticky header; text-only cells.
+- `table.zig` — sorting (a `sortable` column's header toggles a real
+  stable asc/desc sort + the arrow icon), selection (the checkbox column +
+  select-all with the tristate dash), and a wheel/drag body scroll under a
+  pinned header are real; remaining: text-only cells (`cell_paint` takes
+  over a cell's draw — no child widgets in cells), the arrow's rotation
+  snaps (upstream animates it), no column resizing, no virtualization.
 - `tree.zig` — no drag-and-drop reordering. (Keyboard nav with
   selection-follows-focus, synchronous lazy children providers, per-node
   icons and per-row virtual a11y children landed.)
