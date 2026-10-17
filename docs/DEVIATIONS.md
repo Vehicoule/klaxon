@@ -110,10 +110,10 @@ Each widget's header carries the same list; these are the tracked ones
   `TimeInput` only — no 100x120 CornerFull style; the
   auto-advance always runs
   (upstream suppresses it while an a11y service is enabled — no
-  equivalent query here); Tab walks the fields only in tests — the host
-  maps Tab to the global focus traversal, so in-app field navigation is
-  tap / auto-advance / Enter, and the AM/PM column is pointer-only (as in
-  the dial variant).
+  equivalent query here); Tab reaches the focused node before the global
+  focus traversal — the picker consumes it to walk hour⇄minute
+  directionally and bubbles it off the edge — and the AM/PM column is
+  pointer-only (as in the dial variant).
 - `table.zig` — sorting (a `sortable` column's header toggles a real
   stable asc/desc sort + the arrow icon), selection (the checkbox column +
   select-all with the tristate dash), and a wheel/drag body scroll under a

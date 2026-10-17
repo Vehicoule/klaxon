@@ -1426,10 +1426,12 @@ pub const Host = struct {
                         .command = (event.key.mod & shortcut_mod) != 0,
                         .chr = if (event.key.key >= 'a' and event.key.key <= 'z') @intCast(event.key.key) else 0,
                     };
-                    // Tab moves the keyboard focus (Phase 2c) — never reaches the tree.
-                    if (ev.key == .tab) {
-                        if (semantics_mod.currentFocus()) |fm| _ = fm.handleKey(ev);
-                    } else if (!host.input.dispatchKey(ev)) {
+                    // The focused node sees keys first (Tab included —
+                    // time_picker consumes it to walk its hour/minute
+                    // fields and bubbles false off the edge); unhandled
+                    // keys fall to the semantics focus traversal, which
+                    // is what moves keyboard focus on plain Tab.
+                    if (!host.input.dispatchKey(ev)) {
                         // Unhandled by the focused node: Enter/Space activate it.
                         if (semantics_mod.currentFocus()) |fm| _ = fm.handleKey(ev);
                     }

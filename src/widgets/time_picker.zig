@@ -82,10 +82,9 @@
 //   - Upstream suppresses the auto-advance while an a11y service is
 //     enabled (a11yServicesEnabled); we have no equivalent query, so the
 //     advance always runs.
-//   - Tab moves between the fields only in tests — the host maps Tab to
-//     the global focus traversal, so in-app field navigation is tap /
-//     auto-advance / Enter (the AM/PM column is pointer-only, as in the
-//     dial variant).
+//   - The AM/PM column is pointer-only (as in the dial variant); Tab
+//     reaches the focused node before the host's global traversal, so it
+//     walks the fields directionally and bubbles off the edge.
 //   - No per-label hover on the dial; no keyboard navigation on the dial.
 const std = @import("std");
 const kx = @import("../kx.zig");
