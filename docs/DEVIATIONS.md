@@ -55,12 +55,13 @@ Each widget's header carries the same list; these are the tracked ones
   corner-inset thumb mapping match upstream.
 - `split_button.zig` — trailing half is pointer-only (a11y activation pending).
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
-  only; arrows move by codepoint, not grapheme cluster; no double-click
-  word select/handles/undo; the text run stays LTR under RTL chrome
-  (arrows move logically under RTL); the text_field label lerps size, not
-  weight/tracking. All three ride the shared `text_edit.zig` core: real
-  caret (click-to-position hit test, 500ms blink), selection (shift/drag +
-  highlight + range edits), Cmd/Ctrl+A/C/X/V on the platform clipboard.
+  only; no selection handles or undo; the text run stays LTR under RTL
+  chrome (arrows move logically under RTL); the text_field label lerps
+  size, not weight/tracking. All three ride the shared `text_edit.zig`
+  core: real caret (click-to-position hit test, 500ms blink), selection
+  (shift/drag + highlight + range edits), grapheme-cluster arrows and
+  double-click word select via ICU UBRK (ABI 0.23.0), Cmd/Ctrl+A/C/X/V
+  on the platform clipboard.
   The legacy `input.zig` textField (conformance-only) still end-caret.
 - `time_picker.zig` — no text-input variant; en-only strings.
 - `table.zig` — no sorting/selection/scroll/sticky header; text-only cells.

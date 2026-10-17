@@ -290,6 +290,27 @@ pub fn textLayoutPositionAt(l: *TextLayout, dx: f32, dy: f32) i32 {
     return kx.c.kx_text_position_at(l, dx, dy);
 }
 
+/// Grapheme-cluster caret step (ABI 0.23.0): the byte offset of the next
+/// (`dir >= 0`) or previous (`dir < 0`) UAX #29 boundary past `byte_off`
+/// — null at the string edge or when the backend lacks ICU. Callers keep
+/// a codepoint-step fallback for the null case.
+pub fn graphemeBoundary(str: []const u8, byte_off: usize, dir: i32) ?usize {
+    if (byte_off > str.len) return null;
+    const r = kx.c.kx_text_grapheme_boundary(str.ptr, @intCast(str.len), @intCast(byte_off), dir);
+    if (r < 0) return null;
+    return @intCast(r);
+}
+
+/// Word-break range (ABI 0.23.0): the byte span of the UBRK_WORD segment
+/// containing `byte_off` — double-click word select. null on failure.
+pub fn wordRange(str: []const u8, byte_off: usize) ?struct { lo: usize, hi: usize } {
+    if (byte_off > str.len) return null;
+    var lo: i32 = 0;
+    var hi: i32 = 0;
+    if (kx.c.kx_text_word_range(str.ptr, @intCast(str.len), @intCast(byte_off), &lo, &hi) != 0) return null;
+    return .{ .lo = @intCast(@min(@as(usize, @intCast(lo)), str.len)), .hi = @intCast(@min(@as(usize, @intCast(hi)), str.len)) };
+}
+
 // --- Images (per-ctx registry; create once, draw many) ---
 
 pub fn imageCreate(ctx: *kx.Ctx, rgba: [*]const u8, w: i32, h: i32) u64 {
@@ -498,7 +519,7 @@ pub fn offscreenEndImage(ctx: *kx.Ctx) u64 {
 // --- tests ---
 
 test "kx ABI version reports 0.21.0 (paragraph base direction)" {
-    try std.testing.expectEqualStrings("0.22.0", std.mem.span(kx.c.kx_abi_version()));
+    try std.testing.expectEqualStrings("0.23.0", std.mem.span(kx.c.kx_abi_version()));
 }
 
 test "paragraph base direction setter round-trips (default LTR)" {

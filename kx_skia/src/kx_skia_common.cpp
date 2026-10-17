@@ -47,6 +47,9 @@
 #include "modules/skshaper/include/SkShaper_harfbuzz.h"
 #include "modules/skunicode/include/SkUnicode.h"
 #include "modules/skunicode/include/SkUnicode_icu.h"
+// ICU break iteration (0.23.0) — UBRK_CHARACTER = UAX #29 grapheme
+// clusters; libicu is already linked for SkParagraph's bidi/lines.
+#include <unicode/ubrk.h>
 
 #include <algorithm>
 #include <atomic>
@@ -3400,7 +3403,7 @@ kx_backend kx_backend_of(const kx_ctx* ctx) {
 }
 
 const char* kx_abi_version(void) {
-    return "0.22.0";
+    return "0.23.0";
 }
 
 // Paragraph base direction (0.21.0) — the bidi base level every paragraph
@@ -3510,6 +3513,100 @@ int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy) {
     auto* p = kx_layout_paragraph(layout);
     if (!p) return -1;
     return static_cast<int32_t>(p->getGlyphPositionAtCoordinate(dx, dy).position);
+}
+
+// UTF-8 → UTF-16 with a byte-offset map (both units of a surrogate pair
+// record the pair's byte start) — ubrk iterates UTF-16 units while the
+// callers' caret offsets are bytes. Returns false on empty/malformed.
+static bool kx_utf16_with_byte_map(const char* text, int32_t len,
+                                   std::vector<UChar>* u16, std::vector<int32_t>* map) {
+    u16->reserve(static_cast<size_t>(len));
+    map->reserve(static_cast<size_t>(len));
+    const char* p = text;
+    const char* const end = text + len;
+    while (p < end) {
+        const int32_t byte_start = static_cast<int32_t>(p - text);
+        const SkUnichar u = SkUTF::NextUTF8(&p, end);
+        if (u < 0) break; // malformed tail: boundaries past it are unreachable
+        if (u > 0xFFFF) {
+            uint16_t units[2];
+            SkUTF::ToUTF16(u, units);
+            u16->push_back(units[0]);
+            u16->push_back(units[1]);
+            map->push_back(byte_start);
+            map->push_back(byte_start);
+        } else {
+            u16->push_back(static_cast<UChar>(u));
+            map->push_back(byte_start);
+        }
+    }
+    return !u16->empty();
+}
+
+// byte_off → the UTF-16 index of the first unit starting at-or-after it
+// (a mid-cluster byte offset snaps forward; caret offsets are always on
+// boundaries in practice).
+static int32_t kx_u16_index(const std::vector<int32_t>& map, int32_t byte_off) {
+    for (size_t i = 0; i < map.size(); ++i) {
+        if (map[i] >= byte_off) return static_cast<int32_t>(i);
+    }
+    return static_cast<int32_t>(map.size());
+}
+
+// u16 index → byte offset; the end boundary maps to len.
+static int32_t kx_u16_to_byte(const std::vector<int32_t>& map, int32_t r, int32_t len) {
+    return r >= static_cast<int32_t>(map.size()) ? len : map[r];
+}
+
+// Grapheme-cluster boundary navigation (0.23.0): ICU UBRK_CHARACTER over
+// the text — the same break iterator Compose's caret movement rides
+// (emoji, flags, ZWJ sequences stay atomic). -1 at the string edge or on
+// failure; callers keep their byte-level fallback.
+int32_t kx_text_grapheme_boundary(const char* text, int32_t len, int32_t byte_off, int32_t dir) {
+    if (!text || len < 0 || byte_off < 0 || byte_off > len) return -1;
+    std::vector<UChar> u16;
+    std::vector<int32_t> map;
+    if (!kx_utf16_with_byte_map(text, len, &u16, &map)) return -1;
+    UErrorCode ec = U_ZERO_ERROR;
+    UBreakIterator* bi = ubrk_open(UBRK_CHARACTER, "", u16.data(), static_cast<int32_t>(u16.size()), &ec);
+    if (U_FAILURE(ec) || !bi) return -1;
+    const int32_t u16pos = kx_u16_index(map, byte_off);
+    const int32_t r = dir >= 0 ? ubrk_following(bi, u16pos) : ubrk_preceding(bi, u16pos);
+    ubrk_close(bi);
+    if (r == UBRK_DONE) return -1;
+    return kx_u16_to_byte(map, r, len);
+}
+
+// Word-break range (0.23.0): the byte range of the UBRK_WORD segment
+// containing byte_off — double-click word select, the same iterator
+// family Compose's getWordBoundary uses (whitespace/punctuation select as
+// their own segment, like upstream). Returns 0 on success, -1 otherwise.
+int32_t kx_text_word_range(const char* text, int32_t len, int32_t byte_off,
+                           int32_t* out_lo, int32_t* out_hi) {
+    if (!text || len < 0 || byte_off < 0 || byte_off > len || !out_lo || !out_hi) return -1;
+    std::vector<UChar> u16;
+    std::vector<int32_t> map;
+    if (!kx_utf16_with_byte_map(text, len, &u16, &map)) return -1;
+    UErrorCode ec = U_ZERO_ERROR;
+    UBreakIterator* bi = ubrk_open(UBRK_WORD, "", u16.data(), static_cast<int32_t>(u16.size()), &ec);
+    if (U_FAILURE(ec) || !bi) return -1;
+    int32_t lo = 0, hi = static_cast<int32_t>(u16.size());
+    const int32_t u16pos = kx_u16_index(map, byte_off);
+    if (u16pos >= static_cast<int32_t>(u16.size())) {
+        lo = ubrk_preceding(bi, static_cast<int32_t>(u16.size())); // past the end: the last word
+        hi = static_cast<int32_t>(u16.size());
+    } else if (ubrk_isBoundary(bi, u16pos)) {
+        lo = u16pos; // on a boundary: the following segment (its start)
+        hi = ubrk_following(bi, u16pos);
+    } else {
+        lo = ubrk_preceding(bi, u16pos); // mid-segment: containing word
+        hi = ubrk_following(bi, u16pos);
+    }
+    ubrk_close(bi);
+    if (lo == UBRK_DONE || hi == UBRK_DONE || lo >= hi) return -1;
+    *out_lo = kx_u16_to_byte(map, lo, len);
+    *out_hi = kx_u16_to_byte(map, hi, len);
+    return 0;
 }
 
 void kx_text_paint_layout(kx_ctx* ctx, const kx_text_layout* layout, float x, float y) {

@@ -23,8 +23,7 @@ pub fn build(b: *std.Build) void {
     // replaces the -Doptimize flag with -Drelease entirely when a preferred
     // mode is set, so every -Doptimize=<mode> script silently builds Debug.
     const optimize: std.builtin.OptimizeMode = blk: {
-        if (b.option([]const u8, "optimize",
-            "Prioritize performance, safety, or binary size (default: fast)")) |s| {
+        if (b.option([]const u8, "optimize", "Prioritize performance, safety, or binary size (default: fast)")) |s| {
             if (std.meta.stringToEnum(std.builtin.OptimizeMode, s)) |m| break :blk m;
             // Zig 0.17 renamed the enum members (ReleaseSmall -> small); keep
             // the legacy spellings working for packaging scripts and CI.
@@ -404,8 +403,11 @@ fn addKxSkia(
         }),
     });
     const shim_flags = &[_][]const u8{
-        "-std=c++20",  "-fno-exceptions", "-fno-rtti",
-        "-DSK_GANESH", "-DSK_GRAPHITE",   "-DNDEBUG",
+        "-std=c++20",             "-fno-exceptions", "-fno-rtti",
+        "-DSK_GANESH",            "-DSK_GRAPHITE",   "-DNDEBUG",
+        // Match the vendored libicu.a: Skia builds ICU with symbol
+        // renaming off, so ubrk_* links unsuffixed.
+        "-DU_DISABLE_RENAMING=1",
     };
     // On Windows, kx_skia_common.cpp goes through compileMsvcShims instead
     // (MSVC STL ABI — see the .windows case below).
@@ -482,6 +484,9 @@ fn addKxSkia(
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
+    // ICU common headers (ubrk.h — grapheme-cluster boundaries) — the same
+    // path SkUnicode_icu compiles against; libicu.a is already linked.
+    kx_skia.root_module.addIncludePath(b.path("deps/skia/third_party/externals/icu/source/common"));
     kx_skia.root_module.addIncludePath(b.path("deps/SDL/include"));
     if (is_macos) {
         inline for (.{ "Metal", "QuartzCore", "Foundation", "CoreGraphics", "CoreText", "CoreFoundation", "IOSurface" }) |fw| {
@@ -664,10 +669,11 @@ fn addWasmWeb(
         }),
     });
     const shim_flags = &[_][]const u8{
-        "-std=c++20",  "-fno-exceptions", "-fno-rtti",
-        "-DSK_GANESH", "-DSK_GL",         "-DSK_GRAPHITE",
-        "-DSK_DAWN",   "-DSK_FORCE_8_BYTE_ALIGNMENT",
-        "-DNDEBUG",
+        "-std=c++20",             "-fno-exceptions",             "-fno-rtti",
+        "-DSK_GANESH",            "-DSK_GL",                     "-DSK_GRAPHITE",
+        "-DSK_DAWN",              "-DSK_FORCE_8_BYTE_ALIGNMENT", "-DNDEBUG",
+        // Match libicu.wasm.a: Skia builds ICU with symbol renaming off.
+        "-DU_DISABLE_RENAMING=1",
         // zig cc enables UBSan instrumentation that references zig's
         // compiler-rt symbols; emscripten's compiler_rt doesn't provide them
         // (wasm-ld undefined __ubsan_handle_* in emdawnwebgpu's webgpu.cpp).
@@ -676,7 +682,8 @@ fn addWasmWeb(
         // headers which conflict with the emscripten sysroot. All include paths
         // are provided explicitly below (compat + c++/v1 + sysroot + project
         // headers) — the same list emcc assembles (emcc.py get_cflags).
-           "-nostdinc",       "-nostdinc++",
+            "-nostdinc",
+        "-nostdinc++",
     };
     kx_skia.root_module.addCSourceFiles(.{
         .files = &.{
@@ -692,6 +699,9 @@ fn addWasmWeb(
     kx_skia.root_module.addIncludePath(b.path("kx_skia/include"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia"));
     kx_skia.root_module.addIncludePath(b.path("deps/skia/include"));
+    // ICU common headers (ubrk.h — grapheme-cluster boundaries); the wasm
+    // build links libicu.wasm.a like the native one links libicu.a.
+    kx_skia.root_module.addIncludePath(b.path("deps/skia/third_party/externals/icu/source/common"));
     // emdawnwebgpu package headers BEFORE everything else providing
     // webgpu/*.h: the pkg carries the standard-spec headers matching its JS
     // runtime. The vendored Dawn headers (third_party/externals/dawn) are the
@@ -1009,8 +1019,10 @@ fn addIosApp(
                 // (sk_cfp + CFRetain). iOS ships graphite-metal only.
                                        "-fno-objc-arc",    "-DSK_GANESH",
                 "-DSK_GRAPHITE",                    "-DSK_METAL",       "-DNDEBUG",
-                "-I",                               "kx_skia/include",  "-I",
-                "deps/skia",                        "-I",               "deps/skia/include",
+                // libicu.a is built with symbol renaming off (Skia).
+                "-DU_DISABLE_RENAMING=1",           "-I",               "kx_skia/include",
+                "-I",                               "deps/skia",        "-I",
+                "deps/skia/include",                "-I",               "deps/skia/third_party/externals/icu/source/common",
                 "-I",                               "deps/SDL/include", "-c",
                 src,                                "-o",               obj_path,
             };
@@ -1174,8 +1186,7 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         b.fmt("@set \"PATH={s}\"\r\n@set \"INCLUDE={s}\"\r\n", .{ env.path, env.include })
     else
         b.fmt("@call \"{s}\" >NUL 2>&1\r\n@if errorlevel 1 (echo vcvars64 failed>&2& exit /b 1)\r\n", .{vcvars});
-    const wrapper = wf.add("msvc-cl-wrapper.bat",
-        b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n{s}{s}", .{ env_prelude, attempt }));
+    const wrapper = wf.add("msvc-cl-wrapper.bat", b.fmt("@set \"kxlog=%TEMP%\\kx-cl-%RANDOM%-%RANDOM%.log\"\r\n{s}{s}", .{ env_prelude, attempt }));
     var objs: std.ArrayList(std.Build.LazyPath) = .empty;
     // cl runs serialized across ALL shim compiles (global msvc_cl_serial):
     // parallel invocations on a fresh runner race on shared temp state (cl
@@ -1206,7 +1217,9 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         if (s.lean) run.addArg("/DWIN32_LEAN_AND_MEAN");
         run.addArg("/DSK_GANESH");
         run.addArg("/DSK_GRAPHITE");
-        inline for (.{ "kx_skia/include", "deps/skia", "deps/skia/include", "deps/SDL/include", "deps/mcu" }) |inc| {
+        // skia.lib's ICU is built with symbol renaming off.
+        run.addArg("/DU_DISABLE_RENAMING=1");
+        inline for (.{ "kx_skia/include", "deps/skia", "deps/skia/include", "deps/skia/third_party/externals/icu/source/common", "deps/SDL/include", "deps/mcu" }) |inc| {
             run.addArg("/I" ++ inc);
         }
         // Dawn's checked-in headers + the cmake-generated webgpu_cpp.h.

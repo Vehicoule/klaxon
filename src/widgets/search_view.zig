@@ -520,10 +520,10 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             } else {
                 // the header text area / empty space: the query keeps focus
                 input.requestFocus(n);
-                // Click-to-caret: the press maps to the nearest grapheme
-                // boundary and collapses the selection onto it.
-                s.edit.dragging = true;
-                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), false);
+                // Press-to-caret: the press maps to the nearest grapheme
+                // boundary; the shared tap() also handles double-click
+                // word select.
+                s.edit.tap(caretAt(n, s, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
             }
             // the press is modal — nothing under the view sees it
             n.markDirty();
@@ -539,6 +539,7 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.fill_pressed = -1;
             s.pressed_index = -1;
             s.edit.dragging = false;
+            s.edit.drag_word = false;
             n.markDirty();
             if (was_back) {
                 if (inBack(s, b, ev.x, ev.y)) closeSearchView(n, s); // M3: the nav icon dismisses
@@ -554,10 +555,10 @@ fn searchViewOnPointer(n: *Node, ev: input.PointerEvent) bool {
             return true;
         },
         .move => {
-            // A held primary button drags the caret — drag-select (the
-            // pointer is captured, so moves keep arriving off-bounds).
+            // A held primary button drags the selection (word-granular
+            // after a double-tap) — the captured pointer keeps moving.
             if (s.edit.dragging) {
-                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), true);
+                s.edit.dragExtend(caretAt(n, s, ev.x, ev.y));
                 return true;
             }
             // A drag beyond the touch slop is a scroll, not a press: cancel

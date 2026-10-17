@@ -319,10 +319,10 @@ fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
             } else {
                 s.pressed = true;
                 input.requestFocus(n);
-                // Click-to-caret: the press maps to the nearest grapheme
-                // boundary and collapses the selection onto it.
-                s.edit.dragging = true;
-                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), false);
+                // Press-to-caret: the press maps to the nearest grapheme
+                // boundary; the shared tap() also handles double-click
+                // word select.
+                s.edit.tap(caretAt(n, s, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
             }
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
@@ -335,15 +335,16 @@ fn searchBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.clear_pressed = false;
             s.pressed = false;
             s.edit.dragging = false;
+            s.edit.drag_word = false;
             n.markDirty();
             if (was_clear and on_clear) clearText(n, s);
             return was_clear or was_pressed;
         },
         .move => {
-            // A held primary button drags the caret — drag-select (the
-            // pointer is captured, so moves keep arriving off-bounds).
+            // A held primary button drags the selection (word-granular
+            // after a double-tap) — the captured pointer keeps moving.
             if (s.edit.dragging) {
-                s.edit.moveCaret(caretAt(n, s, ev.x, ev.y), true);
+                s.edit.dragExtend(caretAt(n, s, ev.x, ev.y));
                 return true;
             }
             // A drag beyond the touch slop is a scroll, not a press: cancel

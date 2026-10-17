@@ -2,7 +2,7 @@
 // (text_field, search_bar, search_view): the null-terminated UTF-8 buffer,
 // the IME composition (preedit) buffer, the caret/selection model, the
 // 500ms blink ticker, and the editing operations — insert at caret, range
-// deletes, codepoint arrows/home/end, Cmd/Ctrl+A/C/X/V chords.
+// deletes, grapheme-cluster arrows/home/end, Cmd/Ctrl+A/C/X/V chords.
 //
 // The widget owns the GEOMETRY (where the run paints → caretFromPoint's
 // run origin) and the edit follow-ups (layout dirty, signal mirror, a11y
@@ -16,6 +16,10 @@ const Node = ui.node.Node;
 
 /// Compose's caret cadence (a fixed 500ms half-period; re-shown on edits).
 pub const blink_half_ms: u64 = 500;
+/// Double-tap window — ViewConfiguration.getDoubleTapTimeout (300ms) with
+/// the standard touch slop between the two taps.
+pub const double_tap_ms: u64 = 300;
+const tap_slop: f32 = 12;
 
 pub const Edit = struct {
     buf: std.array_list.Managed(u8), // kept null-terminated: items[len] == 0
@@ -31,6 +35,14 @@ pub const Edit = struct {
     sel_anchor: usize = 0,
     /// Primary-button drag in progress (extends the selection).
     dragging: bool = false,
+    /// A word-select double-tap armed word-granular drag (the move handler
+    /// extends to whole-word edges, like upstream's word-drag). Cleared on
+    /// the next plain tap.
+    drag_word: bool = false,
+    /// Double-tap tracking: the previous tap's timestamp + screen spot.
+    last_tap_ms: u64 = 0,
+    last_tap_x: f32 = 0,
+    last_tap_y: f32 = 0,
     /// The blink clock: `caret_on` is the painted phase; `blink_epoch` is
     /// the tick-time the ON phase started — maxInt = "re-base at the next
     /// tick" (set by every caret event, whose KeyEvent has no timestamp).
@@ -71,6 +83,28 @@ pub const Edit = struct {
     /// The ordered selection range [lo, hi); empty when collapsed.
     pub fn selRange(e: *const Edit) struct { lo: usize, hi: usize } {
         return .{ .lo = @min(e.caret, e.sel_anchor), .hi = @max(e.caret, e.sel_anchor) };
+    }
+
+    /// The next grapheme-cluster boundary in `dir` — ICU UBRK_CHARACTER
+    /// via the paint backend (emoji, flags and ZWJ sequences stay atomic,
+    /// matching Compose's BreakIterator-backed caret). Falls back to a
+    /// codepoint step when the backend can't answer.
+    pub fn graphemeStep(e: *const Edit, off: usize, dir: i32) usize {
+        const items = e.buf.items;
+        if (ui.paint.graphemeBoundary(items, @min(off, items.len), dir)) |b| return @min(b, items.len);
+        var p = off;
+        if (dir >= 0) {
+            if (p < items.len) {
+                p += 1;
+                while (p < items.len and (items[p] & 0xC0) == 0x80) p += 1;
+            }
+            return p;
+        }
+        while (p > 0) {
+            p -= 1;
+            if ((items[p] & 0xC0) != 0x80) break;
+        }
+        return p;
     }
 
     /// Delete [lo, hi) from the buffer and collapse the caret onto `lo`.
@@ -114,6 +148,74 @@ pub const Edit = struct {
         if (!extend) e.sel_anchor = p;
         e.resetBlink();
         if (e.node) |n| n.markDirty();
+    }
+
+    /// A primary press at byte offset `off` (screen x/y feed the tap
+    /// slop). A second tap within double_tap_ms and the slop selects the
+    /// containing UBRK_WORD segment and arms word-granular drag — the
+    /// upstream double-click; a plain tap places the caret and arms the
+    /// glyph-granular drag-select. time_ms = 0 means "unstamped" (test
+    /// injections) — it can never be a double-tap.
+    pub fn tap(e: *Edit, off: usize, x: f32, y: f32, time_ms: u64) void {
+        const double = time_ms != 0 and e.last_tap_ms != 0 and
+            time_ms -| e.last_tap_ms < double_tap_ms and
+            @abs(x - e.last_tap_x) <= tap_slop and @abs(y - e.last_tap_y) <= tap_slop;
+        e.last_tap_ms = time_ms;
+        e.last_tap_x = x;
+        e.last_tap_y = y;
+        e.dragging = true;
+        if (double) {
+            e.drag_word = true;
+            e.selectWordAt(off);
+            return;
+        }
+        e.drag_word = false;
+        e.moveCaret(off, false);
+    }
+
+    /// A press-drag move to byte offset `off` — by word when a double-tap
+    /// selected a word, else the plain caret-extend. The anchor is the
+    /// FAR edge of the selection once the hovered word lies entirely on
+    /// one side — the originally double-clicked word stays covered, like
+    /// upstream's word-granular drag.
+    pub fn dragExtend(e: *Edit, off: usize) void {
+        if (e.drag_word) {
+            const items = e.buf.items;
+            if (ui.paint.wordRange(items, @min(off, items.len))) |r| {
+                const sel = e.selRange();
+                if (r.hi <= sel.lo) { // hovered word entirely left of the selection
+                    e.sel_anchor = sel.hi;
+                    e.caret = r.lo;
+                } else if (r.lo >= sel.hi) { // entirely right
+                    e.sel_anchor = sel.lo;
+                    e.caret = r.hi;
+                } else { // overlapping: extend to the word's far edge
+                    e.caret = if (r.lo >= e.sel_anchor) r.hi else r.lo;
+                }
+                e.clampOffsets();
+                e.resetBlink();
+                if (e.node) |n| n.markDirty();
+                return;
+            }
+        }
+        e.moveCaret(off, true);
+    }
+
+    /// Select the word-break segment containing `off` (UBRK_WORD —
+    /// whitespace and punctuation select as their own segment, matching
+    /// upstream getWordBoundary); falls back to a caret move when the
+    /// backend can't answer.
+    pub fn selectWordAt(e: *Edit, off: usize) void {
+        const items = e.buf.items;
+        if (ui.paint.wordRange(items, @min(off, items.len))) |r| {
+            e.sel_anchor = @min(r.lo, items.len);
+            e.caret = @min(r.hi, items.len);
+            e.clampOffsets();
+            e.resetBlink();
+            if (e.node) |n| n.markDirty();
+            return;
+        }
+        e.moveCaret(off, false);
     }
 
     /// Splice `ins` in AT the caret — an open selection is replaced first.
@@ -266,10 +368,7 @@ pub const Edit = struct {
                             return true;
                         }
                         if (e.caret == 0) return true;
-                        var start = e.caret;
-                        while (start > 0 and (e.buf.items[start - 1] & 0xC0) == 0x80) start -= 1;
-                        start -= 1;
-                        e.deleteRange(start, e.caret);
+                        e.deleteRange(e.graphemeStep(e.caret, -1), e.caret);
                         e.resetBlink();
                         apply_edit(n);
                         return true;
@@ -282,18 +381,16 @@ pub const Edit = struct {
                             apply_edit(n);
                             return true;
                         }
-                        // Forward delete: the codepoint at the caret.
+                        // Forward delete: the grapheme cluster at the caret.
                         if (e.caret >= e.buf.items.len or e.comp.items.len > 0) return true;
-                        const l = std.unicode.utf8ByteSequenceLength(e.buf.items[e.caret]) catch 1;
-                        e.deleteRange(e.caret, @min(e.buf.items.len, e.caret + l));
+                        e.deleteRange(e.caret, e.graphemeStep(e.caret, 1));
                         e.resetBlink();
                         apply_edit(n);
                         return true;
                     },
-                    // Logical caret motion — one codepoint per press
-                    // (upstream moves by grapheme cluster — a cluster-aware
-                    // step needs the paragraph's break iterator, tracked as
-                    // a deviation). Shift extends; a plain arrow over an
+                    // Logical caret motion — one grapheme cluster per
+                    // press (UAX #29 via the paint backend, like Compose's
+                    // BreakIterator). Shift extends; a plain arrow over an
                     // open selection collapses onto the range's edge.
                     .left => {
                         const sel = e.selRange();
@@ -301,12 +398,7 @@ pub const Edit = struct {
                             e.moveCaret(sel.lo, false);
                             return true;
                         }
-                        var p = e.caret;
-                        while (p > 0) {
-                            p -= 1;
-                            if ((e.buf.items[p] & 0xC0) != 0x80) break;
-                        }
-                        e.moveCaret(p, ev.shift);
+                        e.moveCaret(e.graphemeStep(e.caret, -1), ev.shift);
                         return true;
                     },
                     .right => {
@@ -315,12 +407,7 @@ pub const Edit = struct {
                             e.moveCaret(sel.hi, false);
                             return true;
                         }
-                        var p = e.caret;
-                        if (p < e.buf.items.len) {
-                            p += 1;
-                            while (p < e.buf.items.len and (e.buf.items[p] & 0xC0) == 0x80) p += 1;
-                        }
-                        e.moveCaret(p, ev.shift);
+                        e.moveCaret(e.graphemeStep(e.caret, 1), ev.shift);
                         return true;
                     },
                     .home => {

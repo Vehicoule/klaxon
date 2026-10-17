@@ -82,6 +82,11 @@
 //   0.22.0 — kx_measure_text_len (length-taking measure for sentinel-less
 //            substring prefixes — caret geometry) + kx_text_position_at
 //            (SkParagraph getGlyphPositionAtCoordinate: click-to-caret).
+//   0.23.0 — kx_text_grapheme_boundary: ICU UBRK_CHARACTER caret stepping
+//            over UTF-8 text (byte_off → byte_off) — emoji/flags/ZWJ move
+//            atomically. -1 at the edge. Plus kx_text_word_range
+//            (UBRK_WORD segment containing an offset — double-click word
+//            select). Additive.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -174,6 +179,19 @@ void kx_text_layout_destroy(kx_text_layout* layout);
 // (SkParagraph::getGlyphPositionAtCoordinate — the same call Compose's
 // TextLayoutResult.getOffsetForPosition rides). -1 on null/unbuilt.
 int32_t kx_text_position_at(kx_text_layout* layout, float dx, float dy);
+
+// Grapheme-cluster navigation (0.23.0): the byte offset of the next
+// (dir >= 0) or previous (dir < 0) user-perceived-character boundary after
+// byte_off — ICU UBRK_CHARACTER (UAX #29), the same rules Compose's caret
+// movement uses. -1 at the string edge, on malformed input or on null.
+int32_t kx_text_grapheme_boundary(const char* text, int32_t len, int32_t byte_off, int32_t dir);
+
+// Word-break range (0.23.0): the byte range [out_lo, out_hi) of the
+// UBRK_WORD segment containing byte_off — double-click word select
+// (whitespace and punctuation select as their own segment). Returns 0 on
+// success, -1 on null/malformed input.
+int32_t kx_text_word_range(const char* text, int32_t len, int32_t byte_off,
+                           int32_t* out_lo, int32_t* out_hi);
 
 // Paragraph base direction (0.21.0) — process-global: the bidi base level
 // every paragraph is built against (kx_draw_text* misses AND

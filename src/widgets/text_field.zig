@@ -77,9 +77,10 @@
 //     @0.4 highlight, collapsed anchors, delete replaces the range).
 //     Cmd/Ctrl+A/C/X/V ride the platform clipboard (ui.clipboard — the
 //     host installs SDL's impl); paste strips line terminators to stay
-//     single-line. Still missing: no selection handles or double-click
-//     word select, no undo, no TextSelectionColors customization, and
-//     arrows move by codepoint, not grapheme cluster.
+//     single-line. Arrows/deletes step by grapheme cluster (ICU
+//     UBRK_CHARACTER) and double-click selects the word (UBRK_WORD)
+//     with word-granular drag. Still missing: no selection handles,
+//     no undo, no TextSelectionColors customization.
 //   - RTL mirrors the chrome; the text run itself stays LTR (no bidi —
 //     same as text.zig); under RTL arrow keys still move logically.
 const std = @import("std");
@@ -750,25 +751,25 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             input.requestFocus(n);
-            // Click-to-caret: the press maps to the nearest grapheme
+            // Press-to-caret: the press maps to the nearest grapheme
             // boundary (the pointer arrives in the node's parent space —
-            // the same space containerRect/textRect build in). A down
-            // collapses the selection onto the caret — the anchor.
-            s.edit.dragging = true;
-            s.edit.moveCaret(caretFromPoint(n, s, ev.x, ev.y), false);
-            s.edit.resetBlink();
+            // the same space containerRect/textRect build in). The shared
+            // tap() handles plain placement vs double-click word select.
+            s.edit.tap(caretFromPoint(n, s, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
             n.markDirty(); // the label float / caret / colors follow focus
             return true;
         },
         .up => {
             s.edit.dragging = false;
+            s.edit.drag_word = false;
             return true;
         },
         .move => {
-            // A held primary button drags the caret — drag-select (the
-            // pointer is captured, so moves keep arriving off-bounds).
+            // A held primary button drags the selection (word-granular
+            // after a double-tap) — the captured pointer keeps moving
+            // off-bounds.
             if (!s.edit.dragging) return false;
-            s.edit.moveCaret(caretFromPoint(n, s, ev.x, ev.y), true);
+            s.edit.dragExtend(caretFromPoint(n, s, ev.x, ev.y));
             return true;
         },
         .enter, .leave => return true, // no hover styling — the state-based colors have no hover axis
@@ -1395,6 +1396,88 @@ test "text_field: the caret steps by codepoint through multibyte text" {
     s2.edit.caret = 4;
     setText(sig_field, "h\xC3\xA9");
     try std.testing.expectEqual(@as(usize, 3), s2.edit.caret); // clamped to len
+}
+
+test "text_field: the caret steps by grapheme cluster over emoji" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // "a" + flag (2 RI codepoints, 8B) + "b" + family ZWJ (5 codepoints,
+    // 18B) = 28 bytes; UAX #29 boundaries at 0, 1, 9, 10, 28 — a codepoint
+    // step would land mid-flag/mid-family.
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "a\u{1F1EB}\u{1F1F7}b\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    try std.testing.expectEqual(@as(usize, 28), s.edit.caret);
+    router.focus(b);
+    // left hops the whole family emoji atomically
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 10), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 9), s.edit.caret); // before 'b'
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 1), s.edit.caret); // before the flag
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left });
+    try std.testing.expectEqual(@as(usize, 0), s.edit.caret);
+    // shift+left selects the family cluster in one press
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .end });
+    try std.testing.expectEqual(@as(usize, 28), s.edit.caret);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .left, .shift = true });
+    try std.testing.expectEqual(@as(usize, 10), s.edit.caret);
+    try std.testing.expectEqual(@as(usize, 28), s.edit.sel_anchor);
+    // backspace removes the whole selected cluster
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .backspace });
+    try std.testing.expectEqualStrings("a\u{1F1EB}\u{1F1F7}b", text(b));
+    try std.testing.expectEqual(@as(usize, 10), s.edit.caret);
+    // forward delete from the end of 'a' removes the flag atomically
+    s.edit.caret = 1;
+    s.edit.sel_anchor = 1;
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .delete });
+    try std.testing.expectEqualStrings("ab", text(b));
+}
+
+test "text_field: double-click selects the word; word-drag extends by word" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    // "Hello, world!" — UBRK_WORD segments: Hello[0,5) , [5,6) " "[6,7)
+    // world[7,12) ![12,13)
+    const b = try textField(std.testing.allocator, null, null, null, .{ .initial = "Hello, world!" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    const s = stateOf(b);
+    router.focus(b);
+    // two taps inside "world" 150ms apart → the word selects atomically
+    s.edit.tap(9, 90, 28, 1000);
+    s.edit.dragging = false;
+    s.edit.tap(9, 90, 28, 1150);
+    var sel = s.edit.selRange();
+    try std.testing.expectEqualStrings("world", text(b)[sel.lo..sel.hi]);
+    // word-drag: a move inside "Hello" extends to ITS edge — not glyphs
+    s.edit.dragExtend(2);
+    sel = s.edit.selRange();
+    try std.testing.expectEqualStrings("Hello, world", text(b)[sel.lo..sel.hi]);
+    // stamped pointer path: down/up/down inside the window selects too
+    s.edit.dragging = false;
+    s.edit.drag_word = false;
+    s.edit.last_tap_ms = 0;
+    router.dispatchPointer(b, .{ .phase = .down, .x = 24, .y = 28, .time_ms = 3000 });
+    router.dispatchPointer(b, .{ .phase = .up, .x = 24, .y = 28, .time_ms = 3030 });
+    router.dispatchPointer(b, .{ .phase = .down, .x = 24, .y = 28, .time_ms = 3150 });
+    sel = s.edit.selRange();
+    try std.testing.expect(sel.hi > sel.lo); // a word segment is selected
+    router.dispatchPointer(b, .{ .phase = .up, .x = 24, .y = 28, .time_ms = 3180 });
+    // a tap past the window collapses back to a caret
+    router.dispatchPointer(b, .{ .phase = .down, .x = 24, .y = 28, .time_ms = 4000 });
+    sel = s.edit.selRange();
+    try std.testing.expectEqual(sel.lo, sel.hi);
+    // and an unstamped second tap (test-style time_ms = 0) never doubles
+    s.edit.tap(9, 90, 28, 5000);
+    s.edit.tap(9, 90, 28, 0);
+    sel = s.edit.selRange();
+    try std.testing.expectEqual(@as(usize, 9), sel.lo);
+    try std.testing.expectEqual(sel.lo, sel.hi);
 }
 
 test "text_field: the caret blinks on the 500ms cadence and re-shows on edits" {
