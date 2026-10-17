@@ -500,33 +500,40 @@ fn fieldMetrics(s: *TextFieldState) ui.paint.TextMetrics {
     return m;
 }
 
-/// Bound the rope: past 64 segs, fold the first shaping-safe adjacent
-/// pair into one (the join was already a legal split, so the merged piece
-/// shapes identically). Edits only ever append at the tail — unbounded
-/// growth otherwise leaks a heap alloc per commit and costs O(#segs) in
-/// every reconcile/draw pass (input_ime grew ~560 segs in 600 frames).
+/// Bound the rope: past 64 segs, fold a shaping-safe adjacent pair into
+/// one (the join was already a legal split, so the merged piece shapes
+/// identically). Edits only ever append at the tail — unbounded growth
+/// otherwise leaks a heap alloc per commit and costs O(#segs) in every
+/// reconcile/draw pass (input_ime grew ~560 segs in 600 frames).
+/// The shortest safe pair is folded: merging at a fixed end lets one seg
+/// absorb piece after piece and forces a re-shape of the whole text per
+/// edit (~1ms/frame in input_ime), while shortest-first keeps pieces
+/// balanced at ~text/64 so the re-shape stays cheap.
 fn compactSegs(s: *TextFieldState) void {
     while (s.segs.items.len > 64) {
-        var i: usize = 0;
-        var merged = false;
-        while (i + 1 < s.segs.items.len) : (i += 1) {
+        var best: ?usize = null;
+        var best_len: usize = std.math.maxInt(usize);
+        for (0..s.segs.items.len - 1) |i| {
             const a = &s.segs.items[i];
             const b = &s.segs.items[i + 1];
+            if (a.text.len + b.text.len >= best_len) continue;
             if (!atomicBoundary(lastCpBefore(a.text, a.text.len)) or
                 !atomicBoundary(firstCpAt(b.text, 0))) continue;
-            const buf = s.segs.allocator.alloc(u8, a.text.len + b.text.len + 1) catch @panic("klaxon: out of memory");
-            @memcpy(buf[0..a.text.len], a.text);
-            @memcpy(buf[a.text.len..][0..b.text.len], b.text);
-            buf[a.text.len + b.text.len] = 0;
-            s.segs.allocator.free(@constCast(a.text.ptr)[0 .. a.text.len + 1]);
-            s.segs.allocator.free(@constCast(b.text.ptr)[0 .. b.text.len + 1]);
-            a.text = buf[0 .. a.text.len + b.text.len :0];
-            a.m = ui.paint.measureText(a.text, a.size, false);
-            _ = s.segs.orderedRemove(i + 1);
-            merged = true;
-            break;
+            best = i;
+            best_len = a.text.len + b.text.len;
         }
-        if (!merged) return; // every adjacent join is shaping-unsafe — rare
+        const i = best orelse return; // every adjacent join is shaping-unsafe — rare
+        const a = &s.segs.items[i];
+        const b = &s.segs.items[i + 1];
+        const buf = s.segs.allocator.alloc(u8, best_len + 1) catch @panic("klaxon: out of memory");
+        @memcpy(buf[0..a.text.len], a.text);
+        @memcpy(buf[a.text.len..][0..b.text.len], b.text);
+        buf[best_len] = 0;
+        s.segs.allocator.free(@constCast(a.text.ptr)[0 .. a.text.len + 1]);
+        s.segs.allocator.free(@constCast(b.text.ptr)[0 .. b.text.len + 1]);
+        a.text = buf[0..best_len :0];
+        a.m = ui.paint.measureText(a.text, a.size, false);
+        _ = s.segs.orderedRemove(i + 1);
     }
 }
 fn segPush(s: *TextFieldState, piece: [:0]const u8, size: f32) void {
