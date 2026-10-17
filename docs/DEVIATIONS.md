@@ -70,10 +70,14 @@ Each widget's header carries the same list; these are the tracked ones
   content padding, mirrored in RTL, tracking the live morph. (a11y:
   the halves are virtual button children and ArrowDown activates the
   trailing — ARIA menu-button.)
-- `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
-  only; no selection handles or undo; the text_field label lerps
-  size, not weight/tracking. All three ride the shared `text_edit.zig`
-  core: real caret (click-to-position hit test, 500ms blink), selection
+- `text_field.zig` / `search_bar.zig` / `search_view.zig` — text_field
+  grows multiline (`multiline`/`min_lines`/`max_lines`: soft wrap, Enter
+  inserts '\n', wheel-scrolled capped viewport, caret-follow on input);
+  search_bar/search_view stay single-line (upstream DockedSearchBar is
+  single-line too). No selection handles or undo; the text_field label
+  lerps size, not weight/tracking. All three ride the shared
+  `text_edit.zig` core: real caret (click-to-position hit test, 500ms
+  blink), selection
   (shift/drag + highlight + range edits), grapheme-cluster arrows and
   double-click word select via ICU UBRK (ABI 0.23.0), Cmd/Ctrl+A/C/X/V
   on the platform clipboard. Caret geometry is direction-aware (ABI

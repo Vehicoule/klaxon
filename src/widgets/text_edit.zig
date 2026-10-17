@@ -424,7 +424,10 @@ pub const Edit = struct {
                             apply_edit(n);
                             return true;
                         },
-                        else => return true, // unknown chord — still consumed
+                        // Unknown chords stay consumed — except Enter:
+                        // the widget's own .enter case submits on
+                        // Cmd/Ctrl+Enter (single- and multi-line alike).
+                        else => return ev.key != .enter,
                     }
                 }
                 switch (ev.key) {

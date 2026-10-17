@@ -1,8 +1,9 @@
 // TextField — the Material 3 Expressive text field: filled and outlined
-// variants, single-line, with a floating label, optional leading/trailing
-// icons, placeholder, supporting text, error + disabled states, and real
-// text entry (the input.zig machinery: a null-terminated buffer,
-// text_input/backspace/enter/escape, a caret at the text end).
+// variants, single- or multi-line (singleLine/lineLimits), with a floating
+// label, optional leading/trailing icons, placeholder, supporting text,
+// error + disabled states, and real text entry (the input.zig machinery:
+// a null-terminated buffer, text_input/backspace/enter/escape, a caret at
+// the text end).
 //
 // Ported from the vendored Compose sources:
 //   .ref/material3/TextField.kt          (state-based TextField)
@@ -60,7 +61,12 @@
 // change; paint-time computation needs none).
 //
 // Remaining deviations:
-//   - Single-line only (no MultiLine lineLimits, no prefix/suffix/counter).
+//   - Multiline is the lineLimits form (singleLine=false + minLines/
+//     maxLines): soft wrap at the text area's width, Enter inserts '\n',
+//     the container grows with the line count inside [min, max], overflow
+//     scrolls on the wheel, and the caret keeps line motion (up/down,
+//     line-relative home/end, Cmd+Home/End to the document edges).
+//     No prefix/suffix/counter decorations.
 //   - The outlined cutout now clips the border stroke with
 //     ClipOp.Difference (kx_clip_rect_diff, ABI 0.20.0) — a real hole like
 //     upstream; the background shows through on any surface.
@@ -76,8 +82,9 @@
 //     real too: drag or shift+arrows/home/end extend the range (primary
 //     @0.4 highlight, collapsed anchors, delete replaces the range).
 //     Cmd/Ctrl+A/C/X/V ride the platform clipboard (ui.clipboard — the
-//     host installs SDL's impl); paste strips line terminators to stay
-//     single-line. Arrows/deletes step by grapheme cluster (ICU
+//     host installs SDL's impl); paste strips line terminators single-
+//     line and normalizes them to '\n' under multiline. Arrows/deletes
+//     step by grapheme cluster (ICU
 //     UBRK_CHARACTER) and double-click selects the word (UBRK_WORD)
 //     with word-granular drag. Still missing: no selection handles,
 //     no undo, no TextSelectionColors customization.
@@ -113,6 +120,18 @@ pub const TextFieldOptions = struct {
     leading_icon: ?icon_w.IconName = null,
     trailing_icon: ?icon_w.IconName = null,
     supporting: []const u8 = "",
+    /// Upstream parity: singleLine=false + the TextFieldDefaults
+    /// minLines/maxLines pair. The text soft-wraps at the text area's
+    /// width, Enter inserts a line break (Cmd/Ctrl+Enter still submits),
+    /// the container grows with the wrapped line count inside
+    /// [min_lines, max_lines], and content past the cap scrolls inside
+    /// the fixed viewport on the wheel.
+    multiline: bool = false,
+    /// minLines — the text area is always at least this many lines tall.
+    min_lines: u16 = 1,
+    /// maxLines — the grown container caps at this many text lines;
+    /// 0 = unbounded (upstream's Int.MAX_VALUE default).
+    max_lines: u16 = 0,
     theme: Theme = theme_mod.light,
 };
 
@@ -135,6 +154,7 @@ const corner: f32 = 4; // CornerExtraSmall (top corners for the filled)
 const outline_w: f32 = 1; // UnfocusedIndicator/BorderThickness
 const outline_w_focus: f32 = 2; // FocusedIndicator/BorderThickness
 const caret_w: f32 = 1;
+const wheel_speed: f32 = 48; // px per wheel click — the list/grid/table convention
 const cutout_pad: f32 = 4; // OutlinedTextFieldInnerPadding
 const supporting_top: f32 = 4; // SupportingTopPadding
 const min_w: f32 = 280; // TextFieldDefaults.MinWidth / OutlinedTextFieldDefaults.MinWidth
@@ -171,6 +191,27 @@ const TextFieldState = struct {
     /// that prefix — appended mid-frame or unsafe to split — measures
     /// whole and merges into the last segment.
     segs: std.array_list.Managed(Seg) = undefined,
+    /// Multiline scroll state: the offset into the wrapped paragraph
+    /// (content = its laid-out height, viewport = the text region's
+    /// clamped height). Untouched single-line.
+    scroll: ui.scroll.ScrollState = .{},
+    /// The painted paragraph memo (multiline): the whole buffer as one
+    /// single-span TextLayout wrapped at edit.wrap_width — the SAME
+    /// constraint the hit layout (text_edit.hitLayout) builds at, so
+    /// what paints is what hit-tests. Keyed on (content hash, wrap,
+    /// size, ink): the ink bakes into the span, so a state-color change
+    /// rebuilds (the wrappedLabel pattern in segmented_button).
+    para: ?*ui.paint.TextLayout = null,
+    para_key: u64 = 0,
+    para_wrap: f32 = 0,
+    para_ink: u32 = 0,
+    para_size: f32 = 0,
+    /// Scroll-to-caret arm: set by every caret-moving path (edits, key
+    /// motion, taps/drags, a wrap change) and consumed by
+    /// paintMultilineText. Wheel scrolling alone leaves it clear — the
+    /// viewport stays where the user put it (upstream scrolls the caret
+    /// into view on input, not on every frame).
+    follow_caret: bool = true,
 
     const Seg = struct {
         text: [:0]u8, // owned
@@ -228,6 +269,7 @@ fn labelProgressCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
 /// Called from paint so externally-routed focus changes transition too.
 fn syncPhase(n: *Node, s: *TextFieldState) void {
     const focused = input.isFocused(n) and s.opts.enabled;
+    if (!focused) s.edit.clearComposition();
     const ph = phaseOf(s, focused);
     if (ph == s.phase) return;
     s.phase = ph;
@@ -250,6 +292,12 @@ fn syncPhase(n: *Node, s: *TextFieldState) void {
 
 fn lerpF(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
+}
+/// The glyph baseline when the text is vertically centered in a `box_h`
+/// line box (Compose's heightIn(min).wrapContentHeight() centers the
+/// measured block).
+fn baselineIn(box_y: f32, box_h: f32, m: ui.paint.TextMetrics) f32 {
+    return box_y + (box_h - (m.ascent + m.descent)) / 2 + m.ascent;
 }
 /// The label's animated point size — lerp(bodyLarge, bodySmall, progress).
 fn labelSize(s: *TextFieldState, t: Theme) f32 {
@@ -337,6 +385,80 @@ pub fn textRect(n: *Node) Rect {
     else
         c.y + (c.h - min_text_line_h) / 2;
     return .{ .x = c.x + leftOffset(s), .y = y, .w = 0, .h = min_text_line_h };
+}
+
+/// The multiline wrap budget — the text area's width between the icons
+/// (containerRect minus both side offsets). Kept on edit.wrap_width so
+/// the painted paragraph AND the hit layout wrap at the same width —
+/// caret/selection geometry then agrees with the glyphs on screen.
+fn syncWrap(n: *Node, s: *TextFieldState) void {
+    const wrap = @max(1, containerRect(n).w - leftOffset(s) - rightOffset(s));
+    if (wrap != s.edit.wrap_width) s.follow_caret = true; // the caret's line moved — re-follow
+    s.edit.wrap_width = wrap;
+}
+
+/// The painted paragraph (multiline): one single-span layout of the
+/// whole buffer wrapped at edit.wrap_width. Memoized on (content hash,
+/// wrap, size, ink) — the ink bakes into the span, so `ink = null` is a
+/// metrics-only probe that reuses whatever ink is cached while a real
+/// draw rebuilds on a color change (wrappedLabel's pattern). null when
+/// the paragraph backend is missing — callers fall back to plain text.
+fn paragraph(s: *TextFieldState, ink: ?Color) ?*ui.paint.TextLayout {
+    const str = s.edit.text();
+    if (str.len == 0) return null;
+    const style = bodyLarge(s.opts.theme);
+    const key = std.hash.Wyhash.hash(0, str);
+    if (s.para == null or s.para_key != key or s.para_wrap != s.edit.wrap_width or
+        s.para_size != style.size or (ink != null and s.para_ink != ink.?))
+    {
+        if (s.para) |old| ui.paint.textLayoutDestroy(old);
+        const l = ui.paint.textLayoutBegin(s.edit.wrap_width) orelse {
+            s.para = null;
+            return null;
+        };
+        const use_ink: u32 = ink orelse @as(u32, 0xFF000000); // probe: any ink shapes the same
+        ui.paint.textLayoutSpan(l, str, ui.paint.textStyle(style.size, @intCast(style.weight), 0, style.letter_spacing, use_ink));
+        s.para = l;
+        s.para_key = key;
+        s.para_wrap = s.edit.wrap_width;
+        s.para_ink = use_ink;
+        s.para_size = style.size;
+    }
+    return s.para;
+}
+
+/// The visible text height under lineLimits — the wrapped line count
+/// clamped to [min_lines, max_lines] × the bodyLarge line height; an
+/// empty (or paragraph-less) buffer claims min_lines. The paragraph
+/// must already be at the current wrap: callers syncWrap / set the
+/// measure budget first.
+fn visibleTextHeight(s: *TextFieldState) f32 {
+    const line_h = ui.paint.measureText(" ", bodyLarge(s.opts.theme).size, false).height;
+    var lines: f32 = @floatFromInt(@max(1, s.opts.min_lines));
+    if (paragraph(s, null)) |l|
+        lines = @round(ui.paint.textLayoutHeight(l) / line_h);
+    const min_l: f32 = @floatFromInt(@max(1, s.opts.min_lines));
+    const max_l: f32 = if (s.opts.max_lines > 0) @floatFromInt(s.opts.max_lines) else std.math.inf(f32);
+    return std.math.clamp(lines, min_l, max_l) * line_h;
+}
+
+/// The multiline text region — the clip + scroll viewport: the area
+/// between the icons (same x/w as the single-line clip), from the
+/// content top pad (contentPadding{With,Without}Label: 8 + the label
+/// box with a label, 16 without) down the clamped visible text height.
+/// Single-line never calls this — textRect is its box.
+pub fn textRegion(n: *Node) Rect {
+    const s = stateOf(n);
+    syncPhase(n, s); // the label box height feeds the top pad
+    syncWrap(n, s); // the paragraph must wrap at the region's own width
+    const c = containerRect(n);
+    const text_top: f32 = if (hasLabel(s)) top_pad_label + labelBoxH(s) else h_padding;
+    return .{
+        .x = c.x + @min(leftOffset(s), rightOffset(s)),
+        .y = c.y + text_top,
+        .w = c.w - leftOffset(s) - rightOffset(s),
+        .h = visibleTextHeight(s),
+    };
 }
 
 /// The resolved colors for the current state — the state-based
@@ -552,20 +674,56 @@ fn segsReset(s: *TextFieldState) void {
 
 // --- the caret ---
 
-/// The run's visual left edge in node-parent space (the `mx` mirror).
+/// The run's visual left edge in node-parent space (the `mx` mirror,
+/// shifted by `scroll_x` when the text overflows the clip width).
 fn runLeft(n: *Node, run_w: f32) f32 {
+    const s = stateOf(n);
     const c = containerRect(n);
     const tr = textRect(n);
-    if (ui.i18n.direction() == .rtl) {
-        return c.x + c.w - (tr.x - c.x) - run_w;
+    const base = if (ui.i18n.direction() == .rtl)
+        c.x + c.w - (tr.x - c.x) - run_w
+    else
+        tr.x;
+    return base - s.edit.scroll_x;
+}
+
+/// Update `scroll_x` so the caret remains inside the visible clip rect
+/// (single-line only — multiline keeps the caret visible with the
+/// vertical caret-follow scroll in paintMultilineText instead).
+fn syncScroll(n: *Node, s: *TextFieldState) void {
+    if (s.opts.multiline) return;
+    const c = containerRect(n);
+    const clip_w = c.w - leftOffset(s) - rightOffset(s);
+    if (s.edit.buf.items.len == 0 and s.edit.comp.items.len == 0) {
+        s.edit.scroll_x = 0;
+        return;
     }
-    return tr.x;
+    const style = bodyLarge(s.opts.theme);
+    const m = fieldMetrics(s);
+    var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse runXAt(s, s.edit.caret);
+    var total_w = m.width;
+    if (s.edit.comp.items.len > 0) {
+        const comp = s.edit.composition();
+        const comp_m = ui.paint.measureText(comp, style.size, false);
+        const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+        caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        total_w += comp_m.width;
+    }
+    s.edit.updateScroll(caret_rel, caret_w, total_w, clip_w);
 }
 
 /// Byte offset of the grapheme boundary nearest to the press — the shared
 /// text_edit hit test; the field projects the parent-space point into the
 /// painted run's space first (the run's mirrored left + line-box top).
 fn caretFromPoint(n: *Node, s: *TextFieldState, px: f32, py: f32) usize {
+    if (s.opts.multiline) {
+        // Multiline: the point projects into paragraph space — region-
+        // relative x, and view y shifted to content y by the scroll
+        // offset (py arrives in the node's parent space, like the
+        // region).
+        const region = textRegion(n);
+        return s.edit.caretAt(px - region.x, py - region.y + s.scroll.offset, bodyLarge(s.opts.theme).size);
+    }
     const m = fieldMetrics(s);
     return s.edit.caretAt(px - runLeft(n, m.width), py - textRect(n).y, bodyLarge(s.opts.theme).size);
 }
@@ -608,7 +766,23 @@ fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const trail_w: f32 = if (s.opts.trailing_icon != null) iconBox(t) else 0;
     const pad_l = leftOffset(s) - lead_w;
     const pad_r = rightOffset(s) - trail_w;
-    const text_w = m.width + pad_l + pad_r;
+    var text_w = m.width + pad_l + pad_r;
+    // lineLimits (singleLine=false + minLines/maxLines): the text wraps
+    // at the width budget, so the width driver is the longest WRAPPED
+    // line, and the container's height grows with the laid-out line
+    // count clamped to [min_lines, max_lines] — content past the cap
+    // scrolls inside the fixed text region.
+    var vis_h: f32 = 0;
+    if (s.opts.multiline) {
+        var wrap = c.max_w - leftOffset(s) - rightOffset(s);
+        if (!std.math.isFinite(wrap) or wrap < 1)
+            wrap = @max(1, min_w - leftOffset(s) - rightOffset(s)); // a sane floor for unbounded/degenerate max_w
+        s.edit.wrap_width = wrap;
+        if (s.edit.buf.items.len > 0) {
+            if (paragraph(s, null)) |l| text_w = ui.paint.textLayoutWidth(l) + pad_l + pad_r;
+        }
+        vis_h = visibleTextHeight(s);
+    }
     var middle: f32 = undefined;
     if (outlined) {
         middle = @max(text_w, lerpF(label_w, 0, s.label_progress));
@@ -623,13 +797,33 @@ fn textFieldMeasure(n: *Node, c: Constraints) Size {
     // Height: the container + the cutout top pad (outlined+label) +
     // supporting text below.
     const top_pad: f32 = if (outlined and hasLabel(s)) bodySmall(t).line_height / 2 else 0;
-    const h = top_pad + container_h + (if (hasSupporting(s)) supporting_top + min_supporting_line_h else 0);
+    const sup_h: f32 = if (hasSupporting(s)) supporting_top + min_supporting_line_h else 0;
+    if (s.opts.multiline) {
+        // The container grows past MinHeight with the clamped text
+        // height — contentPadding{With,Without}Label vertical: 8 + the
+        // label box above the text with a label (16 without), 8 / 16
+        // below it.
+        const text_top: f32 = if (hasLabel(s)) top_pad_label + labelBoxH(s) else h_padding;
+        const text_bottom: f32 = if (hasLabel(s)) top_pad_label else h_padding;
+        return c.constrain(.{ .w = w, .h = top_pad + @max(container_h, text_top + vis_h + text_bottom) + sup_h });
+    }
+    const h = top_pad + container_h + sup_h;
     return c.constrain(.{ .w = w, .h = h });
 }
 
 fn textFieldLayout(n: *Node, bounds: Rect) void {
-    _ = n;
     _ = bounds; // leaf: everything is positioned at paint time
+    const s = stateOf(n);
+    if (s.opts.multiline) {
+        // Sync the wrap budget + scroll viewport now — keyboard-driven
+        // hit geometry (up/down, line-relative home/end) consults the
+        // wrap-keyed hit layout before the next paint, and a resize
+        // re-clamps the offset against the fresh content/viewport.
+        s.scroll.viewport = textRegion(n).h; // syncWrap runs inside
+        _ = s.scroll.setOffset(s.scroll.offset);
+    } else {
+        syncScroll(n, s);
+    }
 }
 
 /// Paint an icon glyph centered in a 24x24 box.
@@ -651,14 +845,6 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const mx = struct {
         fn f(bx: f32, bw: f32, x: f32, w: f32, rtl_flag: bool) f32 {
             return if (rtl_flag) bx + bw - (x - bx) - w else x;
-        }
-    }.f;
-    // The glyph baseline when the text is vertically centered in a `box_h`
-    // line box (Compose's heightIn(min).wrapContentHeight() centers the
-    // measured block).
-    const baselineIn = struct {
-        fn f(box_y: f32, box_h: f32, m: ui.paint.TextMetrics) f32 {
-            return box_y + (box_h - (m.ascent + m.descent)) / 2 + m.ascent;
         }
     }.f;
 
@@ -708,10 +894,17 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     const clip_w = c.w - leftOffset(s) - rightOffset(s);
     ui.paint.clipRect(ctx, clip_x, c.y, clip_w, c.h);
     const has_comp = s.edit.comp.items.len > 0;
-    if (s.edit.buf.items.len > 0 or has_comp) {
+    if (s.opts.multiline) {
+        // The wrapped-paragraph path (singleLine=false): a tighter clip
+        // at the text region + a vertical scroll offset. The
+        // single-line path below is byte-for-byte untouched — the field
+        // is a leaf, so dual paths beat weaving the two geometries.
+        paintMultilineText(n, ctx, s, fc, focused);
+    } else if (s.edit.buf.items.len > 0 or has_comp) {
+        syncScroll(n, s);
         const style = bodyLarge(t);
         const m = fieldMetrics(s);
-        const tx = mx(c.x, c.w, tr.x, m.width, rtl);
+        const tx = mx(c.x, c.w, tr.x, m.width, rtl) - s.edit.scroll_x;
         // Draw segment-by-segment: each piece's shaped blob is text-cache
         // resident — drawing the whole buffer would shape it fresh every
         // frame (the cache key is the full string, which always changes).
@@ -762,6 +955,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         }
     } else {
+        s.edit.scroll_x = 0;
         // The placeholder shows only when the expanded label isn't covering
         // it: focused, or no label (placeholderOpacity).
         if (focused or !hasLabel(s)) {
@@ -797,9 +991,143 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+/// The multiline text pass (singleLine=false): the whole buffer paints
+/// as ONE wrapped paragraph, clipped to + scrolled inside the text
+/// region. The paragraph and the hit layout wrap at the same width
+/// (syncWrap → edit.wrap_width), so caret/selection geometry lands on
+/// the painted glyphs; SkParagraph self-aligns the run kStart under
+/// both base directions — no mx() mirror. Pushes its own clip, balanced
+/// before returning.
+fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColors, focused: bool) void {
+    const style = bodyLarge(s.opts.theme);
+    const region = textRegion(n); // syncWrap inside — wrap = the region width
+    const line_m = ui.paint.measureText(" ", style.size, false);
+    const rtl = ui.paint.textDirectionRtl();
+    const has_comp = s.edit.comp.items.len > 0;
+    ui.paint.clipRect(ctx, region.x, region.y, region.w, region.h);
+    defer ui.paint.clipReset(ctx);
+    if (s.edit.buf.items.len == 0 and !has_comp) {
+        // Nothing scrollable — keep the scroll state honest anyway.
+        s.scroll.content = 0;
+        s.scroll.viewport = region.h;
+        _ = s.scroll.setOffset(s.scroll.offset);
+        // The placeholder shows only when the expanded label isn't
+        // covering it: focused, or no label (placeholderOpacity).
+        // Deviation: painted unwrapped, single-line, at the region's
+        // first line box — it's a hint, not content.
+        if (focused or !hasLabel(s)) {
+            if (s.placeholder.len > 0) {
+                const pm = ui.paint.measureText(s.placeholder, style.size, false);
+                const px = if (rtl) region.x + region.w - pm.width else region.x;
+                ui.paint.text(ctx, s.placeholder, px, baselineIn(region.y, line_m.height, pm), style.size, false, fc.placeholder);
+            }
+        }
+        if (focused and s.edit.caret_on) {
+            // the caret at the first line box's start edge (end under RTL)
+            const cx = if (rtl) region.x + region.w - caret_w else region.x;
+            ui.paint.fillRect(ctx, cx, region.y + (line_m.height - (line_m.ascent + line_m.descent)) / 2, caret_w, line_m.ascent + line_m.descent, fc.caret);
+        }
+        return;
+    }
+    const l = paragraph(s, fc.input) orelse {
+        // Paragraph-less fallback (backend missing, or an empty buffer
+        // carrying an open composition): an unwrapped single-line draw
+        // at the region's top — the same degradation the single-line
+        // path faces when the paragraph can't build.
+        const str = s.edit.text();
+        const m = ui.paint.measureText(str, style.size, false);
+        const tx = if (rtl) region.x + region.w - m.width else region.x;
+        const baseline = baselineIn(region.y, line_m.height, m);
+        if (str.len > 0) ui.paint.text(ctx, str, tx, baseline, style.size, false, fc.input);
+        var caret_x = tx + m.width;
+        if (has_comp) {
+            const comp = s.edit.composition();
+            const comp_m = ui.paint.measureText(comp, style.size, false);
+            ui.paint.text(ctx, comp, caret_x, baseline, style.size, false, fc.input);
+            ui.paint.fillRect(ctx, caret_x, baseline + 1, comp_m.width, 1, fc.input);
+            const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+            caret_x += ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        }
+        if (focused and s.edit.caret_on)
+            ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
+        return;
+    };
+    // The scroll window: laid-out paragraph height vs the region's.
+    s.scroll.content = ui.paint.textLayoutHeight(l);
+    s.scroll.viewport = region.h;
+    _ = s.scroll.setOffset(s.scroll.offset); // re-clamp on content shrink
+    // The caret's line box in layout space — then the caret-follow
+    // scroll (upstream scrolls the caret into view on edits/motion).
+    // Hoisted ahead of the draws so THIS frame already paints at the
+    // corrected offset; a real change still marks dirty for the next.
+    var caret_x: f32 = if (rtl) region.x + region.w - caret_w else region.x;
+    var caret_y: f32 = region.y + (line_m.height - (line_m.ascent + line_m.descent)) / 2;
+    var caret_h: f32 = line_m.ascent + line_m.descent;
+    if (s.edit.caretRect(s.edit.caret, style.size)) |r| {
+        if (s.follow_caret) {
+            s.follow_caret = false;
+            if (r[1] < s.scroll.offset) {
+                if (s.scroll.setOffset(r[1])) n.markDirty();
+            } else if (r[1] + r[3] > s.scroll.offset + s.scroll.viewport) {
+                if (s.scroll.setOffset(r[1] + r[3] - s.scroll.viewport)) n.markDirty();
+            }
+        }
+        caret_x = region.x + r[0];
+        caret_y = region.y + r[1] - s.scroll.offset;
+        caret_h = r[3];
+    } else s.follow_caret = false;
+    // Selection highlight behind the glyphs — one box per run when the
+    // range crosses a bidi boundary (TextSelectionColors, primary @0.4);
+    // layout-space y scrolled into the viewport.
+    const sel = s.edit.selRange();
+    if (sel.hi > sel.lo) {
+        var stack: [8][4]f32 = undefined;
+        var nb = s.edit.caretBoxes(sel.lo, sel.hi, style.size, &stack) orelse 0;
+        var heap: ?[][4]f32 = null;
+        defer if (heap) |b| n.allocator.free(b);
+        if (nb >= stack.len) {
+            // A wrap-crossed range may outgrow the stack buffer — the
+            // sizing call (empty `out`) reports the real box count, and
+            // the second pass fills a heap slice.
+            const total = s.edit.caretBoxes(sel.lo, sel.hi, style.size, &.{}) orelse 0;
+            if (total > stack.len) {
+                if (n.allocator.alloc([4]f32, total) catch null) |buf| {
+                    heap = buf;
+                    nb = s.edit.caretBoxes(sel.lo, sel.hi, style.size, buf) orelse 0;
+                }
+            }
+        }
+        const boxes = heap orelse stack[0..];
+        for (boxes[0..@min(nb, boxes.len)]) |bx|
+            ui.paint.fillRect(ctx, region.x + bx[0], region.y + bx[1] - s.scroll.offset, bx[2], bx[3], ui.paint.withAlphaScaled(fc.caret, 0.4));
+    }
+    // The paragraph — origin at the region's start edge; it wraps at
+    // clip_w and self-aligns kStart, so LTR and RTL both land right.
+    ui.paint.textLayoutPaint(ctx, l, region.x, region.y + ui.paint.textLayoutBaseline(l) - s.scroll.offset);
+    if (has_comp) {
+        // Preedit: appended after the committed text ON THE CARET'S LINE
+        // — the paragraph carries committed text only, so the composition
+        // draws inline at the caret's spot, underlined (the platform-
+        // conventional mark). Deviation: upstream reflows the comp
+        // inside the paragraph; here it overlays the caret's line.
+        const comp = s.edit.composition();
+        const comp_m = ui.paint.measureText(comp, style.size, false);
+        const comp_base = caret_y + ui.paint.textLayoutBaseline(l);
+        ui.paint.text(ctx, comp, caret_x, comp_base, style.size, false, fc.input);
+        ui.paint.fillRect(ctx, caret_x, comp_base + 1, comp_m.width, 1, fc.input);
+        const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
+        caret_x += ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+    }
+    if (focused and s.edit.caret_on) {
+        // the caret at its position (inside the composition when open)
+        ui.paint.fillRect(ctx, caret_x, caret_y, caret_w, caret_h, fc.caret);
+    }
+}
+
 fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
+    if (s.opts.multiline) syncWrap(n, s); // hit geometry agrees with the painted wrap
     switch (ev.phase) {
         .down => {
             input.requestFocus(n);
@@ -808,6 +1136,8 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // the same space containerRect/textRect build in). The shared
             // tap() handles plain placement vs double-click word select.
             s.edit.tap(caretFromPoint(n, s, ev.x, ev.y), ev.x, ev.y, ev.time_ms);
+            s.follow_caret = true; // the tap placed the caret
+            syncScroll(n, s);
             n.markDirty(); // the label float / caret / colors follow focus
             return true;
         },
@@ -822,6 +1152,8 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
             // off-bounds.
             if (!s.edit.dragging) return false;
             s.edit.dragExtend(caretFromPoint(n, s, ev.x, ev.y));
+            s.follow_caret = true;
+            syncScroll(n, s);
             return true;
         },
         .enter, .leave => return true, // no hover styling — the state-based colors have no hover axis
@@ -833,6 +1165,8 @@ fn textFieldOnPointer(n: *Node, ev: input.PointerEvent) bool {
 /// An edit happened: re-layout (the measured width is content-driven),
 /// repaint, sync the a11y value, mirror the signal, fire the callback.
 fn applyEdit(n: *Node, s: *TextFieldState) void {
+    s.follow_caret = true; // edits move the caret — keep it visible
+    syncScroll(n, s);
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows edits
@@ -850,18 +1184,30 @@ fn applyEditNode(n: *Node) void {
 fn textFieldOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (!s.opts.enabled) return false;
+    if (s.opts.multiline) syncWrap(n, s); // arrows/home/end hit-test at the painted wrap
     // The shared editing core: text_input/text_editing, the Cmd/Ctrl
     // clipboard chords, backspace/delete, arrows/home/end.
-    if (s.edit.handleKey(ev, applyEditNode, bodyLarge(s.opts.theme).size)) return true;
+    if (s.edit.handleKey(ev, applyEditNode, bodyLarge(s.opts.theme).size)) {
+        s.follow_caret = true; // caret motion (arrows/home/end) follows
+        syncScroll(n, s);
+        return true;
+    }
     if (ev.kind == .key_down) switch (ev.key) {
         .enter => {
+            // singleLine=false: Enter inserts a line break — upstream
+            // consumes the key for it; Cmd/Ctrl+Enter still submits.
+            if (s.opts.multiline and !ev.command) {
+                if (s.edit.insert("\n")) {
+                    s.edit.resetBlink();
+                    applyEdit(n, s);
+                }
+                return true;
+            }
             if (s.on_submitted) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
         .escape => {
-            s.edit.comp.clearRetainingCapacity();
-            s.edit.comp_cursor = 0;
-            setSentinel(&s.edit.comp);
+            s.edit.clearComposition();
             input.requestFocus(null);
             n.markDirty();
             return true;
@@ -880,6 +1226,7 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
     const s = stateOf(n);
     const incoming = s.sig.?.peek();
     if (std.mem.eql(u8, s.text(), incoming)) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(incoming.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(incoming) catch @panic("klaxon: out of memory");
@@ -887,14 +1234,44 @@ fn textFieldSyncCb(userdata: ?*anyopaque) void {
     // The replaced text may be shorter — pull the caret back onto a
     // codepoint boundary (upstream clamps the selection into the new text).
     s.edit.clampOffsets();
+    syncScroll(n, s);
     n.markLayoutDirty(); // the measured width is content-driven
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text(); // a11y: the value follows external edits
 }
 
+fn textFieldOnBlur(n: *Node) void {
+    stateOf(n).edit.clearComposition();
+}
+
+/// The wheel scrolls the wrapped text's viewport — delta_y > 0 scrolls
+/// up (the offset shrinks), scroll_util's convention. A field whose
+/// content fits can't scroll → false so the event bubbles to a parent
+/// scroller; at an edge scrollBy clamps to a no-op → false and the
+/// parent takes the rest of the gesture (nested-scroll semantics — the
+/// same convention list_view's ScrollInput.onScroll follows).
+fn textFieldOnScroll(n: *Node, ev: input.ScrollEvent) bool {
+    const s = stateOf(n);
+    if (!s.opts.multiline or !s.scroll.info().canScroll()) return false;
+    if (!s.scroll.scrollBy(-ev.delta_y * wheel_speed)) return false;
+    n.markDirty();
+    return true;
+}
+
+/// The Scrollbar's drive hooks (a scrollable multiline field can host
+/// one): read the clamped offset/viewport, write a clamped offset.
+fn textFieldScrollInfo(n: *Node) ui.scroll.ScrollInfo {
+    return stateOf(n).scroll.info();
+}
+fn textFieldScrollSetOffset(n: *Node, value: f32) void {
+    const s = stateOf(n);
+    if (s.scroll.setOffset(value)) n.markDirty();
+}
+
 fn textFieldDeinit(n: *Node) void {
     const s = stateOf(n);
-    s.edit.deinit(); // the blink ticker + both buffers
+    s.edit.deinit(); // the blink ticker + both buffers + the hit layout
+    if (s.para) |l| ui.paint.textLayoutDestroy(l); // the painted paragraph memo
     if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.label_channel)); // the channel writes into state
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = textFieldSyncCb, .userdata = n } });
     input.releaseNode(n);
@@ -908,11 +1285,16 @@ fn textFieldDeinit(n: *Node) void {
 
 const text_field_vtable = ui.node.VTable{
     .measure = textFieldMeasure,
+    .measure_pure = true,
     .layout = textFieldLayout,
     .paint = textFieldPaint,
     .deinit = textFieldDeinit,
     .on_pointer = textFieldOnPointer,
     .on_key = textFieldOnKey,
+    .on_blur = textFieldOnBlur,
+    .on_scroll = textFieldOnScroll,
+    .scroll_info = textFieldScrollInfo,
+    .scroll_set_offset = textFieldScrollSetOffset,
     .wants_text_input = true,
 };
 
@@ -927,6 +1309,11 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
     // truncated). Checked before any allocation so nothing needs freeing.
     const initial: []const u8 = if (sig) |sg| sg.peek() else opts.initial;
     if (initial.len > ui.state.TextSignal.max_len) return error.TextTooLong;
+    // Upstream requires minLines <= maxLines (the lineLimits
+    // precondition) — clamp instead of erroring so the field stays usable.
+    var opts_adj = opts;
+    if (opts_adj.max_lines > 0 and opts_adj.min_lines > opts_adj.max_lines)
+        opts_adj.min_lines = opts_adj.max_lines;
     const node = try Node.create(allocator, &text_field_vtable);
     errdefer node.allocator.destroy(node); // no state yet
     const s = try allocator.create(TextFieldState);
@@ -943,17 +1330,16 @@ pub fn textField(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
         .label = label,
         .placeholder = placeholder,
         .supporting = supporting,
-        .opts = opts,
+        .opts = opts_adj,
         .sig = sig,
         .on_changed = on_changed,
         .on_submitted = on_submitted,
         .label_progress = if (initial.len > 0) 1 else 0,
-        .phase = if (initial.len > 0) .unfocused_not_empty else .unfocused_empty,
+        .phase = if (initial.len > 0) .unfocused_empty else .unfocused_empty,
     };
+    s.phase = if (initial.len > 0) .unfocused_not_empty else .unfocused_empty;
+    s.edit.multiline = s.opts.multiline; // wraps the hit layout, keeps '\n' on paste, line motion
     errdefer {
-        allocator.free(s.label);
-        allocator.free(s.placeholder);
-        allocator.free(s.supporting);
         s.edit.deinit();
         s.segs.deinit();
     }
@@ -990,6 +1376,7 @@ pub fn text(n: *Node) [:0]const u8 {
 pub fn setText(n: *Node, str: []const u8) void {
     const s = stateOf(n);
     if (str.len > ui.state.TextSignal.max_len) return;
+    s.edit.clearComposition();
     s.edit.buf.clearRetainingCapacity();
     s.edit.buf.ensureTotalCapacity(str.len + 1) catch @panic("klaxon: out of memory");
     s.edit.buf.appendSlice(str) catch @panic("klaxon: out of memory");
@@ -997,6 +1384,7 @@ pub fn setText(n: *Node, str: []const u8) void {
     s.edit.caret = s.edit.buf.items.len; // programmatic replace → caret at the end
     s.edit.sel_anchor = s.edit.caret;
     s.edit.resetBlink();
+    syncScroll(n, s);
     n.markLayoutDirty();
     n.markDirty();
     if (n.semantics) |sem| sem.value = s.text();
@@ -1831,4 +2219,100 @@ test "text_field: Cmd/Ctrl chords — select-all, copy, cut, paste (single-line 
     // as text_input)
     _ = router.dispatchKey(.{ .kind = .key_down, .key = .unknown, .chr = 'v' });
     try std.testing.expectEqualStrings("xy", text(b));
+}
+
+test "text_field: multiline grows with lines, wraps, caps at max_lines" {
+    const t = theme_mod.light;
+    const c: Constraints = .{ .max_w = 400, .max_h = 2000 };
+    // one line stays at the 56dp floor (with a label: cutout pad + 56)
+    const one = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .label = "Notes", .initial = "hello", .theme = t });
+    defer one.deinit();
+    try std.testing.expectEqual(bodySmall(t).line_height / 2 + container_h, one.measure(c).h);
+    // five hard lines grow the container
+    const many = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .label = "Notes", .initial = "a\nb\nc\nd\ne", .theme = t });
+    defer many.deinit();
+    const h5 = many.measure(c).h;
+    try std.testing.expect(h5 > container_h + bodySmall(t).line_height / 2);
+    // max_lines caps the growth
+    const capped = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .label = "Notes", .max_lines = 2, .initial = "a\nb\nc\nd\ne", .theme = t });
+    defer capped.deinit();
+    try std.testing.expect(capped.measure(c).h < h5);
+    // min_lines reserves the box even when empty
+    const minf = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .min_lines = 3, .theme = t });
+    defer minf.deinit();
+    try std.testing.expect(minf.measure(c).h > container_h);
+    // a long line SOFT-WRAPS at the width budget: same text, narrower field → taller
+    const long = "a fairly long piece of text that will need a couple of wrapped lines at this width";
+    const wide = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .initial = long, .theme = t });
+    defer wide.deinit();
+    const narrow = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .initial = long, .theme = t });
+    defer narrow.deinit();
+    try std.testing.expect(narrow.measure(.{ .max_w = 160, .max_h = 2000 }).h > wide.measure(c).h);
+    try std.testing.expect(narrow.measure(.{ .max_w = 160, .max_h = 2000 }).w <= 160);
+}
+
+test "text_field: multiline Enter inserts a newline; Cmd+Enter submits" {
+    var submitted: u32 = 0;
+    const sub = Callback{ .fn_ptr = editCounterCb, .userdata = &submitted };
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try textField(std.testing.allocator, null, null, sub, .{ .multiline = true, .initial = "ab" });
+    defer b.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 80 });
+    router.focus(b);
+    // plain Enter commits the line break
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter });
+    try std.testing.expectEqualStrings("ab\n", text(b));
+    try std.testing.expectEqual(@as(u32, 0), submitted);
+    // typing lands on the new line
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "c" });
+    try std.testing.expectEqualStrings("ab\nc", text(b));
+    // Cmd+Enter still submits
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .enter, .command = true });
+    try std.testing.expectEqual(@as(u32, 1), submitted);
+    try std.testing.expectEqualStrings("ab\nc", text(b));
+}
+
+test "text_field: multiline wheel scrolls the capped viewport; edits re-follow the caret" {
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const b = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .max_lines = 1, .initial = "a\nb\nc" });
+    defer b.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 300, 80);
+    defer r.deinit();
+    b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
+    router.focus(b);
+    const s = stateOf(b);
+    // first paint: the caret sits on line 3 of a 1-line viewport → the
+    // follow scroll brings it into view
+    r.paint(b, 0xFFFFFFFF);
+    try std.testing.expect(s.scroll.info().canScroll());
+    try std.testing.expect(s.scroll.offset > 0);
+    const followed = s.scroll.offset;
+    // wheeling up moves the viewport off the caret — and a repaint does
+    // NOT snap back (scroll-to-caret only fires on caret-moving input)
+    router.dispatchScroll(b, .{ .x = 130, .y = 28, .delta_y = 1 });
+    try std.testing.expect(s.scroll.offset < followed);
+    const wheeled = s.scroll.offset;
+    r.paint(b, 0xFFFFFFFF);
+    try std.testing.expectEqual(wheeled, s.scroll.offset);
+    // typing re-arms the follow — the caret's line comes back into view
+    _ = router.dispatchKey(.{ .kind = .text_input, .text = "!" });
+    r.paint(b, 0xFFFFFFFF);
+    try std.testing.expect(s.scroll.offset > wheeled);
+    // the scroll hooks answer for an external scrollbar
+    try std.testing.expect(s.scroll.info().max_offset > 0);
+    b.vtable.scroll_set_offset.?(b, 0);
+    try std.testing.expectEqual(@as(f32, 0), s.scroll.offset);
+    // an uncapped field has nothing to scroll — the wheel passes through
+    const tall = try textField(std.testing.allocator, null, null, null, .{ .multiline = true, .initial = "a\nb" });
+    defer tall.deinit();
+    tall.layout(.{ .x = 0, .y = 0, .w = 260, .h = 120 });
+    r.paint(tall, 0xFFFFFFFF);
+    const ts = stateOf(tall);
+    const before = ts.scroll.offset;
+    router.dispatchScroll(tall, .{ .x = 130, .y = 60, .delta_y = -1 });
+    try std.testing.expectEqual(before, ts.scroll.offset);
 }

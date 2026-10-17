@@ -1994,6 +1994,13 @@ test "registry: text_field (M3E) round-trips (live value, and plain initial)" {
     const long_out = try treeToJson(&ctx, long_node, std.testing.allocator);
     defer std.testing.allocator.free(long_out);
     try std.testing.expectEqualStrings(long_doc, long_out);
+    // the multiline options round-trip through the auto-derived schema
+    const ml_doc = "{\"name\":\"text_field\",\"options\":{\"multiline\":true,\"min_lines\":2,\"max_lines\":6}}";
+    const ml = try treeFromJson(&ctx, std.testing.allocator, ml_doc);
+    defer ml.deinit();
+    const ml_out = try treeToJson(&ctx, ml, std.testing.allocator);
+    defer std.testing.allocator.free(ml_out);
+    try std.testing.expectEqualStrings("{\"name\":\"text_field\",\"options\":{\"multiline\":true,\"min_lines\":2,\"max_lines\":6,\"value\":\"\"}}", ml_out);
 }
 
 test "registry: search_bar (M3E) round-trips (live value, and plain initial)" {
@@ -2055,6 +2062,9 @@ test "registry: text_field (M3E) schema exposes the right editor kinds" {
     try std.testing.expectEqual(value_mod.EditorKind.text, findProp(schema, "value").?);
     try std.testing.expectEqual(value_mod.EditorKind.select, findProp(schema, "leading_icon").?);
     try std.testing.expectEqual(value_mod.EditorKind.select, findProp(schema, "trailing_icon").?);
+    try std.testing.expectEqual(value_mod.EditorKind.toggle, findProp(schema, "multiline").?);
+    try std.testing.expectEqual(value_mod.EditorKind.number, findProp(schema, "min_lines").?);
+    try std.testing.expectEqual(value_mod.EditorKind.number, findProp(schema, "max_lines").?);
     try std.testing.expect(findProp(schema, "theme") == null); // global token set
 }
 
