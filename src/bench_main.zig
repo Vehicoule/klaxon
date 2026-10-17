@@ -114,7 +114,6 @@ fn binarySizeBytes(allocator: std.mem.Allocator) u64 {
     return if (size > 0) @intCast(size) else 0;
 }
 
-
 /// Write the report to stdout. C stdio, same pattern as host.zig's dumpPpm:
 /// std.debug.print writes to stderr and must not pollute the JSON stream.
 fn writeStdout(json: []const u8) void {

@@ -7,40 +7,38 @@ import QtQuick
 Item {
     id: root
     property int benchN: 10
+    property int animFrame: 0
 
-    Repeater {
-        id: rep
-        model: root.benchN
-        Image {
-            source: "image://bench/checker64"
-            width: 48   // 64 * 0.75
-            height: 48
-            smooth: true
+    Image {
+        id: checkerImg
+        source: "image://bench/checker64"
+        visible: false
+    }
+
+    Canvas {
+        id: canvas
+        anchors.fill: parent
+        renderTarget: Canvas.Image
+        onPaint: {
+            const ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            const n = root.benchN
+            const f = root.animFrame
+            for (let i = 0; i < n; ++i) {
+                const cx = 60 + (i * 101) % 540
+                const cy = 40 + (i * 67) % 400
+                const x = cx + 40 * Math.sin(0.10 * f + i * 0.31)
+                const y = cy + 30 * Math.sin(0.1333 * f + i * 0.17)
+                ctx.drawImage(checkerImg, x, y, 48, 48)
+            }
         }
     }
 
     Connections {
         target: bench
-        property var items: null
-        property var centers: null
         function onTickFrame(frame) {
-            if (!items || items.length !== root.benchN) {
-                items = []
-                centers = []
-                for (let i = 0; i < root.benchN; ++i) {
-                    const it = rep.itemAt(i)
-                    if (!it)
-                        return
-                    items.push(it)
-                    centers.push([60 + (i * 101) % 540, 40 + (i * 67) % 400])
-                }
-            }
-            for (let i = 0; i < root.benchN; ++i) {
-                const it = items[i]
-                const c = centers[i]
-                it.x = c[0] + 40 * Math.sin(0.10 * frame + i * 0.31)
-                it.y = c[1] + 30 * Math.sin(0.1333 * frame + i * 0.17)
-            }
+            root.animFrame = frame
+            canvas.requestPaint()
         }
     }
 }

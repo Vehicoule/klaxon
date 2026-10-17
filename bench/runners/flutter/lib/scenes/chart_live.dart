@@ -29,6 +29,7 @@ class ChartLiveScene extends BenchScene {
   @override
   void tick(int frame, BenchHarnessState harness) {
     _frame = frame;
+    harness.refresh();
   }
 
   int get frame => _frame;

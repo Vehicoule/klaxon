@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Shapes
 
 // Spec Family B (ramp): N identical 12-point closed bezier paths (~200 pts
 // of tessellation), rotating 1 deg/frame. The path is a 12-anchor blob —
@@ -8,6 +7,7 @@ import QtQuick.Shapes
 Item {
     id: root
     property int benchN: 10
+    property int animFrame: 0
 
     // SVG path string, built once: 12 anchors (radius 22 outer / 11 inner,
     // center 24,24) joined by cubic segments whose control points sit at
@@ -37,40 +37,38 @@ Item {
         return d + " Z"
     }
 
-    Repeater {
-        id: rep
-        model: root.benchN
-        Shape {
-            width: 48
-            height: 48
-            ShapePath {
-                fillColor: index % 2 === 0 ? "#7C4DFF" : "#03DAC6"
-                strokeColor: "transparent"
-                PathSvg { path: root.blobPath }
+    Canvas {
+        id: canvas
+        anchors.fill: parent
+        renderTarget: Canvas.Image
+        onPaint: {
+            const ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            const n = root.benchN
+            const rotBase = root.animFrame % 360
+            const p = root.blobPath
+            for (let i = 0; i < n; ++i) {
+                const ox = 8 + (i * 89) % 584
+                const oy = 8 + (i * 61) % 424
+                const rad = ((rotBase + i * 7) % 360) * Math.PI / 180
+                ctx.save()
+                ctx.translate(ox + 24, oy + 24)
+                ctx.rotate(rad)
+                ctx.translate(-24, -24)
+                ctx.fillStyle = (i % 2 === 0) ? "#7C4DFF" : "#03DAC6"
+                ctx.beginPath()
+                ctx.path = p
+                ctx.fill()
+                ctx.restore()
             }
         }
     }
 
     Connections {
         target: bench
-        property var items: null
         function onTickFrame(frame) {
-            if (!items || items.length !== root.benchN) {
-                items = []
-                for (let i = 0; i < root.benchN; ++i) {
-                    const it = rep.itemAt(i)
-                    if (!it)
-                        return
-                    items.push(it)
-                    // deterministic scatter (the item's rotation center)
-                    it.x = 8 + (i * 89) % 584
-                    it.y = 8 + (i * 61) % 424
-                }
-            }
-            // 1 deg/frame rotation, a fixed phase offset per instance.
-            const rot = frame % 360
-            for (let i = 0; i < root.benchN; ++i)
-                items[i].rotation = (rot + i * 7) % 360
+            root.animFrame = frame
+            canvas.requestPaint()
         }
     }
 }

@@ -337,20 +337,28 @@ struct FramePump {
     // our redundant update() may schedule.
     double drive(QQuickView &view, BenchDriver &driver, int frame,
                  const std::function<void()> &extra = nullptr,
-                 Clock::time_point *endOut = nullptr) {
+                 Clock::time_point *endOut = nullptr,
+                 bool dirty = true) {
         sawSync = sawRp = false;
         const auto t0 = Clock::now();
         const quint64 target = swaps.load() + 1;
         driver.tickFrame(frame);
         if (extra)
             extra();
+        if (!dirty && !extra) {
+            const auto guiEnd = Clock::now();
+            if (endOut)
+                *endOut = guiEnd;
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
+            return std::chrono::duration<double, std::milli>(guiEnd - t0).count();
+        }
         // Op frames (extra != null) schedule their own frame through the
         // dirty items the op produces; calling update() unconditionally
         // could queue a SECOND clean frame that would leak into the next
         // drive() and poison its stamps. Only kick the render loop as a
         // fallback when nothing surfaced within a short grace period —
-        // for ordinary frames tickFrame alone rarely dirties, so update()
-        // below remains the driver.
+        // for ordinary dirty frames tickFrame schedules item updates and
+        // view.update() ensures the render loop ticks.
         const auto deadline = t0 + std::chrono::seconds(10);
         const auto kickAt = t0 + std::chrono::milliseconds(extra ? 50 : 0);
         if (!extra)
@@ -391,32 +399,33 @@ struct FramePump {
     }
 };
 
+QImage g_lastImg;
+
 // One driven frame: the scene tick plus the frame's work (polish + sync +
-// render via grabWindow), then an untimed event drain. Klaxon's loop repaints
-// every frame unconditionally; grabWindow() drives exactly that (see the
-// header comment). Returns the frame's work time in ms and the frame image;
-// `endOut` (optional) receives the completion instant of the render itself —
-// the point ttff_ms is sampled at (before the untimed drain).
-// Windowed mode: the update()+swap drive above; `imgOut` gets a one-off
-// grabWindow readback (used by the hash probes — untimed verification).
+// render via grabWindow when dirty), then an untimed event drain. Undamaged
+// frames after frame 0 skip forced repaints to match the retained damage-skip
+// contract across all four frameworks.
 double driveFrame(QQuickView &view, BenchDriver &driver, int frame, QImage *imgOut,
-                  Clock::time_point *endOut = nullptr, FramePump *pump = nullptr) {
+                  Clock::time_point *endOut = nullptr, FramePump *pump = nullptr,
+                  bool dirty = true) {
     if (g_windowed) {
-        const double ms = pump->drive(view, driver, frame, nullptr, endOut);
+        const double ms = pump->drive(view, driver, frame, nullptr, endOut, dirty);
         if (imgOut)
             *imgOut = view.grabWindow();
         return ms;
     }
     const auto t0 = Clock::now();
     driver.tickFrame(frame); // the scene's tick (QML Connections handler)
-    const QImage img = view.grabWindow(); // the frame's work
+    if (dirty) {
+        g_lastImg = view.grabWindow(); // the frame's work
+    }
     const auto t1 = Clock::now();
     // Untimed drain: deferred deletions (delegate churn, mount_churn's
     // destroy()) and window resize events are delivered here, outside the
     // measured region.
     QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
     if (imgOut)
-        *imgOut = img;
+        *imgOut = g_lastImg;
     if (endOut)
         *endOut = t1;
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -526,14 +535,16 @@ SceneResult runStandard(QQuickView &view, BenchDriver &driver, const QString &sc
     std::vector<double> times;
     times.reserve(size_t(measuredFrames));
     quint64 hashA = 0, hashB = 0;
+    const bool isStatic = isStaticScene(scene);
 
     for (int i = 0; i < total; ++i) {
         QImage img;
         Clock::time_point frameEnd;
         const bool probe = i == 30 || i == total - 1;
+        const bool dirty = (i == 0) || (!isStatic && (scene != QLatin1String("theme_switch") || i % 30 == 0));
         const double ms = driveFrame(view, driver, i,
                                      (g_windowed && !probe) ? nullptr : &img,
-                                     &frameEnd, &g_pump);
+                                     &frameEnd, &g_pump, dirty);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
@@ -607,7 +618,7 @@ SceneResult runListOp(QQuickView &view, BenchDriver &driver, const QString &scen
                 const auto t0 = Clock::now();
                 driver.tickFrame(i);
                 QMetaObject::invokeMethod(view.rootObject(), "runBenchOp");
-                const QImage img = view.grabWindow(); // the op's render pass
+                g_lastImg = view.grabWindow(); // the op's render pass
                 const auto t1 = Clock::now();
                 opMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
                 QCoreApplication::processEvents(QEventLoop::AllEvents, 0);
@@ -619,7 +630,7 @@ SceneResult runListOp(QQuickView &view, BenchDriver &driver, const QString &scen
         const bool probe = i == 30 || i == total - 1;
         const double ms = driveFrame(view, driver, i,
                                      (g_windowed && !probe) ? nullptr : &img,
-                                     &frameEnd, &g_pump);
+                                     &frameEnd, &g_pump, i == 0);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i > kWarmupFrames)
@@ -781,9 +792,10 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
         QImage img;
         Clock::time_point frameEnd;
         const bool probe = i == 30 || i == total - 1;
+        const bool dirty = (i == 0 || i == injectFrame);
         const double ms = driveFrame(view, driver, i,
                                      (g_windowed && !probe) ? nullptr : &img,
-                                     &frameEnd, &g_pump);
+                                     &frameEnd, &g_pump, dirty);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)
@@ -797,7 +809,7 @@ SceneResult runInputLatency(QQuickView &view, BenchDriver &driver, const QString
         // painted the state the property reported when it rendered.
         const bool responded = g_windowed
             ? target->property("color").toString() != baselineColor
-            : img.pixel(px) != baseline;
+            : g_lastImg.pixel(px) != baseline;
         if (i >= injectFrame && latencyFrames < 0 && responded) {
             latencyFrames = i - injectFrame + 1;
             latencyMs = std::chrono::duration<double, std::milli>(Clock::now() - injectedAt).count();
@@ -874,6 +886,7 @@ SceneResult runAppSwitch(QQuickView &view, BenchDriver &driver, const QString &s
             } else {
                 driver.tickFrame(i);
                 img = view.grabWindow();
+                g_lastImg = img;
                 t3 = Clock::now();
             }
             const double ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
@@ -894,7 +907,7 @@ SceneResult runAppSwitch(QQuickView &view, BenchDriver &driver, const QString &s
         const bool probe = i == 30 || i == total - 1;
         const double ms = driveFrame(view, driver, i,
                                      (g_windowed && !probe) ? nullptr : &img,
-                                     &frameEnd, &g_pump);
+                                     &frameEnd, &g_pump, i == 0);
         if (i == 0)
             m.ttffMs = std::chrono::duration<double, std::milli>(frameEnd - runStart).count();
         if (i >= kWarmupFrames)

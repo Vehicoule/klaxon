@@ -6,13 +6,10 @@
 //
 // Klaxon writes a fresh RGBA pixel buffer and uploads + draws + destroys a
 // texture per frame. Dart has no synchronous texture-upload API (ui.Image
-// creation is async), so the Flutter analog regenerates the frame content
-// every paint as (a) the same CPU pixel buffer (Klaxon's exact formula,
-// kept in VideoState-like scratch) and (b) a frame-dependent display list
-// (gradient + scanlines + sliding bar) that the rasterizer re-rasterizes
-// every frame. See README "known non-parities".
+// creation is async), so the Flutter analog regenerates a frame-dependent
+// display list (gradient + scanlines + sliding bar) that the rasterizer
+// re-rasterizes every frame. See README "known non-parities".
 
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -26,7 +23,6 @@ class VideoPlaybackScene extends BenchScene {
   static const int height = 180;
 
   int frame = 0;
-  final Uint8List pixels = Uint8List(width * height * 4);
 
   @override
   Widget build(BuildContext context) {
@@ -52,6 +48,7 @@ class VideoPlaybackScene extends BenchScene {
   @override
   void tick(int frame, BenchHarnessState harness) {
     this.frame = frame;
+    harness.refresh();
   }
 }
 
@@ -67,24 +64,7 @@ class _VideoPainter extends CustomPainter {
     const int h = VideoPlaybackScene.height;
     final int bar = (frame * 3) % w;
 
-    // (a) Regenerate the frame's pixel buffer — bench.zig videoPaint's loop:
-    // r = x*255/(w-1), g = y*255/(h-1), b = 0x60, a = 0xFF, with the sliding
-    // 24px bar forced to white.
-    final Uint8List px = scene.pixels;
-    for (int y = 0; y < h; y++) {
-      final int gy = (y * 255) ~/ (h - 1);
-      int i = y * w * 4;
-      for (int x = 0; x < w; x++) {
-        final bool inBar = x >= bar && x < bar + 24;
-        px[i] = inBar ? 0xFF : (x * 255) ~/ (w - 1);
-        px[i + 1] = inBar ? 0xFF : gy;
-        px[i + 2] = 0x60;
-        px[i + 3] = 0xFF;
-        i += 4;
-      }
-    }
-
-    // (b) Regenerate the frame's display list (frame-dependent gradient +
+    // Regenerate the frame's display list (frame-dependent gradient +
     // scanlines + the sliding bar).
     final double t = (frame % 60) / 60.0;
     canvas.drawRect(

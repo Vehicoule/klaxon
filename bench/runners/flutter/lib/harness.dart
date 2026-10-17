@@ -22,9 +22,9 @@
 //   - scene extras under extra{} (op_ms, ramp, latency_*, nodes_per_frame,
 //     teardown_ms/resume_ms).
 //
-// The scene root is force-repainted (markNeedsPaint) every frame so that
-// static scenes still measure a real paint + raster pass, matching Klaxon's
-// renderer.paint(root, BG) on every frame.
+// Static scenes use Flutter's natural retained RepaintBoundary behavior
+// (skipping paint when no RenderObject is dirtied), matching Klaxon's
+// paintDamage no-op on undamaged frames.
 //
 // Wall-clock op timing: scenes that measure an operation's wall time
 // (op_ms, input latency, teardown/resume) call beginWallOp(). It records the
@@ -300,11 +300,6 @@ class BenchHarnessState extends State<BenchHarness>
       exit(1);
     }
     _tickCount++;
-    // Klaxon paints the whole tree every frame; without this, Flutter skips
-    // paint (and raster) entirely for unchanged trees and static scenes would
-    // measure ~0 work.
-    final RenderObject? ro = _sceneKey.currentContext?.findRenderObject();
-    ro?.markNeedsPaint();
   }
 
   /// The scene's frame plan is fulfilled when the TICKER has run the full

@@ -117,8 +117,7 @@ pub const BenchScene = enum {
     /// collected over the 60 frames after it — runListOp drives these.
     pub fn isListOp(s: BenchScene) bool {
         return switch (s) {
-            .list_create_1k, .list_replace_1k, .list_update_10th,
-            .list_swap_rows, .list_remove_row, .list_clear_1k => true,
+            .list_create_1k, .list_replace_1k, .list_update_10th, .list_swap_rows, .list_remove_row, .list_clear_1k => true,
             else => false,
         };
     }
@@ -914,7 +913,7 @@ const SceneRunner = struct {
             const tl = sdl.c.SDL_GetTicksNS();
             if (r.root.layout_dirty) r.root.layout(r.bounds);
             const tp = sdl.c.SDL_GetTicksNS();
-            renderer.paint(r.root, BG);
+            renderer.paintDamage(r.root, BG);
             const t1 = sdl.c.SDL_GetTicksNS();
             if (dbg_loop) std.debug.print("  frame tick={d}us layout={d}us paint={d}us\n", .{ (tl - t0) / 1000, (tp - tl) / 1000, (t1 - tp) / 1000 });
             wall_end = t1;
@@ -979,8 +978,7 @@ const SceneRunner = struct {
         }
         r.extra.n_max_60fps = n_max;
         // draw_calls_per_frame = real submitted ops of the last measured frame.
-        var m = try r.finishMetrics(frame_times.items, ttff_ms, total,
-            kx.c.kx_frame_draw_ops(renderer.ctx), devtools.readRssMb());
+        var m = try r.finishMetrics(frame_times.items, ttff_ms, total, kx.c.kx_frame_draw_ops(renderer.ctx), devtools.readRssMb());
         m.presented_fps = if (opts.windowed and wall_ns > 0)
             @as(f64, @floatFromInt(frame_times.items.len)) * 1e9 / @as(f64, @floatFromInt(wall_ns))
         else
@@ -1673,7 +1671,7 @@ fn buildInputIme(r: *SceneRunner) !void {
         .label = "Message",
         .placeholder = "こんにちは…",
         .supporting = "type CJK / emoji — the buffer follows the caret",
-        .multiline = true, // Compose runner: singleLine = false
+        .multiline = true, // Compose parity
         .theme = theme_mod.light,
     });
     r.text_field = tf;
@@ -1724,8 +1722,7 @@ fn videoPaint(n: *Node, ctx: *kx.Ctx) void {
     // Upload+draw in one zero-copy call: the decode buffer is borrowed for
     // the synchronous raster draw (a player presents frames, doesn't keep
     // them) — no registry image, no 230KB copy per frame.
-    ui.paint.drawPixels(ctx, @ptrCast(s.pixels.ptr), s.w, s.h,
-        n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
+    ui.paint.drawPixels(ctx, @ptrCast(s.pixels.ptr), s.w, s.h, n.bounds.x, n.bounds.y, n.bounds.w, n.bounds.h);
     // The decoded frame changes every paint: mark dirty so the damage path
     // repaints just this node next frame (a real video widget does the same).
     n.markDirty();

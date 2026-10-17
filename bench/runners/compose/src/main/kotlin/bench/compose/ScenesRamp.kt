@@ -14,22 +14,21 @@
 package bench.compose
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asComposeImageBitmap
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -64,26 +63,25 @@ internal fun SceneState.RampContent() {
     }
 }
 
-private fun SceneState.lissajousOffset(i: Int): IntOffset {
-    val t = animFrame.longValue * LISSAJOUS_DT
-    val x = 300.0 + 280.0 * sin(t + i * 0.61)
-    val y = 228.0 + 200.0 * sin(t * 1.4 + i * 0.83)
-    return IntOffset(x.roundToInt(), y.roundToInt())
-}
-
 // --- shapes_ramp: N rounded rects (r=8dp, 40x24, alternating colors) ---
 
 @Composable
 private fun SceneState.ShapesRampScene() {
     val n = rampItemCount.intValue
-    Box(Modifier.fillMaxSize()) {
-        repeat(n) { i ->
-            Box(
-                Modifier
-                    .offset { lissajousOffset(i) }
-                    .size(40.dp, 24.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (i % 2 == 0) PURPLE else TEAL),
+    Canvas(Modifier.fillMaxSize()) {
+        val t = animFrame.longValue * LISSAJOUS_DT
+        val w = 40.dp.toPx()
+        val h = 24.dp.toPx()
+        val cr = CornerRadius(8.dp.toPx(), 8.dp.toPx())
+        val sz = Size(w, h)
+        for (i in 0 until n) {
+            val x = (300.0 + 280.0 * sin(t + i * 0.61)).toFloat()
+            val y = (228.0 + 200.0 * sin(t * 1.4 + i * 0.83)).toFloat()
+            drawRoundRect(
+                color = if (i % 2 == 0) PURPLE else TEAL,
+                topLeft = Offset(x, y),
+                size = sz,
+                cornerRadius = cr,
             )
         }
     }
@@ -97,15 +95,16 @@ private fun SceneState.PathsRampScene() {
     // "N identical ... paths": one shared Path object, drawn N times — the
     // geometry is built once (the draw cost is per item, like MotionMark).
     val path = remember { gearBezierPath() }
-    Box(Modifier.fillMaxSize()) {
-        repeat(n) { i ->
-            Canvas(
-                Modifier
-                    .offset { IntOffset((i * 97) % 592, (i * 57) % 432) }
-                    .size(48.dp)
-                    .graphicsLayer { rotationZ = (animFrame.longValue % 360).toFloat() },
-            ) {
-                drawPath(path, PURPLE)
+    Canvas(Modifier.fillMaxSize()) {
+        val rot = (animFrame.longValue % 360).toFloat()
+        for (i in 0 until n) {
+            val ox = ((i * 97) % 592).toFloat()
+            val oy = ((i * 57) % 432).toFloat()
+            withTransform({
+                translate(ox, oy)
+                rotate(rot, Offset(24f, 24f))
+            }) {
+                drawPath(path, if (i % 2 == 0) PURPLE else TEAL)
             }
         }
     }
@@ -148,18 +147,18 @@ private fun gearBezierPath(): Path {
 @Composable
 private fun SceneState.TextRampScene() {
     val n = rampItemCount.intValue
-    Box(Modifier.fillMaxSize()) {
-        repeat(n) { i ->
-            Text(
-                "The quick brown fox 0123456789",
-                fontSize = 14.sp,
-                color = Color.White,
-                softWrap = false,
-                modifier = Modifier.offset {
-                    val dx = 40.0 * sin(animFrame.longValue * 0.1 + i * 0.5)
-                    IntOffset(((i * 53) % 560 + dx).roundToInt(), (i * 37) % 460)
-                },
-            )
+    val measurer = rememberTextMeasurer()
+    val style = remember { TextStyle(color = Color.White, fontSize = 14.sp) }
+    val measured = remember(measurer, style) {
+        measurer.measure("The quick brown fox 0123456789", style = style, softWrap = false)
+    }
+    Canvas(Modifier.fillMaxSize()) {
+        val frame = animFrame.longValue
+        for (i in 0 until n) {
+            val dx = 40.0 * sin(frame * 0.1 + i * 0.5)
+            val x = ((i * 53) % 560 + dx).toFloat()
+            val y = ((i * 37) % 460).toFloat()
+            drawText(measured, topLeft = Offset(x, y))
         }
     }
 }
@@ -173,14 +172,14 @@ private fun SceneState.ImagesRampScene() {
     // which lands in warmup (spec: decode/startup cost excluded; the measured
     // frames only pay sampling/draw).
     val image = remember { makeCheckerboardImage() }
-    Box(Modifier.fillMaxSize()) {
-        repeat(n) { i ->
-            Box(Modifier.offset { lissajousOffset(i) }.size(48.dp)) {
-                Canvas(Modifier.fillMaxSize()) {
-                    // 64 -> 48 px = the spec's 0.75x sampling factor.
-                    drawImage(image, dstSize = IntSize(48, 48))
-                }
-            }
+    Canvas(Modifier.fillMaxSize()) {
+        val t = animFrame.longValue * LISSAJOUS_DT
+        val dstSz = IntSize(48, 48)
+        for (i in 0 until n) {
+            val x = (300.0 + 280.0 * sin(t + i * 0.61)).roundToInt()
+            val y = (228.0 + 200.0 * sin(t * 1.4 + i * 0.83)).roundToInt()
+            // 64 -> 48 px = the spec's 0.75x sampling factor.
+            drawImage(image, dstOffset = IntOffset(x, y), dstSize = dstSz)
         }
     }
 }

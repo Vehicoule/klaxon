@@ -7,43 +7,35 @@ import QtQuick
 Item {
     id: root
     property int benchN: 10
+    property int animFrame: 0
 
-    Repeater {
-        id: rep
-        model: root.benchN
-        Rectangle {
-            width: 40
-            height: 24
-            radius: 8
-            color: index % 2 === 0 ? "#7C4DFF" : "#03DAC6"
+    Canvas {
+        id: canvas
+        anchors.fill: parent
+        renderTarget: Canvas.Image
+        onPaint: {
+            const ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            const n = root.benchN
+            const f = root.animFrame
+            for (let i = 0; i < n; ++i) {
+                const cx = 60 + (i * 101) % 520
+                const cy = 40 + (i * 67) % 400
+                const x = cx + 40 * Math.sin(0.10 * f + i * 0.31)
+                const y = cy + 30 * Math.sin(0.1333 * f + i * 0.17)
+                ctx.fillStyle = (i % 2 === 0) ? "#7C4DFF" : "#03DAC6"
+                ctx.beginPath()
+                ctx.roundedRect(x, y, 40, 24, 8, 8)
+                ctx.fill()
+            }
         }
     }
 
     Connections {
         target: bench
-        property var items: null
-        property var centers: null
         function onTickFrame(frame) {
-            if (!items || items.length !== root.benchN) {
-                items = []
-                centers = []
-                for (let i = 0; i < root.benchN; ++i) {
-                    const it = rep.itemAt(i)
-                    if (!it)
-                        return // delegates still instantiating; next frame fills in
-                    items.push(it)
-                    // deterministic scatter of the Lissajous centers
-                    centers.push([60 + (i * 101) % 520, 40 + (i * 67) % 400])
-                }
-            }
-            // Lissajous path, max 4px/frame per axis (amplitude * omega = 4):
-            // dx <= 40*0.1 = 4, dy <= 30*0.1333 = 4.
-            for (let i = 0; i < root.benchN; ++i) {
-                const it = items[i]
-                const c = centers[i]
-                it.x = c[0] + 40 * Math.sin(0.10 * frame + i * 0.31)
-                it.y = c[1] + 30 * Math.sin(0.1333 * frame + i * 0.17)
-            }
+            root.animFrame = frame
+            canvas.requestPaint()
         }
     }
 }

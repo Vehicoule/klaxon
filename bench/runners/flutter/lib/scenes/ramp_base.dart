@@ -66,6 +66,7 @@ abstract class RampScene extends BenchScene {
   @override
   void tick(int frame, BenchHarnessState harness) {
     _frame = frame;
+    harness.refresh();
   }
 
   @override
