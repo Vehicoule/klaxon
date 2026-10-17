@@ -67,6 +67,8 @@ pub const Key = enum(u32) {
     down = 0x104,
     home = 0x105,
     end = 0x106,
+    page_up = 0x107,
+    page_down = 0x108,
     space = 0x20, // the space bar (key_down, not text input)
     _,
 };

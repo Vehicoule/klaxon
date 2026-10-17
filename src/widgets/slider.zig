@@ -364,17 +364,23 @@ fn sliderOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (ev.kind != .key_down) return false;
     const rtl = ui.i18n.direction() == .rtl;
     // Upstream slideOnKeyEvents: delta = range/(steps+1) discrete, 1% when
-    // continuous; home/end jump to the range edges.
+    // continuous; PageUp/PageDown move by actualSteps/10 clamped to [1,10]
+    // ticks (actualSteps = steps+1 discrete, 100 continuous); home/end jump
+    // to the range edges.
     const step: f32 = if (s.opts.steps > 0) 1.0 / @as(f32, @floatFromInt(s.opts.steps + 1)) else keyboard_step;
+    const actual_ticks: f32 = if (s.opts.steps > 0) @floatFromInt(s.opts.steps + 1) else 100.0;
+    const page_step: f32 = step * std.math.clamp(actual_ticks / 10.0, 1.0, 10.0);
     switch (ev.key) {
-        .left, .down => {
-            const d: f32 = if (ev.key == .left and rtl) step else -step;
+        .left, .down, .page_down => {
+            const base: f32 = if (ev.key == .page_down) page_step else step;
+            const d: f32 = if (ev.key == .left and rtl) base else -base;
             s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
-        .right, .up => {
-            const d: f32 = if (ev.key == .right and rtl) -step else step;
+        .right, .up, .page_up => {
+            const base: f32 = if (ev.key == .page_up) page_step else step;
+            const d: f32 = if (ev.key == .right and rtl) -base else base;
             s.sig.set(std.math.clamp(s.sig.peek() + d, 0, 1));
             if (s.on_changed) |cb| cb.fn_ptr(cb.userdata);
             return true;
@@ -671,6 +677,30 @@ test "slider: arrows step by 1/(steps+1) in discrete mode" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), sig.peek(), 0.001);
     try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .right }));
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), sig.peek(), 0.001);
+    // PageUp/PageDown = clamp((steps+1)/10, 1, 10) ticks = 1 tick here.
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_up }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), sig.peek(), 0.001);
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sig.peek(), 0.001);
+}
+
+test "slider: page keys move 10% of a continuous range" {
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
+    defer sig.deinit();
+    const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x" });
+    defer b.deinit();
+    const on_key = b.vtable.on_key.?;
+    // continuous actualSteps = 100 → 10 ticks = 0.1 per page key.
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_up }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), sig.peek(), 0.001);
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sig.peek(), 0.001);
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expect(on_key(b, .{ .kind = .key_down, .key = .page_down }));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), sig.peek(), 0.001); // clamps
 }
 
 test "golden: slider steps paint the stop ticks with the contrast inversion" {

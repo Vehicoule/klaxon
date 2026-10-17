@@ -51,9 +51,9 @@ Each widget's header carries the same list; these are the tracked ones
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
 - `slider.zig` — the value indicator doesn't morph its shape (upstream's
-  label animates in on drag start); no PageUp/PageDown keys (input.Key
-  lacks them). Steps/ticks, the pressed value bubble and the
-  corner-inset thumb mapping match upstream.
+  label animates in on drag start). Steps/ticks, the pressed value
+  bubble, the corner-inset thumb mapping and PageUp/PageDown
+  (actualSteps/10 clamped to [1,10] ticks) match upstream.
 - `split_button.zig` — trailing half is pointer-only (a11y activation pending).
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
   only; no selection handles or undo; the text run stays LTR under RTL
@@ -66,7 +66,9 @@ Each widget's header carries the same list; these are the tracked ones
   The legacy `input.zig` textField (conformance-only) still end-caret.
 - `time_picker.zig` — no text-input variant; en-only strings.
 - `table.zig` — no sorting/selection/scroll/sticky header; text-only cells.
-- `tree.zig` — no keyboard nav/lazy loading/drag-drop/icons.
+- `tree.zig` — no drag-and-drop reordering. (Keyboard nav with
+  selection-follows-focus, synchronous lazy children providers, per-node
+  icons and per-row virtual a11y children landed.)
 - `carousel.zig` — no contentPadding, no hero/center-aligned strategy, no
   parallax.
 - `progress.zig` — static `progress` snaps on rebuild (the spring runs on
