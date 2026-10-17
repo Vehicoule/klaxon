@@ -119,7 +119,7 @@ fn syncItemSemantics(n: *Node, s: *NavBarState) void {
 /// The child index containing the focused node (keyboard activation).
 fn focusedItem(n: *Node) ?usize {
     const router = input.current() orelse return null;
-    const f = router.focused orelse return null;
+    const f = router.focusedNode() orelse return null;
     var cur: ?*Node = f;
     while (cur) |c| : (cur = c.parent) {
         if (c == n) return null;
@@ -553,14 +553,14 @@ test "nav_bar: arrows move the selection, Enter activates the focused item" {
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .right }));
     try std.testing.expectEqual(@as(usize, 1), sel.peek());
     // focus followed the selection: Enter activates the NEW item, not the old one
-    try std.testing.expect(router.focused == b);
+    try std.testing.expect(router.focusedNode() == b);
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .enter }));
     try std.testing.expectEqual(@as(usize, 1), sel.peek());
     // clamped at the end: nothing to do, the key is not handled
     try std.testing.expect(!router.dispatchKey(.{ .kind = .key_down, .key = .right }));
     try std.testing.expectEqual(@as(usize, 1), sel.peek());
     try std.testing.expect(router.dispatchKey(.{ .kind = .key_down, .key = .left }));
-    try std.testing.expect(router.focused == a);
+    try std.testing.expect(router.focusedNode() == a);
     try std.testing.expectEqual(@as(usize, 0), sel.peek());
 }
 

@@ -159,9 +159,10 @@ const DrawerState = struct {
     pan: ui.gestures.Recognizer = .{ .kind = .pan },
     i18n: ?*i18n_mod.I18n = null,
     dragging: bool = false, // the drawer claimed the pointer (capture moved)
-    /// The node holding keyboard focus when the drawer opened — restored on
-    /// close when it is still in the tree (popup-style focus return).
-    saved_focus: ?*Node = null,
+    /// Weak id of the node holding keyboard focus when the drawer opened —
+    /// restored on close while it is still in the tree (a destroyed node
+    /// resolves null → no restore).
+    saved_focus: ?u64 = null,
     focus_saved: bool = false,
 };
 

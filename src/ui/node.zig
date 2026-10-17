@@ -245,6 +245,12 @@ pub const AUTO_RETAIN_MAX_PX: u64 = 2 * 1024 * 1024;
 
 pub const Node = struct {
     allocator: std.mem.Allocator,
+    /// Process-global monotonic identity — the node's weak handle (see
+    /// "Weak node references" below). The tree owns node lifetimes, so a
+    /// reference that outlives a frame (focus, a pointer capture, a
+    /// scrollbar's scrollable) keeps the id and resolve()s it per use —
+    /// a dead node resolves null instead of dangling.
+    id: u64 = 0,
     parent: ?*Node = null,
     children: std.array_list.Managed(*Node),
     bounds: Rect = .{},
@@ -403,14 +409,27 @@ pub const Node = struct {
 
     pub fn create(allocator: std.mem.Allocator, vtable: *const VTable) !*Node {
         const node = try allocator.create(Node);
+        errdefer allocator.destroy(node);
         node.* = .{
             .allocator = allocator,
+            .id = next_node_id,
             .children = std.array_list.Managed(*Node).init(allocator),
             .vtable = vtable,
             .overlay_subtree = vtable.paint_overlay != null,
             .backdrop_subtree = vtable.reads_backdrop,
         };
+        next_node_id += 1;
+        // List the id before handing the node out — resolve() must find
+        // every live node. OOM rolls back via errdefer; a skipped id is
+        // harmless (the counter is monotonic, never reused).
+        try live_nodes.put(node.id, node);
         return node;
+    }
+
+    /// The node's weak handle: a zero-alloc id safe to hold across
+    /// frames. resolve() it back to the live node — null once it dies.
+    pub fn ref(node: *Node) u64 {
+        return node.id;
     }
 
     /// Append a child. OOM while building the tree is fatal (same as Flutter).
@@ -1303,6 +1322,11 @@ pub const Node = struct {
     /// tears down immediately.
     pub fn deinit(node: *Node) void {
         if (node.zombie) return; // already queued or torn down
+        // Dead from this call on: unlist the weak id BEFORE the zombie mark
+        // so resolve() can never hand out the doomed node — the memory
+        // stays valid until the sweep, but every traversal already treats
+        // the node as gone.
+        unlistLive(node);
         if (traversalActive()) {
             node.zombie = true;
             zombie_list.append(std.heap.c_allocator, node) catch @panic("klaxon: out of memory");
@@ -1323,10 +1347,14 @@ pub const Node = struct {
     /// A zombie child is consumed here (its queue slot turns inert) for the
     /// same reason.
     fn deinitBody(node: *Node) void {
+        // Children drained below never pass through deinit() — unlisting
+        // here is what kills THEIR weak ids (deinit unlists zombie-marked
+        // nodes itself). Either way resolve() never returns a node whose
+        // teardown has begun.
+        unlistLive(node);
         // Drop router references (capture/hover/focus/popup) BEFORE anything
         // is freed — virtualized lists destroy captured items on scroll.
         input_mod.releaseNode(node);
-        semantics_mod.focusNodeDestroyed(node); // drop the a11y focus if it was focused (Phase 2c)
         // Drop signal subscriptions BEFORE the vtable deinit frees any
         // widget-owned signals — a dangling .node subscriber would call
         // markDirty on freed memory at the next notify (UAF).
@@ -1411,6 +1439,41 @@ pub fn traversalEnd() void {
 /// True while a traversal window is open (dispatch/paint/notify/deinit).
 pub fn traversalActive() bool {
     return traversal_depth > 0;
+}
+
+// --- Weak node references -------------------------------------------------
+//
+// A raw *Node held past a traversal is a stale-pointer bug waiting for the
+// zombie sweep: the tree owns node lifetimes, so references that outlive a
+// frame — focus, pointer captures, an open popup, a scrollbar's
+// scrollable, a hero's source element — hold the node's `id` instead and
+// resolve() it per use. The id costs nothing per reference (u64) and never
+// dangles: a dead node resolves null.
+//
+// `id` comes from a monotonic counter — never reused, so a stale id can
+// never resolve to a recycled address. `live_nodes` lists every live node
+// (the UI is single-threaded — no lock). The id dies the moment the node
+// does: deinit() unlists it when it marks the node zombie (a zombie is
+// already dead — every traversal skips it), and deinitBody() unlists
+// again so nodes torn down eagerly (children drained under a parent's
+// teardown never passed through deinit()) are covered too. resolve()
+// therefore never returns a node whose memory is invalid or whose subtree
+// is being torn down — the trade-off is that a zombie resolves null while
+// its memory is still sweep-pending, which is correct: it is dead.
+
+var next_node_id: u64 = 1;
+var live_nodes = std.AutoHashMap(u64, *Node).init(std.heap.c_allocator);
+
+/// Resolve a weak node id to the live node — null once the node dies.
+pub fn resolve(id: u64) ?*Node {
+    return live_nodes.get(id);
+}
+
+/// Unlist the node: it is dead from this point — resolve() must not hand
+/// it out. Idempotent (deinit unlists at zombie-marking; deinitBody
+/// unlists eager teardowns).
+fn unlistLive(node: *Node) void {
+    _ = live_nodes.remove(node.id);
 }
 
 // --- tests (stub leaf widget) ---
@@ -1957,7 +2020,7 @@ test "deinit releases the node's router references (capture/hover/focus/popup)" 
     router.dispatchPointer(root, .{ .phase = .move, .x = 10, .y = 10 }); // hover the child
     router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 }); // capture it
     router.focus(child);
-    router.open_popup = child;
+    router.open_popup = child.ref();
     try std.testing.expect(router.capturedNode(0) == child);
     try std.testing.expect(root.remove(child)); // detach first: the root must not double-free
     // A captured subtree hands its capture to the surviving parent on
@@ -2102,6 +2165,40 @@ test "deinit: a vtable deinit that destroys another node defers it to the sweep"
     const killer = try twinKillNode(detached);
     killer.deinit(); // depth-0 deinit runs the sweep; the nested deinit queues onto it
     // both freed — the testing allocator fails the test on a leak
+}
+
+// --- weak node references (id + resolve) ---------------------------------
+
+test "weak refs: resolve hands out the live node, null after deinit" {
+    const n = try testNode(10, 10);
+    const id = n.ref();
+    try std.testing.expect(resolve(id) == n);
+    n.deinit(); // no traversal: immediate teardown — the id dies with it
+    try std.testing.expect(resolve(id) == null);
+}
+
+test "weak refs: a zombie's id is dead before the sweep frees its memory" {
+    const root = try testNode(100, 100);
+    defer root.deinit();
+    const child = try testNode(10, 10);
+    root.add(child);
+    const id = child.ref();
+    traversalBegin();
+    child.deinit(); // defers — zombie, memory stays until the sweep…
+    try std.testing.expect(child.zombie);
+    try std.testing.expect(resolve(id) == null); // …but the id is already dead
+    traversalEnd(); // sweep frees — the id stays dead
+    try std.testing.expect(resolve(id) == null);
+}
+
+test "weak refs: an eager child teardown unlists the id" {
+    // The child never saw deinit() — the parent's deinitBody consumed it.
+    const root = try testNode(100, 100);
+    const child = try testNode(10, 10);
+    root.add(child);
+    const id = child.ref();
+    root.deinit(); // not deferred — destroys the subtree now
+    try std.testing.expect(resolve(id) == null);
 }
 
 test "paint: a markDirty raised during paint survives to the next frame" {

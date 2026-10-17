@@ -326,18 +326,22 @@ pub const NavigatorOptions = struct {
 
 const HeroEntry = struct {
     tag: []const u8, // owned
-    hero: *Node,
-    wrapper: *Node, // the page wrapper the hero lives in
+    /// Weak node ids: registrations outlive frames — a page rebuild can
+    /// destroy a hero (or its wrapper) between layout and the next
+    /// transition, so the registry resolves them per use.
+    hero: u64,
+    wrapper: u64, // the page wrapper the hero lives in
     rect: Rect, // last laid-out rect (window space)
 };
 
 const HeroFlight = struct {
-    hero: *Node, // the hero wrapper (stays in the entering page, placeholder)
-    flight: *Node, // the flight wrapper (holds the child while it flies)
-    child: *Node, // the hero's child (reparented into the flight wrapper)
+    hero: u64, // weak — the hero wrapper (stays in the entering page, placeholder)
+    flight: *Node, // the flight wrapper — transition-owned: created by the
+    // flight, dies with it, so a raw pointer is safe for the transition's life
+    child: u64, // weak — the hero's child (reparented into the flight wrapper)
     src: Rect,
     dst: Rect,
-    out_hero: *Node, // the same-tag hero in the exiting page (hidden while flying)
+    out_hero: u64, // weak — the same-tag hero in the exiting page (hidden while flying)
 };
 
 const ActiveTransition = struct {
@@ -371,15 +375,15 @@ const NavViewState = struct {
             }
         }
         for (s.heroes.items) |*e| {
-            if (e.hero == h) {
+            if (e.hero == h.ref()) {
                 e.rect = mapped;
                 return;
             }
         }
         s.heroes.append(.{
             .tag = s.node.allocator.dupe(u8, heroStateOf(h).tag) catch @panic("klaxon: out of memory"),
-            .hero = h,
-            .wrapper = wrapper,
+            .hero = h.ref(),
+            .wrapper = wrapper.ref(),
             .rect = mapped,
         }) catch @panic("klaxon: out of memory");
     }
@@ -387,7 +391,7 @@ const NavViewState = struct {
     fn unregisterHero(s: *NavViewState, h: *Node) void {
         var i: usize = 0;
         while (i < s.heroes.items.len) {
-            if (s.heroes.items[i].hero == h) {
+            if (s.heroes.items[i].hero == h.ref()) {
                 s.node.allocator.free(s.heroes.items[i].tag);
                 _ = s.heroes.orderedRemove(i);
             } else {
@@ -407,7 +411,7 @@ const NavViewState = struct {
             if (t.exiting) |ex| pageStateOf(ex).hit_enabled = false;
         }
         if (input_mod.current()) |r| {
-            if (r.focused) |f| {
+            if (r.focusedNode()) |f| {
                 const top: ?*Node = if (s.pages_ui.items.len > 0)
                     s.pages_ui.items[s.pages_ui.items.len - 1]
                 else
@@ -459,11 +463,17 @@ const NavViewState = struct {
         // Hero: the flying child returns to its hero wrapper (at the destination).
         if (t.hero) |f| {
             _ = s.node.remove(f.flight);
-            _ = f.flight.remove(f.child); // Node.add does not detach the old parent
-            f.hero.add(f.child); // Hero is single-child: back at index 0
-            heroStateOf(f.hero).flight_dst = null;
-            f.flight.deinit(); // empty: the child was reparented
-            f.out_hero.setVisible(true); // the source page may stay in the stack
+            // Every party is a weak id — a page rebuild mid-flight may have
+            // destroyed any of them (a dead child rides down with the
+            // flight wrapper; a dead hero just loses the placeholder).
+            const h = ui.node.resolve(f.hero);
+            if (ui.node.resolve(f.child)) |child| {
+                _ = f.flight.remove(child); // Node.add does not detach the old parent
+                if (h) |hero_node| hero_node.add(child); // Hero is single-child: back at index 0
+            }
+            if (h) |hero_node| heroStateOf(hero_node).flight_dst = null;
+            f.flight.deinit();
+            if (ui.node.resolve(f.out_hero)) |out_hero| out_hero.setVisible(true); // the source page may stay in the stack
         }
         // The exiting page leaves the tree — unless it is still in the stack
         // (an interrupted transition snaps it back into place). pages_ui is
@@ -490,16 +500,21 @@ const NavViewState = struct {
     /// Look for a hero shared by the two pages (same tag): the entering
     /// page's hero child is reparented into a flight wrapper (topmost).
     fn beginHeroFlight(s: *NavViewState, entering: *Node, exiting: *Node) ?HeroFlight {
+        const entering_id = entering.ref();
+        const exiting_id = exiting.ref();
         for (s.heroes.items) |out| {
-            if (out.wrapper != exiting) continue;
+            if (out.wrapper != exiting_id) continue;
             for (s.heroes.items) |in| {
                 if (in.hero == out.hero) continue;
-                if (in.wrapper != entering) continue;
+                if (in.wrapper != entering_id) continue;
                 if (!std.mem.eql(u8, out.tag, in.tag)) continue;
                 const src = out.rect;
                 const dst = in.rect;
                 if (src.w <= 0 or src.h <= 0 or dst.w <= 0 or dst.h <= 0) return null;
-                const h = in.hero;
+                // Registered ids are weak: either hero may be dead already
+                // (its page rebuilt) — skip stale entries.
+                const h = ui.node.resolve(in.hero) orelse continue;
+                const out_hero = ui.node.resolve(out.hero) orelse continue;
                 if (h.children.items.len == 0) return null;
                 const child = h.children.items[0];
                 heroStateOf(h).flight_dst = .{ .w = dst.w, .h = dst.h };
@@ -509,8 +524,8 @@ const NavViewState = struct {
                 s.node.add(f); // topmost: paints above both pages
                 child.layout(.{ .x = 0, .y = 0, .w = dst.w, .h = dst.h });
                 f.layout(.{ .x = 0, .y = 0, .w = dst.w, .h = dst.h });
-                out.hero.setVisible(false); // the source hero leaves its page
-                return .{ .hero = h, .flight = f, .child = child, .src = src, .dst = dst, .out_hero = out.hero };
+                out_hero.setVisible(false); // the source hero leaves its page
+                return .{ .hero = h.ref(), .flight = f, .child = child.ref(), .src = src, .dst = dst, .out_hero = out_hero.ref() };
             }
         }
         return null;
@@ -708,8 +723,9 @@ fn navDeinit(n: *Node) void {
     for (s.heroes.items) |h| {
         // Registered heroes hold a back-pointer to this state; a hero that
         // outlives the view (reparented page, deinit order) must not
-        // unregister through a freed pointer.
-        heroStateOf(h.hero).nav = null;
+        // unregister through a freed pointer. Dead registrations resolve
+        // null — their HeroState died with the node.
+        if (ui.node.resolve(h.hero)) |hero_node| heroStateOf(hero_node).nav = null;
         n.allocator.free(h.tag);
     }
     s.heroes.deinit();
@@ -1186,12 +1202,12 @@ test "push clears keyboard focus from the page below" {
     defer view.deinit();
     view.layout(.{ .x = 0, .y = 0, .w = 200, .h = 100 });
     router.focus(ctx_a.last.?);
-    try std.testing.expect(router.focused != null);
+    try std.testing.expect(router.focusedNode() != null);
     try nav.push("b", &.{});
-    try std.testing.expect(router.focused == null); // the page below is not interactive
+    try std.testing.expect(router.focusedNode() == null); // the page below is not interactive
     // focus inside the top page is kept
     router.focus(ctx_b.last.?);
-    try std.testing.expect(router.focused != null);
+    try std.testing.expect(router.focusedNode() != null);
 }
 
 test "hero: the source hero is visible again after the flight" {
@@ -1284,7 +1300,7 @@ test "hero flight: the shared element flies source → destination" {
     try std.testing.expect(s.transition == null);
     try std.testing.expectEqual(@as(usize, 2), view.children.items.len); // flight removed
     // the child is back in the hero wrapper; the placeholder is cleared
-    try std.testing.expectEqual(ctx_b.hero_node.?, flight.child.parent.?);
+    try std.testing.expectEqual(ctx_b.hero_node.?, ui.node.resolve(flight.child).?.parent.?);
     try std.testing.expect(heroStateOf(ctx_b.hero_node.?).flight_dst == null);
 }
 

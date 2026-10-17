@@ -689,7 +689,7 @@ pub const Host = struct {
     /// so the candidate window tracks layout moves, and SDL no-ops a
     /// redundant start.
     fn syncIme(host: *Host) void {
-        const focused = host.input.focused;
+        const focused = host.input.focusedNode();
         const editing = focused != null and focused.?.vtable.wants_text_input;
         if (editing) {
             const node = focused.?;
@@ -1129,7 +1129,7 @@ pub const Host = struct {
     /// whole tree — above everything except the focus ring. Inside the
     /// damage clip: the popup's dirty marks already cover its overflow.
     fn paintPopupOverlay(host: *Host) void {
-        if (host.input.open_popup) |popup| {
+        if (host.input.openPopupNode()) |popup| {
             if (popup.vtable.paint_overlay) |po| po(popup, host.ctx);
         }
     }

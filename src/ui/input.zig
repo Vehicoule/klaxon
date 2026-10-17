@@ -108,7 +108,10 @@ pub const ScrollEvent = struct {
 /// router never allocates.
 pub const MAX_POINTERS = 8;
 
-pub const Capture = struct { pointer: u64, node: *Node };
+/// A live pointer's capture slot. `node` is a weak node id — the capture
+/// outlives frames (a drag across rebuilds), and a captured node's death
+/// must never leave a dangling pointer behind (resolve per use).
+pub const Capture = struct { pointer: u64, node_id: u64 };
 
 /// Back-button handler (Phase 2a): the navigator pops the page stack.
 /// Returns true when the back request was handled.
@@ -125,14 +128,17 @@ fn nullCaptureSlots() [MAX_POINTERS]?Capture {
 
 pub const InputRouter = struct {
     captured: [MAX_POINTERS]?Capture = nullCaptureSlots(), // per-pointer capture (drag)
-    hovered: ?*Node = null,
+    /// Weak node ids (hovered/focused/open_popup): all three outlive the
+    /// traversal that set them — a destroyed node resolves null instead of
+    /// dangling. Resolve through hoveredNode()/focusedNode()/openPopupNode().
+    hovered: ?u64 = null,
     /// Last primary-pointer position (window px) — to refresh hover after a
     /// drag release, a scroll under a stationary pointer, or a layout change.
     last_x: f32 = 0,
     last_y: f32 = 0,
     has_last: bool = false,
-    focused: ?*Node = null,
-    open_popup: ?*Node = null,
+    focused: ?u64 = null,
+    open_popup: ?u64 = null,
     back_handler: ?BackHandler = null, // navigator pop (Phase 2a)
     /// Modal back handlers (Escape / hardware back), consulted by dispatchBack
     /// BEFORE the navigator's back_handler. Fixed-size stack (no allocator):
@@ -151,12 +157,12 @@ pub const InputRouter = struct {
 
     fn captureSet(self: *InputRouter, pointer: u64, node: *Node) void {
         if (self.captureSlot(pointer)) |i| {
-            self.captured[i] = .{ .pointer = pointer, .node = node };
+            self.captured[i] = .{ .pointer = pointer, .node_id = node.ref() };
             return;
         }
         for (self.captured, 0..) |slot, i| {
             if (slot == null) {
-                self.captured[i] = .{ .pointer = pointer, .node = node };
+                self.captured[i] = .{ .pointer = pointer, .node_id = node.ref() };
                 return;
             }
         }
@@ -168,8 +174,9 @@ pub const InputRouter = struct {
     }
 
     /// The node currently capturing `pointer` (receives its move/up), if any.
+    /// A captured node that died resolves null — no stale delivery.
     pub fn capturedNode(self: *InputRouter, pointer: u64) ?*Node {
-        if (self.captureSlot(pointer)) |i| return self.captured[i].?.node;
+        if (self.captureSlot(pointer)) |i| return node_mod.resolve(self.captured[i].?.node_id);
         return null;
     }
 
@@ -182,10 +189,12 @@ pub const InputRouter = struct {
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
         if (self.captureSlot(ev.pointer)) |i| {
-            const prev = self.captured[i].?.node;
-            self.captured[i] = .{ .pointer = ev.pointer, .node = node };
+            const prev = node_mod.resolve(self.captured[i].?.node_id);
+            self.captured[i] = .{ .pointer = ev.pointer, .node_id = node.ref() };
             if (prev != node) {
-                _ = sendPointerExcept(prev, .{ .phase = .outside_down, .x = ev.x, .y = ev.y, .raw_x = ev.raw_x, .raw_y = ev.raw_y, .button = ev.button, .pointer = ev.pointer, .time_ms = ev.time_ms }, except);
+                if (prev) |p| {
+                    _ = sendPointerExcept(p, .{ .phase = .outside_down, .x = ev.x, .y = ev.y, .raw_x = ev.raw_x, .raw_y = ev.raw_y, .button = ev.button, .pointer = ev.pointer, .time_ms = ev.time_ms }, except);
+                }
             }
         } else {
             self.captureSet(ev.pointer, node);
@@ -214,7 +223,7 @@ pub const InputRouter = struct {
             .down => {
                 // A click outside an open popup closes it and is consumed
                 // (barrier semantics — the next click reaches the tree).
-                if (self.open_popup) |popup| {
+                if (self.openPopupNode()) |popup| {
                     const hit = hitPopupOrRoot(root, popup, ev.x, ev.y);
                     const inside = if (hit) |h| isDescendant(h.node, popup) else false;
                     if (!inside) {
@@ -266,7 +275,7 @@ pub const InputRouter = struct {
     pub fn dispatchKey(self: *InputRouter, ev: KeyEvent) bool {
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
-        if (self.focused) |f| return sendKey(f, ev);
+        if (self.focusedNode()) |f| return sendKey(f, ev);
         return false;
     }
 
@@ -305,7 +314,7 @@ pub const InputRouter = struct {
     pub fn dispatchBack(self: *InputRouter) bool {
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
-        if (self.focused) |f| {
+        if (self.focusedNode()) |f| {
             if (sendKey(f, .{ .kind = .key_down, .key = .escape })) return true;
         }
         // The modal stack topmost-first; a handler that declines (returns
@@ -332,11 +341,12 @@ pub const InputRouter = struct {
         // An open popup's overflow children (a menu's item rows live outside
         // the popup's bounds) are hoverable too — without the popup-aware
         // hit-test the mouse could never hover them.
-        const hit = if (self.open_popup) |popup| hitPopupOrRoot(root, popup, x, y) else root.hitTestMapped(x, y);
+        const hit = if (self.openPopupNode()) |popup| hitPopupOrRoot(root, popup, x, y) else root.hitTestMapped(x, y);
         const hovered = if (hit) |h| h.node else null;
-        if (hovered != self.hovered) {
-            if (self.hovered) |h| _ = sendPointer(h, .{ .phase = .leave, .x = x, .y = y, .raw_x = x, .raw_y = y, .pointer = 0, .time_ms = 0 });
-            self.hovered = hovered;
+        const old = self.hoveredNode(); // a dead id resolves null — no .leave for it
+        if (hovered != old) {
+            if (old) |h| _ = sendPointer(h, .{ .phase = .leave, .x = x, .y = y, .raw_x = x, .raw_y = y, .pointer = 0, .time_ms = 0 });
+            self.hovered = if (hovered) |h| h.ref() else null;
             if (hit) |h| _ = sendPointer(h.node, .{ .phase = .enter, .x = h.x, .y = h.y, .raw_x = x, .raw_y = y, .pointer = 0, .time_ms = 0 });
         } else if (send_move) {
             if (hit) |h| _ = sendPointer(h.node, .{ .phase = .hover_move, .x = h.x, .y = h.y, .raw_x = x, .raw_y = y, .pointer = 0, .time_ms = 0 });
@@ -365,7 +375,7 @@ pub const InputRouter = struct {
         // bounds) must receive wheel events like they receive hovers —
         // plain hitTest can't reach them, so the wheel would scroll the
         // page behind the popup.
-        const hit = if (self.open_popup) |popup|
+        const hit = if (self.openPopupNode()) |popup|
             (hitPopupOrRoot(root, popup, ev.x, ev.y) orelse return).node
         else
             root.hitTest(ev.x, ev.y) orelse return;
@@ -376,16 +386,29 @@ pub const InputRouter = struct {
         // The previously focused node's focus styling (caret, focus border,
         // unfloated label) must repaint — dirty it (its damage_overflow
         // covers paint outside its bounds, e.g. a text field's cutout label).
-        if (self.focused) |old| if (old != node) {
+        if (self.focusedNode()) |old| if (old != node) {
             if (old.vtable.on_blur) |b| b(old);
             old.markDirty();
         };
-        self.focused = node;
+        self.focused = if (node) |n| n.ref() else null;
     }
 
-    /// The node currently hovered by the primary (mouse) pointer, if any.
+    /// The node currently hovered by the primary (mouse) pointer, if any
+    /// (a destroyed hover target resolves null).
     pub fn hoveredNode(self: *InputRouter) ?*Node {
-        return self.hovered;
+        return if (self.hovered) |id| node_mod.resolve(id) else null;
+    }
+
+    /// The node currently holding keyboard focus, if any (a destroyed
+    /// focus target resolves null).
+    pub fn focusedNode(self: *InputRouter) ?*Node {
+        return if (self.focused) |id| node_mod.resolve(id) else null;
+    }
+
+    /// The open popup node, if any (a destroyed popup resolves null — the
+    /// stale barrier slot is inert and the next setOpenPopup replaces it).
+    pub fn openPopupNode(self: *InputRouter) ?*Node {
+        return if (self.open_popup) |id| node_mod.resolve(id) else null;
     }
 
     /// Clear the hover (the pointer is over a devtools panel, not the tree).
@@ -396,7 +419,7 @@ pub const InputRouter = struct {
     pub fn clearHover(self: *InputRouter) void {
         node_mod.traversalBegin();
         defer node_mod.traversalEnd();
-        if (self.hovered) |h| {
+        if (self.hoveredNode()) |h| {
             _ = sendPointer(h, .{ .phase = .leave, .x = self.last_x, .y = self.last_y, .raw_x = self.last_x, .raw_y = self.last_y, .pointer = 0, .time_ms = 0 });
         }
         self.hovered = null;
@@ -412,24 +435,30 @@ pub const InputRouter = struct {
         const live_parent: ?*Node = if (parent) |p| (if (p.zombie or p.torn_down) null else p) else null;
         for (&self.captured) |*slot| {
             if (slot.*) |*c| {
-                if (isDescendant(c.node, node)) {
-                    if (live_parent) |p| c.node = p else slot.* = null;
+                // A dead capture id can't dangle (resolve → null) and can't
+                // match the detaching subtree — skip it.
+                const captured = node_mod.resolve(c.node_id) orelse continue;
+                if (isDescendant(captured, node)) {
+                    if (live_parent) |p| c.node_id = p.ref() else slot.* = null;
                 }
             }
         }
     }
 
-    /// Release every reference to a node being destroyed. No GC: widgets with
-    /// input handlers call this from their deinit (dangling pointers are fatal).
+    /// Release every reference to a node being destroyed. The stored ids
+    /// are weak — a dead node already resolves null — so this is eager
+    /// hygiene: freeing the slots keeps gesture/poll state tidy (and
+    /// widgets may still call it from their deinit).
     pub fn releaseNode(self: *InputRouter, node: *Node) void {
+        const id = node.ref();
         for (&self.captured) |*slot| {
             if (slot.*) |c| {
-                if (c.node == node) slot.* = null;
+                if (c.node_id == id) slot.* = null;
             }
         }
-        if (self.hovered == node) self.hovered = null;
-        if (self.focused == node) self.focused = null;
-        if (self.open_popup == node) self.open_popup = null;
+        if (self.hovered == id) self.hovered = null;
+        if (self.focused == id) self.focused = null;
+        if (self.open_popup == id) self.open_popup = null;
     }
 };
 
@@ -587,11 +616,11 @@ pub fn requestFocus(node: ?*Node) void {
 }
 
 pub fn isFocused(node: *Node) bool {
-    return if (current_router) |r| r.focused == node else false;
+    return if (current_router) |r| r.focusedNode() == node else false;
 }
 
 pub fn setOpenPopup(node: ?*Node) void {
-    if (current_router) |r| r.open_popup = node;
+    if (current_router) |r| r.open_popup = if (node) |n| n.ref() else null;
 }
 
 pub fn releaseNode(node: *Node) void {
@@ -750,7 +779,7 @@ test "clearHover sends a leave to the hovered node before clearing" {
     root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
     var router = InputRouter{};
     router.dispatchPointer(root, .{ .phase = .move, .x = 50, .y = 50 }); // enter
-    try std.testing.expect(router.hovered == root);
+    try std.testing.expect(router.hoveredNode() == root);
     router.clearHover();
     try std.testing.expect(router.hoveredNode() == null);
     const log = recState(root).log.items;
@@ -925,7 +954,7 @@ test "click outside an open popup closes it and is consumed (barrier)" {
     popup.layout(.{ .x = 0, .y = 0, .w = 50, .h = 100 });
     other.layout(.{ .x = 50, .y = 0, .w = 50, .h = 100 });
     var router = InputRouter{};
-    router.open_popup = popup;
+    router.open_popup = popup.ref();
     // Click on `other`: popup gets outside_down, other gets nothing.
     router.dispatchPointer(root, .{ .phase = .down, .x = 80, .y = 10 });
     try std.testing.expectEqual(@as(usize, 1), recState(popup).log.items.len);
@@ -944,17 +973,47 @@ test "releaseNode clears every router reference to the node" {
     var router = InputRouter{};
     // hover first (a move with no capture updates hovered)
     router.dispatchPointer(root, .{ .phase = .move, .x = 10, .y = 10 });
-    try std.testing.expect(router.hovered == root);
+    try std.testing.expect(router.hoveredNode() == root);
     // then capture (a down while hovering)
     router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 });
     try std.testing.expect(router.capturedNode(0) == root);
     router.focus(root);
-    router.open_popup = root;
+    router.open_popup = root.ref();
     router.releaseNode(root);
     try std.testing.expect(router.capturedNode(0) == null);
     try std.testing.expect(router.hovered == null);
     try std.testing.expect(router.focused == null);
     try std.testing.expect(router.open_popup == null);
+}
+
+test "a destroyed node's weak refs resolve dead — capture, hover, focus, popup" {
+    const root = try recNode(std.testing.allocator, true);
+    defer root.deinit();
+    const child = try recNode(std.testing.allocator, true);
+    root.add(child);
+    root.layout(.{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    child.layout(.{ .x = 0, .y = 0, .w = 50, .h = 50 });
+    // Not setCurrent: deinit's releaseNode cannot reach this router — the
+    // weak ids alone must keep the slots safe.
+    var router = InputRouter{};
+    router.dispatchPointer(root, .{ .phase = .move, .x = 10, .y = 10 }); // hover the child
+    router.dispatchPointer(root, .{ .phase = .down, .x = 10, .y = 10 }); // capture it
+    router.focus(child);
+    router.open_popup = child.ref();
+    try std.testing.expect(router.capturedNode(0) == child);
+    try std.testing.expect(router.hoveredNode() == child);
+    _ = root.remove(child);
+    child.deinit();
+    // Every slot resolves dead instead of dangling.
+    try std.testing.expect(router.capturedNode(0) == null);
+    try std.testing.expect(router.hoveredNode() == null);
+    try std.testing.expect(router.focusedNode() == null);
+    try std.testing.expect(router.openPopupNode() == null);
+    // And dispatch no longer delivers into the dead node: the .up falls
+    // through to a fresh hit-test (root, not the freed child).
+    router.dispatchPointer(root, .{ .phase = .up, .x = 10, .y = 10 });
+    const log = recState(root).log.items;
+    try std.testing.expectEqual(PointerPhase.up, log[log.len - 1]);
 }
 
 test "multiple pointers are captured independently (multi-touch)" {
@@ -1239,12 +1298,12 @@ test "process-global wrappers: requestFocus/isFocused/setOpenPopup/releaseNode" 
     try std.testing.expect(current() == &router);
     try std.testing.expect(!isFocused(root));
     requestFocus(root);
-    try std.testing.expect(router.focused == root);
+    try std.testing.expect(router.focusedNode() == root);
     try std.testing.expect(isFocused(root));
     requestFocus(null);
     try std.testing.expect(router.focused == null);
     setOpenPopup(root);
-    try std.testing.expect(router.open_popup == root);
+    try std.testing.expect(router.openPopupNode() == root);
     setOpenPopup(null);
     try std.testing.expect(router.open_popup == null);
     // releaseNode through the global clears capture/hover/focus

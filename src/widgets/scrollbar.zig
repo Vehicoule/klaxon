@@ -60,6 +60,10 @@ fn styleOfOpts(opts: ScrollbarOptions) theme_mod.ScrollbarStyle {
 const ScrollbarState = struct {
     opts: ScrollbarOptions,
     node: *Node,
+    /// Weak id for opts.scroll: the scrollable is a SIBLING — the tree owns
+    /// it, not the scrollbar — and it may be destroyed first (a page
+    /// rebuild), so the stored target resolves per use instead of dangling.
+    scroll_id: u64,
     dragging: bool = false,
     /// Last offset seen by the tracker ticker — the thumb follows the
     /// scrollable's offset changes even when the scrollable (a sibling)
@@ -83,6 +87,12 @@ fn widthOf(s: *const ScrollbarState) f32 {
     return s.opts.width orelse s.opts.theme.platform.scrollbar_width;
 }
 
+/// The scrollable the scrollbar drives — null once it is destroyed (a
+/// dead scrollbar inerts: no hit zone, no thumb, no scroll forwarding).
+fn scrollOf(s: *const ScrollbarState) ?*Node {
+    return ui.node.resolve(s.scroll_id);
+}
+
 /// The track rect in parent space: the node's bounds (classic/auto_hide) or
 /// the parent's right edge (overlay — the scrollbar floats over the content
 /// and takes no layout space).
@@ -96,9 +106,10 @@ fn trackRect(s: *const ScrollbarState, n: *Node) Rect {
 
 fn scrollbarHitBounds(n: *Node) Rect {
     const s = stateOf(ScrollbarState, n);
-    // nothing to scroll: an empty hit zone — the overlay never intercepts
-    // the content's clicks
-    if (!s.opts.scroll.vtable.scroll_info.?(s.opts.scroll).canScroll()) return .{};
+    // nothing to scroll (or a dead scrollable): an empty hit zone — the
+    // overlay never intercepts the content's clicks
+    const scroll = scrollOf(s) orelse return .{};
+    if (!scroll.vtable.scroll_info.?(scroll).canScroll()) return .{};
     return trackRect(s, n);
 }
 
@@ -117,7 +128,7 @@ fn damageSb(s: *ScrollbarState) void {
 /// forward it to the scrollable (the strip floats over the content).
 fn scrollbarOnScroll(n: *Node, ev: input.ScrollEvent) bool {
     const s = stateOf(ScrollbarState, n);
-    const scroll = s.opts.scroll;
+    const scroll = scrollOf(s) orelse return false;
     if (scroll.vtable.on_scroll) |h| return h(scroll, ev);
     return false;
 }
@@ -129,7 +140,8 @@ fn scrollbarOnScroll(n: *Node, ev: input.ScrollEvent) bool {
 /// fires the idle hide timer.
 fn sbTickCb(userdata: ?*anyopaque, now_ms: u64) void {
     const s: *ScrollbarState = @ptrCast(@alignCast(userdata.?));
-    const info = s.opts.scroll.vtable.scroll_info.?(s.opts.scroll);
+    const scroll = scrollOf(s) orelse return; // dead scrollable: inert ticker
+    const info = scroll.vtable.scroll_info.?(scroll);
     if (info.offset != s.last_offset) {
         s.last_offset = info.offset;
         damageSb(s);
@@ -165,7 +177,8 @@ fn ensureTicker(s: *ScrollbarState) void {
 }
 
 fn thumbRect(s: *const ScrollbarState, b: Rect) Rect {
-    const info = s.opts.scroll.vtable.scroll_info.?(s.opts.scroll);
+    const scroll = scrollOf(s) orelse return .{};
+    const info = scroll.vtable.scroll_info.?(scroll);
     const track_h = b.h;
     var thumb_h = track_h * info.thumbFraction();
     thumb_h = @max(thumb_h, @min(s.opts.min_thumb, track_h));
@@ -188,7 +201,8 @@ fn scrollbarLayout(n: *Node, bounds: Rect) void {
 fn scrollbarPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(ScrollbarState, n);
     ensureTicker(s); // thumb tracking starts when the bar is on screen
-    const info = s.opts.scroll.vtable.scroll_info.?(s.opts.scroll);
+    const scroll = scrollOf(s) orelse return; // dead scrollable: nothing to paint
+    const info = scroll.vtable.scroll_info.?(scroll);
     if (!info.canScroll()) return; // nothing to scroll: no thumb
     const style = styleOf(s);
     if (style == .classic) {
@@ -214,7 +228,7 @@ fn scrollbarPaint(n: *Node, ctx: *kx.Ctx) void {
 fn scrollbarOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(ScrollbarState, n);
     const b = trackRect(s, n);
-    const scroll = s.opts.scroll;
+    const scroll = scrollOf(s) orelse return false;
     switch (ev.phase) {
         .down => {
             if (styleOf(s) != .classic) showSb(s, ev.time_ms); // drag activity shows it
@@ -347,12 +361,13 @@ pub fn scrollbar(allocator: std.mem.Allocator, opts: ScrollbarOptions) !*Node {
     s.* = .{
         .opts = opts,
         .node = node,
+        .scroll_id = opts.scroll.ref(),
         .shown = styleOfOpts(opts) == .classic,
         .alpha = if (styleOfOpts(opts) == .classic) 1 else 0,
     };
-    // Track the scrollable's offset: the thumb repaints when it moves.
-    // (The scrollbar must not outlive its scrollable — the ticker borrows it,
-    // same convention as the dropdown's borrowed menu-item labels.)
+    // Track the scrollable's offset: the thumb repaints when it moves. The
+    // scrollable is a weak id — the ticker simply goes inert once it dies
+    // (the docs used to require the scrollbar die first).
     ensureTicker(s);
     node.state = s;
     return node;

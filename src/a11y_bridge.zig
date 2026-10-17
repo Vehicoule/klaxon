@@ -367,14 +367,14 @@ test "kx_a11y_focus_node: VoiceOver focus moves Klaxon's focus to the node" {
 
     const root_any: ?*anyopaque = @ptrCast(root);
     kx_a11y_focus_node(root_any, @intFromPtr(btn));
-    try std.testing.expect(fm.focused == btn);
-    try std.testing.expect(router.focused == btn);
+    try std.testing.expect(fm.focusedNode() == btn);
+    try std.testing.expect(router.focusedNode() == btn);
 
     // Unknown ptr / null root: no-op.
     kx_a11y_focus_node(root_any, 0xDEAD_BEEF);
-    try std.testing.expect(fm.focused == btn);
+    try std.testing.expect(fm.focusedNode() == btn);
     kx_a11y_focus_node(null, @intFromPtr(btn));
-    try std.testing.expect(fm.focused == btn);
+    try std.testing.expect(fm.focusedNode() == btn);
 }
 
 test "kx_a11y_activate_node: double-tap synthesizes down+up at the node's center" {
@@ -576,7 +576,7 @@ test "dispatchAtAction: marshalled codes drive focus + activate on this thread" 
 
     const root_any: ?*anyopaque = @ptrCast(root);
     dispatchAtAction(AT_ACTION_FOCUS, root_any, @intFromPtr(btn));
-    try std.testing.expect(fm.focused == btn);
+    try std.testing.expect(fm.focusedNode() == btn);
     dispatchAtAction(AT_ACTION_ACTIVATE, root_any, @intFromPtr(btn));
     try std.testing.expectEqual(@as(u32, 1), clicks.*);
     dispatchAtAction(99, root_any, @intFromPtr(btn)); // unknown code: no-op

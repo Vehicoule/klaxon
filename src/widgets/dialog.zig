@@ -126,7 +126,10 @@ const DialogState = struct {
     anim_channel: u8 = 0, // channel marker (stable address)
     back_registered: bool = false, // on the router's modal back stack while open
     i18n: ?*i18n_mod.I18n = null,
-    saved_focus: ?*Node = null,
+    /// Weak id of the node holding keyboard focus when the dialog opened —
+    /// restored on close while it is still in the tree (a destroyed node
+    /// resolves null → no restore).
+    saved_focus: ?u64 = null,
     focus_saved: bool = false,
 };
 
