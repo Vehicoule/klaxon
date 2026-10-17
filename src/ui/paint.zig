@@ -314,10 +314,12 @@ pub fn textLayoutCaretRect(l: *TextLayout, pos: i32, out: *[4]f32) bool {
 /// Per-run glyph boxes covering the UTF-16 range [lo, hi) (ABI 0.24.0) —
 /// the selection highlight. A range crossing a bidi boundary yields one
 /// box per run, so callers fill a rect per entry rather than spanning
-/// min..max. `out` receives {x,y,w,h} quads; returns the box count
-/// (≤ out.len) or null when the paragraph could not be built.
+/// min..max. `out` receives {x,y,w,h} quads; an EMPTY `out` is the
+/// sizing call — the return is the total box count (long selections
+/// allocate a second pass). Returns the box count (≤ out.len when
+/// out.len > 0) or null when the paragraph could not be built.
 pub fn textLayoutRectsForRange(l: *TextLayout, lo: i32, hi: i32, out: [][4]f32) ?usize {
-    const n = kx.c.kx_text_rects_for_range(l, lo, hi, @ptrCast(out.ptr), @intCast(out.len));
+    const n = kx.c.kx_text_rects_for_range(l, lo, hi, if (out.len == 0) null else @ptrCast(out.ptr), @intCast(out.len));
     if (n < 0) return null;
     return @intCast(n);
 }

@@ -1,14 +1,18 @@
-// TextEdit — the shared single-line editing core for the text widgets
+// TextEdit — the shared editing core for the text widgets
 // (text_field, search_bar, search_view): the null-terminated UTF-8 buffer,
 // the IME composition (preedit) buffer, the caret/selection model, the
 // 500ms blink ticker, and the editing operations — insert at caret, range
 // deletes, grapheme-cluster arrows/home/end, Cmd/Ctrl+A/C/X/V chords.
+// `multiline` + `wrap_width` (owned by the widget) turn on soft-wrap hit
+// geometry, up/down line motion with a sticky column and line-relative
+// home/end; the single-line widgets leave both at their defaults.
 //
 // The widget owns the GEOMETRY (where the run paints → `caretAt`'s
 // run origin) and the edit follow-ups (layout dirty, signal mirror, a11y
 // notify, on_changed) through the `apply_edit` callback — this module owns
 // the buffer/offsets/blink that must behave identically everywhere.
 const std = @import("std");
+const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 
@@ -60,6 +64,22 @@ pub const Edit = struct {
     hit_key: u64 = 0,
     hit_size: f32 = 0,
     hit_rtl: bool = false,
+    /// Multiline mode — the owning widget sets it before events/paint:
+    /// paste keeps line breaks, the hit layout wraps at `wrap_width`,
+    /// arrows gain up/down line motion and home/end go line-relative.
+    multiline: bool = false,
+    /// The wrap width the hit layout builds at — 0 = unconstrained (the
+    /// single-line widgets). The owner syncs it to the painted text
+    /// width so hit geometry agrees with the wrap on screen.
+    wrap_width: f32 = 0,
+    hit_wrap: f32 = 0,
+    /// The sticky column consecutive up/down arrows aim at — the caret
+    /// x the motion started from (Compose's vertical-motion x). Cleared
+    /// by every non-vertical key and by taps.
+    v_motion_x: ?f32 = null,
+    /// Horizontal scroll offset for single-line text fields when the text
+    /// exceeds the visible clip width (keeps the caret inside the viewport).
+    scroll_x: f32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) Edit {
         return .{
@@ -77,6 +97,32 @@ pub const Edit = struct {
         if (e.hit_layout) |l| ui.paint.textLayoutDestroy(l);
         e.buf.deinit();
         e.comp.deinit();
+    }
+
+    /// Clear any active IME preedit composition (e.g. on blur, Escape, or
+    /// programmatic text replacement).
+    pub fn clearComposition(e: *Edit) void {
+        if (e.comp.items.len == 0 and e.comp_cursor == 0) return;
+        e.comp.clearRetainingCapacity();
+        e.comp_cursor = 0;
+        setSentinel(&e.comp);
+        if (e.node) |n| n.markDirty();
+    }
+
+    /// Update `scroll_x` so the caret `[caret_rel_x, caret_rel_x + caret_w]`
+    /// stays visible inside a viewport of width `clip_w` for a run of width `total_w`.
+    pub fn updateScroll(e: *Edit, caret_rel_x: f32, caret_w: f32, total_w: f32, clip_w: f32) void {
+        if (clip_w <= 0) {
+            e.scroll_x = 0;
+            return;
+        }
+        const max_scroll = @max(@as(f32, 0), total_w + caret_w - clip_w);
+        if (caret_rel_x < e.scroll_x) {
+            e.scroll_x = caret_rel_x;
+        } else if (caret_rel_x + caret_w > e.scroll_x + clip_w) {
+            e.scroll_x = caret_rel_x + caret_w - clip_w;
+        }
+        e.scroll_x = std.math.clamp(e.scroll_x, 0, max_scroll);
     }
 
     /// The committed text (borrowed, null-terminated).
@@ -126,6 +172,7 @@ pub const Edit = struct {
         e.buf.items.len -= hi - lo;
         e.caret = lo;
         e.sel_anchor = lo;
+        e.v_motion_x = null; // an edit re-seats the caret — the column resets
         setSentinel(&e.buf);
     }
 
@@ -182,6 +229,7 @@ pub const Edit = struct {
             return;
         }
         e.drag_word = false;
+        e.v_motion_x = null; // a tap re-seats the caret — the column resets
         e.moveCaret(off, false);
     }
 
@@ -245,6 +293,7 @@ pub const Edit = struct {
         e.buf.items.len += ins.len;
         e.caret = at + ins.len;
         e.sel_anchor = e.caret; // inserted text is not left selected
+        e.v_motion_x = null;
         setSentinel(&e.buf);
         return true;
     }
@@ -304,10 +353,19 @@ pub const Edit = struct {
                 return true;
             },
             .key_down => {
+                // The sticky vertical-motion column survives only across
+                // consecutive up/down presses.
+                if (ev.key != .up and ev.key != .down) e.v_motion_x = null;
                 // Clipboard + select-all chords (Cmd on Apple, Ctrl
                 // elsewhere — the platform's shortcut modifier arrives as
                 // `ev.command`).
                 if (ev.command) {
+                    // Cmd/Ctrl+Home/End reach the document edges under
+                    // multiline (single-line home/end already do).
+                    if (e.multiline and (ev.key == .home or ev.key == .end)) {
+                        e.moveCaret(if (ev.key == .home) 0 else e.buf.items.len, ev.shift);
+                        return true;
+                    }
                     const sel = e.selRange();
                     switch (ev.chr) {
                         'a' => { // select all: anchor start, caret end
@@ -334,14 +392,26 @@ pub const Edit = struct {
                             if (clip.len == 0) return true;
                             // Single-line: line terminators don't paste
                             // (upstream filters them through the IME path).
+                            // Multiline keeps them — normalized to '\n'
+                            // so the buffer carries one line ending.
                             var scratch: ?[]u8 = null;
                             defer if (scratch) |b| n.allocator.free(b);
                             var ins: []const u8 = clip;
                             if (std.mem.indexOfAny(u8, clip, "\r\n") != null) {
                                 const b = n.allocator.alloc(u8, clip.len) catch @panic("klaxon: out of memory");
                                 var w: usize = 0;
-                                for (clip) |ch| {
-                                    if (ch == '\r' or ch == '\n') continue;
+                                var i: usize = 0;
+                                while (i < clip.len) : (i += 1) {
+                                    const ch = clip[i];
+                                    if (ch == '\n') {
+                                        if (!e.multiline) continue;
+                                    } else if (ch == '\r') {
+                                        if (!e.multiline) continue;
+                                        if (i + 1 < clip.len and clip[i + 1] == '\n') i += 1;
+                                        b[w] = '\n';
+                                        w += 1;
+                                        continue;
+                                    }
                                     b[w] = ch;
                                     w += 1;
                                 }
@@ -429,12 +499,30 @@ pub const Edit = struct {
                         e.moveCaret(e.visualStep(1, size), ev.shift);
                         return true;
                     },
+                    // Vertical line motion — the sticky column (v_motion_x)
+                    // aims at the caret x the run started from so jagged
+                    // lines don't drift the caret left/right; an open
+                    // selection keeps its anchor under shift.
+                    .up => {
+                        if (e.multiline) {
+                            e.moveCaret(e.lineStep(-1, size), ev.shift);
+                            return true;
+                        }
+                    },
+                    .down => {
+                        if (e.multiline) {
+                            e.moveCaret(e.lineStep(1, size), ev.shift);
+                            return true;
+                        }
+                    },
                     .home => {
-                        e.moveCaret(e.visualEdge(0, e.buf.items.len, -1, size), ev.shift);
+                        const pos = if (e.multiline) e.lineEdge(-1, size) else e.visualEdge(0, e.buf.items.len, -1, size);
+                        e.moveCaret(pos, ev.shift);
                         return true;
                     },
                     .end => {
-                        e.moveCaret(e.visualEdge(0, e.buf.items.len, 1, size), ev.shift);
+                        const pos = if (e.multiline) e.lineEdge(1, size) else e.visualEdge(0, e.buf.items.len, 1, size);
+                        e.moveCaret(pos, ev.shift);
                         return true;
                     },
                     else => {},
@@ -455,9 +543,11 @@ pub const Edit = struct {
         if (str.len == 0) return null;
         const key = std.hash.Wyhash.hash(0, str);
         const rtl = ui.paint.textDirectionRtl();
-        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size or e.hit_rtl != rtl) {
+        if (e.hit_layout == null or e.hit_key != key or e.hit_size != size or e.hit_rtl != rtl or e.hit_wrap != e.wrap_width) {
             if (e.hit_layout) |old| ui.paint.textLayoutDestroy(old);
-            const l = ui.paint.textLayoutBegin(0) orelse { // fields clip
+            // wrap_width constrains the layout — soft wraps hit-test
+            // where they paint; 0 stays unconstrained (single-line).
+            const l = ui.paint.textLayoutBegin(e.wrap_width) orelse {
                 e.hit_layout = null;
                 return null;
             };
@@ -466,6 +556,7 @@ pub const Edit = struct {
             e.hit_key = key;
             e.hit_size = size;
             e.hit_rtl = rtl;
+            e.hit_wrap = e.wrap_width;
         }
         return e.hit_layout;
     }
@@ -486,15 +577,22 @@ pub const Edit = struct {
         return utf16ToByteIndex(str, @intCast(pos));
     }
 
+    /// The caret's rect for `byte_off` in layout space — {x, top, 0, h}
+    /// where top/h bound the caret's LINE (the paragraph's caret rect),
+    /// direction-aware under RTL. null when the paragraph can't build.
+    pub fn caretRect(e: *Edit, byte_off: usize, size: f32) ?[4]f32 {
+        const l = e.hitLayout(size) orelse return null;
+        var r: [4]f32 = undefined;
+        if (!ui.paint.textLayoutCaretRect(l, byteToUtf16Index(e.text(), byte_off), &r)) return null;
+        return r;
+    }
+
     /// The caret's visual x for `byte_off` in layout space — the leading
     /// edge of the grapheme at that offset, direction-aware under RTL.
     /// null when the paragraph can't build; callers fall back to the
     /// prefix-width measure.
     pub fn caretX(e: *Edit, byte_off: usize, size: f32) ?f32 {
-        const l = e.hitLayout(size) orelse return null;
-        var r: [4]f32 = undefined;
-        if (!ui.paint.textLayoutCaretRect(l, byteToUtf16Index(e.text(), byte_off), &r)) return null;
-        return r[0];
+        return (e.caretRect(byte_off, size) orelse return null)[0];
     }
 
     /// The glyph boxes covering byte range [lo, hi) in layout space —
@@ -538,6 +636,52 @@ pub const Edit = struct {
         const lx = e.caretX(lo, size) orelse return if (dir < 0) lo else hi;
         const hx = e.caretX(hi, size) orelse return if (dir < 0) lo else hi;
         return if (dir < 0) (if (lx <= hx) lo else hi) else (if (lx >= hx) lo else hi);
+    }
+
+    /// The caret position one line up (dir < 0) or down (dir > 0),
+    /// aiming at the sticky column — the caret x the vertical run started
+    /// from (Compose's remembered x for line motion). First/last line
+    /// jumps to the document edge like every desktop editor; the
+    /// paragraph-less fallback does the same.
+    fn lineStep(e: *Edit, dir: i32, size: f32) usize {
+        const r = e.caretRect(e.caret, size) orelse {
+            e.v_motion_x = null;
+            return if (dir < 0) 0 else e.buf.items.len;
+        };
+        const aim = e.v_motion_x orelse r[0];
+        const l = e.hitLayout(size) orelse return e.caret;
+        // One pixel past the line box lands on the neighbour line.
+        const y = if (dir < 0) r[1] - 1 else r[1] + r[3] + 1;
+        const pos = ui.paint.textLayoutPositionAt(l, aim, y);
+        if (pos < 0) return e.caret;
+        const next = utf16ToByteIndex(e.text(), @intCast(pos));
+        e.v_motion_x = aim;
+        // The position query clamps onto the nearest line — landing on
+        // the caret's OWN line means there's no line in `dir`, so the
+        // caret goes to the document edge (Compose semantics).
+        if (e.caretRect(next, size)) |nr| {
+            if (nr[1] == r[1]) return if (dir < 0) 0 else e.buf.items.len;
+        }
+        return next;
+    }
+
+    /// The caret position at the caret's own line's edge — dir < 0 =
+    /// the line's start edge, dir > 0 = its end edge, in READING order
+    /// (multiline home/end; visual-left/right follows the base
+    /// direction — under RTL the line start sits on the right). The
+    /// position query at the line's mid-height and the wrap edge lands
+    /// on the boundary; a collapsed (unwrappable) layout falls back to
+    /// the document edges.
+    fn lineEdge(e: *Edit, dir: i32, size: f32) usize {
+        const r = e.caretRect(e.caret, size) orelse return if (dir < 0) 0 else e.buf.items.len;
+        const l = e.hitLayout(size) orelse return if (dir < 0) 0 else e.buf.items.len;
+        // The query clamps dx into the line, so an x past the far edge
+        // lands on the boundary — 1e9 stands in for "the end edge" under
+        // both constrained and unconstrained layouts.
+        const edge_x: f32 = if ((dir < 0) == ui.paint.textDirectionRtl()) 1e9 else 0;
+        const pos = ui.paint.textLayoutPositionAt(l, edge_x, r[1] + r[3] / 2);
+        if (pos < 0) return if (dir < 0) 0 else e.buf.items.len;
+        return utf16ToByteIndex(e.text(), @intCast(pos));
     }
 };
 
@@ -605,4 +749,137 @@ fn caretPendingCb(userdata: ?*anyopaque) bool {
     const e: *Edit = @ptrCast(@alignCast(userdata.?));
     const n = e.node orelse return false;
     return input.isFocused(n);
+}
+
+// --- tests ---
+
+fn testMeasure(_: *Node, _: ui.layout.Constraints) ui.layout.Size {
+    return .{ .w = 0, .h = 0 };
+}
+fn testLayout(_: *Node, _: ui.node.Rect) void {}
+fn testPaint(_: *Node, _: *kx.Ctx) void {}
+
+const test_vtable = ui.node.VTable{
+    .measure = testMeasure,
+    .layout = testLayout,
+    .paint = testPaint,
+};
+
+fn noopApplyEdit(_: *Node) void {}
+
+fn testEdit(a: std.mem.Allocator, text: [:0]const u8, wrap: f32) !struct { n: *Node, e: *Edit } {
+    const n = try Node.create(a, &test_vtable);
+    const e = try a.create(Edit);
+    e.* = Edit.init(a, n);
+    e.multiline = true;
+    e.wrap_width = wrap;
+    if (text.len > 0) {
+        e.buf.appendSlice(text) catch @panic("klaxon: out of memory");
+        setSentinel(&e.buf);
+        e.caret = e.buf.items.len;
+        e.sel_anchor = e.caret;
+    }
+    return .{ .n = n, .e = e };
+}
+
+fn freeTestEdit(a: std.mem.Allocator, n: *Node, e: *Edit) void {
+    e.deinit();
+    a.destroy(e);
+    n.deinit();
+}
+
+// "xx\nxxxxx\nxx": line 1 = [0,2], \n@2, line 2 = [3,8], \n@8, line 3 = [9,11].
+test "edit: multiline up/down ride the sticky column; home/end stay line-relative" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "xx\nxxxxx\nxx", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expectEqual(@as(usize, 11), e.caret);
+    // up from the end of "xx" (x ≈ 2 chars in) lands on line 2 at that
+    // column — "xx|xxx" → offset 5.
+    _ = e.handleKey(.{ .kind = .key_down, .key = .up }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 5), e.caret);
+    // a second up keeps the column onto line 1 — "xx" ends at 2.
+    _ = e.handleKey(.{ .kind = .key_down, .key = .up }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 2), e.caret);
+    // up on the first line jumps to the document edge.
+    _ = e.handleKey(.{ .kind = .key_down, .key = .up }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 0), e.caret);
+    // The sticky column survives the edge jump — down re-aims at the
+    // original x: 0 → "xx|xxx" (5) → the last line's end (11).
+    _ = e.handleKey(.{ .kind = .key_down, .key = .down }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 5), e.caret);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .down }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 11), e.caret);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .down }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 11), e.caret); // last line: already at the doc end
+    // home/end bound the caret's own line — "xxxxx" is [3, 8].
+    e.moveCaret(5, false);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .home }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 3), e.caret);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .end }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 8), e.caret);
+    // Cmd/Ctrl+home/end reach the document edges.
+    _ = e.handleKey(.{ .kind = .key_down, .key = .home, .command = true }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 0), e.caret);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .end, .command = true }, noopApplyEdit, size);
+    try std.testing.expectEqual(@as(usize, 11), e.caret);
+}
+
+test "edit: shift+down extends the selection across lines" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "aa\nbb", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    e.moveCaret(0, false);
+    _ = e.handleKey(.{ .kind = .key_down, .key = .down, .shift = true }, noopApplyEdit, 16);
+    const sel = e.selRange();
+    try std.testing.expectEqual(@as(usize, 0), sel.lo);
+    try std.testing.expectEqual(@as(usize, 3), sel.hi); // line 2's start
+}
+
+test "edit: multiline paste keeps newlines and normalizes CRLF/CR to LF" {
+    const a = std.testing.allocator;
+    const S = struct {
+        var slot: [256]u8 = undefined;
+        var len: usize = 0;
+        fn getImpl(al: std.mem.Allocator) ?[]u8 {
+            if (len == 0) return null;
+            return al.dupe(u8, slot[0..len]) catch null;
+        }
+        fn setImpl(text: []const u8) void {
+            len = @min(text.len, slot.len);
+            @memcpy(slot[0..len], text[0..len]);
+        }
+    };
+    ui.clipboard.install(.{ .get = S.getImpl, .set = S.setImpl });
+    defer ui.clipboard.install(.{});
+    ui.clipboard.set("a\r\nb\rc\nd");
+    const t = try testEdit(a, "", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    _ = t.e.handleKey(.{ .kind = .key_down, .key = .unknown, .chr = 'v', .command = true }, noopApplyEdit, 16);
+    try std.testing.expectEqualStrings("a\nb\nc\nd", t.e.text());
+    // A single-line edit still strips them.
+    const t2 = try testEdit(a, "", 0);
+    defer freeTestEdit(a, t2.n, t2.e);
+    t2.e.multiline = false;
+    _ = t2.e.handleKey(.{ .kind = .key_down, .key = .unknown, .chr = 'v', .command = true }, noopApplyEdit, 16);
+    try std.testing.expectEqualStrings("abcd", t2.e.text());
+}
+
+test "edit: caretRect reports the line box (top/height) on later lines" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, "aa\nbb", 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const r0 = t.e.caretRect(0, 16) orelse return error.TestUnexpectedResult;
+    const r1 = t.e.caretRect(4, 16) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r1[1] > r0[1]); // line 2 sits below line 1
+    try std.testing.expect(r1[3] > 0 and r0[3] > 0);
+    // A wrapped paragraph wraps: "aaaa..." at wrap < text width → taller layout.
+    const w = try testEdit(a, "a a a a a a a a a a", 30);
+    defer freeTestEdit(a, w.n, w.e);
+    const rl = w.e.caretRect(0, 16) orelse return error.TestUnexpectedResult;
+    const rr = w.e.caretRect(19, 16) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rr[1] > rl[1]); // the end caret sits on a later line
 }
