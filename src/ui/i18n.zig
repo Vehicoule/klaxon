@@ -80,6 +80,10 @@ pub const Locale = struct {
     // Static literals — sentinel-terminated for the text painter.
     weekday_short: [7][:0]const u8 = .{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" },
     weekday_letter: [7][:0]const u8 = .{ "S", "M", "T", "W", "T", "F", "S" },
+    // Day-period markers (CLDR dayPeriods abbreviated) — the AM/PM toggle
+    // in time pickers + 12h formatting.
+    am_label: []const u8 = "AM",
+    pm_label: []const u8 = "PM",
 
     pub fn init(allocator: std.mem.Allocator, tag: []const u8) !*Locale {
         const loc = try allocator.create(Locale);
@@ -370,6 +374,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "日", "月", "火", "水", "木", "金", "土" };
         loc.weekday_letter = .{ "日", "月", "火", "水", "木", "金", "土" };
+        loc.am_label = "午前";
+        loc.pm_label = "午後";
     } else if (std.mem.eql(u8, base, "ar")) {
         // CLDR ar numbers: Arabic-Indic digits, ٫ decimal, ٬ group, ٪ percent.
         loc.decimal_sep = "٫";
@@ -408,6 +414,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "أحد", "اثنين", "ثلاثاء", "أربعاء", "خميس", "جمعة", "سبت" };
         loc.weekday_letter = .{ "ح", "ن", "ث", "ر", "خ", "ج", "س" };
+        loc.am_label = "ص";
+        loc.pm_label = "م";
     } else if (std.mem.eql(u8, base, "es")) {
         // CLDR es: 1.234,56 — dates "d/M/yy", long form uses the quoted
         // literal 'de' ("7 de octubre de 2026").
@@ -445,6 +453,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "dom", "lun", "mar", "mié", "jue", "vie", "sáb" };
         loc.weekday_letter = .{ "D", "L", "M", "X", "J", "V", "S" };
+        loc.am_label = "a.m.";
+        loc.pm_label = "p.m.";
     } else if (std.mem.eql(u8, base, "de")) {
         // CLDR de: 1.234,56 — medium date is fully numeric.
         loc.decimal_sep = ",";
@@ -515,6 +525,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
         loc.weekday_letter = .{ "日", "一", "二", "三", "四", "五", "六" };
+        loc.am_label = "上午";
+        loc.pm_label = "下午";
     } else if (std.mem.eql(u8, base, "hi")) {
         // CLDR hi: Devanagari digits and Indian grouping (12,34,567).
         loc.group_first = 3;
@@ -552,6 +564,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "रवि", "सोम", "मंगल", "बुध", "गुरु", "शुक्र", "शनि" };
         loc.weekday_letter = .{ "र", "सो", "म", "बु", "गु", "शु", "श" };
+        loc.am_label = "पूर्वाह्न";
+        loc.pm_label = "अपराह्न";
     } else if (std.mem.eql(u8, base, "pt")) {
         // CLDR pt: 1.234,56 — 'de' literal like es.
         loc.decimal_sep = ",";
@@ -658,6 +672,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "일", "월", "화", "수", "목", "금", "토" };
         loc.weekday_letter = .{ "일", "월", "화", "수", "목", "금", "토" };
+        loc.am_label = "오전";
+        loc.pm_label = "오후";
     } else if (std.mem.eql(u8, base, "it")) {
         // CLDR it: 1.234,56.
         loc.decimal_sep = ",";
@@ -730,6 +746,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "zo", "ma", "di", "wo", "do", "vr", "za" };
         loc.weekday_letter = .{ "Z", "M", "D", "W", "D", "V", "Z" };
+        loc.am_label = "a.m.";
+        loc.pm_label = "p.m.";
     } else if (std.mem.eql(u8, base, "tr")) {
         // CLDR tr: 1.234,56.
         loc.decimal_sep = ",";
@@ -766,6 +784,8 @@ fn applyFormatData0(loc: *Locale) void {
         });
         loc.weekday_short = .{ "Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt" };
         loc.weekday_letter = .{ "P", "P", "S", "Ç", "P", "C", "C" };
+        loc.am_label = "ÖÖ";
+        loc.pm_label = "ÖS";
     }
     // en: defaults
 }
@@ -1294,6 +1314,25 @@ pub fn current() ?*I18n {
 pub fn direction() Direction {
     if (current_i18n) |i| return i.direction();
     return .ltr;
+}
+
+/// Resolve a message in the current locale — gettext-style msgid keys:
+/// the English literal IS the key, so an untranslated key (or no i18n at
+/// all) renders English and an app's ARB overrides it per locale.
+/// Widget built-ins resolve through this — the returned slice is
+/// catalog- or literal-owned (stable for the catalog's lifetime).
+pub fn tr(key: []const u8) []const u8 {
+    if (current_i18n) |i| return i.tr(key);
+    return key;
+}
+
+/// The active locale's day-period markers (CLDR) — the AM/PM toggle in
+/// pickers + 12h formatting. English when no i18n is installed.
+pub fn amPm() struct { am: []const u8, pm: []const u8 } {
+    if (current_i18n) |i| {
+        if (i.locale()) |loc| return .{ .am = loc.am_label, .pm = loc.pm_label };
+    }
+    return .{ .am = "AM", .pm = "PM" };
 }
 
 /// Push the process-global direction into the paragraph engine — the bidi

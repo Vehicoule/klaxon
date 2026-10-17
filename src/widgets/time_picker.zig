@@ -73,13 +73,11 @@
 // Default: shown in input mode only.
 //
 // Remaining deviations (documented, fixed later):
-//   - en strings only ("AM"/"PM", "Hour"/"Minute", the error texts,
-//     Cancel/OK).
 //   - The input variant ports the CLASSIC TimeInput (shapes == null): the
 //     vibrant/uncontained styles (100x120 CornerFull fields, the side
 //     control column) are not.
-//   - The supporting texts are hand-wrapped fixed strings (en-only); no
-//     real text wrap, and no liveRegion announce on the error text.
+//   - The supporting texts are hand-wrapped fixed strings; no real text
+//     wrap, and no liveRegion announce on the error text.
 //   - Upstream suppresses the auto-advance while an a11y service is
 //     enabled (a11yServicesEnabled); we have no equivalent query, so the
 //     advance always runs.
@@ -94,6 +92,7 @@ const ui = @import("../ui.zig");
 const input = @import("../ui/input.zig");
 const gestures = @import("../ui/gestures.zig");
 const theme_mod = @import("../theme.zig");
+const i18n_mod = @import("../ui/i18n.zig");
 const text_edit = @import("text_edit.zig");
 const icon_w = @import("icon.zig");
 const golden = @import("../golden.zig"); // tests
@@ -598,6 +597,10 @@ const TpState = struct {
     /// buffers, which reallocate on edits).
     field_sem_bufs: [2][8]u8 = .{ std.mem.zeroes([8]u8), std.mem.zeroes([8]u8) },
     field_sem_lens: [2]usize = .{ 0, 0 },
+    /// The installed i18n (null when the app runs without one) — the
+    /// widget subscribes to locale_sig: a locale switch repaints the
+    /// tr()-routed labels and rebuilds the a11y tree's strings.
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *TpState {
@@ -702,8 +705,8 @@ fn footerRects(n: *Node) FooterRects {
     const s = stateOf(n);
     const ls = s.opts.theme.type_scale.label_large;
     const bold = ls.weight >= 500;
-    const ok_m = ui.paint.measureText("OK", ls.size, bold);
-    const cancel_m = ui.paint.measureText("Cancel", ls.size, bold);
+    const ok_m = ui.paint.measureTextLen(i18n_mod.tr("OK"), ls.size, bold);
+    const cancel_m = ui.paint.measureTextLen(i18n_mod.tr("Cancel"), ls.size, bold);
     const ok_w = ok_m.width + 2 * footer_pad_x;
     const cancel_w = cancel_m.width + 2 * footer_pad_x;
     const right = n.bounds.x + n.bounds.w - footer_pad_bottom;
@@ -761,7 +764,7 @@ fn tpLayout(n: *Node, bounds: Rect) void {
     _ = bounds; // leaf: the chrome is computed from the bounds at paint/hit
 }
 
-fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, zone: Zone) void {
+fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, zone: Zone) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const hover = std.meta.eql(s.hover, zone);
@@ -772,13 +775,13 @@ fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, zone: Z
     }
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
-    const m = ui.paint.measureText(label, ls.size, bold);
-    ui.paint.text(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
+    const m = ui.paint.measureTextLen(label, ls.size, bold);
+    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
 }
 
 /// A time plate (96x80, CornerSmall): the active mode gets the
 /// PrimaryContainer fill + the 2dp Primary border + OnPrimaryContainer.
-fn paintPlate(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, active: bool, zone: Zone) void {
+fn paintPlate(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, active: bool, zone: Zone) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cs = t.colors;
@@ -793,8 +796,8 @@ fn paintPlate(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, active: bool
     }
     if (active) ui.paint.strokeRRect(ctx, r.x, r.y, r.w, r.h, plate_corner, plate_border, cs.primary);
     const dl = t.type_scale.display_large;
-    const m = ui.paint.measureText(label, dl.size, dl.weight >= 500);
-    ui.paint.text(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, dl.size, dl.weight >= 500, fg);
+    const m = ui.paint.measureTextLen(label, dl.size, dl.weight >= 500);
+    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, dl.size, dl.weight >= 500, fg);
 }
 
 /// A 24dp keyboard glyph (input variant → dial affordance) — a rounded
@@ -854,27 +857,28 @@ fn paintFooter(n: *Node, ctx: *kx.Ctx) void {
         }
     }
     const fr = footerRects(n);
-    paintTextButton(n, ctx, fr.cancel, "Cancel", .cancel);
-    paintTextButton(n, ctx, fr.ok, "OK", .ok);
+    paintTextButton(n, ctx, fr.cancel, i18n_mod.tr("Cancel"), .cancel);
+    paintTextButton(n, ctx, fr.ok, i18n_mod.tr("OK"), .ok);
 }
 
 /// The supporting text's line strings — "Hour"/"Minute" normally, the
 /// upstream error text when the field's input is invalid (hand-wrapped to
-/// the 96dp box; upstream minLines = 2).
-fn supportLine(s: *TpState, which: DialMode, line: usize) ?[:0]const u8 {
+/// the 96dp box; upstream minLines = 2). Localized through tr() — the
+/// English literal is the key (the app's ARB overrides per locale).
+fn supportLine(s: *TpState, which: DialMode, line: usize) ?[]const u8 {
     if (!fieldInvalid(s, which)) {
         if (line != 0) return null;
-        return if (which == .hour) "Hour" else "Minute";
+        return i18n_mod.tr(if (which == .hour) "Hour" else "Minute");
     }
     return switch (which) {
         .hour => switch (line) {
-            0 => "Hour must be",
-            1 => if (s.opts.is_24h) "between 0 and 23" else "between 1 and 12",
+            0 => i18n_mod.tr("Hour must be"),
+            1 => i18n_mod.tr(if (s.opts.is_24h) "between 0 and 23" else "between 1 and 12"),
             else => null,
         },
         .minute => switch (line) {
-            0 => "Minutes must be",
-            1 => "between 0 and 59",
+            0 => i18n_mod.tr("Minutes must be"),
+            1 => i18n_mod.tr("between 0 and 59"),
             else => null,
         },
     };
@@ -979,8 +983,8 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
     var line: usize = 0;
     while (supportLine(s, which, line)) |lbl| : (line += 1) {
         const sup = supportRect(n.bounds, which, s.opts.is_24h, line, t);
-        const lm = ui.paint.measureText(lbl, bs.size, bs_bold);
-        ui.paint.text(ctx, lbl, sup.x, sup.y + lm.ascent, bs.size, bs_bold, ink);
+        const lm = ui.paint.measureTextLen(lbl, bs.size, bs_bold);
+        ui.paint.textSlice(ctx, lbl, sup.x, sup.y + lm.ascent, bs.size, bs_bold, ink);
     }
 }
 
@@ -993,9 +997,10 @@ fn paintPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
     ui.paint.strokeRRect(ctx, pr.x, pr.y, pr.w, pr.h, plate_corner, 1, cs.outline);
     const half_h = pr.h / 2;
     const pm = isPm(tm);
-    const halves = [_]struct { zone: Zone, label: [:0]const u8, selected: bool, y: f32 }{
-        .{ .zone = .am, .label = "AM", .selected = !pm, .y = pr.y },
-        .{ .zone = .pm, .label = "PM", .selected = pm, .y = pr.y + half_h },
+    const ampm = i18n_mod.amPm();
+    const halves = [_]struct { zone: Zone, label: []const u8, selected: bool, y: f32 }{
+        .{ .zone = .am, .label = ampm.am, .selected = !pm, .y = pr.y },
+        .{ .zone = .pm, .label = ampm.pm, .selected = pm, .y = pr.y + half_h },
     };
     for (halves) |h| {
         // the half's corners: the toggle's rounded side only (AM = top,
@@ -1016,9 +1021,9 @@ fn paintPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
         }
         const tm_style = t.type_scale.title_medium;
         const bold = tm_style.weight >= 500;
-        const m = ui.paint.measureText(h.label, tm_style.size, bold);
+        const m = ui.paint.measureTextLen(h.label, tm_style.size, bold);
         const fg: Color = if (h.selected) cs.on_tertiary_container else cs.on_surface_variant;
-        ui.paint.text(ctx, h.label, pr.x + (pr.w - m.width) / 2, h.y + (half_h - m.height) / 2 + m.ascent, tm_style.size, bold, fg);
+        ui.paint.textSlice(ctx, h.label, pr.x + (pr.w - m.width) / 2, h.y + (half_h - m.height) / 2 + m.ascent, tm_style.size, bold, fg);
     }
     // the 1dp divider between the halves
     ui.paint.fillRect(ctx, pr.x, pr.y + half_h - 0.5, pr.w, 1, cs.outline);
@@ -1446,9 +1451,9 @@ fn refreshSemanticsChildren(n: *Node) void {
     if (s.variant != .input) return;
     const act = ui.semantics.Actions.initOne(.activate);
     var i: usize = 0;
-    const fields = [_]struct { which: DialMode, sel_label: [:0]const u8, field_label: [:0]const u8 }{
-        .{ .which = .hour, .sel_label = "Hour selection", .field_label = "for hour" },
-        .{ .which = .minute, .sel_label = "Minute selection", .field_label = "for minutes" },
+    const fields = [_]struct { which: DialMode, sel_label: []const u8, field_label: []const u8 }{
+        .{ .which = .hour, .sel_label = i18n_mod.tr("Hour selection"), .field_label = i18n_mod.tr("for hour") },
+        .{ .which = .minute, .sel_label = i18n_mod.tr("Minute selection"), .field_label = i18n_mod.tr("for minutes") },
     };
     for (fields) |f| {
         const selected = s.mode == f.which;
@@ -1460,13 +1465,14 @@ fn refreshSemanticsChildren(n: *Node) void {
     }
     if (!s.opts.is_24h) {
         const pm = committedPm(s);
-        s.sem_children[i] = .{ .role = .radio, .label = "AM", .checked = !pm, .actions = act };
+        const ampm = i18n_mod.amPm();
+        s.sem_children[i] = .{ .role = .radio, .label = ampm.am, .checked = !pm, .actions = act };
         i += 1;
-        s.sem_children[i] = .{ .role = .radio, .label = "PM", .checked = pm, .actions = act };
+        s.sem_children[i] = .{ .role = .radio, .label = ampm.pm, .checked = pm, .actions = act };
         i += 1;
     }
     if (showModeToggle(s)) {
-        s.sem_children[i] = .{ .role = .button, .label = "Switch to clock", .actions = act };
+        s.sem_children[i] = .{ .role = .button, .label = i18n_mod.tr("Switch to clock"), .actions = act };
         i += 1;
     }
     if (n.semantics) |sem| sem.children = s.sem_children[0..i];
@@ -1480,7 +1486,7 @@ fn attachSemantics(n: *Node) void {
     if (s.variant == .input) {
         ui.semantics.attach(n, .{
             .role = .group,
-            .label = "Time picker",
+            .label = i18n_mod.tr("Time picker"),
             .value = s.value_buf[0..s.value_len],
             .children = &.{},
             .child_bounds = tpChildBounds,
@@ -1489,7 +1495,7 @@ fn attachSemantics(n: *Node) void {
     } else {
         ui.semantics.attach(n, .{
             .role = .group,
-            .label = "Time picker",
+            .label = i18n_mod.tr("Time picker"),
             .value = s.value_buf[0..s.value_len],
         }); // the dial's original descriptor — unchanged
     }
@@ -1506,6 +1512,19 @@ fn tpSyncCb(userdata: ?*anyopaque) void {
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
 
+/// A locale switch: the tr()/amPm() strings re-resolve — repaint the
+/// labels, reformat the a11y value (the day-period literal is localized)
+/// and rebuild the virtual children's strings.
+fn tpLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    updateA11yValue(n); // the day-period literal localizes
+    // The root descriptor's label is tr()-resolved — re-attach (rebuilds
+    // the input variant's virtual children in the new locale).
+    attachSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
+
 /// "10:30 AM" (12h) / "22:30" (24h) — the a11y value + the gallery's time
 /// label (pub for the gallery: it matches what the picker displays).
 pub fn formatTime(t: i32, is_24h: bool, buf: []u8) [:0]const u8 {
@@ -1518,7 +1537,8 @@ pub fn formatTime(t: i32, is_24h: bool, buf: []u8) [:0]const u8 {
     var b2: [4]u8 = undefined;
     const h = std.fmt.bufPrintSentinel(&b1, "{d:0>2}", .{@as(u32, @intCast(hour12Of(t)))}, 0) catch "?";
     const m = std.fmt.bufPrintSentinel(&b2, "{d:0>2}", .{min}, 0) catch "?";
-    return std.fmt.bufPrintSentinel(buf, "{s}:{s} {s}", .{ h, m, if (isPm(t)) "PM" else "AM" }, 0) catch "?";
+    const ampm = i18n_mod.amPm();
+    return std.fmt.bufPrintSentinel(buf, "{s}:{s} {s}", .{ h, m, if (isPm(t)) ampm.pm else ampm.am }, 0) catch "?";
 }
 
 fn updateA11yValue(n: *Node) void {
@@ -1532,6 +1552,7 @@ fn updateA11yValue(n: *Node) void {
 fn tpDeinit(n: *Node) void {
     const s = stateOf(n);
     s.time.unsubscribe(.{ .callback = .{ .fn_ptr = tpSyncCb, .userdata = n } });
+    if (s.i18n) |i| i.locale_sig.unsubscribe(.{ .callback = .{ .fn_ptr = tpLocaleCb, .userdata = n } });
     input.releaseNode(n);
     s.hour_edit.deinit();
     s.minute_edit.deinit();
@@ -1603,6 +1624,8 @@ pub fn timePicker(allocator: std.mem.Allocator, time: *ui.state.Signal(i32), on_
     updateA11yValue(node);
     attachSemantics(node); // Phase 2c — the input variant adds its virtual children
     time.subscribe(.{ .callback = .{ .fn_ptr = tpSyncCb, .userdata = node } });
+    s.i18n = i18n_mod.current();
+    if (s.i18n) |i| i.locale_sig.subscribe(.{ .callback = .{ .fn_ptr = tpLocaleCb, .userdata = node } });
     return node;
 }
 
@@ -2218,6 +2241,49 @@ test "time_picker: the input variant — the a11y children carry the field value
     const hr = inputFieldRect(n.bounds, .hour, false);
     try std.testing.expectEqual(hr.x - n.bounds.x, hb.x);
     try std.testing.expectEqual(hr.y - n.bounds.y, hb.y);
+}
+
+test "time_picker: i18n — labels, the period toggle and the a11y value localize + re-resolve on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("es",
+        \\{"@@locale": "es", "Time picker": "Selector de hora", "Hour selection": "Selección de hora",
+        \\ "Minute selection": "Selección de minutos", "for hour": "para la hora",
+        \\ "Switch to clock": "Cambiar al reloj"}
+    , .ltr);
+    try i18n.setLocale("es");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const sig = try ui.state.Signal(i32).init(a, 810); // 13:30 = 1:30 PM
+    defer sig.deinit();
+    const n = try timePicker(a, sig, null, null, .{ .mode = .input });
+    defer n.deinit();
+    const s = stateOf(n);
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = inputTotalH(s.opts.theme) });
+    const sem = n.semantics.?;
+    // the root label + the virtual children resolve through tr()
+    try std.testing.expectEqualStrings("Selector de hora", sem.label);
+    try std.testing.expectEqualStrings("para la hora", sem.children[0].label);
+    try std.testing.expectEqualStrings("Selección de minutos", sem.children[1].label);
+    // the AM/PM halves come from the es day-period CLDR data
+    try std.testing.expectEqualStrings("a.m.", sem.children[2].label);
+    try std.testing.expectEqualStrings("p.m.", sem.children[3].label);
+    try std.testing.expectEqualStrings("Cambiar al reloj", sem.children[4].label);
+    // the a11y value's day-period literal localizes too
+    try std.testing.expectEqualStrings("01:30 p.m.", sem.value);
+    // support strings resolve in the active locale (untranslated → the en literal)
+    try std.testing.expectEqualStrings("Hour", supportLine(s, .hour, 0).?);
+    // a locale switch re-resolves: the children + the a11y value rebuild
+    try i18n.setLocale("en");
+    const sem2 = n.semantics.?; // re-attached by the locale callback
+    try std.testing.expectEqualStrings("Time picker", sem2.label);
+    try std.testing.expectEqualStrings("for hour", sem2.children[0].label);
+    try std.testing.expectEqualStrings("AM", sem2.children[2].label);
+    try std.testing.expectEqualStrings("PM", sem2.children[3].label);
+    try std.testing.expectEqualStrings("Switch to clock", sem2.children[4].label);
+    try std.testing.expectEqualStrings("01:30 PM", sem2.value);
 }
 
 test "golden: the input variant (editable box, borderless plate, period toggle, supporting text)" {

@@ -87,10 +87,14 @@ Each widget's header carries the same list; these are the tracked ones
   to just that char, a complete valid hour auto-advances, out-of-range
   values paint the error state without touching the signal); the other
   field is the borderless `TimeSelector` plate. `opts.mode_toggle` is the
-  footer dial⇄keyboard affordance (upstream's `toggle` slot). Remaining:
-  en-only strings; the classic (non-vibrant) `TimeInput` only — no
-  100x120 CornerFull style; supporting texts hand-wrapped (no real text
-  wrap, no liveRegion on the error text); the auto-advance always runs
+  footer dial⇄keyboard affordance (upstream's `toggle` slot). The labels,
+  error texts, AM/PM halves, Cancel/OK and the a11y strings localize via
+  `i18n.tr()` (English literals as msgid keys — the app's ARB overrides)
+  plus CLDR `am_label`/`pm_label` locale data; a locale switch re-resolves
+  and rebuilds the semantics tree. Remaining: the classic (non-vibrant)
+  `TimeInput` only — no 100x120 CornerFull style; supporting texts
+  hand-wrapped (no real text wrap, no liveRegion on the error text); the
+  auto-advance always runs
   (upstream suppresses it while an a11y service is enabled — no
   equivalent query here); Tab walks the fields only in tests — the host
   maps Tab to the global focus traversal, so in-app field navigation is
@@ -132,9 +136,9 @@ Each widget's header carries the same list; these are the tracked ones
   the double-tap window when `on_double_tap` exists.)
 - `i18n.zig` — number/date tables cover en/fr/ja/ar/es/de/zh/hi/pt/ru/ko/
   it/nl/tr, with CLDR plural rules (incl. ru's one/few/many and hi/pt's
-  0-or-1 `one`), Arabic-Indic and Devanagari digit sets and the Indian
-  3/2 grouping. The long tail of locales stays on the documented ICU
-  upgrade path. (The paragraph bidi base direction follows the locale —
+  0-or-1 `one`), Arabic-Indic and Devanagari digit sets, the Indian 3/2
+  grouping and CLDR day-period markers (`am_label`/`pm_label`). The long
+  tail of locales stays on the documented ICU upgrade path. (The paragraph bidi base direction follows the locale —
   fixed audit row above.)
 - `color_picker.zig` — no RGB/HSL inputs, no eyedropper. (The alpha slider
   shipped: checkerboard + gradient bar feeding the Signal's alpha byte.

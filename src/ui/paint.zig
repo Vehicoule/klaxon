@@ -162,6 +162,18 @@ pub fn text(ctx: *kx.Ctx, str: [:0]const u8, x: f32, baseline_y: f32, size: f32,
     kx.c.kx_draw_text_styled(ctx, str, x, baseline_y, size, bold, color);
 }
 
+/// Length-taking text draw — sentinel-less slices (tr() results, substrings
+/// of a field) stack-copy into a zero-terminated buffer before the ABI call.
+/// Strings beyond 1 KiB truncate (labels are far below that; a sentinel
+/// slice keeps the full path via text()).
+pub fn textSlice(ctx: *kx.Ctx, str: []const u8, x: f32, baseline_y: f32, size: f32, bold: bool, color: Color) void {
+    var buf: [1025]u8 = undefined;
+    const n = @min(str.len, 1024);
+    @memcpy(buf[0..n], str[0..n]);
+    buf[n] = 0;
+    kx.c.kx_draw_text_styled(ctx, buf[0..n :0], x, baseline_y, size, bold, color);
+}
+
 // --- Text metrics (layout-time; ctx-independent, fonts are process-global) ---
 
 /// Paragraph base direction (ABI 0.21.0) — process-global: the bidi base
