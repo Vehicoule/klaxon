@@ -6,6 +6,16 @@ from upstream Material 3 Expressive / platform behavior. Anything here is
 treated as bugs (see docs/M3E-PORT.md: "replace approximated draw/measure
 code; don't patch it").
 
+## Fixed in the 2026-10-17 technical audit ("Roast")
+
+See [`docs/DECISIONS.md`](file:///Users/btw/Documents/projects/Klaxon/docs/DECISIONS.md) for the full 6-part remediation record:
+- **Benchmark fairness**: removed forced static-scene repaints (`ro?.markNeedsPaint()` in Flutter, `view.update()`/`grabWindow()` in Qt), unified `shapes_ramp`/`paths_ramp`/`text_ramp`/`images_ramp` onto single-Canvas batching across Compose and Qt, removed the dead 230,400-byte CPU loop in Flutter `video_playback.dart`, and switched Klaxon's `runListOp` post-op frames to `paintDamage`.
+- **Binary size & WAMR**: guarded the 4.02 MB embedded `kx_font_wasm.h` array behind `#ifdef __EMSCRIPTEN__` with a runtime disk-asset fallback (`KLAXON_DEFAULT_FONT_PATH` / `assets/fonts/DejaVuSans.ttf`) for deterministic headless tests, and removed WAMR from `klaxon doctor` and `scripts/{fetch,check,pack}-deps.sh` per ADR-0006.
+- **Platform layer & C ABI**: added `src/platform/` (`storage/kv.zig`, `storage/paths.zig`, `net/http.zig`, `os/window_insets.zig`, `os/url.zig`, `os/haptics.zig`, `os/file_picker.zig`, `os/share.zig`, `os/notifications.zig`, `media/video.zig`, `runtime/plugin.zig`), `include/klaxon.h` + `src/c_abi.zig` with compile-time layout assertions, and `gates/thresholds.json`.
+- **GPU backends & HiDPI**: persisted `skgpu::graphite::Recorder` at context lifetime across Linux Vulkan, Windows Dawn/D3D12, and WebGPU (eliminating the per-frame `offscreen_pools`/`images`/`atlas` wipe in `kx_begin_frame`), unified root HiDPI scaling after `kx_begin_frame` across all platforms (fixing iOS 1× scale), scaled `kx_offscreen_acquire` by `display_scale`, shared a single `MTLCommandQueue` on iOS, fixed MRC `+1` leaks on macOS/iOS, fixed RTL sub-run ordering in `shape_line_runs`, fixed Linux `platform_font_mgr`/`platform_font_family`, and fixed the `kx_atlas_alloc` free-slot leak.
+- **6-platform accessibility & modal trapping**: fixed `kx_a11y_dump_tree`/`kx_a11y_free_string` capacity mismatch via `toOwnedSliceSentinel(0)`, trapped focus/semantics to open modals (`Dialog`, `Drawer`, `BottomSheet`, `SideSheet`), and overhauled all 6 native accessibility bridges (macOS, iOS, Android, Windows, Linux, Web).
+- **UI engine, M3E widgets, registry & build/CLI**: fixed `i18n.zig` cross-allocator free, `carousel.zig` `cancelChannel` UAF and keyline stack OOB, `list_view.zig`/`image.zig` `ctxSerialAlive` checks, `registry.zig` `BuildCtx.rollback` UAF + registered all 16 missing widgets, `text_field.zig`/`search_bar.zig` horizontal scroll + IME preedit reset + duplicate `errdefer`, `color_picker.zig` `#RRGGBB` alpha preservation, `anim.zig` scale guards, `node.zig` `.measure_pure = true` + `impure_descendant` recomputation + negative scale culling, `navigator.zig` query-string navigation + Hero transforms, `devtools.zig` `dt_ms` recording, and `build.zig` cross-target `mcu_sources` / `-Dapp-root`.
+
 ## Fixed in the 2026-10-16 audit
 
 | Finding | Fix |

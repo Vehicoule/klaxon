@@ -116,20 +116,20 @@ Each service: Zig interface in `klaxon/src/platform/` + native implementation pe
 ### `kx_skia/` — C++ shim (inside the framework)
 
 ```
+include/
+└── klaxon.h                    ← Canonical framework C ABI contract (ADR-0009)
 kx_skia/
-├── include/kx_skia.h           ← C ABI (103 lines, stable contract)
+├── include/kx_skia.h           ← Renderer C ABI (stable contract)
 └── src/
-    ├── kx_skia_common.cpp      ← Shared: KxFontMgr, contexts, surfaces, readback, paint, para, image, path
+    ├── kx_skia_common.cpp      ← Shared: KxCachingFontMgr, contexts, surfaces, readback, paint, para, image, path, atlas
     ├── kx_skia_platform.h      ← Platform interface: create_gpu_ctx(), create_onscreen_surface(), swapchain
-    ├── kx_skia_macos.mm        ← macOS impl (Metal + raster) — built first (Phase 0), arm64 only, no x64
-    ├── kx_skia_linux.cpp       ← Linux impl (Ganesh GL via SDL, +raster) — Graphite Vulkan Phase 3a
-    ├── kx_skia_android.cpp     ← Android impl (GLES + Vulkan)
-    ├── kx_skia_win.cpp         ← Windows impl (Dawn D3D12 + Vulkan + GL)
-    ├── kx_skia_ios.mm          ← iOS impl (Metal)
-    ├── kx_skia_wasm.cpp        ← WASM impl (WebGL2/WebGPU via emscripten)
-    ├── kx_draw.cpp             ← Drawing API (common, ~40 fns + v2 extensions)
-    ├── kx_scenes.cpp           ← Canonical benchmark scenes (common)
-    └── kx_a11y_*.cpp           ← A11y bridges per platform
+    ├── kx_skia_macos.mm        ← macOS impl (Graphite Metal + raster) — arm64
+    ├── kx_skia_linux.cpp       ← Linux impl (Graphite Vulkan + Ganesh GL + raster)
+    ├── kx_skia_android.cpp     ← Android impl (Ganesh GLES + raster)
+    ├── kx_skia_win.cpp         ← Windows impl (Graphite Dawn D3D12/Vulkan + Ganesh GL + raster)
+    ├── kx_skia_ios.mm          ← iOS impl (Graphite Metal + raster)
+    ├── kx_skia_wasm.cpp        ← WASM impl (Graphite WebGPU + Ganesh WebGL2 + raster via emscripten)
+    └── kx_a11y_*.{cpp,mm}      ← Native A11y bridges per platform (macOS, iOS, Android, Windows, Linux)
 ```
 
 **Rule**: no C++ type crosses the ABI. Zig sees only opaque handles and C functions.
@@ -253,10 +253,10 @@ a failed context there downgrades to raster before `kx_create` even runs.
 |---|---|---|
 | macOS (arm64) | graphite-metal → raster | ✅ complete — no GL fallback (GL frozen at 4.1 since macOS 10.14) |
 | iOS (arm64) | graphite-metal → raster | ✅ complete — ganesh-metal/ganesh-gles/graphite-dawn codepaths removed from shipping |
-| Android | graphite-vulkan → ganesh-gles → raster | 🔧 vulkan pending; gles covers Vulkan-less devices (incl. emulator) |
-| Linux x64/arm64 | graphite-vulkan → ganesh-gl → raster | 🔧 vulkan pending; ganesh-gl implemented (SDL GL context, GLX/EGL/Wayland-agnostic) |
-| Windows x64/arm64 | graphite-dawn-d3d12 → dawn-vulkan → ganesh-gl → raster | 🔧 in flight (win stack); D3D12 is guaranteed on Win10+, Vulkan optional |
-| Web (WASM) | graphite-webgpu → ganesh-webgl2 → raster | 🔧 webgpu pending; webgl2 implemented |
+| Android | ganesh-gles → raster | ✅ ganesh-gles + raster shipped (graphite-vulkan optional for API >= 33) |
+| Linux x64/arm64 | graphite-vulkan → ganesh-gl → raster | ✅ complete — SDL_Vulkan + VMA swapchain with persistent Recorder; ganesh-gl + raster fallback |
+| Windows x64/arm64 | graphite-dawn-d3d12 → dawn-vulkan → ganesh-gl → raster | ✅ complete — Dawn D3D12/Vulkan with persistent Recorder + WGL ganesh-gl + raster fallback |
+| Web (WASM) | graphite-webgpu → ganesh-webgl2 → raster | ✅ complete — emdawnwebgpu Graphite WebGPU with persistent Recorder + WebGL2 + raster fallback |
 
 Rationale: Ganesh GL-family is the *single* universal middle tier — one
 FBO-0-wrap pattern shared by wasm/android/linux/win. The only platform
@@ -264,11 +264,10 @@ without a GL middle tier is Apple, where Metal covers 100% of supported
 hardware. Raster is always built, always tested (CI goldens), always
 reachable — it is what makes AUTO safe.
 
-Current truth: macOS ships graphite-metal + raster; iOS ships
-graphite-metal + raster; Android ships ganesh-gles + raster; Linux ships
-**ganesh-gl + raster** (`KX_BACKEND_GANESH_GL`, `gl` CLI arg — SDL GL
-context, raster fallback when no GL driver). Graphite-vulkan on Linux is
-still Phase 3a.
+Current truth: macOS and iOS ship graphite-metal + raster; Android ships
+ganesh-gles + raster; Linux ships graphite-vulkan + ganesh-gl + raster;
+Windows ships graphite-dawn (D3D12/Vulkan) + ganesh-gl + raster; Web ships
+graphite-webgpu + ganesh-webgl2 + raster.
 
 Historical measurement (iOS Simulator, 2026-10-11,
 `bench/results/ios-backends-20261011.json`, taken while the five-backend

@@ -145,11 +145,13 @@ The benchmark-driven audit that replaced every fake/approximate path with the re
 - **Pixel-perfect policy: spec-identical, never bit-identical** (fonts/AA/shadows differ cross-platform; goldens assert structure + spec values). References: m3.material.io (tokens), matraic/m3e (catalog web components), lnkiai/m3e-canvas (M3E motion + loading indicator + visual oracle), Compose Material3 (canonical), Flutter.
 - **No-code designer** (Phase 2e, after batch 2): native app built with Klaxon — canvas WYSIWYG, auto-generated inspector (comptime introspection), M3E theme panel, preview; export = runtime JSON + golden-tested Zig. Enabler: 2d-0.6 widget registry + serialization.
 
-**Next: Phase 2d.1 — batch 1 PR B (BottomSheet, Dialog, ProgressIndicator, Badge, Tooltip, SnackBar) to complete the 10-widget batch; PR A (AppBar, NavBar, Drawer, Tabs) merged as PR #16. Then 2d-0.5 (platform tokens), batches 2d.2-2d.4 (full M3E catalog), Phase 2e (no-code designer).**
+**Next: Device-tier hardware validation (physical iOS/Android/Linux/Windows GPU boxes) & Phase 2e (no-code designer app).**
 
 ## What exists (code, this repo)
 
 - ✅ `build.zig` — exe + test + run steps, kx_skia shim (C++/ObjC++), Skia + SDL3 static link, macOS frameworks, per-OS platform shim
+- ✅ `include/klaxon.h` + `src/c_abi.zig` — canonical C ABI contract + layout assertions (ADR-0009)
+- ✅ `src/platform/` — Layer 4 platform services (`storage/kv.zig`, `storage/paths.zig`, `net/http.zig`, `os/window_insets.zig`, `os/url.zig`, `os/haptics.zig`, `os/file_picker.zig`, `os/share.zig`, `os/notifications.zig`, `media/video.zig`, `runtime/plugin.zig`)
 - ✅ `src/main.zig` — hello app: builds the demo tree, runs it through the Host
 - ✅ `src/sdl.zig` + `src/sdl_c.h` — SDL3 bindings via `b.addTranslateC`
 - ✅ `src/kx.zig` — Skia ABI bindings via `b.addTranslateC`
@@ -186,11 +188,11 @@ The benchmark-driven audit that replaced every fake/approximate path with the re
 - ✅ `src/ui/node.zig` — `Node.insert` (re-insert at the original index — hero re-attach) (Phase 2a)
 - ✅ `kx_skia/` — ABI 0.4.0: `kx_layer_alpha` (saveLayerAlphaf — fade transitions) (Phase 2a)
 - ✅ `src/golden.zig` — offscreen render + pixel assertions + interactive `Renderer` (golden tests; gallery/conformance reuse)
-- ✅ `kx_skia/` — C++ shim: `include/kx_skia.h` (C ABI 0.3.0: raster, text+metrics, images, readback, canvas state/transforms/clip), `src/kx_skia_common.cpp` (raster + image registry + canvas state), `src/kx_skia_platform.h`, `src/kx_skia_macos.mm` (Graphite-Metal + CoreText), `src/kx_skia_linux.cpp` (raster stub)
-- ✅ `scripts/fetch-deps.sh` — Skia / SDL3 / WAMR at pinned refs
-- ✅ `.github/workflows/ci.yml` — build + test + smoke + size gate on ubuntu + macOS
-- ✅ `docs/` — planning set (ARCHITECTURE, ROADMAP, PERF-BUDGETS, STATUS, README, STATE.md, 9 ADRs)
-- ✅ `deps/` (gitignored) — built artifacts, macos-arm64
+- ✅ `kx_skia/` — C++ shim: `include/kx_skia.h`, `src/kx_skia_common.cpp`, `src/kx_skia_platform.h`, `src/kx_skia_macos.mm`, `src/kx_skia_linux.cpp`, `src/kx_skia_win.cpp`, `src/kx_skia_android.cpp`, `src/kx_skia_ios.mm`, `src/kx_skia_wasm.cpp`, `src/kx_a11y_*.{cpp,mm}`
+- ✅ `scripts/fetch-deps.sh` — Skia / SDL3 at pinned refs (WAMR removed per ADR-0006)
+- ✅ `.github/workflows/ci.yml` — build + test + smoke + size gate across all 6 target platforms
+- ✅ `docs/` — planning & reference set (ARCHITECTURE, ROADMAP, PERF-BUDGETS, STATUS, DEVIATIONS, DECISIONS, M3E-PORT, 10 ADRs)
+- ✅ `deps/` (gitignored) — built artifacts
 
 ## What exists (from spikes — knowledge, not code)
 
@@ -208,15 +210,16 @@ Reference material only: pins, build recipes, platform quirks, measurements. No 
 | Platform quirks (Dawn=CMake, icudtl.dat, 16KiB Android, etc.) | `spikes/` child reports | Platform integration notes |
 | Gallery wasm (proven: Skia wasm renders in Chrome) | `spikes/src/w0-graphite-wasm/` | WASM target feasibility |
 
-## What does NOT exist (greenfield)
+## Shipped in Phases 3–5 & deferred to V2
 
-- ✅ All 73 widgets (the v1 50-widget bar reached + 23: 2d.1 DONE (10/10, PR #16 + #17), 2d.2 PR A DONE (M3E button x5, PR #22), PR B1 DONE (M3E icon buttons, PR #23), PR B2 DONE (M3E checkbox/radio/switch/slider, PR #24), PR C1 DONE (M3E chips x5, PR #25), PR C2 DONE (M3E text fields x2, PR #26 — batch 2d.2 COMPLETE), PR D1 DONE (M3E cards x3 + list items x3, PR #27), PR D2 DONE (M3E dropdown menu, PR #28), PR D3 DONE (M3E segmented button + split button, PR #29), PR D4 DONE (M3E search bar + navigation rail, PR #30), PR D5 DONE (M3E side sheet + pull-to-refresh, PR #31), PR #32 DONE (M3E loading indicator, PR #32), PR #33 DONE (M3E date/time pickers, PR #33); the M3E catalog continues past the bar: batch 2d.4)
-- ❌ A11y OS bridges (6: AT-SPI, NSAccessibility, UIAccessibility, UIA, TalkBack, ARIA — the C-ABI bridge interface is ready, Phase 2c; AT-SPI lands with the Linux target, Phase 3a)
-- ❌ DevTools
-- ❌ CLI
-- ❌ Packaging
-- ❌ Benchmarks
-- ❌ Documentation (beyond this planning set)
+- ✅ All M3E widgets (full M3E catalog ported 1:1 against `.ref/material3/` and registered in `src/registry.zig`)
+- ✅ A11y OS bridges (6/6: Linux AT-SPI2, macOS NSAccessibility, iOS UIAccessibility, Windows UIA, Android TalkBack `AccessibilityNodeProvider`, Web ARIA live DOM)
+- ✅ DevTools & Inspector (`src/devtools.zig`, `src/inspector.zig` — F12/F11 overlays, frame histogram, memory ledger)
+- ✅ CLI (`tools/klaxon/main.zig` — `klaxon create`, `klaxon build`, `klaxon run`, `klaxon test`, `klaxon doctor`)
+- ✅ Packaging (`scripts/package-*.sh` — macOS `.dmg`, iOS `.ipa`/`.app`, Android `.apk`, Linux AppImage/`.deb`/`.rpm`/Flatpak, Windows `.msi`, Web `.tar.gz`)
+- ✅ Benchmarks (`src/bench.zig` + `bench/runners/{flutter,compose,compose-android,qt}` — 33 scenes + HTML matrix generator)
+- ✅ Documentation (`docs/` — full subsystem guides + ADRs + `DECISIONS.md` + `DEVIATIONS.md`)
+- ❌ V2 hardware services (Sensors `accel/gyro`, Camera capture, Bluetooth GATT) and Phase 2e standalone WYSIWYG No-Code Designer app
 
 ## Toolchain quirks (learned 2026-10-06/07, macOS arm64 + Zig 0.17.0)
 

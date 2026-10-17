@@ -117,7 +117,7 @@ fn wasmFrameCallback(arg: ?*anyopaque) callconv(.c) void {
 /// every event to JS. tree_dirty carries no node — the root pointer travels
 /// in node_id so JS can dump the tree.
 fn wasmBridgeCallback(userdata: ?*anyopaque, ev: sem.BridgeEventC) callconv(.c) void {
-    const node_id: u64 = if (ev.kind == @intFromEnum(sem.BridgeEvent.Kind.tree_dirty))
+    const node_id: u64 = if (ev.kind == @backingInt(sem.BridgeEvent.Kind.tree_dirty))
         if (userdata) |u| @intFromPtr(u) else 0
     else
         ev.node_id;
