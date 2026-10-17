@@ -100,7 +100,8 @@ Each widget's header carries the same list; these are the tracked ones
   silently (no `announcement` signal exists).
 - `ios_io.zig` — `std.Io` shim: stderr→SDL_Log is real, all other ops are
   `failing*` stubs (a compile workaround, never app I/O).
-- `inspector.zig` — O(expanded × rows) rebuild; debug-tool only.
+- `inspector.zig` — debug-tool only. (The rebuild is now O(rows) — a
+  node→row index map serves the prune, select and selection-resync.)
 
 ## Benchmark-honesty invariants (do not regress)
 

@@ -51,6 +51,10 @@ pub const Inspector = struct {
     rows: std.array_list.Managed(Row),
     /// Expand overrides (default = expanded). Keyed by node pointer.
     expanded: std.AutoHashMap(*Node, bool),
+    /// node → row index for the current rows list — built during
+    /// rebuildRowsInner (the prune + select paths then stay O(1) instead of
+    /// scanning rows per entry: O(expanded × rows) → O(rows)).
+    row_index: std.AutoHashMap(*Node, usize),
     /// Reusable growable scratch for null-terminated display strings —
     /// sem.label/value can be any length (a node's label is user text).
     /// Valid until the next fmtZ call on it.
@@ -68,6 +72,7 @@ pub const Inspector = struct {
             .allocator = allocator,
             .rows = std.array_list.Managed(Row).init(allocator),
             .expanded = std.AutoHashMap(*Node, bool).init(allocator),
+            .row_index = std.AutoHashMap(*Node, usize).init(allocator),
             .scratch = std.array_list.Managed(u8).init(allocator),
         };
     }
@@ -75,6 +80,7 @@ pub const Inspector = struct {
     pub fn deinit(insp: *Inspector) void {
         insp.rows.deinit();
         insp.expanded.deinit();
+        insp.row_index.deinit();
         insp.scratch.deinit();
     }
 
@@ -91,37 +97,29 @@ pub const Inspector = struct {
     /// reaches the highlight paint (use-after-free).
     pub fn rebuildRows(insp: *Inspector, root: *Node) void {
         insp.rows.clearRetainingCapacity();
+        insp.row_index.clearRetainingCapacity();
         rebuildRowsInner(insp, root, 0);
         // Prune expand-state for nodes no longer in the tree — an entry
         // keyed by a recycled address would silently inherit stale state.
         // Rebuilt rather than removed mid-iteration (swap-remove invalidates
-        // the iterator).
+        // the iterator); the row_index map keeps each check O(1).
         var kept = std.AutoHashMap(*Node, bool).init(insp.allocator);
         var prune = insp.expanded.iterator();
         while (prune.next()) |e| {
-            var present = false;
-            for (insp.rows.items) |row| {
-                if (row.node == e.key_ptr.*) {
-                    present = true;
-                    break;
-                }
+            if (insp.row_index.contains(e.key_ptr.*)) {
+                kept.put(e.key_ptr.*, e.value_ptr.*) catch @panic("klaxon: out of memory");
             }
-            if (present) kept.put(e.key_ptr.*, e.value_ptr.*) catch @panic("klaxon: out of memory");
         }
         insp.expanded.deinit();
         insp.expanded = kept;
         // Drop the selection if the node vanished from the tree; otherwise
         // re-sync sel_index to its row (the walk order may have shifted).
         if (insp.selected) |sel| {
-            var found = false;
-            for (insp.rows.items, 0..) |row, i| {
-                if (row.node == sel) {
-                    found = true;
-                    insp.sel_index = i;
-                    break;
-                }
+            if (insp.row_index.get(sel)) |i| {
+                insp.sel_index = i;
+            } else {
+                insp.selected = null;
             }
-            if (!found) insp.selected = null;
         }
         // Clamp the selection index into range.
         if (insp.rows.items.len > 0) {
@@ -133,6 +131,7 @@ pub const Inspector = struct {
 
     fn rebuildRowsInner(insp: *Inspector, node: *Node, depth: u8) void {
         if (!node.visible or node.zombie) return;
+        insp.row_index.put(node, insp.rows.items.len) catch @panic("klaxon: out of memory");
         insp.rows.append(.{ .node = node, .depth = depth }) catch @panic("klaxon: out of memory");
         const is_expanded = insp.expanded.get(node) orelse true;
         if (is_expanded) {
@@ -146,12 +145,7 @@ pub const Inspector = struct {
     pub fn select(insp: *Inspector, node: ?*Node) void {
         insp.selected = node;
         if (node) |n| {
-            for (insp.rows.items, 0..) |row, i| {
-                if (row.node == n) {
-                    insp.sel_index = i;
-                    return;
-                }
-            }
+            if (insp.row_index.get(n)) |i| insp.sel_index = i;
         }
     }
 
