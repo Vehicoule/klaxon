@@ -1,0 +1,196 @@
+# Valgrind suppressions for the Klaxon smoke suite (scripts/valgrind.sh).
+#
+# The prebuilt Skia/SDL3 in deps/ are not valgrind-clean: font caches,
+# graphite/gpu singletons, thread pools and driver plumbing all leave
+# reachable allocations behind at exit. Entries below keep that noise out
+# of the nightly report so real findings stay visible. Extend as reports
+# arrive — mint new entries with:
+#
+#   SDL_VIDEODRIVER=dummy valgrind --gen-suppressions=all \
+#     --suppressions=ci/valgrind.supp ./zig-out/bin/hello
+#
+# A leading `...` lets the location match anywhere in the stack.
+
+# --- prebuilt libs: leak noise (font/glyph caches, ICU data, singletons) ---
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libskia*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libskparagraph*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libskunicode*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libicu*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libharfbuzz*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libfreetype2*
+   ...
+}
+{
+   klaxon-prebuilt-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libSDL3*
+   ...
+}
+
+# --- system libraries pulled in by SDL3 / the a11y bridge ---
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libfontconfig*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libdbus-1*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libX11*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libwayland-*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libatk*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libatspi*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libglib*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libgobject*
+   ...
+}
+{
+   klaxon-syslibs-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libgio*
+   ...
+}
+
+# --- dlopen plumbing: SDL loads video/audio backends dynamically ---
+{
+   klaxon-dlopen-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:dlopen*
+   ...
+}
+{
+   klaxon-dlinternal-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*/ld-linux*
+   ...
+}
+
+# --- graphics drivers loaded by Skia/SDL (mesa, GL/Vulkan loaders) ---
+{
+   klaxon-gl-drivers-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libGL*
+   ...
+}
+{
+   klaxon-gl-drivers-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libEGL*
+   ...
+}
+{
+   klaxon-gl-drivers-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*libvulkan*
+   ...
+}
+{
+   klaxon-gl-drivers-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:*dri/*.so
+   ...
+}
