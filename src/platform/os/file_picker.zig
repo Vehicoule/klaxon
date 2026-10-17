@@ -69,6 +69,7 @@ test "file_picker: uninstalled reports unavailable, not a cancelled pick" {
             const self: *@This() = @ptrCast(@alignCast(ud.?));
             self.called.* = true;
             self.st.* = status;
+            std.debug.assert(paths.len == 0);
         }
     };
     var ctx: Ctx = .{ .called = &called, .st = &st };

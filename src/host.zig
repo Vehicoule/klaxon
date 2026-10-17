@@ -683,6 +683,13 @@ pub const Host = struct {
     /// null is legal — dialogs just aren't parented).
     var dialog_window: ?*sdl.c.SDL_Window = null;
 
+    /// allocSentinel + copy — every SDL C-string the services hand over.
+    fn dupeZ(a: std.mem.Allocator, s: []const u8) ![:0]u8 {
+        const z = try a.allocSentinel(u8, s.len, 0);
+        @memcpy(z, s);
+        return z;
+    }
+
     fn sdlOpenUrl(url: []const u8) bool {
         const alloc = clipboard_allocator orelse return false;
         const z = alloc.allocSentinel(u8, url.len, 0) catch return false;
@@ -761,18 +768,18 @@ pub const Host = struct {
         defer sdl.c.SDL_DestroyProperties(props);
 
         if (title) |t| {
-            const z = a.dupeZ(u8, t) catch return;
+            const z = dupeZ(a, t) catch return;
             _ = sdl.c.SDL_SetStringProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_TITLE_STRING, z.ptr);
         }
         if (default_path) |d| {
-            const z = a.dupeZ(u8, d) catch return;
+            const z = dupeZ(a, d) catch return;
             _ = sdl.c.SDL_SetStringProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_LOCATION_STRING, z.ptr);
         }
         if (filters.len > 0) {
             const sf = a.alloc(sdl.c.SDL_DialogFileFilter, filters.len) catch return;
             for (filters, sf) |f, *dst| {
-                dst.name = (a.dupeZ(u8, f.name) catch return).ptr;
-                dst.pattern = (a.dupeZ(u8, f.pattern) catch return).ptr;
+                dst.name = (dupeZ(a, f.name) catch return).ptr;
+                dst.pattern = (dupeZ(a, f.pattern) catch return).ptr;
             }
             _ = sdl.c.SDL_SetPointerProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_FILTERS_POINTER, sf.ptr);
             _ = sdl.c.SDL_SetNumberProperty(props, sdl.c.SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, @intCast(filters.len));
@@ -816,13 +823,13 @@ pub const Host = struct {
     }
 
     fn prefPathJoin(alloc: std.mem.Allocator, org: []const u8, app: []const u8, leaf: ?[]const u8) ?[]u8 {
-        const zorg = alloc.dupeZ(u8, if (org.len == 0) "klaxon" else org) catch return null;
+        const zorg = dupeZ(alloc, if (org.len == 0) "klaxon" else org) catch return null;
         defer alloc.free(zorg);
-        const zapp = alloc.dupeZ(u8, if (app.len == 0) "app" else app) catch return null;
+        const zapp = dupeZ(alloc, if (app.len == 0) "app" else app) catch return null;
         defer alloc.free(zapp);
         const raw = sdl.c.SDL_GetPrefPath(zorg.ptr, zapp.ptr) orelse return null;
         defer sdl.c.SDL_free(raw);
-        const base = std.mem.trimRight(u8, std.mem.span(raw), "/\\");
+        const base = std.mem.trimEnd(u8, std.mem.span(raw), "/\\");
         if (leaf) |l| return std.fmt.allocPrint(alloc, "{s}/{s}", .{ base, l }) catch null;
         return alloc.dupe(u8, base) catch null;
     }

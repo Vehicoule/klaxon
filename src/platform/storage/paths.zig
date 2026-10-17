@@ -115,7 +115,7 @@ fn tempFallback(allocator: std.mem.Allocator) ![]u8 {
         return allocator.dupe(u8, ".");
     }
     // $TMPDIR may carry a trailing slash — trim for a canonical form.
-    return allocator.dupe(u8, std.mem.trimRight(u8, env("TMPDIR") orelse "/tmp", "/"));
+    return allocator.dupe(u8, std.mem.trimEnd(u8, env("TMPDIR") orelse "/tmp", "/"));
 }
 
 pub fn appDataDir(allocator: std.mem.Allocator, org: []const u8, app: []const u8) ![]u8 {
