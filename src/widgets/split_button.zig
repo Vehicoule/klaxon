@@ -36,9 +36,10 @@
 // v1 deviations (documented):
 //   - Filled style only (tonal / elevated / outlined variants are
 //     follow-ups — same structure, different colors).
-//   - The trailing icon sits at the geometric center — upstream nudges it
-//     toward the gap via an optical-centering modifier we can't reproduce
-//     without its private source.
+//   - The trailing icon rides upstream's horizontalCenterOptically:
+//     0.11 * (avgStart − avgEnd) corner radii, clamped to the content
+//     padding, RTL-mirrored — it nudges toward the gap and flattens to
+//     the geometric center as the checked morph reaches the circle.
 //   - No embedded menu: the trailing button fires `on_trailing` and the app
 //     opens a menu and drives `trailing_checked` (the M3E menu widget,
 //     PR D2).
@@ -380,7 +381,15 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
                 ui.paint.fillRRectCorners(ctx, tx, b.y, tw, b.h, tl, tr, br, bl, theme_mod.stateLayer(container, cs.on_primary, alpha));
             }
         }
-        paintIcon(ctx, s.opts.trailing_icon, tx + (tw - d.trail_icon) / 2, b.y + (b.h - d.trail_icon) / 2, d.trail_icon, fg);
+        // Upstream's horizontalCenterOptically: the icon shifts by
+        // 0.11 * (avgStart − avgEnd) corners — toward the small inner
+        // (gap-side) corner — clamped to the content padding and mirrored
+        // by placeRelative in RTL. The live trail_inner feeds it, so the
+        // nudge follows the press/check morphs (checked circle → 0).
+        const optical_corr = 0.11 * (s.trail_inner - d.height / 2);
+        const optical_off = @round(std.math.clamp(optical_corr, -d.trail_pad, d.trail_pad));
+        const icon_x = tx + (tw - d.trail_icon) / 2 + if (rtl) -optical_off else optical_off;
+        paintIcon(ctx, s.opts.trailing_icon, icon_x, b.y + (b.h - d.trail_icon) / 2, d.trail_icon, fg);
         // upstream drawWithContent: the checked trailing button fills its
         // (circle) shape with contentColor @ pressed opacity — a scrim
         // over the half, content included

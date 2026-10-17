@@ -62,10 +62,12 @@ Each widget's header carries the same list; these are the tracked ones
   animation) instead of popping. Steps/ticks, the pressed value
   bubble, the corner-inset thumb mapping and PageUp/PageDown
   (actualSteps/10 clamped to [1,10] ticks) match upstream.
-- `split_button.zig` — filled only; trailing icon geometric center
-  (upstream optical nudge); no embedded menu. The inner-corner morphs
-  run on the effects spring and `splitSetTrailingChecked` morphs the
-  trailing half to CircleShape with the contentColor@0.12 scrim. (a11y:
+- `split_button.zig` — filled only; no embedded menu. The inner-corner
+  morphs run on the effects spring, `splitSetTrailingChecked` morphs the
+  trailing half to CircleShape with the contentColor@0.12 scrim, and the
+  trailing icon rides upstream's `horizontalCenterOptically` — 0.11 ×
+  (avgStart − avgEnd) corner radii toward the gap, clamped to the
+  content padding, mirrored in RTL, tracking the live morph. (a11y:
   the halves are virtual button children and ArrowDown activates the
   trailing — ARIA menu-button.)
 - `text_field.zig` / `search_bar.zig` / `search_view.zig` — single-line
