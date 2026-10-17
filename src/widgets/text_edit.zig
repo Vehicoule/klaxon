@@ -118,6 +118,8 @@ pub const Edit = struct {
     line_spans: std.ArrayListUnmanaged(LineSpan) = .empty,
     /// Reconcile scratch: the next line table (kept paras move into it).
     line_next: std.ArrayListUnmanaged(LinePara) = .empty,
+    /// Reconcile scratch: a segmented line's next seg table.
+    seg_next: std.ArrayListUnmanaged(SegPara) = .empty,
     /// Shared paragraph for empty lines, built over a single space — an
     /// empty line's height is the span's line metrics (SkParagraph gives
     /// in-text empty lines the run metrics too; an empty PARAGRAPH would
@@ -138,8 +140,13 @@ pub const Edit = struct {
     para_builds: u64 = 0,
 
     /// One hard line's incremental layout record. `para` is the line's
-    /// own paragraph over buf[start..content_end]; null only for empty
-    /// lines, which answer geometry through `empty_para` instead.
+    /// own paragraph over buf[start..content_end]; null for empty lines
+    /// (which answer geometry through `empty_para`) AND for segmented
+    /// lines (which answer through `segs`). `segs` is the same idea one
+    /// level down: when a hard line wraps past the seg budget, its text
+    /// splits at soft-wrap row boundaries into independently rebuilt
+    /// paragraphs, so a keystroke inside one chunk doesn't re-lay the
+    /// whole line.
     pub const LinePara = struct {
         /// [start, end) byte range in buf — `end` sits past the '\n' when
         /// the line has one; `content_end` is `end` minus that '\n' (the
@@ -150,6 +157,12 @@ pub const Edit = struct {
         /// Wyhash of buf[start..content_end] — the reconcile identity.
         key: u64 = 0,
         para: ?*ui.paint.TextLayout = null,
+        /// Soft-wrap shards — non-empty iff the line is segmented.
+        segs: std.ArrayListUnmanaged(SegPara) = .empty,
+        /// The line-content hash the seg table was built against — a
+        /// match on lp.key means every seg is still exact (offsets may
+        /// just shift), so reconcile skips the hashing entirely.
+        segs_key: u64 = 0,
         /// Layout-space top of the line's first soft row.
         y: f32 = 0,
         /// Laid-out height — every soft row of the line summed.
@@ -158,6 +171,30 @@ pub const Edit = struct {
         w: f32 = 0,
         /// First soft row's baseline — the uniform style makes it every
         /// row's baseline offset, so it also positions the comp overlay.
+        base: f32 = 0,
+    };
+
+    /// One soft-wrap shard inside a segmented line: a paragraph over
+    /// buf[start..end) covering one or more COMPLETE visual rows. Its
+    /// start is always a real wrap boundary of the line's layout (or the
+    /// line start), so the paragraph reproduces the same rows those bytes
+    /// occupy in the monolithic layout — the break state resets at row
+    /// starts. Geometry entry points translate line-local coordinates in
+    /// and out of it; `y` is line-local (doc y = line.y + seg.y).
+    pub const SegPara = struct {
+        /// [start, end) byte range in buf — inside the line's content.
+        start: usize = 0,
+        end: usize = 0,
+        /// Wyhash of buf[start..end] — the seg reconcile identity.
+        key: u64 = 0,
+        para: ?*ui.paint.TextLayout = null,
+        /// Line-local top of the seg's first row.
+        y: f32 = 0,
+        /// Laid-out height — every row the seg covers.
+        h: f32 = 0,
+        /// The seg's longest row width.
+        w: f32 = 0,
+        /// First row's baseline (uniform style ⇒ every row's offset).
         base: f32 = 0,
     };
 
@@ -194,13 +231,18 @@ pub const Edit = struct {
             if (ui.anim.timeline()) |tl| tl.removeTicker(t);
         }
         if (e.hit_layout) |l| ui.paint.textLayoutDestroy(l);
-        for (e.line_paras.items) |lp| {
+        for (e.line_paras.items) |*lp| {
             if (lp.para) |p| ui.paint.textLayoutDestroy(p);
+            for (lp.segs.items) |sg| {
+                if (sg.para) |p| ui.paint.textLayoutDestroy(p);
+            }
+            lp.segs.deinit(e.buf.allocator);
         }
         const a = e.buf.allocator;
         e.line_paras.deinit(a);
         e.line_spans.deinit(a);
         e.line_next.deinit(a);
+        e.seg_next.deinit(a);
         if (e.empty_para) |p| ui.paint.textLayoutDestroy(p);
         e.buf.deinit();
         e.comp.deinit();
@@ -681,8 +723,9 @@ pub const Edit = struct {
     /// Drop every cached line paragraph + the shared empty line's — a
     /// style/wrap/direction/size change invalidates the whole table.
     fn clearLines(e: *Edit) void {
-        for (e.line_paras.items) |lp| {
+        for (e.line_paras.items) |*lp| {
             if (lp.para) |p| ui.paint.textLayoutDestroy(p);
+            e.dropSegs(lp);
         }
         e.line_paras.clearRetainingCapacity();
         if (e.empty_para) |p| ui.paint.textLayoutDestroy(p);
@@ -690,6 +733,17 @@ pub const Edit = struct {
         e.lines_built = false;
         e.lines_total_h = 0;
         e.lines_max_w = 0;
+    }
+
+    /// Destroy a line's seg paragraphs and release the list — the line is
+    /// no longer segmented.
+    fn dropSegs(e: *Edit, lp: *LinePara) void {
+        for (lp.segs.items) |sg| {
+            if (sg.para) |p| ui.paint.textLayoutDestroy(p);
+        }
+        lp.segs.deinit(e.buf.allocator);
+        lp.segs = .empty;
+        lp.segs_key = 0;
     }
 
     /// Build one hard line's paragraph over `content` — a '\n'-free slice;
@@ -781,12 +835,56 @@ pub const Edit = struct {
                 (o.para != null) != (n.content_end > n.start)) break;
             tail += 1;
         }
-        // Assemble the next table: kept head + fresh middle + kept tail.
+        // Assemble the next table: kept head + middle + kept tail. A
+        // middle span pairs with a stored middle entry carrying a seg
+        // table so an edited long line keeps its shard granularity —
+        // content-identical (moved) lines keep every seg, same-start
+        // lines keep up to the dirty point, leftovers pair positionally.
         e.line_next.clearRetainingCapacity();
         e.line_next.ensureTotalCapacity(a, spans.len) catch @panic("klaxon: out of memory");
         e.line_next.appendSlice(a, old[0..head]) catch @panic("klaxon: out of memory");
+        const mid_old = old[head .. old.len - tail];
         for (spans[head .. spans.len - tail]) |n| {
-            e.line_next.append(a, .{ .start = n.start, .end = n.end, .content_end = n.content_end, .key = n.key }) catch @panic("klaxon: out of memory");
+            var src: ?*LinePara = null;
+            for (mid_old) |*o| {
+                if (o.segs.items.len == 0) continue;
+                if (o.content_end - o.start == n.content_end - n.start and o.key == n.key) {
+                    src = o;
+                    break;
+                }
+            }
+            if (src == null) {
+                for (mid_old) |*o| {
+                    if (o.segs.items.len > 0 and o.start == n.start) {
+                        src = o;
+                        break;
+                    }
+                }
+            }
+            if (src == null) {
+                for (mid_old) |*o| {
+                    if (o.segs.items.len > 0) {
+                        src = o;
+                        break;
+                    }
+                }
+            }
+            if (src) |o| {
+                var lp = o.*;
+                o.segs = .empty; // moved — the destroy pass must skip it
+                o.para = null;
+                if (lp.para) |p| {
+                    ui.paint.textLayoutDestroy(p);
+                    lp.para = null;
+                }
+                lp.start = n.start;
+                lp.end = n.end;
+                lp.content_end = n.content_end;
+                lp.key = n.key;
+                e.line_next.append(a, lp) catch @panic("klaxon: out of memory");
+            } else {
+                e.line_next.append(a, .{ .start = n.start, .end = n.end, .content_end = n.content_end, .key = n.key }) catch @panic("klaxon: out of memory");
+            }
         }
         e.line_next.appendSlice(a, old[old.len - tail ..]) catch @panic("klaxon: out of memory");
         // Refresh every entry's range from the new split — kept tail
@@ -798,9 +896,13 @@ pub const Edit = struct {
             lp.content_end = spans[i].content_end;
             lp.key = spans[i].key;
         }
-        // Free the dropped middle lines' paragraphs, then swap tables.
-        for (old[head .. old.len - tail]) |o| {
+        // Free the dropped middle lines' paragraphs + segs, then swap.
+        for (mid_old) |*o| {
             if (o.para) |p| ui.paint.textLayoutDestroy(p);
+            for (o.segs.items) |sg| {
+                if (sg.para) |p| ui.paint.textLayoutDestroy(p);
+            }
+            o.segs.deinit(a);
         }
         e.line_paras.deinit(a);
         e.line_paras = e.line_next;
@@ -808,7 +910,9 @@ pub const Edit = struct {
         // Measure: build paragraphs only for fresh lines — kept lines
         // reuse their cached h/w/base (same content + same style, wrap,
         // size, direction ⇒ same geometry). y accumulates over all of
-        // them, so a kept line's band slides with the lines above.
+        // them, so a kept line's band slides with the lines above. A
+        // paired middle entry keeps its seg table — syncSegs reconciles
+        // it against the new content shard by shard.
         var y: f32 = 0;
         var maxw: f32 = 0;
         var ok = true;
@@ -818,6 +922,7 @@ pub const Edit = struct {
                 // Empty line — the shared " " paragraph supplies the
                 // line-metrics height SkParagraph's own empty lines get;
                 // it contributes no width and paints nothing.
+                e.dropSegs(lp);
                 if (e.empty_para == null) {
                     e.empty_para = e.buildLinePara(" ", size);
                     ok = ok and e.empty_para != null;
@@ -825,12 +930,19 @@ pub const Edit = struct {
                 lp.h = if (e.empty_para) |p| ui.paint.textLayoutHeight(p) else ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
                 lp.base = if (e.empty_para) |p| ui.paint.textLayoutBaseline(p) else 0;
                 lp.w = 0;
+            } else if (lp.segs.items.len > 0) {
+                if (lp.para) |p| {
+                    ui.paint.textLayoutDestroy(p);
+                    lp.para = null;
+                }
+                ok = ok and e.syncSegs(lp, str, size);
             } else if (lp.para == null) {
                 lp.para = e.buildLinePara(str[lp.start..lp.content_end], size);
                 if (lp.para) |p| {
                     lp.h = ui.paint.textLayoutHeight(p);
                     lp.w = ui.paint.textLayoutWidth(p);
                     lp.base = ui.paint.textLayoutBaseline(p);
+                    e.maybeSegment(lp, str, size);
                 } else {
                     ok = false;
                     lp.h = ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
@@ -843,6 +955,360 @@ pub const Edit = struct {
         }
         e.lines_total_h = y;
         e.lines_max_w = maxw;
+        return ok;
+    }
+
+    /// A line's rows are segmented once it wraps past this many — short
+    /// lines keep the whole-line `para`, so most lines pay zero seg
+    /// overhead. A seg's own para beyond it splits off its complete rows.
+    const seg_row_budget: usize = 8;
+
+    /// Uniform style ⇒ uniform row height; the first row's caret height
+    /// supplies it. Position 0 sits on the first row for any non-empty
+    /// paragraph.
+    fn paraRowH(e: *const Edit, p: *ui.paint.TextLayout, size: f32) f32 {
+        var r: [4]f32 = undefined;
+        if (ui.paint.textLayoutCaretRect(p, 0, &r) and r[3] > 0) return r[3];
+        return ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+    }
+
+    /// Visual row count of a laid-out paragraph.
+    fn paraRows(p: *ui.paint.TextLayout, row_h: f32) usize {
+        if (row_h <= 0) return 0;
+        return @intFromFloat(@round(ui.paint.textLayoutHeight(p) / row_h));
+    }
+
+    /// The byte offset (within `span`, the paragraph's own text) where
+    /// its last visual row begins — probed at the row's left edge. No new
+    /// C ABI: a position query at the row top + ε returns its first
+    /// cluster.
+    fn lastRowStart(p: *ui.paint.TextLayout, span: []const u8, row_h: f32, rows: usize) usize {
+        if (rows == 0) return 0;
+        const pos = ui.paint.textLayoutPositionAt(p, 0, @as(f32, @floatFromInt(rows - 1)) * row_h + 1);
+        if (pos < 0) return 0;
+        return utf16ToByteIndex(span, @intCast(pos));
+    }
+
+    /// Seg index covering byte offset `off` — the first seg whose end is
+    /// past it, so a boundary offset belongs to the NEXT seg (the caret
+    /// there is a row start, not a row tail). Clamps to the last seg.
+    fn segIndexOf(lp: *const LinePara, off: usize) usize {
+        const items = lp.segs.items;
+        var lo: usize = 0;
+        var hi: usize = items.len - 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].end > off) hi = mid else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    /// Seg index covering LINE-LOCAL `ly` — first seg whose bottom is
+    /// past it. y above 0 → 0; past the last seg → last.
+    fn segIndexOfY(lp: *const LinePara, ly: f32) usize {
+        const items = lp.segs.items;
+        var lo: usize = 0;
+        var hi: usize = items.len - 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].y + items[mid].h > ly) hi = mid else lo = mid + 1;
+        }
+        return lo;
+    }
+
+    /// A freshly built line is long enough to shard: seed the seg table
+    /// with one seg covering the content (reusing the just-built para),
+    /// then split off its complete rows so the tail stays small.
+    fn maybeSegment(e: *Edit, lp: *LinePara, str: [:0]const u8, size: f32) void {
+        const p = lp.para orelse return;
+        if (e.hasStrongRtl()) return; // per-seg bidi could diverge
+        const row_h = paraRowH(e, p, size);
+        if (paraRows(p, row_h) <= seg_row_budget) return;
+        lp.segs.append(e.buf.allocator, .{
+            .start = lp.start,
+            .end = lp.content_end,
+            .key = lp.key,
+            .para = p,
+            .h = lp.h,
+            .w = lp.w,
+            .base = lp.base,
+        }) catch @panic("klaxon: out of memory");
+        lp.para = null;
+        lp.segs_key = lp.key;
+        _ = e.oversizeSplit(lp, lp.segs.items.len - 1, str, size);
+    }
+
+    /// If seg `idx` lays out past the row budget, split off its complete
+    /// rows (all but the last) into a stable seg — one paragraph over
+    /// those bytes — leaving a small remainder seg behind it. The split
+    /// point is a real wrap boundary by construction, so both halves are
+    /// exact.
+    fn oversizeSplit(e: *Edit, lp: *LinePara, idx: usize, str: [:0]const u8, size: f32) bool {
+        const a = e.buf.allocator;
+        const sg = lp.segs.items[idx];
+        const p = sg.para orelse return false;
+        const row_h = paraRowH(e, p, size);
+        const rows = paraRows(p, row_h);
+        if (rows <= seg_row_budget) return true;
+        const b = lastRowStart(p, str[sg.start..sg.end], row_h, rows);
+        if (b == 0) return true; // degenerate: a single row can't split
+        const stable = e.buildLinePara(str[sg.start .. sg.start + b], size);
+        const tail = e.buildLinePara(str[sg.start + b .. sg.end], size);
+        ui.paint.textLayoutDestroy(p);
+        const stable_h = if (stable) |q| ui.paint.textLayoutHeight(q) else 0;
+        lp.segs.items[idx] = .{
+            .start = sg.start,
+            .end = sg.start + b,
+            .key = std.hash.Wyhash.hash(0, str[sg.start .. sg.start + b]),
+            .para = stable,
+            .y = sg.y,
+            .h = stable_h,
+            .w = if (stable) |q| ui.paint.textLayoutWidth(q) else 0,
+            .base = if (stable) |q| ui.paint.textLayoutBaseline(q) else 0,
+        };
+        lp.segs.insert(a, idx + 1, .{
+            .start = sg.start + b,
+            .end = sg.end,
+            .key = std.hash.Wyhash.hash(0, str[sg.start + b .. sg.end]),
+            .para = tail,
+            .y = sg.y + stable_h,
+            .h = if (tail) |q| ui.paint.textLayoutHeight(q) else 0,
+            .w = if (tail) |q| ui.paint.textLayoutWidth(q) else 0,
+            .base = if (tail) |q| ui.paint.textLayoutBaseline(q) else 0,
+        }) catch @panic("klaxon: out of memory");
+        return stable != null and tail != null;
+    }
+
+    /// Reconcile a segmented line against its new content — lp's
+    /// start/content_end/key are already refreshed. The stored segs
+    /// partition the line's OLD content (seg[0].start is the old line
+    /// start); this pass keeps matching prefix segs, keeps suffix segs
+    /// only when a bridge paragraph proves their first boundary is still
+    /// real, and otherwise rebuilds the tail as one seg — the re-wrap
+    /// frontier stops at the first provable boundary.
+    fn syncSegs(e: *Edit, lp: *LinePara, str: [:0]const u8, size: f32) bool {
+        const a = e.buf.allocator;
+        const segs = lp.segs.items;
+        const old_start = segs[0].start;
+        const old_end = segs[segs.len - 1].end;
+        const new_start = lp.start;
+        const new_end = lp.content_end;
+        const new_len = new_end - new_start;
+        var ok = true;
+
+        // Fast path — the line's content is unchanged (same key) and the
+        // seg table spans the same length: every seg is still exact, its
+        // absolute offsets just shift by the delta. O(#segs), no hashing.
+        if (lp.segs_key == lp.key and old_end - old_start == new_len) {
+            const delta = @as(isize, @intCast(new_start)) - @as(isize, @intCast(old_start));
+            var ly: f32 = 0;
+            var maxw: f32 = 0;
+            for (lp.segs.items) |*sg| {
+                sg.start = @intCast(@as(isize, @intCast(sg.start)) + delta);
+                sg.end = @intCast(@as(isize, @intCast(sg.end)) + delta);
+                sg.y = ly;
+                ly += sg.h;
+                maxw = @max(maxw, sg.w);
+            }
+            lp.h = ly;
+            lp.w = maxw;
+            lp.base = lp.segs.items[0].base;
+            return true;
+        }
+
+        // A strong-RTL buffer keeps whole-line paras — per-seg bidi
+        // resolution could diverge. Collapse back to `para`.
+        if (e.hasStrongRtl()) {
+            e.dropSegs(lp);
+            lp.para = e.buildLinePara(str[new_start..new_end], size);
+            if (lp.para) |p| {
+                lp.h = ui.paint.textLayoutHeight(p);
+                lp.w = ui.paint.textLayoutWidth(p);
+                lp.base = ui.paint.textLayoutBaseline(p);
+                return true;
+            }
+            lp.h = ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+            lp.w = 0;
+            lp.base = 0;
+            return false;
+        }
+
+        // Prefix pass — a seg survives at the same position with the
+        // same length and the same content hash: its wrap is provably
+        // identical (row starts reset the break state).
+        var pos: usize = 0;
+        var head: usize = 0;
+        while (head < segs.len) {
+            const sg = &segs[head];
+            const rel = sg.start - old_start;
+            const len = sg.end - sg.start;
+            if (rel != pos or pos + len > new_len) break;
+            if (std.hash.Wyhash.hash(0, str[new_start + pos .. new_start + pos + len]) != sg.key) break;
+            pos += len;
+            head += 1;
+        }
+        // Suffix pass — content-identical segs anchored from the line's
+        // end (a mid-line edit shifts their absolute offsets but not
+        // their distance from the end).
+        var tail_n: usize = 0;
+        while (tail_n < segs.len - head) {
+            const sg = &segs[segs.len - 1 - tail_n];
+            const len = sg.end - sg.start;
+            const from_end = old_end - sg.end;
+            if (from_end + len > new_len - pos) break;
+            const ns = new_end - from_end - len;
+            if (std.hash.Wyhash.hash(0, str[ns .. ns + len]) != sg.key) break;
+            tail_n += 1;
+        }
+        const fs = segs.len - tail_n; // first kept suffix seg index
+        var mid_start = new_start + pos;
+
+        // The dirty region's start is a kept seg's END — a real wrap
+        // boundary only when both neighbouring bytes are unchanged
+        // (a kept seg's START always satisfies that: its own bytes and
+        // the previous seg's are identical). When content follows —
+        // a dirty middle, or appended bytes continuing the old last row
+        // — retreat one kept seg so the rebuild begins at a provable
+        // boundary. Without this the appended tail would start mid-row.
+        var dirty = mid_start < new_end;
+        if (tail_n > 0) {
+            const f_start = new_end - (old_end - segs[fs].start);
+            dirty = mid_start < f_start;
+        }
+        if (dirty and head > 0) {
+            head -= 1;
+            pos = segs[head].start - old_start;
+            mid_start = new_start + pos;
+        }
+
+        e.seg_next.clearRetainingCapacity();
+        e.seg_next.ensureTotalCapacity(a, segs.len + 1) catch @panic("klaxon: out of memory");
+        // Move kept prefix segs to their new absolute positions.
+        for (segs[0..head]) |sg| {
+            var ns = sg;
+            ns.start = new_start + (sg.start - old_start);
+            ns.end = ns.start + (sg.end - sg.start);
+            e.seg_next.append(a, ns) catch @panic("klaxon: out of memory");
+        }
+        // Old segs in [head, destroy_upto) get destroyed; the kept
+        // suffix moves at index destroy_upto and up.
+        var destroy_upto = segs.len;
+        var moved_from = segs.len; // index of first moved suffix seg
+        var rebuild_tail = (tail_n == 0);
+        var bridge_idx: ?usize = null; // seg_next index of a fused bridge seg
+        if (tail_n > 0) {
+            const first = &segs[fs];
+            const f_start = new_end - (old_end - first.start);
+            const f_end = new_end - (old_end - first.end);
+            if (mid_start < f_start) {
+                // The bridge covers the dirty middle PLUS the first kept
+                // suffix seg — its last row must start at f_start for
+                // the suffix's stored boundaries to be real.
+                const bridge = e.buildLinePara(str[mid_start..f_end], size);
+                var boundary_ok = false;
+                if (bridge) |bp| {
+                    const row_h = paraRowH(e, bp, size);
+                    const b = lastRowStart(bp, str[mid_start..f_end], row_h, paraRows(bp, row_h));
+                    boundary_ok = (mid_start + b == f_start);
+                }
+                if (boundary_ok) {
+                    // Middle + first suffix seg fuse into one seg — the
+                    // bridge para covers exactly that range and its last
+                    // row IS the suffix's first row (just verified).
+                    bridge_idx = e.seg_next.items.len;
+                    e.seg_next.append(a, .{
+                        .start = mid_start,
+                        .end = f_end,
+                        .key = std.hash.Wyhash.hash(0, str[mid_start..f_end]),
+                        .para = bridge,
+                        .h = ui.paint.textLayoutHeight(bridge.?),
+                        .w = ui.paint.textLayoutWidth(bridge.?),
+                        .base = ui.paint.textLayoutBaseline(bridge.?),
+                    }) catch @panic("klaxon: out of memory");
+                    destroy_upto = fs + 1; // fs was absorbed — its para dies
+                    moved_from = fs + 1;
+                } else {
+                    if (bridge) |bp| ui.paint.textLayoutDestroy(bp);
+                    rebuild_tail = true; // boundary drifted — drop the suffix
+                }
+            } else {
+                // Empty middle — f_start == pos is the prefix end,
+                // already a real boundary; the suffix stands untouched.
+                destroy_upto = fs;
+                moved_from = fs;
+            }
+        }
+        if (rebuild_tail and mid_start < new_end) {
+            // The tail: one paragraph over everything from the dirty
+            // point — then ratchet off its complete rows if oversized.
+            const tail = e.buildLinePara(str[mid_start..new_end], size);
+            ok = ok and tail != null;
+            e.seg_next.append(a, .{
+                .start = mid_start,
+                .end = new_end,
+                .key = std.hash.Wyhash.hash(0, str[mid_start..new_end]),
+                .para = tail,
+                .h = if (tail) |q| ui.paint.textLayoutHeight(q) else 0,
+                .w = if (tail) |q| ui.paint.textLayoutWidth(q) else 0,
+                .base = if (tail) |q| ui.paint.textLayoutBaseline(q) else 0,
+            }) catch @panic("klaxon: out of memory");
+        }
+        // Move kept suffix segs to their end-anchored absolute offsets.
+        for (segs[moved_from..]) |sg| {
+            var ns = sg;
+            ns.start = new_end - (old_end - sg.start);
+            ns.end = new_end - (old_end - sg.end);
+            e.seg_next.append(a, ns) catch @panic("klaxon: out of memory");
+        }
+        // Destroy the dropped old segs' paragraphs, then swap tables.
+        for (segs[head..destroy_upto]) |sg| {
+            if (sg.para) |p| ui.paint.textLayoutDestroy(p);
+        }
+        lp.segs.clearRetainingCapacity();
+        lp.segs.appendSlice(a, e.seg_next.items) catch @panic("klaxon: out of memory");
+
+        // Ratchet: a freshly built seg splits off its complete rows when
+        // it exceeds the budget — the fused bridge seg separates back
+        // into middle + first-suffix at their verified boundary, and the
+        // mutable tail stays small (~one row of shaping per keystroke).
+        if (bridge_idx) |bi| {
+            if (bi < lp.segs.items.len) ok = ok and e.oversizeSplit(lp, bi, str, size);
+        }
+        if (lp.segs.items.len > 0 and lp.segs.items.len - 1 != (bridge_idx orelse std.math.maxInt(usize))) {
+            ok = ok and e.oversizeSplit(lp, lp.segs.items.len - 1, str, size);
+        }
+        lp.segs_key = lp.key;
+
+        // Collapse: a single seg covering the whole content within the
+        // budget is just `para` again (the line shrank back below it).
+        if (lp.segs.items.len == 1) {
+            const sg = lp.segs.items[0];
+            if (sg.start == lp.start and sg.end == lp.content_end and sg.para != null and
+                paraRows(sg.para.?, paraRowH(e, sg.para.?, size)) <= seg_row_budget)
+            {
+                lp.para = sg.para;
+                lp.h = sg.h;
+                lp.w = sg.w;
+                lp.base = sg.base;
+                lp.segs.items[0].para = null;
+                lp.segs.clearRetainingCapacity();
+                lp.segs_key = 0;
+            }
+        }
+
+        // Aggregate line metrics + line-local seg offsets.
+        var ly: f32 = 0;
+        var maxw: f32 = 0;
+        for (lp.segs.items) |*sg| {
+            sg.y = ly;
+            ly += sg.h;
+            maxw = @max(maxw, sg.w);
+        }
+        if (lp.segs.items.len > 0) {
+            lp.h = ly;
+            lp.w = maxw;
+            lp.base = lp.segs.items[0].base;
+        }
         return ok;
     }
 
@@ -909,6 +1375,16 @@ pub const Edit = struct {
             if (!e.syncLines(size)) return if (px <= 0) near else str.len - near;
             const i = e.lineIndexOfY(py) orelse return if (px <= 0) near else str.len - near;
             const lp = &e.line_paras.items[i];
+            if (lp.segs.items.len > 0) {
+                // Pick the seg by line-local y-band, then hit-test
+                // inside its own paragraph.
+                const ly = py - lp.y;
+                const sg = &lp.segs.items[segIndexOfY(lp, ly)];
+                const p = sg.para orelse return if (px <= 0) near else str.len - near;
+                const pos = ui.paint.textLayoutPositionAt(p, px, ly - sg.y);
+                if (pos < 0) return if (px <= 0) near else str.len - near;
+                return sg.start + utf16ToByteIndex(str[sg.start..sg.end], @intCast(pos));
+            }
             const para = lp.para orelse (e.empty_para orelse return if (px <= 0) near else str.len - near);
             const pos = ui.paint.textLayoutPositionAt(para, px, py - lp.y);
             if (pos < 0) return if (px <= 0) near else str.len - near;
@@ -936,6 +1412,15 @@ pub const Edit = struct {
             // terminated line's trailing edge, not the empty last line.
             if (off == str.len and str[off - 1] == '\n' and i > 0) i -= 1;
             const lp = &e.line_paras.items[i];
+            if (lp.segs.items.len > 0) {
+                const sg = &lp.segs.items[segIndexOf(lp, off)];
+                const p = sg.para orelse return null;
+                const local = @min(off - sg.start, sg.end - sg.start);
+                var r: [4]f32 = undefined;
+                if (!ui.paint.textLayoutCaretRect(p, byteToUtf16Index(str[sg.start..sg.end], local), &r)) return null;
+                r[1] += lp.y + sg.y;
+                return r;
+            }
             const para = lp.para orelse (e.empty_para orelse return null);
             const local = @min(off - lp.start, lp.content_end - lp.start);
             var r: [4]f32 = undefined;
@@ -988,8 +1473,33 @@ pub const Edit = struct {
                 if (lp.start >= hi) break;
                 const s = @max(lo, lp.start);
                 const t = @min(hi, lp.content_end);
-                const para = lp.para orelse (e.empty_para orelse continue);
                 if (s < t) {
+                    if (lp.segs.items.len > 0) {
+                        // Same boxes one level down — per-seg local
+                        // ranges shifted by lp.y + seg.y. A boundary seg
+                        // start (s == sg.start) maps into that seg; an
+                        // interior end clips at its seg's edge.
+                        var si = segIndexOf(lp, s);
+                        while (si < lp.segs.items.len) : (si += 1) {
+                            const sg = &lp.segs.items[si];
+                            if (sg.start >= t) break;
+                            const p = sg.para orelse continue;
+                            const s2 = @max(s, sg.start);
+                            const t2 = @min(t, sg.end);
+                            if (s2 >= t2) continue;
+                            const content = str[sg.start..sg.end];
+                            const lo16 = byteToUtf16Index(content, s2 - sg.start);
+                            const hi16 = byteToUtf16Index(content, t2 - sg.start);
+                            const cnt = ui.paint.textLayoutRectsForRange(p, lo16, hi16, &.{}) orelse return null;
+                            if (total + cnt <= out.len) {
+                                _ = ui.paint.textLayoutRectsForRange(p, lo16, hi16, out[total .. total + cnt]);
+                                for (out[total .. total + cnt]) |*b| b[1] += lp.y + sg.y;
+                            }
+                            total += cnt;
+                        }
+                        continue;
+                    }
+                    const para = lp.para orelse (e.empty_para orelse continue);
                     const content = str[lp.start..lp.content_end];
                     const lo16 = byteToUtf16Index(content, s - lp.start);
                     const hi16 = byteToUtf16Index(content, t - lp.start);
@@ -1069,10 +1579,19 @@ pub const Edit = struct {
             // paragraph hit-tests the sticky column at a line-local y.
             const i = e.lineIndexOfY(y) orelse return if (dir < 0) 0 else str.len;
             const lp = &e.line_paras.items[i];
-            const para = lp.para orelse (e.empty_para orelse return e.caret);
-            const pos = ui.paint.textLayoutPositionAt(para, aim, y - lp.y);
-            if (pos < 0) return e.caret;
-            next = lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
+            if (lp.segs.items.len > 0) {
+                const ly = y - lp.y;
+                const sg = &lp.segs.items[segIndexOfY(lp, ly)];
+                const p = sg.para orelse return e.caret;
+                const pos = ui.paint.textLayoutPositionAt(p, aim, ly - sg.y);
+                if (pos < 0) return e.caret;
+                next = sg.start + utf16ToByteIndex(str[sg.start..sg.end], @intCast(pos));
+            } else {
+                const para = lp.para orelse (e.empty_para orelse return e.caret);
+                const pos = ui.paint.textLayoutPositionAt(para, aim, y - lp.y);
+                if (pos < 0) return e.caret;
+                next = lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
+            }
         } else {
             const l = e.hitLayout(size) orelse return e.caret;
             const pos = ui.paint.textLayoutPositionAt(l, aim, y);
@@ -1109,8 +1628,16 @@ pub const Edit = struct {
             // above, matching where the caret was answered.
             const i = e.lineIndexOfY(r[1] + r[3] / 2) orelse return if (dir < 0) 0 else str.len;
             const lp = &e.line_paras.items[i];
+            const mid_y = r[1] + r[3] / 2 - lp.y;
+            if (lp.segs.items.len > 0) {
+                const sg = &lp.segs.items[segIndexOfY(lp, mid_y)];
+                const p = sg.para orelse return if (dir < 0) 0 else str.len;
+                const pos = ui.paint.textLayoutPositionAt(p, edge_x, mid_y - sg.y);
+                if (pos < 0) return if (dir < 0) 0 else str.len;
+                return sg.start + utf16ToByteIndex(str[sg.start..sg.end], @intCast(pos));
+            }
             const para = lp.para orelse (e.empty_para orelse return if (dir < 0) 0 else str.len);
-            const pos = ui.paint.textLayoutPositionAt(para, edge_x, r[1] + r[3] / 2 - lp.y);
+            const pos = ui.paint.textLayoutPositionAt(para, edge_x, mid_y);
             if (pos < 0) return if (dir < 0) 0 else str.len;
             return lp.start + utf16ToByteIndex(str[lp.start..lp.content_end], @intCast(pos));
         }
@@ -1454,4 +1981,158 @@ test "edit: a trailing newline yields a counted empty last line" {
     const rm = m.e.caretRect(2, size) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(mi[0].h, rm[1]); // the empty line's row
     try std.testing.expectEqual(@as(f32, 0), rm[0]);
+}
+
+/// A test scratch pad: `text` repeated `n` times, sentinel-terminated.
+fn testRepeat(comptime n: usize, comptime text: []const u8) *const [text.len * n:0]u8 {
+    const S = struct {
+        var buf: [text.len * n:0]u8 = undefined;
+    };
+    for (0..n) |i| @memcpy(S.buf[i * text.len ..][0..text.len], text);
+    S.buf[text.len * n] = 0;
+    return &S.buf;
+}
+
+// One ~2000-byte hard line — no '\n' — wraps to dozens of soft rows at
+// wrap 200; the seg table is the same incremental idea one level down.
+test "edit: appends to a soft-wrapped line rebuild only the tail seg" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, testRepeat(2000, "x"), 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expectEqual(@as(usize, 1), e.lineParas().len);
+    const lp = e.lineParas()[0];
+    // Engaged: the line is segmented at real wrap boundaries, the
+    // mutable tail holding only its last rows.
+    try std.testing.expect(lp.segs.items.len >= 2);
+    try std.testing.expect(lp.para == null);
+    const tail = lp.segs.items[lp.segs.items.len - 1];
+    try std.testing.expect(tail.h < lp.h / 4.0);
+    const p0 = lp.segs.items[0].para;
+
+    // One 50-char insert at the end — O(1) builds (the tail's own
+    // rebuild + a possible promote), NOT ~one-per-row.
+    var before = e.para_builds;
+    _ = e.insert(testRepeat(50, "y"));
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expect(e.para_builds - before <= 4);
+
+    // Ten single keystrokes — each costs ~one small tail para, never a
+    // re-lay of the line's stable segs.
+    for (0..10) |_| {
+        before = e.para_builds;
+        _ = e.insert("z");
+        try std.testing.expect(e.syncLines(size));
+        try std.testing.expect(e.para_builds - before <= 4);
+    }
+    // The stable segs' paragraphs survived all of it.
+    const lp2 = e.lineParas()[0];
+    try std.testing.expect(lp2.segs.items.len >= 2);
+    try std.testing.expect(lp2.segs.items[0].para == p0);
+
+    // Pure appends continue the LAST ROW — the old content end was never
+    // a real boundary — so the grown tail's geometry must still answer
+    // bit-identically to the monolithic layout. (The reconcile retreats
+    // one kept seg so the rebuild starts inside unchanged bytes.)
+    const str = e.text();
+    const mono = e.hitLayout(size) orelse return error.TestUnexpectedResult;
+    var off = str.len - 60;
+    while (off <= str.len) : (off += 7) {
+        var want: [4]f32 = undefined;
+        try std.testing.expect(ui.paint.textLayoutCaretRect(mono, byteToUtf16Index(str, off), &want));
+        try std.testing.expectEqual(want, e.caretRect(off, size).?);
+    }
+    // …and the hit-test over the grown tail's band maps identically.
+    const tail2 = lp2.segs.items[lp2.segs.items.len - 1];
+    var px: f32 = 3;
+    while (px < 210) : (px += 31) {
+        const py = lp2.y + tail2.y + tail2.h - 1;
+        const pos = ui.paint.textLayoutPositionAt(mono, px, py);
+        const want = if (pos < 0) 0 else utf16ToByteIndex(str, @intCast(pos));
+        try std.testing.expectEqual(want, e.caretAt(px, py, size));
+    }
+}
+
+test "edit: a segmented line's geometry matches the monolithic paragraph" {
+    const a = std.testing.allocator;
+    const t = try testEdit(a, testRepeat(64, "abcdefghijklmnopqrstuvwxyzabc "), 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expect(e.syncLines(size));
+    const lp0 = e.lineParas()[0];
+    try std.testing.expect(lp0.segs.items.len >= 2); // engaged
+    const str = e.text();
+    const mono = e.hitLayout(size) orelse return error.TestUnexpectedResult;
+
+    // Caret rects: every 37th offset plus the exact seg boundaries —
+    // per-seg answers must be bit-identical to the monolithic layout's.
+    var off: usize = 0;
+    while (off <= str.len) : (off += 37) {
+        var want: [4]f32 = undefined;
+        try std.testing.expect(ui.paint.textLayoutCaretRect(mono, byteToUtf16Index(str, off), &want));
+        try std.testing.expectEqual(want, e.caretRect(off, size).?);
+    }
+    for (lp0.segs.items) |sg| {
+        for ([_]usize{ sg.start, sg.end }) |b| {
+            var want: [4]f32 = undefined;
+            try std.testing.expect(ui.paint.textLayoutCaretRect(mono, byteToUtf16Index(str, b), &want));
+            try std.testing.expectEqual(want, e.caretRect(@min(b, str.len), size).?);
+        }
+    }
+    // Hit-test: a grid over the line's whole band maps identically.
+    var py: f32 = 1;
+    while (py < e.linesHeight()) : (py += 13.7) {
+        var px: f32 = 3;
+        while (px < 210) : (px += 41) {
+            const pos = ui.paint.textLayoutPositionAt(mono, px, py);
+            const want = if (pos < 0) 0 else utf16ToByteIndex(str, @intCast(pos));
+            try std.testing.expectEqual(want, e.caretAt(px, py, size));
+        }
+    }
+    // Selection across several rows: same boxes, same count.
+    var got: [32][4]f32 = undefined;
+    var want_boxes: [32][4]f32 = undefined;
+    const lo: usize = 950;
+    const hi: usize = 1050;
+    const lo16 = byteToUtf16Index(str, lo);
+    const hi16 = byteToUtf16Index(str, hi);
+    const cnt = e.caretBoxes(lo, hi, size, &got) orelse return error.TestUnexpectedResult;
+    const mono_cnt = ui.paint.textLayoutRectsForRange(mono, lo16, hi16, &.{}).?;
+    try std.testing.expectEqual(mono_cnt, cnt);
+    _ = ui.paint.textLayoutRectsForRange(mono, lo16, hi16, want_boxes[0..mono_cnt]);
+    for (0..cnt) |i| try std.testing.expectEqual(want_boxes[i], got[i]);
+
+    // A mid-line edit re-verifies boundaries downstream — geometry still
+    // bit-identical to a fresh monolithic layout.
+    e.moveCaret(960, false);
+    _ = e.insert("QQQ");
+    try std.testing.expect(e.syncLines(size));
+    const str2 = e.text();
+    const mono2 = e.hitLayout(size) orelse return error.TestUnexpectedResult;
+    off = 0;
+    while (off <= str2.len) : (off += 41) {
+        var want: [4]f32 = undefined;
+        try std.testing.expect(ui.paint.textLayoutCaretRect(mono2, byteToUtf16Index(str2, off), &want));
+        try std.testing.expectEqual(want, e.caretRect(off, size).?);
+    }
+}
+
+test "edit: a strong-RTL line keeps its whole-line paragraph" {
+    const a = std.testing.allocator;
+    // Hebrew words — strong RTL — long enough to wrap past the budget.
+    const t = try testEdit(a, testRepeat(60, "שלום עולם "), 200);
+    defer freeTestEdit(a, t.n, t.e);
+    const e = t.e;
+    const size: f32 = 16;
+    try std.testing.expect(e.syncLines(size));
+    try std.testing.expect(e.hasStrongRtl());
+    const lp = e.lineParas()[0];
+    // Per-seg bidi resolution could diverge — segs must stay off.
+    try std.testing.expectEqual(@as(usize, 0), lp.segs.items.len);
+    try std.testing.expect(lp.para != null);
+    const r = e.caretRect(4, size) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(r[3] > 0);
 }

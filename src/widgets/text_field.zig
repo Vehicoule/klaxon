@@ -1092,10 +1092,21 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
     // wrap width so its kStart alignment lands identically to the
     // monolithic paragraph (LTR left edge, RTL right edge). Lines fully
     // outside the scroll window skip the draw — the clip would discard
-    // them anyway. Empty lines carry no ink — nothing to paint.
+    // them anyway. Empty lines carry no ink — nothing to paint. A
+    // segmented long line draws its soft-wrap shards at their own
+    // accumulated offsets, one level down the same scheme.
     for (s.edit.lineParas()) |lp| {
-        const p = lp.para orelse continue;
         if (lp.y + lp.h <= s.scroll.offset or lp.y >= s.scroll.offset + region.h) continue;
+        if (lp.segs.items.len > 0) {
+            for (lp.segs.items) |sg| {
+                const p = sg.para orelse continue;
+                const top = lp.y + sg.y;
+                if (top + sg.h <= s.scroll.offset or top >= s.scroll.offset + region.h) continue;
+                ui.paint.textLayoutPaint(ctx, p, region.x, region.y + top + sg.base - s.scroll.offset);
+            }
+            continue;
+        }
+        const p = lp.para orelse continue;
         ui.paint.textLayoutPaint(ctx, p, region.x, region.y + lp.y + lp.base - s.scroll.offset);
     }
     if (has_comp) {
