@@ -69,14 +69,17 @@ Each widget's header carries the same list; these are the tracked ones
   (`fab.zig`, `time_picker.zig`; both no-ops in the baselines, kept for
   custom themes that collapse a container role onto `surface`).
 - `ui/interactions.zig` + `ui/state_layer.zig` + `ui/ripple.zig` — the
-  Compose indication machinery has landed as shared modules
-  (InteractionSource semantics, the animated StateLayer, and
-  RippleAnimation/CommonRipple), but **no widget consumes them yet**:
-  widgets still paint fixed-alpha interaction overlays (checkbox's 40dp
-  circle, button's hand-rolled pressed/focused/hovered precedence,
-  nav_bar's index tracking) and draw no expanding ink ripple. Widget
-  migration is deliberately deferred to follow-up batches; the integration
-  contract lives in each module's header. Deliberate port deltas inside
+  Compose indication machinery (InteractionSource semantics, the animated
+  StateLayer, and RippleAnimation/CommonRipple) is wired into the
+  navigation/surface widgets: `nav_bar`, `navigation_rail`, `list_item`,
+  `menu` and `card` run a per-item/per-node Tracker → animated layer →
+  bounded ripple (the pill/row-clipped indication upstream's
+  `indication(offsetInteractionSource, ripple)` produces); `app_bar`,
+  `bottom_app_bar` and `drawer` carry no indication upstream and own
+  none here. The remaining widgets still paint fixed-alpha interaction
+  overlays (checkbox's 40dp circle, button's hand-rolled
+  pressed/focused/hovered precedence) and draw no expanding ink ripple —
+  migration is deliberately batched. Deliberate port deltas inside
   the machinery itself: concurrent ripples capped at 4 (upstream's
   scatter map is unbounded, though every `addRipple` finishes all live
   ripples anyway — overflow retires the oldest instantly); active

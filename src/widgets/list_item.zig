@@ -23,6 +23,12 @@
 //   - shape: CornerNone (flat — the M3E hover/press morph to CornerLarge
 //     lands with the Phase 3 motion)
 //
+// Indication (ListItem.kt:1600-1615): the clickable row is upstream's
+// `Modifier.combinedClickable(interactionSource, indication =
+// ripple(focusRingShape = shape))` after `.clip(shape)` — a bounded ripple
+// clipped to the whole row + the animated state layer, fed by the row's
+// own interactions.Tracker. Enter/Space presses at the row's center.
+//
 // The widget is a LEAF (like the M3E text field): all of its chrome is
 // painted by the widget itself (the colors/positions change with the
 // selected state — paint-time computation needs no child recolor).
@@ -85,8 +91,12 @@ const ListItemState = struct {
     /// The selected state (read-only visual — the click does not flip it).
     sig: ?*ui.state.Signal(bool) = null,
     on_click: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The shared indication machinery (upstream's combinedClickable
+    /// interactionSource + ripple() indication).
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0, // the live press's tracker id (0 = none)
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
 };
@@ -241,19 +251,17 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
     if (fc.container & 0xFF != 0) {
         ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, fc.container);
     }
-    // the state layer (clickable, enabled): on_surface over the container
+    // the indication (clickable, enabled): the animated state layer + the
+    // bounded ink ripple over the whole row (upstream's combinedClickable
+    // indication = ripple() draws both, clipped to the row shape = rect).
+    // The focus interaction is polled — there is no focus-gained hook.
     if (isClickable(s)) {
-        const alpha: f32 = if (s.pressed)
-            t.state.pressed
-        else if (input.isFocused(n))
-            t.state.focus
-        else if (s.hovered)
-            t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, theme_mod.stateLayer(fc.container, fc.on, alpha));
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, fc.on);
+        if (s.layer.paintColor()) |lc| {
+            ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, lc);
         }
+        s.ripples.paint(ctx, n, .rect);
     }
 
     // --- the text column (three-line top-aligns at its 12dp padding; the
@@ -317,21 +325,30 @@ fn listItemCursor(n: *Node) ui.node.PointerCursor {
     return if (isClickable(stateOf(n))) .hand else .default;
 }
 
+/// End the live press (release = up, cancel = slop/outside) — the tracker
+/// entry and its ripple pair on `press_id`.
+fn endPress(s: *ListItemState, id: u32, now_ms: u64, cancel: bool) void {
+    if (cancel) s.inter.cancel(id) else s.inter.release(id);
+    s.ripples.release(id, now_ms);
+    s.press_id = 0;
+}
+
 fn listItemOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!isClickable(s)) return false;
+    s.inter.setFocused(input.isFocused(n)); // focus sync — poll, no hook
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            if (s.press_id != 0) endPress(s, s.press_id, ev.time_ms, true); // a second pointer supersedes
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) endPress(s, s.press_id, ev.time_ms, false);
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.on_click) |cb| cb.fn_ptr(cb.userdata);
             }
@@ -339,34 +356,41 @@ fn listItemOnPointer(n: *Node, ev: input.PointerEvent) bool {
         },
         .move => {
             // a drag past the touch slop cancels the press (a scroll)
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    endPress(s, s.press_id, ev.time_ms, true);
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            if (s.press_id != 0) endPress(s, s.press_id, ev.time_ms, true);
             return true;
         },
         .enter => {
-            s.hovered = true;
-            n.markDirty();
+            _ = s.inter.hoverEnter();
             return true;
         },
         .leave => {
-            s.hovered = false;
-            n.markDirty();
+            s.inter.endHover();
             return true;
         },
         else => {},
     }
     return false;
+}
+
+/// A key press spawns its ripple at the indication's center and releases
+/// it immediately — the ripple still runs its full expand + fade-out.
+fn keyPressRipple(s: *ListItemState, n: *Node) void {
+    const cx = n.bounds.x + n.bounds.w / 2;
+    const cy = n.bounds.y + n.bounds.h / 2;
+    const pid = s.inter.pressDown(cx, cy);
+    s.ripples.spawn(pid, cx, cy, 0);
+    s.inter.release(pid);
+    s.ripples.release(pid, 0);
 }
 
 /// Keyboard activation: Enter/Space press the focused list item.
@@ -376,6 +400,7 @@ fn listItemOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            keyPressRipple(s, n);
             if (s.on_click) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -396,6 +421,8 @@ fn listItemSyncCb(userdata: ?*anyopaque) void {
 fn listItemDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = listItemSyncCb, .userdata = n } });
+    s.layer.deinit(); // in-flight tween userdata = `l`
+    s.ripples.deinit(); // the live ticker userdata = `r`
     input.releaseNode(n);
     n.allocator.free(s.headline);
     n.allocator.free(s.supporting);
@@ -447,6 +474,15 @@ pub fn listItem(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_c
         allocator.free(s.trailing_text);
     }
     node.state = s;
+    // The indication machinery: mutations + ticks damage this node; the
+    // layer alpha table + ripple ink come straight from the theme (the
+    // row's contentColor is OnSurface).
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples.node = node;
+    s.ripples.color = opts.theme.colors.on_surface;
+    s.ripples.pressed_alpha = opts.theme.state.pressed;
     ui.semantics.attach(node, .{
         .role = .list_item,
         .label = s.headline,

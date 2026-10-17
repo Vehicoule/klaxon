@@ -17,6 +17,13 @@
 //   - position: below the anchor, start-aligned, intrinsic width (the widest
 //     item), clamped to the window width (a long label stays onscreen)
 //
+// Indication (Menu.kt:2155-2160): each item row is upstream's
+// `Modifier.clickable(interactionSource, indication = ripple(true))` — a
+// bounded ripple clipped to the row rect + the animated state layer, fed
+// by the row's own interactions.Tracker. The keyboard highlight maps to a
+// focus interaction (upstream items take real focus); Enter on the
+// highlighted row presses at its center.
+//
 // The menu is a wrapper: the anchor is a document child (it sizes the menu);
 // the item rows are internal chrome overlaying below the anchor (the P0
 // dropdown pattern: hidden children + the router's open-popup barrier closes
@@ -92,8 +99,9 @@ const MenuState = struct {
     on_select: ?Callback = null,
     open: bool = false,
     /// The hovered/highlighted item (-1 = none; keyboard nav moves it too).
+    /// Maps to a focus interaction on the highlighted row's tracker
+    /// (upstream rows take real focus).
     highlight: i32 = -1,
-    pressed_index: i32 = -1,
     /// The last selected index (pub accessor `selectedIndex`).
     selected: usize = 0,
     /// Open/close animation progress: 0..1 lerps scale 0.8→1 and alpha
@@ -198,7 +206,15 @@ fn applyOpen(n: *Node, s: *MenuState, open: bool) void {
     s.open = open;
     if (open) for (n.children.items[1..]) |child| child.setVisible(true); // fade in from 0
     s.highlight = -1;
-    s.pressed_index = -1;
+    // The interaction set dies with the open state (upstream's per-item
+    // MutableInteractionSource lives in the composed row): a close
+    // mid-press, or a reopen, never inherits a stale press/hover.
+    for (n.children.items[1..]) |child| {
+        const is_ = itemStateOf(child);
+        is_.inter.clear();
+        is_.press_id = 0;
+        is_.ripples.releaseAll(0);
+    }
     markMenuDirty(n);
     if (open) {
         input.setOpenPopup(n); // the router's barrier closes on outside clicks
@@ -257,6 +273,13 @@ fn menuSelect(owner: *Node, index: usize) void {
 const ItemState = struct {
     def_index: usize,
     owner: *Node,
+    /// The shared indication machinery (upstream's clickable
+    /// interactionSource + ripple(true) indication): the ordered
+    /// interaction set, the animated state layer, the bounded ink ripples.
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0, // the live press's tracker id (0 = none)
 };
 
 fn itemStateOf(n: *Node) *ItemState {
@@ -302,18 +325,17 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
     const label_col = if (def.enabled) cs.on_surface else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
     const icon_col = if (def.enabled) cs.on_secondary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
     const trail_col = if (def.enabled) cs.on_surface_variant else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-    // the state layer (enabled only): pressed > highlight (focus when the menu
-    // holds the keyboard focus, hover otherwise)
+    // the indication (enabled only): the keyboard/hover highlight maps to
+    // a focus interaction (upstream rows take real focus — the row lights
+    // at the focus alpha while the open menu holds the keyboard focus);
+    // then the animated state layer + the bounded ink ripple over the row.
     if (def.enabled) {
-        const alpha: f32 = if (ms.pressed_index == @as(i32, @intCast(s.def_index)))
-            t.state.pressed
-        else if (ms.highlight == @as(i32, @intCast(s.def_index)))
-            if (input.isFocused(s.owner)) t.state.focus else t.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, theme_mod.stateLayer(cs.surface_container, cs.on_surface, alpha));
+        s.inter.setFocused(ms.highlight == @as(i32, @intCast(s.def_index)) and input.isFocused(s.owner));
+        s.layer.sync(&s.inter, cs.on_surface);
+        if (s.layer.paintColor()) |lc| {
+            ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, lc);
         }
+        s.ripples.paint(ctx, n, .rect);
     }
     // the label (vertically centered, upstream ProvideTextStyle labelLarge)
     const lm = ui.paint.measureText(def.label, t.type_scale.label_large.size, false);
@@ -334,6 +356,15 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+/// End the row's live press (release = up, cancel = drag-off/outside) —
+/// the tracker entry and its ripple pair on `press_id`.
+fn itemEndPress(s: *ItemState, now_ms: u64, cancel: bool) void {
+    if (s.press_id == 0) return;
+    if (cancel) s.inter.cancel(s.press_id) else s.inter.release(s.press_id);
+    s.ripples.release(s.press_id, now_ms);
+    s.press_id = 0;
+}
+
 fn itemOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = itemStateOf(n);
     const ms = stateOf(s.owner);
@@ -342,23 +373,27 @@ fn itemOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const idx: i32 = @intCast(s.def_index);
     switch (ev.phase) {
         .enter => {
+            _ = s.inter.hoverEnter();
             ms.highlight = idx;
             markMenuDirty(s.owner);
             return true;
         },
         .leave => {
+            s.inter.endHover();
             if (ms.highlight == idx) ms.highlight = -1;
             markMenuDirty(s.owner);
             return true;
         },
         .down => {
-            ms.pressed_index = idx;
+            if (s.press_id != 0) itemEndPress(s, ev.time_ms, true); // a second pointer supersedes
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             markMenuDirty(s.owner);
             return true;
         },
         .up => {
-            const was = ms.pressed_index == idx;
-            ms.pressed_index = -1;
+            const was = s.press_id != 0;
+            itemEndPress(s, ev.time_ms, false);
             if (was and n.bounds.contains(ev.x, ev.y)) {
                 menuSelect(s.owner, s.def_index);
             } else {
@@ -366,13 +401,29 @@ fn itemOnPointer(n: *Node, ev: input.PointerEvent) bool {
             }
             return true;
         },
+        .move => {
+            // upstream clickable cancels the press when the pointer leaves
+            // the row — the move itself keeps bubbling (not claimed)
+            if (s.press_id != 0 and !n.bounds.contains(ev.x, ev.y)) {
+                itemEndPress(s, ev.time_ms, true);
+                markMenuDirty(s.owner);
+            }
+            return false;
+        },
+        .outside_down => {
+            itemEndPress(s, ev.time_ms, true);
+            return false; // the owner's outside_down closes the menu
+        },
         else => {},
     }
     return false;
 }
 
 fn itemDeinit(n: *Node) void {
-    n.allocator.destroy(itemStateOf(n));
+    const s = itemStateOf(n);
+    s.layer.deinit(); // in-flight tween userdata = `l`
+    s.ripples.deinit(); // the live ticker userdata = `r`
+    n.allocator.destroy(s);
 }
 
 const item_vtable = ui.node.VTable{
@@ -494,7 +545,24 @@ fn menuOnKey(n: *Node, ev: input.KeyEvent) bool {
             return true;
         },
         .enter => {
-            if (s.highlight >= 0) menuSelect(n, @intCast(s.highlight));
+            if (s.highlight >= 0) {
+                const hi: usize = @intCast(s.highlight);
+                // A key press lands at the row's center (upstream's
+                // keyboard press position = the component center); the
+                // ripple releases immediately but still runs its full
+                // expand + fade-out.
+                if (hi < s.items.items.len) {
+                    const row = n.children.items[1 + hi];
+                    const is_ = itemStateOf(row);
+                    const cx = row.bounds.x + row.bounds.w / 2;
+                    const cy = row.bounds.y + row.bounds.h / 2;
+                    const pid = is_.inter.pressDown(cx, cy);
+                    is_.ripples.spawn(pid, cx, cy, 0);
+                    is_.inter.release(pid);
+                    is_.ripples.release(pid, 0);
+                }
+                menuSelect(n, hi);
+            }
             return true;
         },
         .escape => {
@@ -611,6 +679,16 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
         errdefer allocator.destroy(is);
         is.* = .{ .def_index = i, .owner = node };
         item_node.state = is;
+        // The indication machinery: mutations + ticks damage the row node;
+        // the layer alpha table + the ripple ink come from the theme (the
+        // row's contentColor is OnSurface).
+        const mt = opts.theme;
+        is.inter.node = item_node;
+        is.layer.node = item_node;
+        is.layer.alphas = .{ .hover = mt.state.hover, .focus = mt.state.focus, .pressed = mt.state.pressed, .drag = mt.state.drag };
+        is.ripples.node = item_node;
+        is.ripples.color = mt.colors.on_surface;
+        is.ripples.pressed_alpha = mt.state.pressed;
         item_node.setVisible(false);
         item_node.internal = true; // chrome: never serialized
         // NOT exclude_semantics: each row carries its own .menu_item

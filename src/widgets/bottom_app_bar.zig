@@ -16,9 +16,13 @@
 //   - placeRelative → RTL mirrors the whole layout: the FAB docks at the
 //     left and the actions flow right-to-left
 //
-// The bar owns no interaction: the actions/fab slots are ordinary widgets
-// (icon buttons, FABs) with their own semantics. The widget is a pure
-// chrome container: measure/layout/paint + a group semantic.
+// The bar owns no interaction: upstream's BottomAppBar carries no
+// interactionSource/indication — a plain Surface layout (AppBar.kt's
+// BottomAppBar has no clickable/indication modifier); the actions/fab
+// slots are ordinary widgets (icon buttons, FABs) with their own
+// clickable + ripple/state-layer (see icon_button.zig/fab.zig). The
+// widget is a pure chrome container: measure/layout/paint + a group
+// semantic.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");

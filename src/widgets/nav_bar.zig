@@ -23,9 +23,20 @@
 //     inactive both OnSurfaceVariant — destination() supplies the colors
 //   - unbounded measure: an item's natural width = icon +
 //     2*NavigationBarItemToIconMinimumPadding(44)
-//   - state layers: on_secondary_container over the active indicator,
-//     on_surface_variant over the indicator zone when inactive (the
-//     upstream ripple's LocalContentColor equivalent)
+//   - state layers + ripple: on_surface over the indicator pill zone —
+//     the upstream ripple's LocalContentColor (the bar's contentColor =
+//     contentColorFor(SurfaceContainer) = OnSurface)
+//
+// Indication (NavigationBar.kt:221-228,247-272): the whole item is
+// `selectable(interactionSource, indication = null)` — the indication is
+// instead a separate indicator-sized Box,
+// `.clip(indicatorShape).indication(offsetInteractionSource,
+// ripple(focusRingShape = indicatorShape))`: a bounded ripple clipped to
+// the 56x32 CornerFull pill, fed by a per-item interactions.Tracker (the
+// upstream MappedInteractionSource remaps press coords into the pill —
+// free here, since the press position already lands in the pill's own
+// coordinate space). Press = the ripple; hover/focus = the animated
+// state layer. Enter/Space presses at the pill's center.
 //
 // Deviations: Klaxon nodes are content-sized, so a generic child's "icon"
 // is its content top — the destination() child reproduces the upstream
@@ -72,6 +83,34 @@ pub const NavBarOptions = struct {
     label: ?[]const u8 = null,
 };
 
+/// Per-item indication state (the upstream per-item MutableInteractionSource
+/// + the indicator Box's ripple). Heap-allocated: the StateLayer's timeline
+/// channel takes `l`'s address, so the struct must never move once wired.
+const ItemFx = struct {
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0, // the live press's tracker id (0 = none)
+
+    fn create(allocator: std.mem.Allocator, n: *Node, t: Theme) !*ItemFx {
+        const fx = try allocator.create(ItemFx);
+        fx.* = .{};
+        fx.inter.node = n;
+        fx.layer.node = n;
+        fx.layer.alphas = .{ .hover = t.state.hover, .focus = t.state.focus, .pressed = t.state.pressed, .drag = t.state.drag };
+        fx.ripples.node = n;
+        fx.ripples.color = t.colors.on_surface;
+        fx.ripples.pressed_alpha = t.state.pressed;
+        return fx;
+    }
+
+    fn destroy(fx: *ItemFx, allocator: std.mem.Allocator) void {
+        fx.layer.deinit(); // in-flight tween userdata = `l`
+        fx.ripples.deinit(); // the live ticker userdata = `r`
+        allocator.destroy(fx);
+    }
+};
+
 const NavBarState = struct {
     sig: *ui.state.Signal(usize),
     opts: NavBarOptions,
@@ -81,6 +120,8 @@ const NavBarState = struct {
     /// centering) and the content sizes (indicator vertical placement).
     cells: std.array_list.Managed(Rect),
     content_sizes: std.array_list.Managed(Size),
+    /// Per-item indication (parallel to `cells` — same count/order).
+    fx: std.array_list.Managed(*ItemFx),
     semantics_attached: bool = false,
     i18n: ?*i18n_mod.I18n = null,
 };
@@ -162,11 +203,6 @@ fn navBarMeasure(n: *Node, c: Constraints) Size {
 fn navBarLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     const count = n.children.items.len;
-    if (count == 0) return;
-    // Arrangement.spacedBy(NavigationBarItemHorizontalPadding) between
-    // weight(1f) cells: equal cells with 8dp gaps that belong to no item.
-    const gaps = @as(f32, @floatFromInt(count - 1)) * item_gap;
-    const cell_w = @max(0, (bounds.w - gaps) / @as(f32, @floatFromInt(count)));
     if (s.cells.items.len != count) {
         s.cells.clearRetainingCapacity();
         s.content_sizes.clearRetainingCapacity();
@@ -175,6 +211,24 @@ fn navBarLayout(n: *Node, bounds: Rect) void {
             s.content_sizes.append(.{}) catch @panic("klaxon: out of memory");
         }
     }
+    // The indication set tracks the child count: removed items' modules
+    // die with them (upstream's interaction set dies with the row).
+    while (s.fx.items.len > count) {
+        const fx = s.fx.pop().?;
+        fx.destroy(n.allocator);
+    }
+    while (s.fx.items.len < count) {
+        s.fx.append(ItemFx.create(n.allocator, n, s.opts.theme) catch @panic("klaxon: out of memory")) catch @panic("klaxon: out of memory");
+    }
+    // The indices die with the shrunk items (the interactions inside the
+    // removed fx are already gone with it).
+    if (s.hovered != null and s.hovered.? >= count) s.hovered = null;
+    if (s.pressed != null and s.pressed.? >= count) s.pressed = null;
+    if (count == 0) return;
+    // Arrangement.spacedBy(NavigationBarItemHorizontalPadding) between
+    // weight(1f) cells: equal cells with 8dp gaps that belong to no item.
+    const gaps = @as(f32, @floatFromInt(count - 1)) * item_gap;
+    const cell_w = @max(0, (bounds.w - gaps) / @as(f32, @floatFromInt(count)));
     const loose: Constraints = .{ .max_w = cell_w, .max_h = bounds.h };
     const rtl = ui.i18n.direction() == .rtl;
     for (n.children.items, 0..) |child, i| {
@@ -199,6 +253,21 @@ fn navBarLayout(n: *Node, bounds: Rect) void {
     }
 }
 
+/// The item's indicator rect (the 56x32 pill) in parent space — upstream:
+/// icon + 2*IndicatorHorizontalPadding(16) wide x icon +
+/// 2*IndicatorVerticalPadding(4) high, centered horizontally, vertically
+/// at contentVerticalPadding - IVP (it wraps the icon, not the label).
+/// Shared by the paint path and the keyboard ripple.
+fn indicatorRect(s: *NavBarState, cell: Rect, i: usize) Rect {
+    const v = itemVerticals(s.content_sizes.items[i].h);
+    return .{
+        .x = cell.x + (cell.w - indicator_w) / 2,
+        .y = cell.y + (cell.h - v.frame_h) / 2 + v.cvp - ind_v_pad,
+        .w = indicator_w,
+        .h = indicator_h,
+    };
+}
+
 fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
@@ -206,38 +275,69 @@ fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, t.colors.surface_container);
     const sel = s.sig.peek();
     for (s.cells.items, 0..) |cell, i| {
-        // Upstream: the indicator is icon + 2*IndicatorHorizontalPadding
-        // (16) wide x icon + 2*IndicatorVerticalPadding (4) high — 56x32
-        // for the 24dp icon — centered horizontally, and vertically at
-        // contentVerticalPadding - IVP (it wraps the icon, not the label).
-        const iw = indicator_w;
-        const v = itemVerticals(s.content_sizes.items[i].h);
-        const iy = cell.y + (cell.h - v.frame_h) / 2 + v.cvp - ind_v_pad;
-        const ix = cell.x + (cell.w - iw) / 2;
-        const hovered = s.hovered != null and s.hovered.? == i;
-        const pressed = s.pressed != null and s.pressed.? == i;
+        const pill = indicatorRect(s, cell, i);
+        // The active indicator (secondary_container, CornerFull).
         if (i == sel) {
-            var c = t.colors.secondary_container;
-            if (pressed) {
-                c = theme_mod.stateLayer(c, t.colors.on_secondary_container, t.state.pressed);
-            } else if (hovered) {
-                c = theme_mod.stateLayer(c, t.colors.on_secondary_container, t.state.hover);
-            }
-            ui.paint.fillRRect(ctx, ix, iy, iw, indicator_h, indicator_h / 2, c);
-        } else if (hovered or pressed) {
-            const alpha = if (pressed) t.state.pressed else t.state.hover;
-            ui.paint.fillRRect(ctx, ix, iy, iw, indicator_h, indicator_h / 2, theme_mod.stateLayer(t.colors.surface_container, t.colors.on_surface_variant, alpha));
+            ui.paint.fillRRect(ctx, pill.x, pill.y, pill.w, pill.h, pill.h / 2, t.colors.secondary_container);
         }
     }
+}
+
+/// The indication pass — upstream's `indicatorRipplePlaceable` places LAST
+/// (NavigationBar.kt:711-714: indicator, label, icon, then the ripple), so
+/// the layer + ink paint OVER the destination's icon/label — hence the
+/// post-children hook rather than the bar's own paint.
+fn navBarPostPaint(n: *Node, ctx: *kx.Ctx) void {
+    const s = stateOf(n);
+    const t = s.opts.theme;
+    for (s.cells.items, 0..) |cell, i| {
+        const pill = indicatorRect(s, cell, i);
+        const fx = s.fx.items[i];
+        // The item's focus is its child node's (the .tab) — polled, there
+        // is no focus-gained hook.
+        fx.inter.setFocused(input.isFocused(n.children.items[i]));
+        fx.layer.sync(&fx.inter, t.colors.on_surface);
+        if (fx.layer.paintColor()) |lc| {
+            ui.paint.fillRRect(ctx, pill.x, pill.y, pill.w, pill.h, pill.h / 2, lc);
+        }
+        // Ripples.paint reads n.bounds for the clip + geometry — rebind it
+        // to the pill rect (a shallow proxy; only .bounds is consulted).
+        if (fx.ripples.live()) {
+            var proxy = n.*;
+            proxy.bounds = pill;
+            fx.ripples.paint(ctx, &proxy, .{ .rrect = pill.h / 2 });
+        }
+    }
+}
+
+/// End an item's live press (release = up, cancel = drag-off/outside) —
+/// the tracker entry and its ripple pair on `press_id`.
+fn navBarEndPress(s: *NavBarState, i: usize, now_ms: u64, cancel: bool) void {
+    const fx = s.fx.items[i];
+    if (fx.press_id == 0) return;
+    if (cancel) fx.inter.cancel(fx.press_id) else fx.inter.release(fx.press_id);
+    fx.ripples.release(fx.press_id, now_ms);
+    fx.press_id = 0;
+}
+
+/// Move the hover interaction to a new item (null = none).
+fn navBarSetHover(s: *NavBarState, h: ?usize) void {
+    if (h == s.hovered) return;
+    if (s.hovered) |old| s.fx.items[old].inter.endHover();
+    s.hovered = h;
+    if (s.hovered) |new| _ = s.fx.items[new].inter.hoverEnter();
 }
 
 fn navBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     switch (ev.phase) {
         .down => {
-            s.pressed = itemAtPoint(n, s, ev.raw_x, ev.raw_y);
-            if (s.pressed != null) {
-                n.markDirty();
+            if (itemAtPoint(n, s, ev.raw_x, ev.raw_y)) |i| {
+                const fx = s.fx.items[i];
+                if (fx.press_id != 0) navBarEndPress(s, i, ev.time_ms, true); // a second pointer supersedes
+                fx.press_id = fx.inter.pressDown(ev.x, ev.y);
+                fx.ripples.spawn(fx.press_id, ev.x, ev.y, ev.time_ms);
+                s.pressed = i;
                 return true;
             }
             return false;
@@ -246,37 +346,47 @@ fn navBarOnPointer(n: *Node, ev: input.PointerEvent) bool {
             const up_item = itemAtPoint(n, s, ev.raw_x, ev.raw_y);
             const was = s.pressed;
             s.pressed = null;
-            n.markDirty();
             if (was != null) {
+                navBarEndPress(s, was.?, ev.time_ms, false);
                 if (up_item != null and up_item.? == was.?) s.sig.set(up_item.?);
                 return true; // the press is consumed even when released outside
             }
             return false;
         },
         .enter => {
-            s.hovered = itemAtPoint(n, s, ev.raw_x, ev.raw_y);
-            n.markDirty();
+            navBarSetHover(s, itemAtPoint(n, s, ev.raw_x, ev.raw_y));
             return true;
         },
         .leave => {
-            if (s.hovered != null) {
-                s.hovered = null;
-                n.markDirty();
-            }
+            navBarSetHover(s, null);
             return true;
         },
-        .move => return s.pressed != null,
+        .move => {
+            // upstream selectable cancels the press when the pointer
+            // leaves the item — the move stays claimed while pressed
+            if (s.pressed) |p| {
+                if (itemAtPoint(n, s, ev.raw_x, ev.raw_y) != p) {
+                    navBarEndPress(s, p, ev.time_ms, true);
+                    s.pressed = null;
+                }
+                return true;
+            }
+            return false;
+        },
+        .outside_down => {
+            if (s.pressed) |p| {
+                navBarEndPress(s, p, ev.time_ms, true);
+                s.pressed = null;
+                return true; // it owned the interaction
+            }
+            return false;
+        },
         // Uncaptured hover over an unchanged deepest node: track the hovered
         // cell (the enter/leave pair only fires when the node changes).
         .hover_move => {
-            const h = itemAtPoint(n, s, ev.raw_x, ev.raw_y);
-            if (h != s.hovered) {
-                s.hovered = h;
-                n.markDirty();
-            }
+            navBarSetHover(s, itemAtPoint(n, s, ev.raw_x, ev.raw_y));
             return true;
         },
-        else => return false,
     }
 }
 
@@ -286,6 +396,19 @@ fn navBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     switch (ev.key) {
         .enter, .space => {
             if (focusedItem(n)) |i| {
+                // A key press lands at the indication's center — the pill
+                // (upstream's keyboard press position = the component
+                // center); released immediately, the ripple still expands.
+                if (i < s.fx.items.len and i < s.cells.items.len) {
+                    const fx = s.fx.items[i];
+                    const pill = indicatorRect(s, s.cells.items[i], i);
+                    const cx = pill.x + pill.w / 2;
+                    const cy = pill.y + pill.h / 2;
+                    const pid = fx.inter.pressDown(cx, cy);
+                    fx.ripples.spawn(pid, cx, cy, 0);
+                    fx.inter.release(pid);
+                    fx.ripples.release(pid, 0);
+                }
                 s.sig.set(i);
                 return true;
             }
@@ -323,6 +446,8 @@ fn navBarDeinit(n: *Node) void {
     s.sig.unsubscribe(.{ .callback = .{ .fn_ptr = navBarSyncCb, .userdata = n } });
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = navBarLocaleCb, .userdata = n });
     input.releaseNode(n);
+    for (s.fx.items) |fx| fx.destroy(n.allocator);
+    s.fx.deinit();
     s.cells.deinit();
     s.content_sizes.deinit();
     n.allocator.destroy(s);
@@ -345,6 +470,7 @@ const nav_bar_vtable = ui.node.VTable{
     .deinit = navBarDeinit,
     .on_pointer = navBarOnPointer,
     .on_key = navBarOnKey,
+    .post_children_paint = navBarPostPaint,
 };
 
 /// Bottom navigation bar (M3E). Children = the destinations (passive
@@ -355,7 +481,7 @@ pub fn navBar(allocator: std.mem.Allocator, selected: *ui.state.Signal(usize), o
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(NavBarState);
     errdefer allocator.destroy(s);
-    s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator) };
+    s.* = .{ .sig = selected, .opts = opts, .cells = .init(allocator), .content_sizes = .init(allocator), .fx = .init(allocator) };
     node.state = s;
     navBarLocaleCb(node); // Phase 2c — the same path resolves the label
     s.i18n = i18n_mod.subscribeLocale(.{ .fn_ptr = navBarLocaleCb, .userdata = node });

@@ -15,6 +15,13 @@
 //     padding (apps add their own); this widget exposes a `padding` option
 //     (default 16) + `gap` (default 0); children stretch to the inner width
 //
+// Indication (Card.kt:906-918 → Surface.kt:253-264): the clickable card is
+// upstream's Surface(onClick) — `Modifier.clickable(interactionSource,
+// indication = ripple(focusRingShape = shape))`: a bounded ripple clipped
+// to the card shape (CornerMedium) + the animated state layer, fed by the
+// per-card interactions.Tracker. Keyboard Enter/Space presses at the
+// center like upstream's key-press.
+//
 // The card is a CONTAINER: its children are document data (they keep their
 // own semantics; a child's own click handler wins the hit test first).
 //
@@ -59,8 +66,14 @@ const outline_w: f32 = 1;
 const CardState = struct {
     opts: CardOptions,
     on_click: ?Callback = null,
-    pressed: bool = false,
-    hovered: bool = false,
+    /// The shared indication machinery (upstream's clickable
+    /// interactionSource + indication): the ordered interaction set, the
+    /// animated state layer and the bounded ink ripples.
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    /// The live press's tracker id (0 = none — the up/slop paths pair it).
+    press_id: u32 = 0,
     /// The down position in raw (window) coordinates (drag deltas are
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
@@ -99,9 +112,9 @@ fn variantIndex(s: *CardState) usize {
 fn targetElevation(n: *Node, s: *CardState) f32 {
     if (!s.opts.enabled)
         return elev_rest[variantIndex(s)]; // DisabledContainerElevation = rest
-    if (s.pressed) return elev_rest[variantIndex(s)]; // Pressed = rest
+    if (s.inter.isPressed()) return elev_rest[variantIndex(s)]; // Pressed = rest
     if (input.isFocused(n)) return elev_rest[variantIndex(s)]; // Focus = rest
-    if (s.hovered) return elev_hover;
+    if (s.inter.isHovered()) return elev_hover;
     return elev_rest[variantIndex(s)];
 }
 
@@ -184,19 +197,17 @@ fn cardPaint(n: *Node, ctx: *kx.Ctx) void {
     if (container & 0xFF != 0) {
         ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, container);
     }
-    // the state layer (clickable, enabled): on_surface over the container
+    // the indication (clickable, enabled): the animated state layer +
+    // the bounded ink ripple — upstream's clickable indication = ripple()
+    // draws both over the container, clipped to the card shape. The layer
+    // polls the router focus (there is no focus-gained hook).
     if (isClickable(s)) {
-        const alpha: f32 = if (s.pressed)
-            s.opts.theme.state.pressed
-        else if (input.isFocused(n))
-            s.opts.theme.state.focus
-        else if (s.hovered)
-            s.opts.theme.state.hover
-        else
-            0;
-        if (alpha > 0) {
-            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, theme_mod.stateLayer(container, cs.on_surface, alpha));
+        s.inter.setFocused(input.isFocused(n));
+        s.layer.sync(&s.inter, cs.on_surface);
+        if (s.layer.paintColor()) |lc| {
+            ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, card_radius, lc);
         }
+        s.ripples.paint(ctx, n, .{ .rrect = card_radius });
     }
     // the outline (outlined variant)
     if (s.opts.variant == .outlined) {
@@ -210,21 +221,30 @@ fn cardPaint(n: *Node, ctx: *kx.Ctx) void {
     }
 }
 
+/// End the live press (release = up, cancel = slop/outside) — the tracker
+/// entry and its ripple pair on `press_id` (Ripple.kt:383-385).
+fn endPress(s: *CardState, id: u32, now_ms: u64, cancel: bool) void {
+    if (cancel) s.inter.cancel(id) else s.inter.release(id);
+    s.ripples.release(id, now_ms);
+    s.press_id = 0;
+}
+
 fn cardOnPointer(n: *Node, ev: input.PointerEvent) bool {
     const s = stateOf(n);
     if (!isClickable(s)) return false;
+    s.inter.setFocused(input.isFocused(n)); // focus sync — poll, no hook
     switch (ev.phase) {
         .down => {
-            s.pressed = true;
+            if (s.press_id != 0) endPress(s, s.press_id, ev.time_ms, true); // a second pointer supersedes
+            s.press_id = s.inter.pressDown(ev.x, ev.y);
+            s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
-            const was_pressed = s.pressed;
-            s.pressed = false;
-            n.markDirty();
+            const was_pressed = s.press_id != 0;
+            if (was_pressed) endPress(s, s.press_id, ev.time_ms, false);
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.on_click) |cb| cb.fn_ptr(cb.userdata);
             }
@@ -233,36 +253,44 @@ fn cardOnPointer(n: *Node, ev: input.PointerEvent) bool {
         .move => {
             // a drag past the touch slop cancels the press (a scroll); the
             // move is NOT claimed so it keeps bubbling to scrollables
-            if (s.pressed) {
+            if (s.press_id != 0) {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
-                    s.pressed = false;
-                    n.markDirty();
+                    endPress(s, s.press_id, ev.time_ms, true);
                 }
             }
             return false;
         },
         .outside_down => {
-            s.pressed = false;
-            n.markDirty();
+            if (s.press_id != 0) endPress(s, s.press_id, ev.time_ms, true);
             return true;
         },
         .enter => {
-            s.hovered = true;
+            _ = s.inter.hoverEnter();
             retargetElevation(n, s);
-            n.markDirty();
             return true;
         },
         .leave => {
-            s.hovered = false;
+            s.inter.endHover();
             retargetElevation(n, s);
-            n.markDirty();
             return true;
         },
         else => {},
     }
     return false;
+}
+
+/// A key press spawns its ripple at the indication's center (upstream's
+/// keyboard press position = the component center) and releases it
+/// immediately — the ripple still runs its full expand + fade-out.
+fn keyPressRipple(s: *CardState, n: *Node) void {
+    const cx = n.bounds.x + n.bounds.w / 2;
+    const cy = n.bounds.y + n.bounds.h / 2;
+    const pid = s.inter.pressDown(cx, cy);
+    s.ripples.spawn(pid, cx, cy, 0);
+    s.inter.release(pid);
+    s.ripples.release(pid, 0);
 }
 
 /// Keyboard activation: Enter/Space press the focused card.
@@ -272,6 +300,7 @@ fn cardOnKey(n: *Node, ev: input.KeyEvent) bool {
     if (ev.kind != .key_down) return false;
     switch (ev.key) {
         .enter, .space => {
+            keyPressRipple(s, n);
             if (s.on_click) |cb| cb.fn_ptr(cb.userdata);
             return true;
         },
@@ -283,6 +312,8 @@ fn cardOnKey(n: *Node, ev: input.KeyEvent) bool {
 fn cardDeinit(n: *Node) void {
     const s = stateOf(n);
     if (anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.elev_channel));
+    s.layer.deinit(); // in-flight tween userdata = `l`
+    s.ripples.deinit(); // the live ticker userdata = `r`
     input.releaseNode(n);
     n.allocator.destroy(s);
 }
@@ -306,6 +337,15 @@ pub fn card(allocator: std.mem.Allocator, on_click: ?Callback, opts: CardOptions
     errdefer allocator.destroy(s);
     s.* = .{ .opts = opts, .on_click = on_click };
     node.state = s;
+    // The indication machinery: mutations + ticks damage this node; the
+    // layer alpha table + ripple ink come straight from the theme (the
+    // card's contentColor is OnSurface — contentColorFor(containers)).
+    s.inter.node = node;
+    s.layer.node = node;
+    s.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+    s.ripples.node = node;
+    s.ripples.color = opts.theme.colors.on_surface;
+    s.ripples.pressed_alpha = opts.theme.state.pressed;
     if (on_click != null) {
         ui.semantics.attach(node, .{
             .role = .button,

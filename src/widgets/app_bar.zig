@@ -33,8 +33,12 @@
 // would sit the title flush to the row bottom — bottom-edge padding is
 // the closer spec read).
 //
-// The bar owns no interaction: the leading/title/subtitle/actions slots
-// are ordinary widgets with their own semantics. The widget is a pure
+// The bar owns no interaction: upstream's top app bars carry no
+// interactionSource/indication — the bar is a plain Surface layout
+// (AppBar.kt SingleRowTopAppBar/TwoRowsTopAppBar: no clickable, no
+// indication modifier); the leading/title/subtitle/actions slots are
+// ordinary widgets (icon buttons carry their own clickable +
+// ripple/state-layer — see icon_button.zig). The widget is a pure
 // chrome container: measure/layout/paint + a group semantic.
 const std = @import("std");
 const kx = @import("../kx.zig");

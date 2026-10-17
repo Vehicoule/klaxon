@@ -60,6 +60,15 @@
 //   (IconSize), label LabelLarge, Active* = OnSecondaryContainer,
 //   Inactive* = OnSurfaceVariant; selected rows also carry the .checked
 //   semantic (upstream Role.Tab + selected state).
+//   Indication: this widget ships no drawer-item node — the `content`
+//   slot is app-composed (list_item carries the row indication).
+//   Upstream's NavigationDrawerItem delegates to Surface(selected,
+//   onClick, interactionSource) — `clickable(interactionSource,
+//   indication = ripple(focusRingShape = shape))` over the
+//   CornerFull indicator zone (NavigationDrawer.kt:1123-1165) — so a
+//   row built from listItem/card-style nodes gets the shared
+//   Tracker + StateLayer + Ripples behavior for free. The scrim is a
+//   plain tap-catcher (Scrim.kt carries no indication).
 //
 // Structure: the drawer node holds three internal children — a body
 // wrapper (translates the `body` slot for dismissible/permanent), an

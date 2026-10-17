@@ -23,8 +23,21 @@
 //     56x56 CornerFull circle centered in the 96x64 item
 //   - colors: active icon OnSecondaryContainer, active label Secondary
 //     (ItemActiveLabelText), inactive both OnSurfaceVariant, disabled
-//     OnSurfaceVariant @ 0.38, indicator SecondaryContainer, state layer
-//     OnSecondaryContainer over the indicator only
+//     OnSurfaceVariant @ 0.38, indicator SecondaryContainer, state layer +
+//     ripple OnSurface over the indicator only (the upstream ripple's
+//     LocalContentColor = the rail's contentColor =
+//     contentColorFor(Surface) = OnSurface)
+//
+// Indication (NavigationRail.kt:222-231 + NavigationItem.kt:379-386,
+// 1275-1280): the whole item is `selectable(interactionSource,
+// indication = null)` — the indication is a separate indicator-sized
+// composable, `.clip(indicatorShape).indication(mappedSource,
+// ripple(focusRingShape = indicatorShape))`: a bounded ripple clipped to
+// the CornerFull indicator (the 56x32 pill / the icon-only 56x56 circle /
+// the expanded start-icon pill), fed by a per-item
+// interactions.Tracker. Press = the ripple; hover/focus = the animated
+// state layer. The group focus lands on the selected item's layer;
+// Enter/Space presses at the indicator's center.
 //   - the plain NavigationRail.kt widget (widthIn(min = 80), 4dp
 //     padding, spacedBy 4) is NOT what this widget models: it has no
 //     expanded state — Klaxon's `expanded` flag is WideNavigationRail's
@@ -121,11 +134,24 @@ const ItemDef = struct {
     enabled: bool,
 };
 
+/// Per-item indication state (the upstream per-item MutableInteractionSource
+/// + the indicator composable's ripple). Items are fixed at construction,
+/// so a stable slice holds them — the StateLayer's timeline channel takes
+/// `l`'s address and must never move once wired.
+const ItemFx = struct {
+    inter: ui.interactions.Tracker = .{},
+    layer: ui.state_layer.StateLayer = .{},
+    ripples: ui.ripple.Ripples = .{},
+    press_id: u32 = 0, // the live press's tracker id (0 = none)
+};
+
 const RailState = struct {
     items: std.array_list.Managed(ItemDef), // owned defs
     /// Live per-item a11y descriptors — the semantics tree's virtual
     /// children borrow this slice; railSelect updates `checked` in place.
     sem_children: std.array_list.Managed(ui.semantics.Semantics),
+    /// Per-item indication (parallel to `items` — same count/order, fixed).
+    fx: []ItemFx = &.{},
     opts: NavigationRailOptions,
     sig: ?*ui.state.Signal(usize) = null,
     on_change: ?Callback = null,
@@ -213,6 +239,27 @@ fn itemGeom(s: *RailState, b: Rect, i: usize) Rect {
     var y = b.y + collapsed_top;
     for (s.items.items[0..i]) |prev| y += collapsedItemH(s, prev) + item_gap;
     return .{ .x = b.x, .y = y, .w = b.w, .h = collapsedItemH(s, s.items.items[i]) };
+}
+
+/// The item's indication zone — upstream's separate indicator-sized
+/// composable (`.clip(indicatorShape).indication(...)`): the 56x32 pill
+/// (labeled collapsed), the 56x56 circle (icon-only) or the expanded
+/// start-icon pill. Shared by the paint path and the keyboard ripple —
+/// the press/hover/focus chrome clips to exactly this rect.
+fn indicatorRect(s: *RailState, b: Rect, i: usize) Rect {
+    const def = s.items.items[i];
+    const ir = itemGeom(s, b, i);
+    if (s.opts.expanded) {
+        const pw = pillWidth(s, b, def);
+        // placeRelative inside the already-mirrored item rect (itemGeom).
+        const x = if (ui.i18n.direction() == .rtl) ir.x + ir.w - item_hpad - pw else ir.x + item_hpad;
+        return .{ .x = x, .y = ir.y, .w = pw, .h = pill_h };
+    }
+    if (def.label.len > 0) {
+        const v = collapsedVerticals(labelMetrics(s, def));
+        return .{ .x = ir.x + (ir.w - indicator_w) / 2, .y = ir.y + v.ind_y, .w = indicator_w, .h = ind_h_label };
+    }
+    return .{ .x = ir.x + (ir.w - ind_h_nolabel) / 2, .y = ir.y + (ir.h - ind_h_nolabel) / 2, .w = ind_h_nolabel, .h = ind_h_nolabel };
 }
 
 /// The item under the point (-1 = none), in the widget's parent space.
@@ -324,7 +371,6 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
     // paints over nearby content (hit-testing already bounds-checks)
     ui.paint.clipRect(ctx, b.x, b.y, b.w, b.h);
     for (s.items.items, 0..) |def, i| {
-        const idx: i32 = @intCast(i);
         const ir = itemGeom(s, b, i);
         const selected = i == s.selected;
         const has_label = def.label.len > 0;
@@ -348,17 +394,15 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
             cs.on_secondary_container
         else
             cs.secondary;
-        // the indicator geometry (LTR, then mirrored per element in RTL)
-        var ind_x: f32 = undefined;
-        var ind_y: f32 = undefined;
-        var ind_w: f32 = undefined;
-        var ind_h: f32 = undefined;
+        // the indicator geometry — the indication zone (a bounded ripple
+        // clipped to it); icon/label offsets stay per-branch like upstream's
+        // placeAnimatedLabelAndIcon/placeIcon.
+        const ind = indicatorRect(s, b, i);
         var icon_x: f32 = undefined;
         var icon_y: f32 = undefined;
         var label_x: f32 = 0;
         var label_y: f32 = 0;
         if (s.opts.expanded) {
-            const pw = pillWidth(s, b, def);
             // placeRelative offsets inside the ITEM: the pill leads
             // WNRItemHorizontalPadding, the icon leads
             // FullWidthLeadingSpace inside it, the label follows the icon +
@@ -373,10 +417,6 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
                     return if (self.rtl) self.x + self.w - off - w else self.x + off;
                 }
             }{ .x = ir.x, .w = ir.w, .rtl = rtl };
-            ind_x = im.f(item_hpad, pw);
-            ind_y = ir.y;
-            ind_w = pw;
-            ind_h = pill_h;
             icon_x = im.f(item_hpad + pill_lead, icon_size);
             icon_y = ir.y + (pill_h - icon_size) / 2;
             label_x = im.f(item_hpad + pill_lead + icon_size + icon_label_gap, lm.width);
@@ -387,41 +427,18 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
             // top at the centered content's top; the icon 4 inside it; the
             // label centered at indicator_bottom + IconLabelSpace 4.
             const v = collapsedVerticals(lm);
-            ind_x = ir.x + (ir.w - indicator_w) / 2;
-            ind_y = ir.y + v.ind_y;
-            ind_w = indicator_w;
-            ind_h = ind_h_label;
             icon_x = ir.x + (ir.w - icon_size) / 2;
             icon_y = ir.y + v.ind_y + ind_ivp;
             label_x = ir.x + (ir.w - lm.width) / 2;
             label_y = ir.y + v.ind_y + ind_h_label + col_icon_label_gap;
         } else {
             // placeIcon: the 56x56 circle + icon centered in the item.
-            ind_x = ir.x + (ir.w - ind_h_nolabel) / 2;
-            ind_y = ir.y + (ir.h - ind_h_nolabel) / 2;
-            ind_w = ind_h_nolabel;
-            ind_h = ind_h_nolabel;
             icon_x = ir.x + (ir.w - icon_size) / 2;
             icon_y = ir.y + (ir.h - icon_size) / 2;
         }
         // the active indicator (CornerFull: a pill, or the icon-only circle)
         if (selected) {
-            ui.paint.fillRRect(ctx, ind_x, ind_y, ind_w, ind_h, ind_h / 2, cs.secondary_container);
-        }
-        // the state layer over the indicator (enabled only)
-        if (def.enabled) {
-            const alpha: f32 = if (s.pressed == idx)
-                t.state.pressed
-            else if (group_focused and selected)
-                t.state.focus
-            else if (s.hovered == idx)
-                t.state.hover
-            else
-                0;
-            if (alpha > 0) {
-                const base = if (selected) cs.secondary_container else cs.surface;
-                ui.paint.fillRRect(ctx, ind_x, ind_y, ind_w, ind_h, ind_h / 2, theme_mod.stateLayer(base, cs.on_secondary_container, alpha));
-            }
+            ui.paint.fillRRect(ctx, ind.x, ind.y, ind.w, ind.h, ind.h / 2, cs.secondary_container);
         }
         // the icon (24dp)
         paintIcon(ctx, def.icon, icon_x, icon_y, icon_c);
@@ -430,8 +447,53 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
         if (has_label) {
             ui.paint.text(ctx, def.label, label_x, label_y + lm.ascent, ls.size, bold, label_c);
         }
+        // The indication — upstream's indicator ripple composable places
+        // LAST in the item (over the icon+label): the animated state layer
+        // + the bounded ink ripple over the indicator, clipped CornerFull.
+        // A disabled item has no interaction set at all (upstream's
+        // enabled=false drops the selectable). The rail's single group
+        // focus lands on the SELECTED item's layer.
+        if (def.enabled) {
+            const fx = &s.fx[i];
+            fx.inter.setFocused(group_focused and selected);
+            fx.layer.sync(&fx.inter, cs.on_surface);
+            if (fx.layer.paintColor()) |lc| {
+                ui.paint.fillRRect(ctx, ind.x, ind.y, ind.w, ind.h, ind.h / 2, lc);
+            }
+            // Ripples.paint reads n.bounds for the clip + geometry — rebind
+            // it to the indicator rect (a shallow proxy; only .bounds is
+            // consulted).
+            if (fx.ripples.live()) {
+                var proxy = n.*;
+                proxy.bounds = ind;
+                fx.ripples.paint(ctx, &proxy, .{ .rrect = ind.h / 2 });
+            }
+        }
     }
     ui.paint.clipReset(ctx); // the rail-bounds clip
+}
+
+/// End an item's live press (release = up, cancel = slop/outside) — the
+/// tracker entry and its ripple pair on `press_id`.
+fn railEndPress(s: *RailState, i: usize, now_ms: u64, cancel: bool) void {
+    const fx = &s.fx[i];
+    if (fx.press_id == 0) return;
+    if (cancel) fx.inter.cancel(fx.press_id) else fx.inter.release(fx.press_id);
+    fx.ripples.release(fx.press_id, now_ms);
+    fx.press_id = 0;
+}
+
+/// Move the hover interaction to a new item (-1 = none). A disabled item
+/// gets no tracker entry (upstream's enabled = false drops the whole
+/// interaction set); `hovered` still records it — the geometry/tests use
+/// the bookkeeping, the layer the tracker.
+fn railSetHover(s: *RailState, idx: i32) void {
+    if (idx == s.hovered) return;
+    if (s.hovered >= 0) s.fx[@intCast(s.hovered)].inter.endHover();
+    s.hovered = idx;
+    if (idx >= 0 and s.items.items[@intCast(idx)].enabled) {
+        _ = s.fx[@intCast(idx)].inter.hoverEnter();
+    }
 }
 
 fn railOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -440,17 +502,34 @@ fn railOnPointer(n: *Node, ev: input.PointerEvent) bool {
     switch (ev.phase) {
         .down => {
             if (idx < 0 or !s.items.items[@intCast(idx)].enabled) return false;
+            // a second pointer supersedes the live press (single-press
+            // bookkeeping — the tracker itself supports more)
+            if (s.pressed >= 0) railEndPress(s, @intCast(s.pressed), ev.time_ms, true);
+            const i: usize = @intCast(idx);
+            const fx = &s.fx[i];
+            fx.press_id = fx.inter.pressDown(ev.x, ev.y);
+            fx.ripples.spawn(fx.press_id, ev.x, ev.y, ev.time_ms);
             s.pressed = idx;
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
-            n.markDirty();
             return true;
         },
         .up => {
             const was = s.pressed;
             s.pressed = -1;
-            n.markDirty();
-            if (was >= 0 and idx == was) railSelect(n, @intCast(was));
+            if (was >= 0) {
+                const w: usize = @intCast(was);
+                railEndPress(s, w, ev.time_ms, false);
+                if (idx == was) {
+                    // the click's router focus is pointer-provenance —
+                    // upstream never emits a Focus interaction on click;
+                    // noted BEFORE railSelect's requestFocus so the next
+                    // setFocused(true) records .pointer and the layer
+                    // stays invisible (focus-visible gating).
+                    s.fx[w].inter.noteFocusVia(.pointer);
+                    railSelect(n, w);
+                }
+            }
             return true;
         },
         .move => {
@@ -461,40 +540,35 @@ fn railOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 const dx = ev.raw_x - s.down_raw_x;
                 const dy = ev.raw_y - s.down_raw_y;
                 if (dx * dx + dy * dy > gestures.SLOP * gestures.SLOP) {
+                    railEndPress(s, @intCast(s.pressed), ev.time_ms, true);
                     s.pressed = -1;
-                    n.markDirty();
                 }
             }
             return false;
         },
         // the pointer went down outside while we held the capture: cancel
         .outside_down => {
-            s.pressed = -1;
-            n.markDirty();
+            if (s.pressed >= 0) {
+                railEndPress(s, @intCast(s.pressed), ev.time_ms, true);
+                s.pressed = -1;
+            }
             return true;
         },
         .enter => {
-            s.hovered = idx;
-            n.markDirty();
+            railSetHover(s, idx);
             return true;
         },
         // moving across items within the leaf emits hover_move (not
         // enter/leave): re-resolve the item under the pointer
         .hover_move => {
-            const h = itemAt(s, n.bounds, ev.x, ev.y);
-            if (h != s.hovered) {
-                s.hovered = h;
-                n.markDirty();
-            }
+            railSetHover(s, itemAt(s, n.bounds, ev.x, ev.y));
             return true;
         },
         .leave => {
-            s.hovered = -1;
-            n.markDirty();
+            railSetHover(s, -1);
             return true;
         },
     }
-    return false;
 }
 
 /// Keyboard: the rail is a focusable group; up/down move AND select
@@ -516,6 +590,23 @@ fn railOnKey(n: *Node, ev: input.KeyEvent) bool {
             railSelect(n, @intCast(i));
             return true;
         },
+        .enter, .space => {
+            // Activate the focused item — the group's selected one
+            // (selection-follows-focus means it's already selected; the
+            // key press still emits the upstream activation ripple at the
+            // indicator's center and re-fires on_change like a click).
+            const i = @min(s.selected, s.items.items.len - 1);
+            const fx = &s.fx[i];
+            const ind = indicatorRect(s, n.bounds, i);
+            const cx = ind.x + ind.w / 2;
+            const cy = ind.y + ind.h / 2;
+            const pid = fx.inter.pressDown(cx, cy);
+            fx.ripples.spawn(pid, cx, cy, 0);
+            fx.inter.release(pid);
+            fx.ripples.release(pid, 0);
+            railSelect(n, i);
+            return true;
+        },
         else => {},
     }
     return false;
@@ -526,6 +617,13 @@ fn railDeinit(n: *Node) void {
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = railSyncCb, .userdata = n } });
     i18n_mod.unsubscribeLocale(s.i18n, .{ .fn_ptr = railLocaleCb, .userdata = n });
     input.releaseNode(n);
+    // in-flight tween userdata = `l` / live ticker userdata = `r` — both
+    // die with the state struct; cancel before freeing.
+    for (s.fx) |*fx| {
+        fx.layer.deinit();
+        fx.ripples.deinit();
+    }
+    n.allocator.free(s.fx);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
     s.sem_children.deinit();
@@ -592,6 +690,21 @@ pub fn navigationRail(allocator: std.mem.Allocator, items: []const NavRailItem, 
         try s.items.append(.{ .label = label, .icon = item.icon, .enabled = item.enabled });
     }
     node.state = s;
+    // The per-item indication set (upstream's per-item interactionSource +
+    // the indicator composable's ripple): mutations + ticks damage the rail
+    // node; the layer alphas + ripple ink come straight from the theme (the
+    // rail's contentColor = OnSurface).
+    s.fx = try allocator.alloc(ItemFx, s.items.items.len);
+    errdefer allocator.free(s.fx);
+    for (s.fx) |*fx| {
+        fx.* = .{};
+        fx.inter.node = node;
+        fx.layer.node = node;
+        fx.layer.alphas = .{ .hover = opts.theme.state.hover, .focus = opts.theme.state.focus, .pressed = opts.theme.state.pressed, .drag = opts.theme.state.drag };
+        fx.ripples.node = node;
+        fx.ripples.color = opts.theme.colors.on_surface;
+        fx.ripples.pressed_alpha = opts.theme.state.pressed;
+    }
     if (sig) |sg| {
         sg.subscribe(.{ .callback = .{ .fn_ptr = railSyncCb, .userdata = node } });
         const v = sg.peek();
@@ -782,7 +895,7 @@ test "golden: expanded — the selected item paints the pill (label_w + 64) at x
     try std.testing.expect(f.countColorIn(.{ .x = 30 + pill_lead + icon_size + icon_label_gap, .y = iy0 + 18, .w = 60, .h = 20 }, t.colors.on_surface_variant) > 0);
 }
 
-test "golden: a hovered item paints the OnSecondaryContainer state layer over the indicator" {
+test "golden: a hovered item paints the OnSurface state layer over the indicator" {
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try navigationRail(a, &.{ .{ .label = "Home", .icon = .home }, .{ .label = "Music", .icon = .play } }, null, null, .{ .selected = 0, .theme = t });
@@ -790,7 +903,8 @@ test "golden: a hovered item paints the OnSecondaryContainer state layer over th
     var r = try golden.Renderer.init(a, 120, 200);
     defer r.deinit();
     n.layout(.{ .x = 10, .y = 10, .w = 96, .h = 180 });
-    // hover the 2nd (unselected) item
+    // hover the 2nd (unselected) item — the tracker's hover feeds the
+    // animated state layer (no timeline → it snaps to the target alpha)
     const s = stateOf(n);
     const ir2 = itemGeom(s, n.bounds, 1);
     const y2 = ir2.y + ir2.h / 2;
@@ -798,12 +912,13 @@ test "golden: a hovered item paints the OnSecondaryContainer state layer over th
     r.paint(n, 0xFFFFFFFF);
     var f = try r.readback(a);
     defer f.deinit();
-    // the state layer: on_secondary_container @ 0.08 over the surface, at
-    // the pill's left edge midpoint (the unselected indicator zone)
+    // the state layer: on_surface @ 0.08 over the surface (the rail's
+    // contentColor — the upstream ripple's LocalContentColor), at the
+    // pill's left edge midpoint (the unselected indicator zone)
     const v2 = collapsedVerticals(labelMetrics(s, s.items.items[1]));
     const ind_x = ir2.x + (ir2.w - indicator_w) / 2;
     const ind_y = ir2.y + v2.ind_y;
-    try golden.expectPixelApprox(f, @as(i32, @intFromFloat(ind_x)) + 1, @intFromFloat(ind_y + ind_h_label / 2), golden.blendOver(theme_mod.stateLayer(t.colors.surface, t.colors.on_secondary_container, t.state.hover), 0xFFFFFFFF));
+    try golden.expectPixelApprox(f, @as(i32, @intFromFloat(ind_x)) + 1, @intFromFloat(ind_y + ind_h_label / 2), golden.blendOver(ui.state_layer.copyAlpha(t.colors.on_surface, t.state.hover), t.colors.surface));
 }
 
 test "navigation_rail: hover_move re-resolves the item under the pointer" {
