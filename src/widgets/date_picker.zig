@@ -40,8 +40,10 @@
 // v1 deviations (documented, fixed later):
 //   - No date-input mode, no range selection, no docked variant, no swipe
 //     paging on the day grid (chevron paging, the desktop idiom).
-//   - Header/footer strings are en-only ("Select date", Cancel/OK); the
-//     month/weekday names already route through the active locale.
+//   - Header/footer strings route through i18n.tr() (the English literal
+//     is the msgid key — an app's ARB overrides; the default title and
+//     the a11y label re-resolve on a locale switch); the month/weekday
+//     names come from the active locale's CLDR tables.
 //   - UTC dates (epoch days); no timezone/locale calendar model (the grid
 //     is always Sunday-first — RTL mirrors it, it does not re-order it).
 //   - The headline color follows the Compose token (OnSurfaceVariant; the
@@ -76,8 +78,9 @@ pub const DatePickerOptions = struct {
     theme: Theme = theme_mod.light,
     /// The panel width (DatePickerModalTokens.ContainerWidth = 360dp).
     width: f32 = 360,
-    /// The header title (the supporting text; "Select date" by default).
-    title: []const u8 = "Select date",
+    /// The header title (the supporting text; the localized "Select date"
+    /// by default — the app's string is used verbatim when set).
+    title: ?[]const u8 = null,
     /// "Today" as a UTC epoch day (null = the system clock, UTC) — injected
     /// for deterministic tests.
     today: ?i64 = null,
@@ -323,6 +326,10 @@ const DpState = struct {
     /// selected) — Phase 2c. Points into value_buf or at title_z.
     value_buf: [32]u8 = std.mem.zeroes([32]u8),
     a11y_value: []const u8 = "",
+    /// The installed i18n (null when the app runs without one) — the
+    /// widget subscribes to locale_sig: a locale switch re-dupes a default
+    /// title, re-resolves the tr() labels and repaints.
+    i18n: ?*i18n_mod.I18n = null,
 };
 
 fn stateOf(n: *Node) *DpState {
@@ -509,8 +516,8 @@ fn footerRects(n: *Node) FooterRects {
     const s = stateOf(n);
     const ls = s.opts.theme.type_scale.label_large;
     const bold = ls.weight >= 500;
-    const ok_m = ui.paint.measureText("OK", ls.size, bold);
-    const cancel_m = ui.paint.measureText("Cancel", ls.size, bold);
+    const ok_m = ui.paint.measureTextLen(i18n_mod.tr("OK"), ls.size, bold);
+    const cancel_m = ui.paint.measureTextLen(i18n_mod.tr("Cancel"), ls.size, bold);
     const ok_w = ok_m.width + 2 * footer_pad_x;
     const cancel_w = cancel_m.width + 2 * footer_pad_x;
     const right = n.bounds.x + n.bounds.w - footer_pad_bottom;
@@ -615,7 +622,7 @@ fn paintChevron(n: *Node, ctx: *kx.Ctx, r: Rect, name: icon_w.IconName, zone: Zo
     paintIcon(ctx, name, r.x + (r.w - chevron_icon) / 2, r.y + (r.h - chevron_icon) / 2, chevron_icon, base);
 }
 
-fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, zone: Zone) void {
+fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, zone: Zone) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const hover = std.meta.eql(s.hover, zone);
@@ -626,8 +633,8 @@ fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: [:0]const u8, zone: Z
     }
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
-    const m = ui.paint.measureText(label, ls.size, bold);
-    ui.paint.text(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
+    const m = ui.paint.measureTextLen(label, ls.size, bold);
+    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
 }
 
 fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -716,8 +723,8 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
 
 fn paintFooter(n: *Node, ctx: *kx.Ctx) void {
     const fr = footerRects(n);
-    paintTextButton(n, ctx, fr.cancel, "Cancel", .cancel);
-    paintTextButton(n, ctx, fr.ok, "OK", .ok);
+    paintTextButton(n, ctx, fr.cancel, i18n_mod.tr("Cancel"), .cancel);
+    paintTextButton(n, ctx, fr.ok, i18n_mod.tr("OK"), .ok);
 }
 
 /// The year picker grid (DatePicker.kt YearPicker): a clipped, scrollable
@@ -900,6 +907,31 @@ fn dpDispSyncCb(userdata: ?*anyopaque) void {
     n.markDirty();
 }
 
+/// The group semantics descriptor — the root label resolves through
+/// tr(), so the locale callback re-attaches in the new locale.
+fn attachSemantics(n: *Node) void {
+    const s = stateOf(n);
+    ui.semantics.attach(n, .{ .role = .group, .label = i18n_mod.tr("Date picker"), .value = s.a11y_value });
+}
+
+/// A locale switch: re-dupe the default title in the new locale (an
+/// app-supplied title is verbatim — left alone), re-resolve the a11y
+/// label/value and repaint.
+fn dpLocaleCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    if (s.opts.title == null) {
+        if (dupeZ(n.allocator, i18n_mod.tr("Select date"))) |t2| {
+            n.allocator.free(s.title_z);
+            s.title_z = t2;
+        } else |_| {}
+    }
+    updateA11yValue(n);
+    attachSemantics(n);
+    n.markDirty();
+    ui.semantics.notifyControlChanged(n);
+}
+
 fn updateA11yValue(n: *Node) void {
     const s = stateOf(n);
     if (s.sel.peek()) |d| {
@@ -918,6 +950,7 @@ fn dpDeinit(n: *Node) void {
     const s = stateOf(n);
     s.sel.unsubscribe(.{ .callback = .{ .fn_ptr = dpSelSyncCb, .userdata = n } });
     s.disp.unsubscribe(.{ .callback = .{ .fn_ptr = dpDispSyncCb, .userdata = n } });
+    if (s.i18n) |i| i.locale_sig.unsubscribe(.{ .callback = .{ .fn_ptr = dpLocaleCb, .userdata = n } });
     n.allocator.free(s.title_z);
     input.releaseNode(n);
     n.allocator.destroy(s);
@@ -950,7 +983,7 @@ pub fn datePicker(allocator: std.mem.Allocator, selected: *ui.state.Signal(?i64)
     errdefer node.allocator.destroy(node); // no state yet
     const s = try allocator.create(DpState);
     errdefer allocator.destroy(s);
-    const title = try dupeZ(allocator, opts.title);
+    const title = try dupeZ(allocator, opts.title orelse i18n_mod.tr("Select date"));
     errdefer allocator.free(title);
     s.* = .{
         .opts = opts,
@@ -963,9 +996,11 @@ pub fn datePicker(allocator: std.mem.Allocator, selected: *ui.state.Signal(?i64)
     };
     node.state = s;
     updateA11yValue(node);
-    ui.semantics.attach(node, .{ .role = .group, .label = "Date picker", .value = s.a11y_value }); // Phase 2c
+    attachSemantics(node); // Phase 2c
     selected.subscribe(.{ .callback = .{ .fn_ptr = dpSelSyncCb, .userdata = node } });
     displayed.subscribe(.{ .callback = .{ .fn_ptr = dpDispSyncCb, .userdata = node } });
+    s.i18n = i18n_mod.current();
+    if (s.i18n) |i| i.locale_sig.subscribe(.{ .callback = .{ .fn_ptr = dpLocaleCb, .userdata = node } });
     return node;
 }
 
@@ -1180,6 +1215,40 @@ test "date_picker: the app drives the selection + the displayed month (two-way s
     // January 2027 starts on a Friday (5)
     try std.testing.expectEqual(@as(?i64, null), dayAtCell(n, 4));
     try std.testing.expectEqual(daysFromCivil(2027, 1, 1), dayAtCell(n, 5).?);
+}
+
+test "date_picker: i18n — the default title, a11y label and month names re-resolve on a locale switch" {
+    const a = std.testing.allocator;
+    const i18n = try i18n_mod.I18n.init(a, "en");
+    defer i18n.deinit();
+    try i18n.addArb("en", "{}", .ltr);
+    try i18n.addArb("fr", "{\"@@locale\": \"fr\", \"Select date\": \"Sélectionner une date\", \"Date picker\": \"Sélecteur de date\"}", .ltr);
+    try i18n.setLocale("fr");
+    i18n_mod.setCurrent(i18n);
+    defer i18n_mod.setCurrent(null);
+    const f = try dpFixture(a);
+    defer f[1].deinit();
+    defer f[2].deinit();
+    defer f[0].deinit();
+    const n = f[0];
+    n.layout(.{ .x = 0, .y = 0, .w = 360, .h = total_h });
+    f[1].set(null);
+    // the default title resolved in fr at build time
+    try std.testing.expectEqualStrings("Sélectionner une date", n.semantics.?.value);
+    try std.testing.expectEqualStrings("Sélecteur de date", n.semantics.?.label);
+    // the month name comes from the fr CLDR table
+    var m_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("octobre 2026", formatMonthYear(displayedMonth(n), &m_buf));
+    // a locale switch re-dupes the title + re-resolves the a11y label/value
+    try i18n.setLocale("en");
+    try std.testing.expectEqualStrings("Select date", n.semantics.?.value);
+    try std.testing.expectEqualStrings("Date picker", n.semantics.?.label);
+    // an app-supplied title is verbatim — a switch leaves it alone
+    const n2 = try datePicker(a, f[1], f[2], null, null, .{ .title = "Pick a day", .today = daysFromCivil(2026, 10, 8) });
+    defer n2.deinit();
+    try i18n.setLocale("fr");
+    try std.testing.expectEqualStrings("Pick a day", n2.semantics.?.value);
+    try std.testing.expectEqualStrings("Sélecteur de date", n2.semantics.?.label);
 }
 
 test "date_picker: the month-year button opens the year picker; a year tap pages and closes it" {
