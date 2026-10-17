@@ -159,14 +159,15 @@ Each widget's header carries the same list; these are the tracked ones
   resolves "Expand", the snackbar dismiss button gets the upstream
   "Dismiss" content description and the expansion panel's default title
   localizes.
-- `color_picker.zig` — no HSL inputs, no preset swatches, no eyedropper.
-  (The alpha slider shipped: checkerboard + gradient bar feeding the
-  Signal's alpha byte. The hex field + the R/G/B numeric fields ride the
-  shared `text_edit.zig` core — real caret, selection, clipboard and IME
-  session via `wants_text_input` — and commit on Enter, revert on
-  blur/Escape. The RGB row is digit-filtered, byte-range-checked and
-  writes the channel back through the HSV model so the SV square, hue
-  and alpha sliders resync.)
+- `color_picker.zig` — no preset swatches, no eyedropper. (The alpha
+  slider shipped: checkerboard + gradient bar feeding the Signal's alpha
+  byte. The hex field + the two numeric rows — R/G/B bytes and the
+  H/S/L triplet in degrees/percents — ride the shared `text_edit.zig`
+  core (real caret, selection, clipboard, IME session via
+  `wants_text_input`), commit on Enter and revert on blur/Escape. The
+  numeric rows are digit-filtered and range-checked (255 / 360 / 100);
+  RGB writes the byte, HSL round-trips through `hslToColor` preserving
+  alpha, and every commit resyncs the SV square, hue and alpha sliders.)
 - `kx_skia_android.cpp` — the default/fallback families are resolved
   from the device at first use (Roboto → first Latin-covering family;
   Droid Sans → a second Latin family), never the clock face that sorts
