@@ -373,6 +373,23 @@ pub const Animation = struct {
             .tween => |t| t.to,
         };
     }
+
+    /// The instantaneous per-lane velocity at `now_ms` (units/second) —
+    /// retargets pass it as the new spring's v0 for velocity continuity.
+    /// Springs get the closed-form derivative; tweens a forward difference.
+    pub fn velocityAt(a: *const Animation, now_ms: u64) Vec4 {
+        if (!a.started or now_ms <= a.start_ms) {
+            return switch (a.kind) {
+                .spring => |s| s.v0,
+                .tween => @splat(0),
+            };
+        }
+        const t_ms = now_ms - a.start_ms;
+        return switch (a.kind) {
+            .spring => |s| springVelocity(a.from, s.to, s.spring, s.v0, t_ms),
+            .tween => (a.valueAt(now_ms + 1) - a.valueAt(now_ms)) * @as(Vec4, @splat(1000)),
+        };
+    }
 };
 
 /// SIMD closed-form spring value (all lanes share the physics, per-lane
@@ -405,6 +422,16 @@ fn springValue(from: Vec4, to: Vec4, spring: Spring, v0: Vec4, t_ms: u64) Vec4 {
     }
     const e: Vec4 = @splat(@exp(-omega0 * t));
     return to + (d0 + (v0 + @as(Vec4, @splat(omega0)) * d0) * @as(Vec4, @splat(t))) * e;
+}
+
+/// Per-lane closed-form spring velocity (scalar Spring.velocity per lane).
+fn springVelocity(from: Vec4, to: Vec4, spring: Spring, v0: Vec4, t_ms: u64) Vec4 {
+    const t: f32 = @as(f32, @floatFromInt(t_ms)) / 1000;
+    var out: Vec4 = undefined;
+    inline for (0..4) |i| {
+        out[i] = spring.velocity(from[i] - to[i], v0[i], t);
+    }
+    return out;
 }
 
 fn tweenValue(from: Vec4, to: Vec4, curve: Curve, t_ms: u64, duration_ms: u32) Vec4 {
@@ -538,6 +565,18 @@ pub const Timeline = struct {
         for (tl.animations.items) |*a| {
             if (!a.done and a.channel != null and a.channel.? == channel) a.done = true;
         }
+    }
+
+    /// The in-flight animation's instantaneous velocity on `channel` —
+    /// a retarget passes it as the new spring's v0 so the motion continues
+    /// with the velocity it had instead of restarting at 0 (upstream's
+    /// Animatable.velocity pass-through). Zero when nothing runs.
+    pub fn channelVelocity(tl: *Timeline, channel: *anyopaque) Vec4 {
+        const idx = tl.channel_map.get(@intFromPtr(channel)) orelse return @splat(0);
+        if (idx >= tl.animations.items.len) return @splat(0);
+        const a = &tl.animations.items[idx];
+        if (a.done) return @splat(0);
+        return a.velocityAt(tl.last_now_ms);
     }
 
     pub fn addTicker(tl: *Timeline, t: Ticker) void {
@@ -1065,4 +1104,36 @@ test "easings: emphasized matches the M3 spec curves" {
         try std.testing.expectApproxEqAbs(@as(f32, 0), sampleEase(e, 0), 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 1), sampleEase(e, 1), 1e-6);
     }
+}
+
+test "timeline: channelVelocity hands a mid-flight retarget its velocity" {
+    var tl = testTimeline();
+    defer tl.deinit();
+    var channel: u8 = 0;
+    // A: spring 0→100 underdamped; after 100ms it's moving with |v|>0
+    const spring = Spring.fromDampingRatio(500, 0.6, 1);
+    _ = tl.play(.{
+        .kind = Animation.springAnim(.{ 0, 0, 0, 0 }, .{ 100, 0, 0, 0 }, spring, @splat(0)),
+        .from = @splat(0),
+        .channel = @ptrCast(&channel),
+    });
+    tl.tick(0);
+    tl.tick(100);
+    const v_mid = tl.channelVelocity(@ptrCast(&channel));
+    try std.testing.expect(@abs(v_mid[0]) > 100); // still moving fast mid-flight
+    // retarget to -50 carrying the velocity → the new spring starts MOVING
+    // (no 0-velocity restart bump)
+    _ = tl.play(.{
+        .kind = Animation.springAnim(.{ 50, 0, 0, 0 }, .{ -50, 0, 0, 0 }, spring, v_mid),
+        .from = .{ 50, 0, 0, 0 },
+        .channel = @ptrCast(&channel),
+    });
+    tl.tick(100);
+    // value immediately after the retarget keeps moving in the OLD
+    // direction (velocity carried over) rather than snapping toward -50
+    const v2 = tl.channelVelocity(@ptrCast(&channel));
+    try std.testing.expect(@abs(v2[0]) > 0);
+    // an idle channel reports 0 — callers fall back to a 0-velocity start
+    var idle: u8 = 0;
+    try std.testing.expectEqual(@as(Vec4, @splat(0)), tl.channelVelocity(@ptrCast(&idle)));
 }

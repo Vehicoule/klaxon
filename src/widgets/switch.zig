@@ -45,8 +45,7 @@
 //     the offset counts from the end side (the checked thumb sits at the
 //     start edge like upstream RTL)
 //
-// Remaining deviations: a mid-flight re-press restarts the spring from 0
-// velocity (velocity continuity isn't carried); the InsetRing focus-ring
+// Remaining deviations: the InsetRing focus-ring
 // configuration isn't modeled (the thumb layer carries focus like the
 // default configuration).
 const std = @import("std");
@@ -299,14 +298,17 @@ fn retargetThumb(n: *Node, s: *SwitchState) void {
             return;
         }
         const from: ui.anim.Vec4 = .{ s.thumb_size, s.thumb_off, 0, 0 };
+        // Velocity continuity: a mid-flight retarget carries the running
+        // channel's velocity into the new spring (upstream passes the
+        // Animatable's velocity through animateToAsState).
         _ = tl.play(.{
-            .kind = ui.anim.Animation.springAnim(.{ from[0], 0, 0, 0 }, .{ t.size, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, .{ 0, 0, 0, 0 }),
+            .kind = ui.anim.Animation.springAnim(.{ from[0], 0, 0, 0 }, .{ t.size, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&s.size_channel))),
             .from = .{ from[0], 0, 0, 0 },
             .channel = @ptrCast(&s.size_channel),
             .on_update = .{ .fn_ptr = thumbSizeCb, .userdata = n },
         });
         _ = tl.play(.{
-            .kind = ui.anim.Animation.springAnim(.{ from[1], 0, 0, 0 }, .{ t.off, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, .{ 0, 0, 0, 0 }),
+            .kind = ui.anim.Animation.springAnim(.{ from[1], 0, 0, 0 }, .{ t.off, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&s.off_channel))),
             .from = .{ from[1], 0, 0, 0 },
             .channel = @ptrCast(&s.off_channel),
             .on_update = .{ .fn_ptr = thumbOffCb, .userdata = n },

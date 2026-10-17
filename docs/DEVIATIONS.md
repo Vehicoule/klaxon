@@ -48,7 +48,8 @@ Each widget's header carries the same list; these are the tracked ones
 - `segmented_button.zig` — single-choice only; equal-width = widest content
   (upstream weight(1f) distributes the mean); no checked-icon crossfade.
 - `icon_button.zig` — no elevation shadows; instant shape morphs.
-- `switch.zig` — mid-flight re-press restarts the spring from 0 velocity.
+- `switch.zig` — no deviations beyond the header (mid-flight retargets
+  carry channel velocity since `Animation.velocityAt`).
 - `slider.zig` — the value indicator doesn't morph its shape (upstream's
   label animates in on drag start); no PageUp/PageDown keys (input.Key
   lacks them). Steps/ticks, the pressed value bubble and the
@@ -72,9 +73,9 @@ Each widget's header carries the same list; these are the tracked ones
   `progress_sig` writes); wave attach micro-animations skipped.
 - `drawer.zig` — no predictive back, window-inset padding, content
   scale-down during overshoot, or `confirmStateChange`.
-- `gestures.zig` — first tap fires immediately (no double-tap hold);
-  long-press without a timeline fires on the first event after the
-  deadline. (Slop is now pointer-type aware — fixed audit row above.)
+- `gestures.zig` — long-press without a timeline fires on the first event
+  after the deadline. (Slop is pointer-type aware — fixed audit row; the
+  tap now holds for the double-tap window when on_double_tap exists.)
 - `i18n.zig` — number/date tables cover en/fr/ja/ar/es; no native digits
   (ar renders Latin digits); ICU/CLDR is the upgrade path. (The paragraph
   bidi base direction follows the locale — fixed audit row above.)

@@ -554,6 +554,14 @@ pub const GestureArena = struct {
     recognizers: [8]Recognizer,
     count: u8 = 0,
     callbacks: GestureCallbacks,
+    /// Tap events held for the double-tap window — only queued when an
+    /// on_double_tap callback exists (upstream's TapRecognizer waits for
+    /// DoubleTapRecognizer to lose before firing). Each entry is the tap's
+    /// fire deadline; the tick drains them in order so back-to-back taps
+    /// each fire once — never early, never lost.
+    pending_taps: [4]u64 = .{ 0, 0, 0, 0 },
+    pending_head: u8 = 0,
+    pending_len: u8 = 0,
 
     /// Build the arena from the callbacks: one recognizer per gesture kind
     /// with at least one callback set.
@@ -635,11 +643,21 @@ pub const GestureArena = struct {
                 }
             }
         }
-        // Resolution: double-tap suppresses the same-event tap.
+        // Resolution: double-tap suppresses the same-event tap. A tap only
+        // pends when a double-tap callback exists — otherwise it fires on
+        // the up like before.
         if (double_tap_fire) {
+            arena.pending_len = 0; // the window closed on a double — drop held taps
             if (cbs.on_double_tap) |cb| cb.fn_ptr(cb.userdata);
         } else if (tap_fire) {
-            if (cbs.on_tap) |cb| cb.fn_ptr(cb.userdata);
+            if (cbs.on_double_tap != null) {
+                if (arena.pending_len < arena.pending_taps.len) {
+                    arena.pending_taps[(arena.pending_head + arena.pending_len) % arena.pending_taps.len] = ev.time_ms +| DOUBLE_TAP_MS;
+                    arena.pending_len += 1;
+                } else if (cbs.on_tap) |cb| {
+                    cb.fn_ptr(cb.userdata); // >4 taps inside one window: fire the excess at once
+                }
+            } else if (cbs.on_tap) |cb| cb.fn_ptr(cb.userdata);
         } else if (terminal) |f| {
             switch (f) {
                 .long_press => if (cbs.on_long_press) |cb| cb.fn_ptr(cb.userdata),
@@ -653,9 +671,11 @@ pub const GestureArena = struct {
     /// Cancel every in-flight gesture (pointer left the detector / popup barrier).
     pub fn cancel(arena: *GestureArena) void {
         for (arena.recognizers[0..arena.count]) |*r| r.reset();
+        arena.pending_len = 0;
     }
 
-    /// Timeline tick: advance time-based recognizers (long-press precision).
+    /// Timeline tick: advance time-based recognizers (long-press precision)
+    /// and drain taps whose double-tap window closed without a second tap.
     pub fn tick(arena: *GestureArena, now_ms: u64) void {
         for (arena.recognizers[0..arena.count]) |*r| {
             if (r.tick(now_ms)) |f| {
@@ -665,11 +685,19 @@ pub const GestureArena = struct {
                 }
             }
         }
+        while (arena.pending_len > 0 and now_ms >= arena.pending_taps[arena.pending_head]) {
+            arena.pending_taps[arena.pending_head] = 0;
+            arena.pending_head = (arena.pending_head + 1) % @as(u8, arena.pending_taps.len);
+            arena.pending_len -= 1;
+            if (arena.callbacks.on_tap) |cb| cb.fn_ptr(cb.userdata);
+        }
     }
 
     /// True while a time-based gesture is pending (a long-press waiting for
-    /// its deadline) — the host bounds its idle wait while this is true.
+    /// its deadline, or a held tap inside its double-tap window) — the host
+    /// bounds its idle wait while this is true.
     pub fn hasPendingTimeWork(arena: *const GestureArena) bool {
+        if (arena.pending_len > 0) return true;
         for (arena.recognizers[0..arena.count]) |r| {
             if (r.kind == .long_press and r.state == .possible and !r.long_press_fired) return true;
         }
@@ -839,21 +867,37 @@ test "arena: builds one recognizer per callback set and resolves conflicts" {
     };
     var arena = GestureArena.init(cbs);
     try std.testing.expectEqual(@as(u8, 2), arena.count);
-    // a quick tap fires on_tap only
+    // a tap with on_double_tap registered is HELD for the window (upstream:
+    // TapRecognizer only fires once DoubleTapRecognizer has lost)
     arena.feed(pev(.down, 0, 0, 0, 0));
     arena.feed(pev(.up, 0, 0, 50, 0));
+    try std.testing.expectEqual(@as(u32, 0), taps); // held, not fired yet
+    try std.testing.expect(arena.hasPendingTimeWork());
+    arena.tick(349); // inside the window — still held
+    try std.testing.expectEqual(@as(u32, 0), taps);
+    arena.tick(350); // window closed → the tap fires
     try std.testing.expectEqual(@as(u32, 1), taps);
     try std.testing.expectEqual(@as(u32, 0), double_taps);
-    // a second quick tap fires on_double_tap only (tap suppressed same-event)
-    arena.feed(pev(.down, 0, 0, 150, 0));
-    arena.feed(pev(.up, 0, 0, 200, 0));
-    try std.testing.expectEqual(@as(u32, 1), taps);
+    // a tap 500ms later is too late to double → it pends and fires at 850
+    arena.feed(pev(.down, 0, 0, 500, 0));
+    arena.feed(pev(.up, 0, 0, 550, 0));
+    try std.testing.expectEqual(@as(u32, 1), taps); // held again
+    arena.tick(850);
+    try std.testing.expectEqual(@as(u32, 2), taps);
+    // a third tap pends; a fourth INSIDE its window resolves as the double —
+    // and the held tap is dropped with it (the whole window is one gesture)
+    arena.feed(pev(.down, 0, 0, 900, 0));
+    arena.feed(pev(.up, 0, 0, 950, 0)); // pends (950 → last tap 550, 400ms)
+    arena.feed(pev(.down, 0, 0, 1100, 0));
+    arena.feed(pev(.up, 0, 0, 1150, 0)); // 200ms after the pending tap → double
+    try std.testing.expectEqual(@as(u32, 2), taps); // the held tap never fired
     try std.testing.expectEqual(@as(u32, 1), double_taps);
-    // cancel resets in-flight gestures
-    arena.feed(pev(.down, 0, 0, 300, 0));
-    arena.feed(pev(.leave, 0, 0, 300, 0));
-    arena.feed(pev(.up, 0, 0, 350, 0)); // stale up after cancel → no tap
-    try std.testing.expectEqual(@as(u32, 1), taps);
+    try std.testing.expect(!arena.hasPendingTimeWork());
+    // cancel resets in-flight gestures + drops held taps
+    arena.feed(pev(.down, 0, 0, 2000, 0));
+    arena.feed(pev(.leave, 0, 0, 2000, 0));
+    arena.feed(pev(.up, 0, 0, 2050, 0)); // stale up after cancel → no tap
+    try std.testing.expectEqual(@as(u32, 2), taps);
 }
 
 fn countCb(userdata: ?*anyopaque) void {
