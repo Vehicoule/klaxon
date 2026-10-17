@@ -38,12 +38,13 @@
 //     segments and wrapping (RTL flips left/right)
 //
 // v1 deviations (documented, fixed later):
-//   - Single choice only (MultiChoiceSegmentedButtonRow is a follow-up).
 //   - Equal width = the WIDEST content (Compose weight(1f) + IntrinsicSize
 //     .Min distributes the row's intrinsic width evenly — the mean; v1 uses
 //     the max, the common visual case).
 //   - No checked-icon crossfade / icon-less-to-icon transition animation
 //     (the M3E segment morph lands with the animation system, Phase 3).
+//   - Multi-choice (`segmentedButtonMulti`) is a u64 bitmask — selectable
+//     segments cap at 64; a click/space toggles, arrows move the cursor.
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -72,6 +73,8 @@ pub const SegmentedButtonOptions = struct {
     /// The fixed selection when no signal is given (with one, the signal is
     /// the source of truth and this is only the fallback).
     selected: usize = 0,
+    /// Multi-choice fallback bitmask (segmentedButtonMulti): bit i = item i.
+    selected_mask: u64 = 0,
     theme: Theme = theme_mod.light,
 };
 
@@ -100,6 +103,15 @@ const SegState = struct {
     sig: ?*ui.state.Signal(usize) = null,
     on_change: ?Callback = null,
     selected: usize = 0,
+    /// MultiChoiceSegmentedButtonRow mode: each segment is a toggle, the
+    /// selection is a u64 bitmask (bit i = segment i — caps the row at 64
+    /// selectable items). The arrows move `cursor` without toggling;
+    /// space/enter/click toggles (upstream: segments keep their own
+    /// checked state, the row is not a radio group).
+    multi: bool = false,
+    mask: u64 = 0,
+    cursor: usize = 0,
+    multi_sig: ?*ui.state.Signal(u64) = null,
     pressed: i32 = -1,
     hovered: i32 = -1,
     /// The down position in raw (window) coordinates (drag deltas are
@@ -221,6 +233,12 @@ fn segAt(s: *SegState, t: Theme, b: Rect, x: f32, y: f32) i32 {
     return -1;
 }
 
+/// Is segment `i` selected (radio `selected` vs the multi bitmask)?
+fn isSel(s: *const SegState, i: usize) bool {
+    if (s.multi) return i < 64 and (s.mask >> @intCast(i)) & 1 == 1;
+    return i == s.selected;
+}
+
 /// Select a segment: the state + the signal (if any) + the a11y value, then
 /// on_change. Radio-group semantics: the selection follows.
 fn segSelect(n: *Node, index: usize) void {
@@ -233,6 +251,24 @@ fn segSelect(n: *Node, index: usize) void {
     if (n.semantics) |sem| {
         sem.value = s.items.items[index].label; // a11y: the value follows
         for (s.sem_children.items, 0..) |*c, i| c.checked = (i == index);
+        ui.semantics.notifyControlChanged(n);
+    }
+    if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
+}
+
+/// Multi-choice: flip segment `index`'s bit (the mask is the source of
+/// truth — the signal re-syncs idempotently), update the a11y children,
+/// then on_change.
+fn segToggle(n: *Node, index: usize) void {
+    const s = stateOf(n);
+    if (index >= s.items.items.len or index >= 64) return;
+    if (!s.items.items[index].enabled) return;
+    s.mask ^= @as(u64, 1) << @intCast(index);
+    if (s.multi_sig) |sig| sig.set(s.mask);
+    s.cursor = index;
+    n.markDirty();
+    if (n.semantics != null) {
+        for (s.sem_children.items, 0..) |*c, i| c.checked = isSel(s, i);
         ui.semantics.notifyControlChanged(n);
     }
     if (s.on_change) |cb| cb.fn_ptr(cb.userdata);
@@ -254,9 +290,29 @@ fn segSyncCb(userdata: ?*anyopaque) void {
     }
 }
 
-/// The last selected index (pub accessor).
+/// The multi mask sync (the app moved the selection externally).
+fn segMultiSyncCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    const v = s.multi_sig.?.peek();
+    if (v != s.mask) {
+        s.mask = v;
+        if (n.semantics != null) {
+            for (s.sem_children.items, 0..) |*c, i| c.checked = isSel(s, i);
+            ui.semantics.notifyControlChanged(n);
+        }
+        n.markDirty();
+    }
+}
+
+/// The last selected index (pub accessor — single-choice rows).
 pub fn selectedIndex(n: *Node) usize {
     return stateOf(n).selected;
+}
+
+/// The current selection bitmask (pub accessor — multi-choice rows).
+pub fn selectedMask(n: *Node) u64 {
+    return stateOf(n).mask;
 }
 
 fn segMeasure(n: *Node, c: Constraints) Size {
@@ -294,7 +350,7 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     const idx: i32 = @intCast(i);
     const sh = segShape(b, i, count, w);
     const sr = sh.sr;
-    const selected = i == s.selected;
+    const selected = isSel(s, i);
     const ls = t.type_scale.label_large;
     const bold = ls.weight >= 500;
     ui.paint.clipRect(ctx, sr.x, sr.y, sr.w, sr.h); // saves
@@ -306,9 +362,12 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     // Upstream the focused segment carries the layer — the Klaxon row is
     // one focused control whose virtual focus is the selected segment.
     if (def.enabled) {
+        // The virtual focus: single = the selected segment, multi = the
+        // keyboard cursor (the next toggled segment).
+        const focused_here = focused and (if (s.multi) i == s.cursor else selected);
         const alpha: f32 = if (s.pressed == idx)
             t.state.pressed
-        else if (focused and selected)
+        else if (focused_here)
             t.state.focus
         else if (s.hovered == idx)
             t.state.hover
@@ -332,12 +391,16 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     else
         cs.on_surface;
     const lm = ui.paint.measureText(def.label, ls.size, bold);
+    // Upstream icon slot: multi-checked segments show the check mark (the
+    // default SegmentedButtonDefaults.Icon); a checked item icon yields to
+    // the check — the icon is the affordance, not decoration.
+    const shown_icon: ?icon_w.IconName = if (s.multi and selected) .check else def.icon;
     var content_w = lm.width;
-    if (def.icon != null) content_w += icon_size + icon_gap;
+    if (shown_icon != null) content_w += icon_size + icon_gap;
     const cx = sr.x + (sr.w - content_w) / 2;
     const baseline = sr.y + (sr.h - lm.height) / 2 + lm.ascent;
     var tx = cx;
-    if (def.icon) |iname| {
+    if (shown_icon) |iname| {
         paintIcon(ctx, iname, tx, sr.y + (sr.h - icon_size) / 2, icon_size, fg);
         tx += icon_size + icon_gap;
     }
@@ -357,18 +420,18 @@ fn segPaint(n: *Node, ctx: *kx.Ctx) void {
     if (count == 0) return;
     const w = segWidthFit(s, t, b);
     const focused = input.isFocused(n);
-    // Upstream z-order (zIndex = interactionCount + checked*5): a checked
-    // segment paints ABOVE its neighbours in the 1dp overlap, and an
+    // Upstream z-order (zIndex = interactionCount + checked*5): checked
+    // segments paint ABOVE their neighbours in the 1dp overlap, and an
     // interacting (pressed) unchecked segment above quiet ones — the
     // higher-z segment claims the shared border.
     for (0..count) |i| {
-        if (i != s.selected and s.pressed != @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
+        if (!isSel(s, i) and s.pressed != @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
     }
     for (0..count) |i| {
-        if (i != s.selected and s.pressed == @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
+        if (!isSel(s, i) and s.pressed == @as(i32, @intCast(i))) segPaintOne(n, s, ctx, i, w, focused);
     }
     for (0..count) |i| {
-        if (i == s.selected) segPaintOne(n, s, ctx, i, w, focused);
+        if (isSel(s, i)) segPaintOne(n, s, ctx, i, w, focused);
     }
 }
 
@@ -388,7 +451,9 @@ fn segOnPointer(n: *Node, ev: input.PointerEvent) bool {
             const was = s.pressed;
             s.pressed = -1;
             n.markDirty();
-            if (was >= 0 and idx == was) segSelect(n, @intCast(was));
+            if (was >= 0 and idx == was) {
+                if (s.multi) segToggle(n, @intCast(was)) else segSelect(n, @intCast(was));
+            }
             return true;
         },
         .move => {
@@ -435,9 +500,11 @@ fn segOnPointer(n: *Node, ev: input.PointerEvent) bool {
     return false;
 }
 
-/// Keyboard: the row is focusable; the arrows move AND select (radio-group
-/// semantics), skipping disabled segments and wrapping (RTL flips
-/// left/right).
+/// Keyboard: the row is focusable. Single choice = radio-group semantics —
+/// the arrows move AND select. Multi choice = each segment is a toggle —
+/// the arrows move the cursor (skipping disabled, wrapping, RTL-flipped)
+/// and space/enter toggles the segment under it (upstream: segments are
+/// individually focusable toggles).
 fn segOnKey(n: *Node, ev: input.KeyEvent) bool {
     const s = stateOf(n);
     if (ev.kind != .key_down) return false;
@@ -448,13 +515,23 @@ fn segOnKey(n: *Node, ev: input.KeyEvent) bool {
             const rtl = ui.i18n.direction() == .rtl;
             const forward: i32 = if (ev.key == .right or ev.key == .down) 1 else -1;
             const step: i32 = if (rtl and (ev.key == .left or ev.key == .right)) -forward else forward;
-            var i: i32 = @intCast(@min(s.selected, s.items.items.len - 1));
+            var i: i32 = @intCast(@min(if (s.multi) s.cursor else s.selected, s.items.items.len - 1));
             var guard: i32 = 0;
             while (guard < count) : (guard += 1) {
                 i = @mod(i + step, count);
                 if (s.items.items[@intCast(i)].enabled) break;
             }
-            segSelect(n, @intCast(i));
+            if (s.multi) {
+                s.cursor = @intCast(i);
+                n.markDirty();
+            } else {
+                segSelect(n, @intCast(i));
+            }
+            return true;
+        },
+        .space, .enter => {
+            if (!s.multi) return false;
+            if (s.cursor < s.items.items.len) segToggle(n, s.cursor);
             return true;
         },
         else => {},
@@ -465,6 +542,7 @@ fn segOnKey(n: *Node, ev: input.KeyEvent) bool {
 fn segDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = n } });
+    if (s.multi_sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = segMultiSyncCb, .userdata = n } });
     input.releaseNode(n);
     for (s.items.items) |*def| n.allocator.free(def.label);
     s.items.deinit();
@@ -501,7 +579,9 @@ const seg_vtable = ui.node.VTable{
 /// are copied (the labels are owned). `sig` drives the selection
 /// (round-trips); `on_change` fires with `selectedIndex(n)` valid after a
 /// click or an arrow-key selection.
-pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedItem, sig: ?*ui.state.Signal(usize), on_change: ?Callback, opts: SegmentedButtonOptions) !*Node {
+/// Shared row construction — `multi` selects single-choice (radio) vs
+/// multi-choice (toggle bitmask) semantics.
+fn segBuild(allocator: std.mem.Allocator, items: []const SegmentedItem, opts: SegmentedButtonOptions, multi: bool) !*Node {
     const node = try Node.create(allocator, &seg_vtable);
     errdefer node.allocator.destroy(node); // no state yet; children list is empty
     const s = try allocator.create(SegState);
@@ -510,9 +590,11 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
         .items = std.array_list.Managed(ItemDef).init(allocator),
         .sem_children = std.array_list.Managed(ui.semantics.Semantics).init(allocator),
         .opts = opts,
-        .sig = sig,
-        .on_change = on_change,
+        .on_change = null,
         .selected = opts.selected,
+        .multi = multi,
+        .mask = opts.selected_mask,
+        .cursor = opts.selected,
     };
     // One ownership boundary: on ANY failure this errdefer frees the
     // appended defs' labels (segDeinit owns them only once returned).
@@ -527,33 +609,69 @@ pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedIte
         try s.items.append(.{ .label = label, .icon = item.icon, .enabled = item.enabled });
     }
     node.state = s;
-    if (sig) |sg| {
-        sg.subscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = node } });
-        const v = sg.peek();
-        if (v < s.items.items.len) s.selected = v; // the signal wins
-    }
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
     // Per-segment virtual a11y children — VoiceOver reads/selects each
-    // segment (radio), not just an opaque group. The borrowed slice is
-    // stable (items never re-alloc after init); `checked` mutates in
-    // place on selection changes.
+    // segment (radio or checkbox by mode), not just an opaque group. The
+    // borrowed slice is stable (items never re-alloc after init);
+    // `checked` mutates in place on selection changes.
     for (s.items.items, 0..) |*def, i| {
         s.sem_children.append(.{
-            .role = .radio,
+            .role = if (multi) .checkbox else .radio,
             .label = def.label,
-            .checked = i == s.selected,
+            .checked = isSel(s, i),
             .disabled = !def.enabled,
             .actions = ui.semantics.Actions.initOne(.activate),
         }) catch @panic("klaxon: out of memory");
     }
     ui.semantics.attach(node, .{
-        .role = .group, // a radio group (single choice)
+        .role = .group, // a radio group (single) / toggle group (multi)
         .label = "Segmented button",
         .focusable = true, // takes the keyboard focus (arrow nav)
-        .value = if (s.items.items.len > 0) s.items.items[s.selected].label else "",
+        .value = if (!multi and s.items.items.len > 0) s.items.items[s.selected].label else "",
         .children = s.sem_children.items,
         .child_bounds = segChildBounds,
     }); // Phase 2c
+    return node;
+}
+
+/// An M3E single-choice segmented button row. The segments are internal
+/// chrome painted by the widget (a leaf — no document children). `items`
+/// are copied (the labels are owned). `sig` drives the selection
+/// (round-trips); `on_change` fires with `selectedIndex(n)` valid after a
+/// click or an arrow-key selection.
+pub fn segmentedButton(allocator: std.mem.Allocator, items: []const SegmentedItem, sig: ?*ui.state.Signal(usize), on_change: ?Callback, opts: SegmentedButtonOptions) !*Node {
+    const node = try segBuild(allocator, items, opts, false);
+    const s = stateOf(node);
+    s.sig = sig;
+    s.on_change = on_change;
+    if (sig) |sg| {
+        sg.subscribe(.{ .callback = .{ .fn_ptr = segSyncCb, .userdata = node } });
+        const v = sg.peek();
+        if (v < s.items.items.len) s.selected = v; // the signal wins
+        if (node.semantics) |sem| {
+            sem.value = s.items.items[s.selected].label;
+            for (s.sem_children.items, 0..) |*c, i| c.checked = (i == s.selected);
+        }
+    }
+    return node;
+}
+
+/// An M3E MultiChoiceSegmentedButtonRow: same chrome, but every segment is
+/// an independent toggle. The selection is a u64 bitmask (bit i = item i —
+/// selectable segments cap at 64); `sig`/`on_change` round-trip it. A
+/// click or space/enter on the keyboard cursor toggles; arrows move the
+/// cursor only. `selectedMask(n)` reads it back. Checked segments paint
+/// the check icon (upstream's default icon slot).
+pub fn segmentedButtonMulti(allocator: std.mem.Allocator, items: []const SegmentedItem, sig: ?*ui.state.Signal(u64), on_change: ?Callback, opts: SegmentedButtonOptions) !*Node {
+    const node = try segBuild(allocator, items, opts, true);
+    const s = stateOf(node);
+    s.multi_sig = sig;
+    s.on_change = on_change;
+    if (sig) |sg| {
+        sg.subscribe(.{ .callback = .{ .fn_ptr = segMultiSyncCb, .userdata = node } });
+        s.mask = sg.peek(); // the signal wins
+        for (s.sem_children.items, 0..) |*c, i| c.checked = isSel(s, i);
+    }
     return node;
 }
 
@@ -630,6 +748,51 @@ test "segmented_button: semantics — role group, focusable, value follows the s
     try std.testing.expect(n.semantics.?.focusable);
     try std.testing.expectEqualStrings("B", n.semantics.?.value);
     try std.testing.expectEqual(@as(usize, 1), selectedIndex(n));
+}
+
+test "segmented_button: multi-choice toggles a bitmask — click, cursor+space, signal round-trip" {
+    var count: u32 = 0;
+    const cb = Callback{ .fn_ptr = changeCounterCb, .userdata = &count };
+    const sig = try ui.state.Signal(u64).init(std.testing.allocator, 0b001);
+    defer sig.deinit();
+    var router = input.InputRouter{};
+    input.setCurrent(&router);
+    defer input.setCurrent(null);
+    const a = std.testing.allocator;
+    const n = try segmentedButtonMulti(a, &.{ .{ .label = "Bold" }, .{ .label = "Italic" }, .{ .label = "Underline", .enabled = false } }, sig, cb, .{});
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 300, .h = 40 });
+    // the signal seeds the mask; a11y children are checkboxes
+    try std.testing.expectEqual(@as(u64, 0b001), selectedMask(n));
+    try std.testing.expectEqual(ui.semantics.Role.checkbox, n.semantics.?.children[0].role);
+    try std.testing.expect(n.semantics.?.children[0].checked.?);
+    try std.testing.expect(!n.semantics.?.children[1].checked.?);
+    // click segment 1 → toggles its bit ON without clearing segment 0
+    const t = theme_mod.light;
+    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Underline", t.type_scale.label_large.size, true).width);
+    const x1 = w - border_w + 10;
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
+    try std.testing.expectEqual(@as(u64, 0b011), selectedMask(n));
+    try std.testing.expectEqual(@as(u64, 0b011), sig.peek());
+    try std.testing.expectEqual(@as(u32, 1), count);
+    try std.testing.expect(n.semantics.?.children[1].checked.?);
+    // clicking a selected segment toggles it OFF
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
+    _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
+    try std.testing.expectEqual(@as(u64, 0b001), selectedMask(n));
+    // keyboard: arrows move the cursor WITHOUT toggling (skips disabled 2,
+    // wraps), space toggles
+    input.requestFocus(n);
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .right }); // cursor 1 → wraps to 0
+    try std.testing.expectEqual(@as(u64, 0b001), selectedMask(n)); // moved, no toggle
+    _ = router.dispatchKey(.{ .kind = .key_down, .key = .space });
+    try std.testing.expectEqual(@as(u64, 0b000), selectedMask(n)); // toggled segment 0 off
+    // the external signal moves the mask
+    sig.set(0b010);
+    try std.testing.expectEqual(@as(u64, 0b010), selectedMask(n));
+    try std.testing.expect(!n.semantics.?.children[0].checked.?);
+    try std.testing.expect(n.semantics.?.children[1].checked.?);
 }
 
 test "golden: the selected segment paints SecondaryContainer; the row's ends are rounded, the middle is square" {

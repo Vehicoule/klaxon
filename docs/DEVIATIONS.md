@@ -45,8 +45,10 @@ Each widget's header carries the same list; these are the tracked ones
 (file:line is approximate — headers move):
 
 - `input.zig` — legacy P0 controls co-exported alongside the M3E ports.
-- `segmented_button.zig` — single-choice only; equal-width = widest content
-  (upstream weight(1f) distributes the mean); no checked-icon crossfade.
+- `segmented_button.zig` — equal-width = widest content (upstream
+  weight(1f) distributes the mean); no checked-icon crossfade; the
+  multi-choice row (`segmentedButtonMulti`) is a u64 bitmask capped at 64
+  segments.
 - `icon_button.zig` — no elevation shadows; instant shape morphs.
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
