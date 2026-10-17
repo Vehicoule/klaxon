@@ -20,7 +20,10 @@
 #include "include/gpu/graphite/mtl/MtlBackendContext.h"
 #include "include/gpu/graphite/mtl/MtlGraphiteTypes_cpp.h"
 #include "include/ports/SkCFObject.h"
+#include "include/ports/SkFontMgr_directory.h"
 #include "include/ports/SkFontMgr_mac_ct.h"
+
+#include <cstdlib>
 
 #include <memory>
 
@@ -228,6 +231,15 @@ sk_sp<SkImage> gpu_stream_image(GpuState* state, const void* rgba, int w, int h)
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {
+    // KLAXON_FONT_DIR pins the font set (fidelity harness: deps/fonts =
+    // the DejaVu Sans that the Compose runner pins too). The custom
+    // directory manager resolves families + per-codepoint fallback inside
+    // that directory only — deterministic, no host-font dependence.
+    if (const char* dir = std::getenv("KLAXON_FONT_DIR"); dir && dir[0]) {
+        if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Directory(dir)) {
+            return mgr;
+        }
+    }
     return SkFontMgr_New_CoreText(nullptr);
 }
 

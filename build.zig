@@ -221,6 +221,19 @@ pub fn build(b: *std.Build) void {
     const conf_step = b.step("conformance", "Run the conformance suite (conformance/tests/*.json)");
     conf_step.dependOn(&run_conf.step);
 
+    // --- pixel-fidelity harness ---
+    // Renders fidelity/scenes.json through the real widget tree (headless
+    // raster), writing fidelity/out/klaxon/<scene>.ppm + JSON sidecars for
+    // tools/fidelity_diff.py to compare with the Compose runner's frames.
+    const fid_exe = addApp(b, target, optimize, "fidelity", "src/fidelity_main.zig", translate_sdl, translate_kx, kx_skia, is_macos, tag, san_rt);
+    b.installArtifact(fid_exe);
+
+    const run_fid = b.addRunArtifact(fid_exe);
+    run_fid.step.dependOn(b.getInstallStep());
+    run_fid.addPassthruArgs(); // zig build fidelity -- --scene=<substr>
+    const fid_step = b.step("fidelity", "Render fidelity scenes (fidelity/out/klaxon/*.ppm)");
+    fid_step.dependOn(&run_fid.step);
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),

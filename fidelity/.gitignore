@@ -1,0 +1,5 @@
+# Generated fidelity artifacts — renders, diffs and reports are rebuild
+# outputs, not source.
+out/
+report.json
+report.html
