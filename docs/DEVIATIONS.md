@@ -107,11 +107,14 @@ Each widget's header carries the same list; these are the tracked ones
   mask+translation — item content stays full-size inside a moving clip
   band, upstream's mechanism verbatim. No end-aligned variant (upstream
   exposes only the centered hero).
-- `progress.zig` — static `progress` snaps on rebuild (the spring runs on
-  `progress_sig` writes). The wavy amplitude runs the upstream
-  `updateAmplitudeAnimation` spec: a 500ms tween (standard easing up,
-  emphasized-accelerate down, quantized to 1/12 morph steps) between the
-  ring and the rounded-star path.
+- `progress.zig` — a brand-new node can't animate from the previous
+  one's value (no diffing layer); in-place updates DO spring: the
+  `progress_sig` path and the new `progressSetValue` setter both ride
+  the ProgressAnimationSpec spring with velocity-carrying retargets
+  (upstream `animateFloatAsState` semantics). The wavy amplitude runs
+  the upstream `updateAmplitudeAnimation` spec: a 500ms tween (standard
+  easing up, emphasized-accelerate down, quantized to 1/12 morph steps)
+  between the ring and the rounded-star path.
 - `drawer.zig` — no predictive back, window-inset padding, or content
   scale-down during overshoot; `confirm_state_change` gates only
   drawer-initiated transitions (the app owns the signal).

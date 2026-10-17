@@ -180,6 +180,9 @@ const ProgressState = struct {
     prog_effect: ?*ui.state.Effect = null,
     prog_channel: u8 = 0, // timeline channel marker (stable address)
     displayed: f32 = 0, // current animated value (read at paint)
+    /// A `progressSetValue` spring is in flight on a signal-less widget —
+    /// effProgress reads `displayed` until it completes.
+    static_animating: bool = false,
     node: ?*Node = null, // back-pointer for the update callback's markDirty
 };
 
@@ -202,9 +205,10 @@ fn progressMeasure(n: *Node, c: Constraints) Size {
 /// nothing moves between value writes, so no animation is registered and
 /// the host idles.
 /// The value paint/schedule code reads: the animated display value when a
-/// progress signal drives the widget, else the static option.
+/// progress signal or a progressSetValue spring drives the widget, else
+/// the static option.
 fn effProgress(s: *const ProgressState) ?f32 {
-    return if (s.opts.progress_sig != null) s.displayed else s.opts.progress;
+    return if (s.opts.progress_sig != null or s.static_animating) s.displayed else s.opts.progress;
 }
 
 fn wantsPhaseLoop(s: *const ProgressState) bool {
@@ -1086,11 +1090,63 @@ fn progressEffectCb(userdata: ?*anyopaque) void {
         return;
     };
     _ = tl.play(.{
-        .kind = anim.Animation.kindOf(.{ .spring = progress_spring }, .{ s.displayed, 0, 0, 0 }, .{ target, 0, 0, 0 }),
+        // Velocity continuity on retarget (upstream animateFloatAsState).
+        .kind = anim.Animation.springAnim(.{ s.displayed, 0, 0, 0 }, .{ target, 0, 0, 0 }, progress_spring, tl.channelVelocity(@ptrCast(&s.prog_channel))),
         .from = .{ s.displayed, 0, 0, 0 },
         .channel = @ptrCast(&s.prog_channel),
         .on_update = .{ .fn_ptr = progressUpdateCb, .userdata = s.node.? },
     });
+}
+
+/// The static-value spring completed — the paint falls back to the
+/// (already-written) `opts.progress` target.
+fn staticDoneCb(userdata: ?*anyopaque) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    const s = stateOf(n);
+    s.static_animating = false;
+    n.markDirty();
+}
+
+/// Move a determinate progress to `v` through the same
+/// ProgressAnimationSpec spring the signal path uses — upstream's
+/// `animateFloatAsState(progress())` semantics for callers that don't
+/// bind a signal. Routes through the signal when one is bound.
+pub fn progressSetValue(n: *Node, v: f32) void {
+    const s = stateOf(n);
+    if (s.opts.progress_sig) |sig| {
+        sig.set(clamp01(v));
+        return;
+    }
+    const from = effProgress(s) orelse {
+        // Indeterminate: keep the loop, just record the value.
+        s.opts.progress = null;
+        return;
+    };
+    const target = clamp01(v);
+    if (target == from) {
+        s.opts.progress = target;
+        return;
+    }
+    s.opts.progress = target;
+    const tl = anim.timeline() orelse {
+        s.static_animating = false;
+        s.displayed = target; // snap (tests, pre-host paint)
+        n.markDirty();
+        return;
+    };
+    // A mid-flight retarget hands the spring its velocity — the same
+    // continuity the signal path gets by re-playing the channel.
+    const v0 = tl.channelVelocity(@ptrCast(&s.prog_channel));
+    s.displayed = from;
+    s.static_animating = true;
+    _ = tl.play(.{
+        .kind = anim.Animation.springAnim(.{ from, 0, 0, 0 }, .{ target, 0, 0, 0 }, progress_spring, v0),
+        .from = .{ from, 0, 0, 0 },
+        .channel = @ptrCast(&s.prog_channel),
+        .on_update = .{ .fn_ptr = progressUpdateCb, .userdata = n },
+        .on_complete = .{ .fn_ptr = staticDoneCb, .userdata = n },
+    });
+    n.markDirty();
 }
 
 /// Linear + circular progress indicators (M3E).
@@ -1214,6 +1270,36 @@ test "progress: determinate wavy runs the phase loop too (the wave scrolls); fla
     flat.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
     try std.testing.expect(!stateOf(flat).loop_running);
     try std.testing.expectEqual(@as(usize, 1), tl.animations.items.len); // only the wavy loop
+}
+
+test "progress: progressSetValue springs the static value (upstream animateFloatAsState)" {
+    var tl = anim.Timeline.init(std.testing.allocator);
+    defer tl.deinit();
+    anim.setCurrent(&tl);
+    defer anim.setCurrent(null);
+    const n = try progressIndicator(std.testing.allocator, .{ .progress = 0.2 });
+    defer n.deinit();
+    n.layout(.{ .x = 0, .y = 0, .w = 200, .h = 4 });
+    const s = stateOf(n);
+    try std.testing.expectEqual(@as(f32, 0.2), effProgress(s).?);
+    // A static write moves the display through the spring, not a snap.
+    progressSetValue(n, 0.9);
+    try std.testing.expect(s.static_animating);
+    tl.tick(0); // lazy start
+    tl.tick(50);
+    const mid = effProgress(s).?;
+    try std.testing.expect(mid > 0.2 and mid < 0.9);
+    // Settled: the flag clears, the logical target stands.
+    tl.tick(20_000);
+    try std.testing.expect(!s.static_animating);
+    try std.testing.expectEqual(@as(f32, 0.9), effProgress(s).?);
+    // A bound signal routes through the signal path instead.
+    const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.3);
+    defer sig.deinit();
+    const sn = try progressIndicator(std.testing.allocator, .{ .progress_sig = sig });
+    defer sn.deinit();
+    progressSetValue(sn, 0.7);
+    try std.testing.expectEqual(@as(f32, 0.7), sig.peek());
 }
 
 test "progress: linear measures full width x 4 (flat) / 10 (wavy); circular 40x40" {
