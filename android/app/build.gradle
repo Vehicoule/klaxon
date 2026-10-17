@@ -48,6 +48,10 @@ android {
             signingConfig System.getenv('KX_KEYSTORE') != null ? signingConfigs.release : signingConfigs.debug
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // run-as / files-dir access without a debug build (bench only —
+            // same approach as bench/runners/compose-android). Stripped when
+            // a real KX_KEYSTORE signs for distribution.
+            debuggable System.getenv('KX_KEYSTORE') == null
         }
         debug {
             minifyEnabled false

@@ -49,6 +49,10 @@ target_include_directories(main PRIVATE
     "${KLAXON_ROOT}/kx_skia/include"
     "${KLAXON_ROOT}/deps/skia"
     "${KLAXON_ROOT}/deps/skia/include"
+    # Vendored ICU headers (ubrk.h — grapheme-cluster boundaries) BEFORE
+    # the NDK sysroot: its <unicode/*.h> gates ubrk_* on API 31 while we
+    # link the static libicu.a that exports them on every API level.
+    "${KLAXON_ROOT}/deps/skia/third_party/externals/icu/source/common"
     "${KLAXON_ROOT}/deps/SDL/include")
 
 # Same flags as the Zig-built shim (shim_flags in build.zig). SK_GRAPHITE
@@ -58,6 +62,9 @@ target_include_directories(main PRIVATE
 target_compile_options(main PRIVATE
     -std=c++20 -fno-exceptions -fno-rtti
     -ffunction-sections -fdata-sections
+    # Match the vendored libicu.a: Skia builds ICU with symbol renaming
+    # off, so ubrk_* links unsuffixed.
+    -DU_DISABLE_RENAMING=1
     -DSK_GANESH -DSK_GRAPHITE -DSK_GL -DNDEBUG)
 
 # Section GC (Phase 4e.1, binary size): drop unreferenced sections from the
