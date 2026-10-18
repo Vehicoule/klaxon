@@ -35,9 +35,8 @@
 // children — they never paint in the normal children pass).
 //
 // v1 deviations (documented, fixed later):
-//   - Flat panel (no Level2 shadow — Phase 3); no submenus, no checkable
-//     items, no group labels/dividers; no scroll for long menus; no M3E shape
-//     morph. RTL mirrors the panel and the item rows (the text runs stay LTR
+//   - Flat panel (no Level2 shadow — Phase 3); no submenus, no group
+//     labels/dividers; no scroll for long menus; no M3E shape morph. RTL mirrors the panel and the item rows (the text runs stay LTR
 //     — no bidi, same as text.zig).
 const std = @import("std");
 const kx = @import("../kx.zig");
@@ -58,12 +57,15 @@ const Color = ui.paint.Color;
 const Callback = ui.state.Callback;
 const Theme = theme_mod.Theme;
 
-/// A menu item (the factory copies the strings).
+/// A menu item (the factory copies the strings). `checked` non-null makes
+/// the item checkable (CheckableDropdownMenuItem): a checked item paints the
+/// TertiaryContainer selection + a check leading icon.
 pub const MenuItem = struct {
     label: []const u8,
     leading_icon: ?icon_w.IconName = null,
     trailing_text: []const u8 = "",
     enabled: bool = true,
+    checked: ?bool = null,
 };
 
 pub const MenuOptions = struct {
@@ -90,6 +92,7 @@ const ItemDef = struct {
     leading_icon: ?icon_w.IconName,
     trailing_text: [:0]const u8, // owned
     enabled: bool,
+    checked: ?bool,
 };
 
 const MenuState = struct {
@@ -127,6 +130,12 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
     return buf[0..str.len :0];
 }
 
+/// True when the item reserves the leading slot (an icon, or the check on a
+/// checked checkable item — the check occupies the slot).
+fn hasLeading(def: ItemDef) bool {
+    return def.leading_icon != null or def.checked == true;
+}
+
 /// The panel width: the widest item's content + paddings, clamped to the
 /// upstream item band [DropdownMenuItemDefaultMinWidth 112,
 /// DropdownMenuItemDefaultMaxWidth 280].
@@ -134,7 +143,7 @@ fn panelWidth(s: *MenuState, t: Theme) f32 {
     var w: f32 = 0;
     for (s.items.items) |def| {
         var cw = item_h_pad * 2 + ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width;
-        if (def.leading_icon != null) cw += icon_size + icon_gap;
+        if (hasLeading(def)) cw += icon_size + icon_gap;
         if (def.trailing_text.len > 0) cw += trail_gap + ui.paint.measureTextStyled(def.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
         w = @max(w, cw);
     }
@@ -295,7 +304,7 @@ fn itemMeasure(n: *Node, c: Constraints) Size {
     const t = ms.opts.theme;
     const def = ms.items.items[s.def_index];
     var w = item_h_pad * 2 + ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width;
-    if (def.leading_icon != null) w += icon_size + icon_gap;
+    if (hasLeading(def)) w += icon_size + icon_gap;
     if (def.trailing_text.len > 0) w += trail_gap + ui.paint.measureTextStyled(def.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
     return c.constrain(.{ .w = @min(@max(w, item_min_w), item_max_w), .h = item_h });
 }
@@ -325,16 +334,28 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
             return if (rtl_flag) bx + bw - (x - bx) - w else x;
         }
     }.f;
-    const label_col = if (def.enabled) cs.on_surface else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-    const icon_col = if (def.enabled) cs.on_secondary_container else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
-    const trail_col = if (def.enabled) cs.on_surface_variant else ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+    // CheckableDropdownMenuItem selected colors (StandardMenuTokens
+    // ItemSelected*): TertiaryContainer fill + OnTertiaryContainer content.
+    // Disabled wins over selected (ItemDisabled*Opacity 0.38).
+    const selected = def.checked == true;
+    const dis = ui.paint.withAlphaScaled(cs.on_surface, 0.38);
+    const label_col = if (!def.enabled) dis else if (selected) cs.on_tertiary_container else cs.on_surface;
+    const icon_col = if (!def.enabled) dis else if (selected) cs.on_tertiary_container else cs.on_secondary_container;
+    const trail_col = if (!def.enabled) dis else if (selected) cs.on_tertiary_container else cs.on_surface_variant;
+    // the selected container fill (ItemSelectedContainerColor) under the
+    // state layer + ink
+    if (selected and def.enabled) {
+        ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, cs.tertiary_container);
+    }
     // the indication (enabled only): the keyboard/hover highlight maps to
     // a focus interaction (upstream rows take real focus — the row lights
     // at the focus alpha while the open menu holds the keyboard focus);
     // then the animated state layer + the bounded ink ripple over the row.
     if (def.enabled) {
         s.inter.setFocused(ms.highlight == @as(i32, @intCast(s.def_index)) and input.isFocused(s.owner));
-        s.layer.sync(&s.inter, cs.on_surface);
+        const ink = if (selected) cs.on_tertiary_container else cs.on_surface;
+        s.layer.sync(&s.inter, ink);
+        s.ripples.color = ink;
         if (s.layer.paintColor()) |lc| {
             ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, lc);
         }
@@ -342,11 +363,13 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
     }
     // the label (vertically centered, upstream ProvideTextStyle labelLarge)
     const lm = ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing);
-    const label_x = b.x + item_h_pad + (if (def.leading_icon != null) icon_size + icon_gap else 0);
+    const label_x = b.x + item_h_pad + (if (hasLeading(def)) icon_size + icon_gap else 0);
     const label_y = b.y + (b.h - lm.height) / 2 + lm.ascent;
     ui.paint.textStyled(ctx, def.label, mx(b.x, b.w, label_x, lm.width, rtl), label_y, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing, label_col);
-    // the leading icon (start side, vertically centered)
-    if (def.leading_icon) |iname| {
+    // the leading slot (start side, vertically centered): the check glyph on
+    // a checked item (checkedLeadingIcon), else the item's leading icon
+    if (hasLeading(def)) {
+        const iname: icon_w.IconName = if (selected) .check else def.leading_icon.?;
         const ix = mx(b.x, b.w, b.x + item_h_pad, icon_size, rtl);
         paintIcon(ctx, iname, ix, b.y + (b.h - icon_size) / 2, icon_col);
     }
@@ -719,6 +742,7 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
             .leading_icon = item.leading_icon,
             .trailing_text = trailing,
             .enabled = item.enabled,
+            .checked = item.checked,
         });
     }
     node.state = s;
@@ -757,6 +781,7 @@ pub fn menu(allocator: std.mem.Allocator, anchor: *Node, items: []const MenuItem
         ui.semantics.attach(item_node, .{
             .role = .menu_item,
             .label = s.items.items[i].label,
+            .checked = s.items.items[i].checked, // CheckableDropdownMenuItem
             .disabled = !s.items.items[i].enabled,
             .actions = ui.semantics.Actions.initOne(.activate),
         });
@@ -918,6 +943,23 @@ test "menu: the panel width is clamped to the window (a long label stays onscree
     try std.testing.expectEqual(@min(intrinsic, avail), item0.bounds.w);
 }
 
+test "menu: a checked item reserves the leading slot and reports checked semantics" {
+    const a = std.testing.allocator;
+    const anchor = try anchorBox(a, 120, 40);
+    const m = try menu(a, anchor, &.{ .{ .label = "Grid", .checked = true }, .{ .label = "List", .checked = false } }, null, null, .{});
+    defer m.deinit();
+    m.layout(.{ .x = 0, .y = 0, .w = 120, .h = 40 });
+    const checked = m.children.items[1];
+    try std.testing.expectEqual(@as(?bool, true), checked.semantics.?.checked);
+    const unchecked = m.children.items[2];
+    try std.testing.expectEqual(@as(?bool, false), unchecked.semantics.?.checked);
+    // the checked item's intrinsic width includes the leading slot (icon+gap)
+    const ls = theme_mod.light.type_scale.label_large;
+    const w_checked = item_h_pad * 2 + icon_size + icon_gap + ui.paint.measureTextStyled("Grid", ls.size, ls.weight, ls.letter_spacing).width;
+    const w_unchecked = item_h_pad * 2 + ui.paint.measureTextStyled("List", ls.size, ls.weight, ls.letter_spacing).width;
+    try std.testing.expect(w_checked > w_unchecked);
+}
+
 test "menu: semantics — role menu, focusable, value follows the selection" {
     const a = std.testing.allocator;
     const anchor = try anchorBox(a, 120, 40);
@@ -988,6 +1030,27 @@ test "golden: disabled menu item paints the OnSurface@0.38 label" {
     // the label ink: on_surface @ 0.38 over the panel
     const dis = golden.blendOver(ui.paint.withAlphaScaled(t.colors.on_surface, 0.38), t.colors.surface_container);
     try std.testing.expect(f.countColorIn(.{ .x = 32, .y = 68 + 8 + 12, .w = 80, .h = 24 }, dis) > 0);
+}
+
+test "golden: a checked item paints TertiaryContainer + the check icon (selectableItemColors)" {
+    const t = theme_mod.light;
+    const a = std.testing.allocator;
+    const anchor = try anchorBox(a, 120, 40);
+    const m = try menu(a, anchor, &.{ .{ .label = "Grid", .checked = true }, .{ .label = "List", .checked = false } }, null, null, .{ .theme = t });
+    defer m.deinit();
+    var r = try golden.Renderer.init(std.testing.allocator, 260, 200);
+    defer r.deinit();
+    m.layout(.{ .x = 20, .y = 20, .w = 120, .h = 40 });
+    setOpen(m, true);
+    r.paint(m, 0xFFFFFFFF);
+    var f = try r.readback(std.testing.allocator);
+    defer f.deinit();
+    // checked row (y = 60 + 8 = 68..116): ItemSelectedContainerColor fill
+    try std.testing.expectEqual(t.colors.tertiary_container, f.pixelAt(100, 92));
+    // the check leading icon ink (ItemSelectedLeadingIconColor)
+    try std.testing.expect(f.countColorIn(.{ .x = 32, .y = 80, .w = 24, .h = 24 }, t.colors.on_tertiary_container) > 0);
+    // the unchecked row stays transparent → the panel's SurfaceContainer
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(100, 140));
 }
 
 test "golden: the open menu paints ABOVE a later sibling (the overlay pass)" {
