@@ -75,6 +75,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -957,6 +958,14 @@ static bool mgr_has_latin_face(SkFontMgr* mgr) {
 }
 
 sk_sp<SkFontMgr> platform_font_mgr() {
+    // KLAXON_FONT_DIR pins the font set (fidelity harness + tests) — same
+    // escape hatch as the macOS port.
+    if (const char* dir = std::getenv("KLAXON_FONT_DIR"); dir && dir[0]) {
+        if (sk_sp<SkFontMgr> mgr = SkFontMgr_New_Custom_Directory(dir)) {
+            g_linux_font_family = pick_latin_family(mgr.get());
+            return mgr;
+        }
+    }
     // System and workspace font directories — verify the directory actually
     // yields at least one Latin-covering face (SkFontMgr_New_Custom_Directory
     // returns a non-null manager with SkTypeface_Empty when a directory is

@@ -841,8 +841,11 @@ fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime
         const name = b.fmt("libclang_rt.{s}-{s}.so", .{ rt, arch });
         switch (b.runFallible(&.{ "clang", b.fmt("-print-file-name={s}", .{name}) }, .{ .stderr_behavior = .ignore })) {
             .success => |out| {
+                // clang resolves to an absolute path inside its resource
+                // dir; a miss echoes the bare name back — and the bare
+                // name ends in .so too, so check for the leading slash.
                 const p = std.mem.trim(u8, out, &std.ascii.whitespace);
-                if (std.mem.endsWith(u8, p, ".so"))
+                if (p.len > 0 and p[0] == '/' and std.mem.endsWith(u8, p, ".so"))
                     objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
             },
             else => {},

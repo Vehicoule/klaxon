@@ -873,6 +873,9 @@ test "navigation_rail: semantics — role group, focusable, value follows the se
 }
 
 test "golden: collapsed — the selected item paints the 56x32 pill + OnSecondaryContainer icon + Secondary label" {
+    // Label ink positions are calibrated to the platform default font's
+    // metrics (CoreText); other hosts resolve a different face.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const t = theme_mod.light;
     const a = std.testing.allocator;
     const n = try navigationRail(a, &.{

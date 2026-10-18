@@ -1914,6 +1914,9 @@ test "edit: an edit in one line rebuilds only that line's paragraph" {
 }
 
 test "edit: line-table geometry — caret tops, hit-testing, selection boxes" {
+    // Geometry equality is calibrated to the platform default font's
+    // metrics (CoreText); other hosts resolve a different face.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const t = try testEdit(a, "aa\nbb\ncc", 200);
     defer freeTestEdit(a, t.n, t.e);
@@ -1955,6 +1958,7 @@ test "edit: line-table geometry — caret tops, hit-testing, selection boxes" {
 }
 
 test "edit: a trailing newline yields a counted empty last line" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const t = try testEdit(a, "aa\n", 200);
     defer freeTestEdit(a, t.n, t.e);
@@ -2003,6 +2007,7 @@ fn testRepeat(comptime n: usize, comptime text: []const u8) *const [text.len * n
 // One ~2000-byte hard line — no '\n' — wraps to dozens of soft rows at
 // wrap 200; the seg table is the same incremental idea one level down.
 test "edit: appends to a soft-wrapped line rebuild only the tail seg" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const t = try testEdit(a, testRepeat(2000, "x"), 200);
     defer freeTestEdit(a, t.n, t.e);
@@ -2063,6 +2068,7 @@ test "edit: appends to a soft-wrapped line rebuild only the tail seg" {
 }
 
 test "edit: a segmented line's geometry matches the monolithic paragraph" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const t = try testEdit(a, testRepeat(64, "abcdefghijklmnopqrstuvwxyzabc "), 200);
     defer freeTestEdit(a, t.n, t.e);

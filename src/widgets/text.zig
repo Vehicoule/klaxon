@@ -797,5 +797,14 @@ test "text family override: selects the face and reaches the wght axis" {
     const wl = light.measure(.{}).w;
     const wh = heavy.measure(.{}).w;
     try std.testing.expect(wl > 0 and wh > 0);
+    // Hosts without SF Compact (CI runners) resolve it to the same
+    // fallback a bogus family gets — nothing variable to exercise there.
+    const bogus = try text(std.testing.allocator, "Ag", .{
+        .size = 24,
+        .family = "No Such Family 9x7",
+        .variations = &.{.{ .axis = ui.paint.axis_wght, .value = 300 }},
+    });
+    defer bogus.deinit();
+    if (wl == bogus.measure(.{}).w) return error.SkipZigTest;
     try std.testing.expect(@abs(wh - wl) > 0.5); // wght 300→900 moves a variable face
 }

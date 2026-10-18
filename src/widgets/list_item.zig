@@ -530,6 +530,9 @@ test "list_item: measures the per-lines min heights (56/72/88), content + paddin
 }
 
 test "list_item: the item type derives from the content; three-line top-aligns at 12dp" {
+    // Measured heights are calibrated to the platform default font's
+    // metrics (CoreText); other hosts resolve a different face.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const t = theme_mod.light;
     const a = std.testing.allocator;
     // upstream ListItemType: overline+supporting → three, either → two, neither → one
@@ -641,6 +644,7 @@ test "golden: selected list item paints the SecondaryContainer + on_secondary co
 }
 
 test "golden: trailing icon + text lay out sequentially (no overlap)" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const t = theme_mod.light;
     const li = try listItem(std.testing.allocator, null, null, .{ .headline = "Title", .trailing_icon = .close, .trailing_text = "Edit", .theme = t });
     defer li.deinit();

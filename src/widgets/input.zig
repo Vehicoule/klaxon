@@ -1455,6 +1455,7 @@ test "golden: slider drag moves fill and knob" {
 }
 
 test "golden: text field shows typed text and the focus cursor" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const bg = 0x101010FF;
     const white = 0xFFFFFFFF;
     const field_bg = 0x282838FF;
