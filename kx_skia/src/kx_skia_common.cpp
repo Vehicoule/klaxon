@@ -3003,6 +3003,32 @@ void kx_backdrop_blur(kx_ctx* ctx, float x, float y, float w, float h, float sig
 void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radius,
                      float elevation, uint32_t ambient_rgba, uint32_t spot_rgba, int transparent_occluder) {
     if (!ctx || !ctx->canvas || !(w > 0.0f) || !(h > 0.0f) || !(elevation > 0.0f)) return;
+    const SkMatrix ctm = ctx->canvas->getTotalMatrix();
+    const float ds = fabsf(ctm.getScaleX());
+    // Compose Desktop lighting (GraphicsLayerOwnerLayer.skiko.kt): the key
+    // light is pinned to the window's top-center — local light pos =
+    // (winW/2 - offX, -offY, 500dp·s) with s = (min(win)/450dp + 2)/3 and
+    // radius 800dp; alphas are Android LightsComputer's 0.039/0.19 folded
+    // into the caller's colors. offX/offY = the shape's device-space
+    // origin, i.e. how far the widget sits below the window top — the
+    // spot drop scales with it (widgets near the top throw shorter
+    // shadows).
+    const SkISize win = ctx->canvas->getBaseLayerSize();
+    const SkPoint org = ctm.mapPoint(SkPoint::Make(x, y));
+    const float rel_x = win.width() * 0.5f - org.fX;
+    const float rel_y = -org.fY;
+    const float light_z = (ds > 0.0f)
+        ? 500.0f * ds * ((fminf((float)win.width(), (float)win.height()) / (450.0f * ds) + 2.0f) / 3.0f)
+        : 0.0f;
+    const float light_r = 800.0f * ds;
+    // Spot reach ≈ elevation · dist/light_z on top of the blur — bound it
+    // so deep-window widgets don't clip their raster or damage rect.
+    const float reach = light_z > 0.0f
+        ? elevation * fabsf(rel_y) / light_z + elevation * 0.5f
+        : elevation;
+    // Integer pad keeps the offscreen's raster phase pixel-aligned with
+    // the destination (a fractional pad shifts every AA fringe).
+    const float pad = std::ceil(elevation * 2.0f + 28.0f + reach);
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::ShadowRRect};
         op.f[0] = x; op.f[1] = y; op.f[2] = w; op.f[3] = h;
@@ -3010,8 +3036,10 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
         op.color = ambient_rgba;
         op.cols.push_back(spot_rgba);
         op.flag = transparent_occluder != 0;
-        const float pad = elevation * 2.0f + 24.0f; // M3 shadow reach bound
-        op.local_bounds = SkRect::MakeLTRB(x - pad, y - pad, x + w + pad, y + h + pad);
+        // The record canvas may not carry the real window transform —
+        // over-bound the damage rect so a deep-window replay can't clip.
+        const float rpad = pad + elevation * 4.0f + 16.0f;
+        op.local_bounds = SkRect::MakeLTRB(x - rpad, y - rpad, x + w + rpad, y + h + rpad);
         kx_rec_op(ctx, std::move(op));
         return;
     }
@@ -3022,12 +3050,14 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
     // optimization Qt's RectangularGlow performs with its 9-patch texture.
     // HiDPI: the texture is a device-pixel raster — fold the canvas scale
     // into the key or a Retina display re-blits a 1x shadow upscaled.
-    const float ds = fabsf(ctx->canvas->getTotalMatrix().getScaleX());
-    const float pad = elevation * 2.0f + 24.0f;
+    // The light geometry is window-relative, so the shape's device-space
+    // origin must key the raster too.
     uint64_t key = 14695981039346656037ull;
     for (uint32_t v : {__builtin_bit_cast(uint32_t, w), __builtin_bit_cast(uint32_t, h),
                        __builtin_bit_cast(uint32_t, radius), __builtin_bit_cast(uint32_t, elevation),
                        __builtin_bit_cast(uint32_t, ds),
+                       __builtin_bit_cast(uint32_t, rel_x), __builtin_bit_cast(uint32_t, rel_y),
+                       __builtin_bit_cast(uint32_t, light_z),
                        ambient_rgba, spot_rgba, (uint32_t)(transparent_occluder != 0)}) {
         key ^= v; key *= 1099511628211ull;
     }
@@ -3055,10 +3085,13 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
                 SkRect::MakeXYWH(pad * scale, pad * scale, w * scale, h * scale),
                 radius * scale, radius * scale);
         const SkPoint3 z_plane = SkPoint3::Make(0.0f, 0.0f, elevation * scale);
+        // rel_x/rel_y/light_z/light_r are canvas device px; the offscreen
+        // raster is local-unit * scale — rescale by scale/ds.
+        const float k = ds > 0.0f ? scale / ds : 1.0f;
         const SkPoint3 light_pos = SkPoint3::Make(
-                (pad + w * 0.5f) * scale, (pad - 600.0f) * scale, 600.0f * scale);
+                pad * scale + rel_x * k, pad * scale + rel_y * k, light_z * k);
         SkShadowUtils::DrawShadow(surf->getCanvas(), path, z_plane, light_pos,
-                                  800.0f * scale /*light radius, M3 key*/,
+                                  light_r * k /*M3 key light radius*/,
                                   kx_to_skcolor(ambient_rgba), kx_to_skcolor(spot_rgba),
                                   transparent_occluder
                                       ? (uint32_t)kTransparentOccluder_ShadowFlag

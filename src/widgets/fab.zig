@@ -1067,8 +1067,15 @@ test "golden: standard FAB paints the primary_container squircle" {
     defer f.deinit();
     // inside the container, off the glyph ink: primary_container
     try std.testing.expectEqual(t.colors.primary_container, f.pixelAt(12, 36));
-    // outside the rounded corner (top-left clipped by the 16px radius): bg
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(9, 9));
+    // outside the rounded corner (top-left clipped by the 16px radius):
+    // the elevation-6 ambient halo tints it a few steps off pure bg —
+    // a neutral near-white, definitely not the container fill
+    const corner = f.pixelAt(9, 9);
+    const cr = corner >> 24;
+    const cg = (corner >> 16) & 0xFF;
+    const cb = (corner >> 8) & 0xFF;
+    try std.testing.expect(corner != t.colors.primary_container);
+    try std.testing.expect(cr == cg and cg == cb and cr > 0xE0);
 }
 
 test "golden: toggle FAB checked paints the primary circle (CornerFull)" {
@@ -1085,8 +1092,13 @@ test "golden: toggle FAB checked paints the primary circle (CornerFull)" {
     defer f.deinit();
     // the checked state is a 56 circle at the center: primary on the edge-mid
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(9, 36));
-    // the corner (off the circle): bg
-    try std.testing.expectEqual(@as(Color, 0xFFFFFFFF), f.pixelAt(10, 10));
+    // the corner (off the circle): faint ambient-shadow tint, not the fill
+    const corner = f.pixelAt(10, 10);
+    const cr = corner >> 24;
+    const cg = (corner >> 16) & 0xFF;
+    const cb = (corner >> 8) & 0xFF;
+    try std.testing.expect(corner != t.colors.primary);
+    try std.testing.expect(cr == cg and cg == cb and cr > 0xE0);
 }
 
 test "golden: extended FAB paints the container + icon + label" {

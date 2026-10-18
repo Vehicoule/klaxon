@@ -318,7 +318,7 @@ Each widget's header carries the same list; these are the tracked ones
 ## Fidelity harness — known reference-runner deltas (do not "fix" by regressing Klaxon)
 
 `fidelity/` compares our Skia raster output against a Compose M3 desktop
-runner (66 scenes, `tools/fidelity_diff.py`, mean 0.156%). The residual
+runner (66 scenes, `tools/fidelity_diff.py`, mean 0.126%). The residual
 nonzero scenes are version deltas in the runner's material3, not Klaxon
 bugs — the vendored `.ref/material3` spec is authoritative:
 
@@ -331,9 +331,16 @@ bugs — the vendored `.ref/material3` spec is authoritative:
   on the check icon + label after the layout fix (fixed 3-slot row,
   spacedBy 8dp — see below). Spec unselected-hover label/layer =
   OnSurfaceVariant (FilterChipTokens).
-- `fab_default`/`fab_small_pressed` (~0.7-1.1%) — shadow fringe: ambient
-  0.08/spot 0.10 calibrated against the runner's renderer; remaining
-  pixels are ±2-4 in the blurred band plus the pressed-ripple edge.
+- `fab_default`/`fab_small_pressed` (~0.3%) — residual ripple-ink edge AA.
+  The elevation shadow itself now uses the real Compose Desktop model
+  (extracted from `GraphicsLayerOwnerLayer.skiko.kt` bytecode + skiko
+  `RenderNode::drawShadow` disassembly): key light pinned at the window's
+  top-center, `lightPos=(winW/2-offX, -offY, 500dp·s)` with
+  `s=(min(win)/450dp+2)/3`, radius 800dp, alphas 0.039/0.19 — the same
+  `SkShadowUtils::DrawShadow` we call, with the same geometry. The raster
+  cache keys on the shape's window-space origin since the light is
+  window-relative, and the pad is integer-rounded so the raster's AA
+  phase matches the destination.
 - `card_*`/`nav_bar_*` (<0.3%) — anti-alias noise on card outline and the
   indicator pill's rounded ends.
 - `slider_pressed` resolved (0.000%): upstream drives the value indicator
