@@ -53,6 +53,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -3053,11 +3054,11 @@ void kx_shadow_rrect(kx_ctx* ctx, float x, float y, float w, float h, float radi
     // The light geometry is window-relative, so the shape's device-space
     // origin must key the raster too.
     uint64_t key = 14695981039346656037ull;
-    for (uint32_t v : {__builtin_bit_cast(uint32_t, w), __builtin_bit_cast(uint32_t, h),
-                       __builtin_bit_cast(uint32_t, radius), __builtin_bit_cast(uint32_t, elevation),
-                       __builtin_bit_cast(uint32_t, ds),
-                       __builtin_bit_cast(uint32_t, rel_x), __builtin_bit_cast(uint32_t, rel_y),
-                       __builtin_bit_cast(uint32_t, light_z),
+    for (uint32_t v : {std::bit_cast<uint32_t>(w), std::bit_cast<uint32_t>(h),
+                       std::bit_cast<uint32_t>(radius), std::bit_cast<uint32_t>(elevation),
+                       std::bit_cast<uint32_t>(ds),
+                       std::bit_cast<uint32_t>(rel_x), std::bit_cast<uint32_t>(rel_y),
+                       std::bit_cast<uint32_t>(light_z),
                        ambient_rgba, spot_rgba, (uint32_t)(transparent_occluder != 0)}) {
         key ^= v; key *= 1099511628211ull;
     }
