@@ -95,6 +95,7 @@ for b in "${BUNDLES[@]}"; do
         "skia/include" \
         "skia/out/$TAG" \
         "skia/modules" \
+        "skia/third_party/externals/icu/source/common" \
         ${dawn_dirs[@]+"${dawn_dirs[@]}"} \
         "SDL/include" \
         "SDL/build-$TAG" || rc=1
@@ -105,6 +106,7 @@ for b in "${BUNDLES[@]}"; do
         "skia/out/web-wasm" \
         "skia/modules" \
         "skia/src" \
+        "skia/third_party/externals/icu/source/common" \
         "emdawnwebgpu_pkg" \
         "SDL/include" \
         "SDL/build-web-wasm" || rc=1
@@ -114,6 +116,7 @@ for b in "${BUNDLES[@]}"; do
         "skia/include" \
         "skia/out/android-arm64" \
         "skia/modules" \
+        "skia/third_party/externals/icu/source/common" \
         "SDL/include" \
         "SDL/build-android-arm64" || rc=1
       ;;
@@ -123,6 +126,7 @@ for b in "${BUNDLES[@]}"; do
         "skia/out/ios-arm64" \
         "skia/out/ios-sim-arm64" \
         "skia/modules" \
+        "skia/third_party/externals/icu/source/common" \
         "skia/third_party/externals/dawn/include" \
         "skia/third_party/externals/dawn/src/dawn/partition_alloc" \
         "skia/third_party/externals/abseil-cpp" \

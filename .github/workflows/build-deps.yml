@@ -23,6 +23,12 @@ concurrency:
   group: build-deps-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The producer must never consume its own artifacts — a stale tarball
+  # would otherwise self-perpetuate ("skia already built" skips the source
+  # fetch, and pack then misses anything the tarball lacked).
+  KLAXON_DEPS_SOURCE: "1"
+
 jobs:
   deps-id:
     runs-on: ubuntu-latest
