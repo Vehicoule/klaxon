@@ -46,9 +46,11 @@
 //   - layout: the extended FAB's content row mirrors in RTL
 //
 // v1 deviations (documented, fixed later):
-//   - Flat colors (no elevation shadows — Phase 3); the toggle morph is
-//     instant (no size/corner/color lerp animation); the FAB menu is not
-//     implemented (the toggle's menu items are a separate M3E widget).
+//   - Flat colors (no elevation shadows — Phase 3); the toggle morph
+//     springs size + corner through the spatial spec (the colors still
+//     swap instantly — upstream's animateColorAsState is unported); the
+//     FAB menu is not implemented (the toggle's menu items are a separate
+//     M3E widget).
 const std = @import("std");
 const kx = @import("../kx.zig");
 const ui = @import("../ui.zig");
@@ -190,6 +192,13 @@ const FabState = struct {
     /// physical finger motion — see PointerEvent.raw_x/raw_y).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The toggle morph progress — 0 = the unchecked size/corner, 1 = the
+    /// checked 56dp circle. Springs toward the checked state on every
+    /// signal flip (upstream's AnimatedShape + size interpolation), -1 =
+    /// uninitialized (the first paint snaps).
+    morph: f32 = -1,
+    /// Animation channel marker (a stable address — see icon_button.zig).
+    morph_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *FabState {
@@ -216,11 +225,44 @@ fn currentColors(s: *FabState) FabColors {
     return .{ .container = fc.container, .icon = fc.content, .on = fc.content };
 }
 
-/// The painted container size + corner for the current state (the toggle
-/// morph: checked = the 56dp full-circle CloseButton).
+/// The painted container size + corner for the current morph progress —
+/// checked = the 56dp full-circle CloseButton; `s.morph` lerps size +
+/// radius between the unchecked and checked shapes (the toggle morph).
 fn currentDims(s: *FabState) FabDims {
-    if (isChecked(s)) return .{ .container = checked_container, .icon = checked_icon, .radius = checked_container / 2 };
-    return fabDims(s.opts.theme, s.opts.size);
+    const rest = fabDims(s.opts.theme, s.opts.size);
+    if (s.morph < 0) return if (isChecked(s)) .{ .container = checked_container, .icon = checked_icon, .radius = checked_container / 2 } else rest;
+    const a = s.morph;
+    return .{
+        .container = rest.container + (checked_container - rest.container) * a,
+        .icon = rest.icon + (checked_icon - rest.icon) * a,
+        .radius = rest.radius + (checked_container / 2 - rest.radius) * a,
+    };
+}
+
+fn fabMorphCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).morph = v[0];
+    n.markLayoutDirty(); // the container rect feeds the child layout too
+}
+
+/// Retarget the toggle morph toward the checked state — the channel's
+/// velocity carries through a mid-flight retarget (the Animatable upstream
+/// drives). No timeline (headless/tests) → snaps.
+fn fabRetargetMorph(n: *Node, s: *FabState) void {
+    if (s.sig == null) return; // a plain FAB never morphs
+    const target: f32 = if (isChecked(s)) 1 else 0;
+    if (ui.anim.timeline()) |tl| {
+        if (s.morph >= 0 and s.morph != target) {
+            _ = tl.play(.{
+                .kind = ui.anim.Animation.springAnim(.{ s.morph, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.spatial_spring, tl.channelVelocity(@ptrCast(&s.morph_channel))),
+                .from = .{ s.morph, 0, 0, 0 },
+                .channel = @ptrCast(&s.morph_channel),
+                .on_update = .{ .fn_ptr = fabMorphCb, .userdata = n },
+            });
+            return;
+        }
+    }
+    s.morph = target;
 }
 
 fn fabMeasure(n: *Node, c: Constraints) Size {
@@ -426,6 +468,7 @@ fn fabSyncCb(userdata: ?*anyopaque) void {
     }
     if (n.semantics) |sem| sem.checked = checked;
     if (layout_changed) n.markLayoutDirty();
+    fabRetargetMorph(n, s); // the toggle morph springs
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the value changed
 }
@@ -433,6 +476,7 @@ fn fabSyncCb(userdata: ?*anyopaque) void {
 fn fabDeinit(n: *Node) void {
     const s = stateOf(n);
     if (s.sig) |sig| sig.unsubscribe(.{ .callback = .{ .fn_ptr = fabSyncCb, .userdata = n } });
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.morph_channel));
     s.layer.deinit();
     s.ripples.deinit(); // drops the ticker before the state frees
     input.releaseNode(n);

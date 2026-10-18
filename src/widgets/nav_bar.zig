@@ -91,6 +91,13 @@ const ItemFx = struct {
     layer: ui.state_layer.StateLayer = .{},
     ripples: ui.ripple.Ripples = .{},
     press_id: u32 = 0, // the live press's tracker id (0 = none)
+    /// The indicator width-expansion progress — upstream's
+    /// `sizeAnimationProgress` (animateFloatAsState(FastSpatial),
+    /// NavigationBar.kt:242-245): `animatedIndicatorWidth =
+    /// totalIndicatorWidth * progress` (:561-562). Springs on every
+    /// selection change; only the selected item paints the indicator.
+    sel_a: f32 = 0,
+    sel_channel: u8 = 0, // channel marker (stable address — heap fx)
 
     fn create(allocator: std.mem.Allocator, n: *Node, t: Theme) !*ItemFx {
         const fx = try allocator.create(ItemFx);
@@ -105,6 +112,7 @@ const ItemFx = struct {
     }
 
     fn destroy(fx: *ItemFx, allocator: std.mem.Allocator) void {
+        if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&fx.sel_channel));
         fx.layer.deinit(); // in-flight tween userdata = `l`
         fx.ripples.deinit(); // the live ticker userdata = `r`
         allocator.destroy(fx);
@@ -218,7 +226,12 @@ fn navBarLayout(n: *Node, bounds: Rect) void {
         fx.destroy(n.allocator);
     }
     while (s.fx.items.len < count) {
-        s.fx.append(ItemFx.create(n.allocator, n, s.opts.theme) catch @panic("klaxon: out of memory")) catch @panic("klaxon: out of memory");
+        const fx = ItemFx.create(n.allocator, n, s.opts.theme) catch @panic("klaxon: out of memory");
+        // Upstream's animateFloatAsState starts at the target on the
+        // item's first composition — a newly-added item shows its
+        // selection state without a growth animation.
+        fx.sel_a = if (s.fx.items.len == s.sig.peek()) 1 else 0;
+        s.fx.append(fx) catch @panic("klaxon: out of memory");
     }
     // The indices die with the shrunk items (the interactions inside the
     // removed fx are already gone with it).
@@ -268,6 +281,45 @@ fn indicatorRect(s: *NavBarState, cell: Rect, i: usize) Rect {
     };
 }
 
+/// The PAINTED indicator rect — the width scales by the item's
+/// `sizeAnimationProgress` (NavigationBar.kt:561-562: totalWidth *
+/// progress, coerceAtLeast 0 for spring undershoot) around the same
+/// center. The state layer + ripple stay on the FULL pill (upstream's
+/// indicatorRipple measures at the unanimated totalIndicatorWidth, :571).
+fn indicatorRectAnimated(s: *NavBarState, cell: Rect, i: usize) Rect {
+    const r = indicatorRect(s, cell, i);
+    const w = r.w * @max(0, s.fx.items[i].sel_a);
+    return .{ .x = r.x + (r.w - w) / 2, .y = r.y, .w = w, .h = r.h };
+}
+
+fn navBarSelCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const fx: *ItemFx = @ptrCast(@alignCast(userdata.?));
+    fx.sel_a = v[0];
+    if (fx.inter.node) |n| n.markDirty();
+}
+
+/// Retarget every item's indicator progress toward `selected` — the
+/// channel's velocity carries through a mid-flight retarget (upstream's
+/// animateFloatAsState). No timeline → snaps.
+fn navBarRetargetSel(s: *NavBarState) void {
+    const sel = s.sig.peek();
+    for (s.fx.items, 0..) |fx, i| {
+        const target: f32 = if (i == sel) 1 else 0;
+        if (ui.anim.timeline()) |tl| {
+            if (fx.sel_a != target) {
+                _ = tl.play(.{
+                    .kind = ui.anim.Animation.springAnim(.{ fx.sel_a, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&fx.sel_channel))),
+                    .from = .{ fx.sel_a, 0, 0, 0 },
+                    .channel = @ptrCast(&fx.sel_channel),
+                    .on_update = .{ .fn_ptr = navBarSelCb, .userdata = fx },
+                });
+            }
+        } else {
+            fx.sel_a = target;
+        }
+    }
+}
+
 fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     const s = stateOf(n);
     const t = s.opts.theme;
@@ -275,10 +327,12 @@ fn navBarPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRect(ctx, b.x, b.y, b.w, b.h, t.colors.surface_container);
     const sel = s.sig.peek();
     for (s.cells.items, 0..) |cell, i| {
-        const pill = indicatorRect(s, cell, i);
-        // The active indicator (secondary_container, CornerFull).
+        // The active indicator (secondary_container, CornerFull) — the
+        // width expands through the FastSpatial selection progress
+        // (NavigationBar.kt's animatedIndicatorWidth).
         if (i == sel) {
-            ui.paint.fillRRect(ctx, pill.x, pill.y, pill.w, pill.h, pill.h / 2, t.colors.secondary_container);
+            const pill = indicatorRectAnimated(s, cell, i);
+            if (pill.w > 0) ui.paint.fillRRect(ctx, pill.x, pill.y, pill.w, pill.h, pill.h / 2, t.colors.secondary_container);
         }
     }
 }
@@ -432,11 +486,13 @@ fn navBarOnKey(n: *Node, ev: input.KeyEvent) bool {
     }
 }
 
-/// Selection changed: sync the items' checked state, repaint, announce.
+/// Selection changed: sync the items' checked state, retarget the
+/// indicator expansion, repaint, announce.
 fn navBarSyncCb(userdata: ?*anyopaque) void {
     const n: *Node = @ptrCast(@alignCast(userdata.?));
     const s = stateOf(n);
     if (s.semantics_attached) syncItemSemantics(n, s);
+    navBarRetargetSel(s); // the indicator width springs
     n.markDirty();
     ui.semantics.notifyControlChanged(n); // a11y: the selection changed
 }

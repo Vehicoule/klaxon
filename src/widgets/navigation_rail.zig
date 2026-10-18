@@ -143,6 +143,12 @@ const ItemFx = struct {
     layer: ui.state_layer.StateLayer = .{},
     ripples: ui.ripple.Ripples = .{},
     press_id: u32 = 0, // the live press's tracker id (0 = none)
+    /// The indicator width-expansion progress — upstream's
+    /// indicatorAnimationProgress (NavigationItem.kt:694/924:
+    /// animatedIndicatorWidth = indicatorWidth * progress). Springs on
+    /// every selection change; only the selected item paints it.
+    sel_a: f32 = 0,
+    sel_channel: u8 = 0, // channel marker (stable address — heap fx)
 };
 
 const RailState = struct {
@@ -262,6 +268,50 @@ fn indicatorRect(s: *RailState, b: Rect, i: usize) Rect {
     return .{ .x = ir.x + (ir.w - ind_h_nolabel) / 2, .y = ir.y + (ir.h - ind_h_nolabel) / 2, .w = ind_h_nolabel, .h = ind_h_nolabel };
 }
 
+/// The PAINTED indicator — the width scales by the item's
+/// indicatorAnimationProgress (coerceAtLeast 0 upstream for spring
+/// undershoot). Collapsed indicators grow around their center; the
+/// expanded pill stays anchored at its leading edge (LTR) / trailing
+/// edge (RTL) like upstream's placeAnimatedLabelAndIcon. The state
+/// layer + ripple keep the FULL rect (upstream's indicatorRipple
+/// measures at the unanimated totalIndicatorWidth, :700).
+fn indicatorRectAnimated(s: *RailState, b: Rect, i: usize) Rect {
+    const r = indicatorRect(s, b, i);
+    const w = r.w * @max(0, s.fx[i].sel_a);
+    if (s.opts.expanded) {
+        const x = if (ui.i18n.direction() == .rtl) r.x + r.w - w else r.x;
+        return .{ .x = x, .y = r.y, .w = w, .h = r.h };
+    }
+    return .{ .x = r.x + (r.w - w) / 2, .y = r.y, .w = w, .h = r.h };
+}
+
+fn railSelCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const fx: *ItemFx = @ptrCast(@alignCast(userdata.?));
+    fx.sel_a = v[0];
+    if (fx.inter.node) |n| n.markDirty();
+}
+
+/// Retarget every item's indicator progress toward `selected` — the
+/// channel's velocity carries through a mid-flight retarget (upstream's
+/// animateIndicatorProgressAsState). No timeline → snaps.
+fn railRetargetSel(s: *RailState) void {
+    for (s.fx, 0..) |*fx, i| {
+        const target: f32 = if (i == s.selected) 1 else 0;
+        if (ui.anim.timeline()) |tl| {
+            if (fx.sel_a != target) {
+                _ = tl.play(.{
+                    .kind = ui.anim.Animation.springAnim(.{ fx.sel_a, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&fx.sel_channel))),
+                    .from = .{ fx.sel_a, 0, 0, 0 },
+                    .channel = @ptrCast(&fx.sel_channel),
+                    .on_update = .{ .fn_ptr = railSelCb, .userdata = fx },
+                });
+            }
+        } else {
+            fx.sel_a = target;
+        }
+    }
+}
+
 /// The item under the point (-1 = none), in the widget's parent space.
 fn itemAt(s: *RailState, b: Rect, x: f32, y: f32) i32 {
     for (s.items.items, 0..) |_, i| {
@@ -278,6 +328,7 @@ fn railSelect(n: *Node, index: usize) void {
     if (index >= s.items.items.len) return;
     if (!s.items.items[index].enabled) return;
     s.selected = index;
+    railRetargetSel(s); // the indicator width springs
     input.requestFocus(n); // a clicked/arrow-selected tab takes the focus
     if (s.sig) |sig| sig.set(index); // the sync callback re-reads (idempotent)
     n.markDirty();
@@ -296,6 +347,7 @@ fn railSyncCb(userdata: ?*anyopaque) void {
     const v = s.sig.?.peek();
     if (v < s.items.items.len and v != s.selected) {
         s.selected = v;
+        railRetargetSel(s); // external moves spring the indicator too
         if (n.semantics) |sem| {
             sem.value = s.items.items[v].label;
             for (s.sem_children.items, 0..) |*c, i| c.checked = (i == v);
@@ -436,9 +488,12 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
             icon_x = ir.x + (ir.w - icon_size) / 2;
             icon_y = ir.y + (ir.h - icon_size) / 2;
         }
-        // the active indicator (CornerFull: a pill, or the icon-only circle)
+        // the active indicator (CornerFull: a pill, or the icon-only
+        // circle) — its width expands through the FastSpatial selection
+        // progress (NavigationItem.kt's animatedIndicatorWidth).
         if (selected) {
-            ui.paint.fillRRect(ctx, ind.x, ind.y, ind.w, ind.h, ind.h / 2, cs.secondary_container);
+            const ind_a = indicatorRectAnimated(s, b, i);
+            if (ind_a.w > 0) ui.paint.fillRRect(ctx, ind_a.x, ind_a.y, ind_a.w, ind_a.h, ind_a.h / 2, cs.secondary_container);
         }
         // the icon (24dp)
         paintIcon(ctx, def.icon, icon_x, icon_y, icon_c);
@@ -620,6 +675,7 @@ fn railDeinit(n: *Node) void {
     // in-flight tween userdata = `l` / live ticker userdata = `r` — both
     // die with the state struct; cancel before freeing.
     for (s.fx) |*fx| {
+        if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&fx.sel_channel));
         fx.layer.deinit();
         fx.ripples.deinit();
     }
@@ -711,6 +767,9 @@ pub fn navigationRail(allocator: std.mem.Allocator, items: []const NavRailItem, 
         if (v < s.items.items.len) s.selected = v; // the signal wins
     }
     if (s.selected >= s.items.items.len) s.selected = 0; // clamp bad data
+    // Upstream's animateFloatAsState starts at the target on first
+    // composition — the initially selected item shows its full indicator.
+    for (s.fx, 0..) |*fx, i| fx.sel_a = if (i == s.selected) 1 else 0;
     // Per-destination virtual a11y children — VoiceOver reads/selects
     // each tab, not just an opaque group.
     for (s.items.items, 0..) |*def, i| {

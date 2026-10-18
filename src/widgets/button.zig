@@ -52,8 +52,9 @@
 //     end side); the children paint clipped to the button's bounds (a
 //     constrained button never lets label ink cross the container edge)
 //
-//   - Shape morph on press is instant (the animated morph lands with the
-//     animation system, Phase 3).
+//   - Shape morph on press springs through the fast_spatial spec on the
+//     timeline (upstream's AnimatedShape + MotionScheme.fast — the corner
+//     radius retargets on every press state change).
 //   - Upstream's asymmetric per-icon content padding
 //     (contentPaddingFor(hasStartIcon/hasEndIcon)) is opt-in upstream and
 //     never used by the composable defaults — not exposed in this API.
@@ -236,10 +237,54 @@ const ButtonState = struct {
     /// finger (PointerEvent.raw_x/raw_y doc).
     down_raw_x: f32 = 0,
     down_raw_y: f32 = 0,
+    /// The painted corner radius — springs toward `buttonCornerTarget` on
+    /// every press state change (upstream's AnimatedShape morph), -1 =
+    /// uninitialized (the first paint snaps, like icon_button.zig).
+    corner: f32 = -1,
+    /// Animation channel marker (a stable address — see icon_button.zig).
+    corner_channel: u8 = 0,
 };
 
 fn stateOf(n: *Node) *ButtonState {
     return @ptrCast(@alignCast(n.state.?));
+}
+
+/// The corner radius TARGET for the current press state — the paint reads
+/// `s.corner`, which `buttonRetargetCorner` springs toward this value
+/// (upstream's AnimatedShape: every interaction change morphs the
+/// ContainerShape between PressedContainerShape and the rest shape).
+fn buttonCornerTarget(s: *ButtonState, height: f32) f32 {
+    const d = dimsFor(s.opts.size);
+    if (s.inter.isPressed()) return d.pressed_corner;
+    return if (s.opts.shape == .round) height / 2 else d.square_corner;
+}
+
+fn buttonCornerCb(userdata: ?*anyopaque, v: ui.anim.Vec4) void {
+    const n: *Node = @ptrCast(@alignCast(userdata.?));
+    stateOf(n).corner = v[0];
+    n.markDirty();
+}
+
+/// Retarget the corner spring toward the current press state's target —
+/// the channel's velocity carries through a mid-flight retarget (the
+/// Animatable upstream drives). No timeline (headless/tests) → snaps.
+fn buttonRetargetCorner(n: *Node, s: *ButtonState) void {
+    if (n.bounds.h <= 0) return; // unlaid-out: the first paint snaps
+    const target = buttonCornerTarget(s, n.bounds.h);
+    if (ui.anim.timeline()) |tl| {
+        if (s.corner >= 0 and s.corner != target) {
+            _ = tl.play(.{
+                // Button.kt:253-255 — DefaultEffects "to prevent any
+                // bounce": the corner morph rides the effects spring.
+                .kind = ui.anim.Animation.springAnim(.{ s.corner, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.effects_spring, tl.channelVelocity(@ptrCast(&s.corner_channel))),
+                .from = .{ s.corner, 0, 0, 0 },
+                .channel = @ptrCast(&s.corner_channel),
+                .on_update = .{ .fn_ptr = buttonCornerCb, .userdata = n },
+            });
+            return;
+        }
+    }
+    s.corner = target;
 }
 
 fn buttonMeasure(n: *Node, c: Constraints) Size {
@@ -334,13 +379,11 @@ fn buttonPaint(n: *Node, ctx: *kx.Ctx) void {
     // entry is keyboard-provenance and visible to the state layer.
     s.inter.setFocused(input.isFocused(n));
     const pressed = s.inter.isPressed();
-    // shape morph: pressed = the pressed corner (round and square alike)
-    const radius: f32 = if (pressed)
-        d.pressed_corner
-    else if (s.opts.shape == .round)
-        b.h / 2 // CornerFull = pill
-    else
-        d.square_corner;
+    // shape morph: the painted corner springs toward the press target
+    // (AnimatedShape — pressed = the pressed corner, round and square
+    // alike); the first paint snaps.
+    if (s.corner < 0) s.corner = buttonCornerTarget(s, b.h);
+    const radius: f32 = s.corner;
     // Elevation (upstream ButtonElevation state tables): filled/tonal are
     // flat except a Level-1 hover shadow (Hovered/HoverContainerElevation);
     // elevated rests at Level 1, lifts to Level 2 hovered, Level 1
@@ -398,6 +441,7 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
             s.ripples.spawn(s.press_id, ev.x, ev.y, ev.time_ms);
             s.down_raw_x = ev.raw_x;
             s.down_raw_y = ev.raw_y;
+            buttonRetargetCorner(n, s); // the press morph springs
             return true;
         },
         .up => {
@@ -410,6 +454,7 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.ripples.release(s.press_id, ev.time_ms);
                 s.press_id = 0;
             }
+            buttonRetargetCorner(n, s); // release → morph back
             if (was_pressed and n.bounds.contains(ev.x, ev.y)) {
                 if (s.on_pressed) |cb| cb.fn_ptr(cb.userdata);
             }
@@ -427,6 +472,7 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
                     s.inter.cancel(s.press_id);
                     s.ripples.release(s.press_id, ev.time_ms); // upstream treats Cancel like Release
                     s.press_id = 0;
+                    buttonRetargetCorner(n, s);
                 }
             }
             return false;
@@ -437,6 +483,7 @@ fn buttonOnPointer(n: *Node, ev: input.PointerEvent) bool {
                 s.inter.cancel(s.press_id);
                 s.ripples.release(s.press_id, ev.time_ms);
                 s.press_id = 0;
+                buttonRetargetCorner(n, s);
             }
             return true;
         },
@@ -480,6 +527,7 @@ fn buttonOnKey(n: *Node, ev: input.KeyEvent) bool {
 
 fn buttonDeinit(n: *Node) void {
     const s = stateOf(n);
+    if (ui.anim.timeline()) |tl| tl.cancelChannel(@ptrCast(&s.corner_channel));
     s.layer.deinit();
     s.ripples.deinit(); // drops the timeline ticker before the state frees
     input.releaseNode(n);
