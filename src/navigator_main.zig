@@ -265,7 +265,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const view = try widgets.navigator.navigatorView(allocator, .{ .navigator = &nav });
     defer view.deinit(); // LIFO: the tree dies before the navigator's strings
 
-    view.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) });
+    view.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
 
     std.debug.print("klaxon navigator (Skia {s}) — {d} route(s), stack depth {d}, {d}x{d}\n", .{ host.stats.backend, 5, nav.depth(), width, height });
     try host.run(view, max_frames, onFrame, &app);

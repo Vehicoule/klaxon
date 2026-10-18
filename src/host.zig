@@ -141,8 +141,16 @@ pub const Host = struct {
     renderer: ?*sdl.c.SDL_Renderer,
     texture: ?*sdl.c.SDL_Texture,
     pixels: []u8,
+    /// The layout space (dp): points on desktop, pixels / display density
+    /// on Android — SDL's window units are device pixels there.
     width: c_int,
     height: c_int,
+    /// SDL window units (what SDL_GetWindowSize + event coords report):
+    /// equals width/height on desktop, device pixels on Android. Input
+    /// coords + safe-area rects convert to layout units through
+    /// `inputScale()`.
+    window_w: c_int,
+    window_h: c_int,
     ppm_path: ?[:0]const u8,
     stats: Stats,
     /// DevTools overlay (Phase 4a): disabled by default — F12 (handleEvent)
@@ -182,9 +190,10 @@ pub const Host = struct {
     /// layout space.
     pixel_width: c_int = 0,
     pixel_height: c_int = 0,
-    /// Mobile: pixels per layout unit (Retina DPR on iOS, 1.0 on Android
-    /// where the window size is already in pixels). renderFrame scales the
-    /// point-space paint onto the pixel canvas by this factor.
+    /// Pixels per layout unit (Retina DPR on iOS/macOS, the display
+    /// density on Android — SDL's window units are already pixels there).
+    /// renderFrame scales the layout-space paint onto the pixel canvas
+    /// by this factor.
     display_scale: f32 = 1.0,
     /// iOS: timestamp (ns) when the UIWindow's root view was first mapped.
     /// -1 = not yet mapped. Presents before mapping are silently lost.
@@ -474,18 +483,27 @@ pub const Host = struct {
         var pixel_w: c_int = width;
         var pixel_h: c_int = height;
         var display_scale: f32 = 1.0;
-        // All platforms: logical window size (layout space) vs backing pixel
-        // size (canvas space). On desktop they differ whenever the display
+        // All platforms: logical layout size vs backing pixel size
+        // (canvas space). On desktop they differ whenever the display
         // scale isn't 1.0 (Retina 2x, Windows 150%, Wayland fractional).
+        // On Android SDL's window units ARE the surface pixels — the
+        // layout space is pixels / display density instead (one layout
+        // unit ≈ one dp, matching Compose's logical width).
         _ = sdl.c.SDL_GetWindowSize(window, &win_w, &win_h);
         _ = sdl.c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
-        display_scale = displayScaleOf(window, win_w, pixel_w);
+        display_scale = sdl.c.SDL_GetWindowDisplayScale(window);
+        if (display_scale <= 0) display_scale = displayScaleOf(window, win_w, pixel_w);
+        var layout_w = win_w;
+        var layout_h = win_h;
         // Test/capture override: force the layout:canvas factor (the
         // pixel buffer/texture stay at logical size below).
         if (forcedDpr() > 0) {
             display_scale = forcedDpr();
             pixel_w = @intFromFloat(@as(f32, @floatFromInt(win_w)) * display_scale);
             pixel_h = @intFromFloat(@as(f32, @floatFromInt(win_h)) * display_scale);
+        } else if (display_scale > 0 and pixel_w > 0 and pixel_h > 0) {
+            layout_w = @intFromFloat(@round(@as(f32, @floatFromInt(pixel_w)) / display_scale));
+            layout_h = @intFromFloat(@round(@as(f32, @floatFromInt(pixel_h)) / display_scale));
         }
 
         // kx_create walks the backend fallback chain internally (explicit
@@ -641,8 +659,10 @@ pub const Host = struct {
             .texture = texture,
             .pixels = pixels,
             .present_rect = null,
-            .width = win_w,
-            .height = win_h,
+            .width = layout_w,
+            .height = layout_h,
+            .window_w = win_w,
+            .window_h = win_h,
             .pixel_width = pixel_w,
             .pixel_height = pixel_h,
             .display_scale = display_scale,
@@ -867,11 +887,14 @@ pub const Host = struct {
             const node = focused.?;
             host.ime_node = node;
             const r = node.mapRectToRoot(node.bounds);
+            // SDL_SetTextInputArea takes window units — pixels on Android,
+            // where the node's rect is in layout dp: divide by inputScale.
+            const wk = 1 / host.inputScale();
             var area = sdl.c.SDL_Rect{
-                .x = @intFromFloat(@round(r.x)),
-                .y = @intFromFloat(@round(r.y)),
-                .w = @intFromFloat(@round(@max(0, r.w))),
-                .h = @intFromFloat(@round(@max(0, r.h))),
+                .x = @intFromFloat(@round(r.x * wk)),
+                .y = @intFromFloat(@round(r.y * wk)),
+                .w = @intFromFloat(@round(@max(0, r.w) * wk)),
+                .h = @intFromFloat(@round(@max(0, r.h) * wk)),
             };
             // cursor offset: at the field's end edge (caret-side anchor).
             _ = sdl.c.SDL_SetTextInputArea(host.window, &area, area.w);
@@ -1415,7 +1438,7 @@ pub const Host = struct {
             event.type == sdl.c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED)
         {
             host.syncWindowInsets(root);
-            host.resize(host.width, host.height);
+            host.resize(host.window_w, host.window_h);
             root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
             root.dirty = true;
             return false;
@@ -1428,7 +1451,7 @@ pub const Host = struct {
                 host.resize(w, h);
                 // The surface is recreated (garbage pixels) and the tree is
                 // laid out at the new size: full repaint, no dirty-rect.
-                root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(w), .h = @floatFromInt(h) });
+                root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
                 root.dirty = true;
                 root.clearDamage();
                 // The layout consumed the dirty flag renderFrame uses to
@@ -1453,10 +1476,10 @@ pub const Host = struct {
                 // the captured node keeps receiving moves even outside its
                 // bounds, and dropping them would leave a stale drag whose
                 // release lands later as an accidental click. SDL reports
-                // pointer coords in logical window units on every platform
-                // (the tree's own layout space) — no scaling needed.
-                const sx = event.motion.x;
-                const sy = event.motion.y;
+                // pointer coords in window units — the tree's layout space
+                // on desktop, device pixels on Android (inputScale converts).
+                const sx = event.motion.x * host.inputScale();
+                const sy = event.motion.y * host.inputScale();
                 const has_capture = host.input.capturedNode(0) != null;
                 if (host.inspector.enabled and !has_capture and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
                     host.input.clearHover();
@@ -1475,8 +1498,8 @@ pub const Host = struct {
                 // (tree: select/expand, props: no-op); a click on the canvas
                 // passively selects the hit node (routing continues normally).
                 if (host.inspector.enabled) {
-                    const px = event.button.x;
-                    const py = event.button.y;
+                    const px = event.button.x * host.inputScale();
+                    const py = event.button.y * host.inputScale();
                     const z = host.inspector.hitZone(px, py, host.width, host.height);
                     if (z != .none) {
                         host.inspector.clickAt(root, px, py, host.width, host.height);
@@ -1490,9 +1513,9 @@ pub const Host = struct {
                 // care treat all buttons alike, consumers that do
                 // (context menus, secondary actions) can finally see them.
                 {
-                    // Logical window units — the tree's layout space.
-                    const sx = event.button.x;
-                    const sy = event.button.y;
+                    // Window units → the tree's layout space.
+                    const sx = event.button.x * host.inputScale();
+                    const sy = event.button.y * host.inputScale();
                     host.input.dispatchPointer(root, .{
                         .phase = .down,
                         .x = sx,
@@ -1509,15 +1532,15 @@ pub const Host = struct {
                 // `.up` it never saw `.down` for.
                 if (host.inspector.enabled and host.input.capturedNode(0) == null and
                     host.inspector.hitZone(
-                        event.button.x,
-                        event.button.y,
+                        event.button.x * host.inputScale(),
+                        event.button.y * host.inputScale(),
                         host.width,
                         host.height,
                     ) != .none)
                     return false;
                 {
-                    const sx = event.button.x;
-                    const sy = event.button.y;
+                    const sx = event.button.x * host.inputScale();
+                    const sy = event.button.y * host.inputScale();
                     host.input.dispatchPointer(root, .{
                         .phase = .up,
                         .x = sx,
@@ -1553,9 +1576,9 @@ pub const Host = struct {
             // Wheel → scroll event (Phase 1f): routed like pointer input.
             // The content may scroll under a stationary pointer: refresh hover.
             sdl.c.SDL_EVENT_MOUSE_WHEEL => {
-                // Logical window units — the tree's layout space.
-                const sx = event.wheel.mouse_x;
-                const sy = event.wheel.mouse_y;
+                // Window units → the tree's layout space.
+                const sx = event.wheel.mouse_x * host.inputScale();
+                const sy = event.wheel.mouse_y * host.inputScale();
                 // Inspector (Phase 4a.2): wheel over the panel scrolls the
                 // tree view (consumed — no widget scroll).
                 if (host.inspector.enabled and host.inspector.hitZone(sx, sy, host.width, host.height) != .none) {
@@ -1668,11 +1691,22 @@ pub const Host = struct {
         };
     }
 
+    /// layout units per SDL window unit — 1 on desktop (points), 1/density
+    /// on Android where window units are device pixels. Multiplies event
+    /// coords + window-unit rects into the tree's layout space.
+    fn inputScale(host: *Host) f32 {
+        return if (host.window_w > 0)
+            @as(f32, @floatFromInt(host.width)) / @as(f32, @floatFromInt(host.window_w))
+        else
+            1;
+    }
+
     fn resize(host: *Host, w: c_int, h: c_int) void {
-        host.width = w;
-        host.height = h;
+        // w/h are SDL window units (points on desktop, pixels on Android).
+        host.window_w = w;
+        host.window_h = h;
         // All platforms: the canvas is pixel-sized — re-query the pixel size
-        // and DPR (WINDOW_RESIZED carries points). Mobile has no SDL
+        // and DPR (WINDOW_RESIZED carries window units). Mobile has no SDL
         // renderer/texture/pixel buffer to rebuild.
         host.refreshPixelSize();
         kx.c.kx_resize(host.ctx, host.pixel_width, host.pixel_height);
@@ -1717,11 +1751,14 @@ pub const Host = struct {
     fn syncWindowInsets(host: *Host, root: *Node) void {
         var r: sdl.c.SDL_Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         if (!sdl.c.SDL_GetWindowSafeArea(host.window, &r)) return;
+        // The safe rect is in window units — device pixels on Android
+        // where the layout space is dp. inputScale converts.
+        const k = host.inputScale();
         var sa: ui.platform.window_insets.SafeArea = .{
-            .top = @max(0, @as(f32, @floatFromInt(r.y))),
-            .left = @max(0, @as(f32, @floatFromInt(r.x))),
-            .right = @max(0, @as(f32, @floatFromInt(host.width - (r.x + r.w)))),
-            .bottom = @max(0, @as(f32, @floatFromInt(host.height - (r.y + r.h)))),
+            .top = @max(0, @as(f32, @floatFromInt(r.y)) * k),
+            .left = @max(0, @as(f32, @floatFromInt(r.x)) * k),
+            .right = @max(0, @as(f32, @floatFromInt(host.window_w - (r.x + r.w))) * k),
+            .bottom = @max(0, @as(f32, @floatFromInt(host.window_h - (r.y + r.h))) * k),
         };
         var kb: f32 = 0;
         if (is_ios) {
@@ -1757,7 +1794,17 @@ pub const Host = struct {
             host.pixel_width = pw;
             host.pixel_height = ph;
         }
-        host.display_scale = displayScaleOf(host.window, host.width, host.pixel_width);
+        // pixel_density × content_scale: the Retina DPR on desktop, the
+        // display density on Android (whose window units are pixels).
+        host.display_scale = sdl.c.SDL_GetWindowDisplayScale(host.window);
+        if (host.display_scale <= 0)
+            host.display_scale = displayScaleOf(host.window, host.window_w, host.pixel_width);
+        // The layout space is pixels / scale — equals window units on
+        // desktop, becomes dp on Android.
+        if (host.display_scale > 0 and host.pixel_width > 0 and host.pixel_height > 0) {
+            host.width = @intFromFloat(@round(@as(f32, @floatFromInt(host.pixel_width)) / host.display_scale));
+            host.height = @intFromFloat(@round(@as(f32, @floatFromInt(host.pixel_height)) / host.display_scale));
+        }
     }
 
     /// One-shot diagnostic for a failed texture upload — a persistent

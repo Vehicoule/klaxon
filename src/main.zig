@@ -173,7 +173,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer demo.deinit();
     const root = demo.root;
 
-    root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) });
+    root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
 
     std.debug.print("klaxon hello (Skia {s}) — widget tree: {d} nodes, reactive bg\n", .{ host.stats.backend, countNodes(root) });
     try host.run(root, max_frames, animate, demo.bg);

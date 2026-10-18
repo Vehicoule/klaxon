@@ -187,7 +187,9 @@ fn galleryMain(opts: Options) !void {
         }
     }.cb, .userdata = &platform_ctx };
 
-    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(opts.width), .h = @floatFromInt(opts.height) });
+    // Layout in the host's space — the requested window units on desktop,
+    // the display-density-scaled dp space on Android.
+    g.root.layout(.{ .x = 0, .y = 0, .w = @floatFromInt(host.width), .h = @floatFromInt(host.height) });
     if (opts.scroll != 0) _ = @import("widgets/scroll_view.zig").setScrollOffset(g.refs.scroll_view, opts.scroll);
     // KLAXON_OPEN_OVERLAYS=1 opens the demo overlays (search view, dialogs,
     // sheet) before the first frame — capture-time inspection of the states
