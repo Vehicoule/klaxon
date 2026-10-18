@@ -26,7 +26,7 @@
         {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
         {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 250}
       ],
-      "expect": {"gestures": []}
+      "expect": {"gestures": ["tap"]}
     },
     {
       "id": "GEST-002.2",
@@ -40,7 +40,7 @@
         {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
         {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 400}
       ],
-      "expect": {"gestures": []}
+      "expect": {"gestures": ["tap"]}
     },
     {
       "id": "GEST-003.1",
@@ -56,7 +56,22 @@
         {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 150},
         {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 200}
       ],
-      "expect": {"gestures": ["tap", "double_tap"]}
+      "expect": {"gestures": ["double_tap"]}
+    },
+    {
+      "id": "GEST-003.2",
+      "rule": "GEST-003",
+      "domain": "gestures",
+      "setup": {
+        "viewport": [100, 100],
+        "tree": {"type": "gesture_detector", "id": "g", "props": {"gestures": ["tap", "double_tap"]}}
+      },
+      "actions": [
+        {"op": "pointer", "phase": "down", "x": 50, "y": 50, "t": 0},
+        {"op": "pointer", "phase": "up", "x": 50, "y": 50, "t": 50},
+        {"op": "tick", "ms": 400}
+      ],
+      "expect": {"gestures": ["tap"]}
     },
     {
       "id": "GEST-004.1",

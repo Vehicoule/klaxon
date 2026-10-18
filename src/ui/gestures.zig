@@ -598,7 +598,8 @@ pub const GestureArena = struct {
     ///     pan-end, swipe) are collected and resolved after the pass:
     ///     double-tap suppresses the same-event tap.
     pub fn feed(arena: *GestureArena, ev: input.PointerEvent) void {
-        if (ev.phase == .enter or ev.phase == .leave or ev.phase == .outside_down) {
+        if (ev.phase == .enter) return; // synthesized hover arrival — no gesture state
+        if (ev.phase == .leave or ev.phase == .outside_down) {
             arena.cancel();
             return;
         }

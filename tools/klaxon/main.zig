@@ -644,8 +644,13 @@ const template_main_zig =
     \\    const is_android = builtin.os.tag == .linux and builtin.abi == .android;
     \\    const is_ios = builtin.os.tag == .ios;
     \\    var debug_alloc = std.heap.DebugAllocator(.{}){};
+    \\    // Leak gate: registered first so it runs LAST — host and tree are
+    \\    // already deinit'd when the check fires (safety builds only).
     \\    defer if (!is_wasm and !is_android and !is_ios) {
-    \\        _ = debug_alloc.deinit();
+    \\        if (debug_alloc.deinit() == .leak) {
+    \\            std.debug.print("klaxon: memory leak detected\n", .{});
+    \\            std.process.exit(1);
+    \\        }
     \\    };
     \\    const allocator = if (is_wasm or is_android or is_ios)
     \\        std.heap.c_allocator
