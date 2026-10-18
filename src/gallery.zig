@@ -642,23 +642,26 @@ fn buildHeader(g: *Gallery, theme: Theme) !*Node {
         .border_color = theme.colors.outline_variant,
         .border_width = 1,
     });
-    const row = try layout.row(a, .{ .gap = 12, .main_align = .space_between, .cross_align = .center });
-    header.add(row);
+    // Header = a column: titles over a right-aligned toggle row. The
+    // side-by-side row pushed the density switch offscreen on phone-width
+    // viewports (titles + toggles > 411dp).
+    const col = try layout.column(a, .{ .gap = 8, .cross_align = .stretch });
+    header.add(col);
     const titles = try layout.column(a, .{ .gap = 2 });
     titles.add(try text_w.text(a, "Klaxon Gallery", .{ .size = 24, .bold = true, .color = theme.colors.on_surface }));
     titles.add(try text_w.text(a, "31 widgets · dark/light themes · gestures · animations · scroll 10k", .{ .size = 12, .color = theme.colors.on_surface_variant }));
-    row.add(titles);
-    const right = try layout.row(a, .{ .gap = 8, .cross_align = .center });
+    col.add(titles);
+    const row = try layout.row(a, .{ .gap = 12, .main_align = .end, .cross_align = .center });
+    col.add(row);
     const toggle = try switch_w.@"switch"(a, g.dark_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{ .theme = theme });
     g.refs.theme_toggle = toggle;
-    right.add(toggle);
-    right.add(try text_w.BoundText(bool).text(a, g.dark_mode, fmtMode, .{ .size = 13, .color = theme.colors.on_surface_variant }));
+    row.add(toggle);
+    row.add(try text_w.BoundText(bool).text(a, g.dark_mode, fmtMode, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     // Density switch (Phase 2d-0.5): mobile presets ↔ desktop presets.
     const dtoggle = try switch_w.@"switch"(a, g.desktop_mode, .{ .fn_ptr = themeToggleCb, .userdata = g }, .{ .theme = theme });
     g.refs.desktop_toggle = dtoggle;
-    right.add(dtoggle);
-    right.add(try text_w.BoundText(bool).text(a, g.desktop_mode, fmtDensity, .{ .size = 13, .color = theme.colors.on_surface_variant }));
-    row.add(right);
+    row.add(dtoggle);
+    row.add(try text_w.BoundText(bool).text(a, g.desktop_mode, fmtDensity, .{ .size = 13, .color = theme.colors.on_surface_variant }));
     return header;
 }
 

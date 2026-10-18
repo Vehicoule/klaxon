@@ -569,10 +569,26 @@ build_skia() {
 
 # --- SDL3 -------------------------------------------------------------------
 
+# The artifact existing says nothing about WHICH source rev built it — a
+# pin bump or a manual source update used to be silently skipped (a stale
+# libSDL3.so once crashed the app: the Java side called JNI methods the
+# old binary lacked). Stamp the source rev at build time; rebuild on drift.
+sdl_built_fresh() {
+  local build="$1" artifact="$2"
+  [ -f "$build/$artifact" ] || return 1
+  local rev
+  rev="$(git -C "$DEPS/SDL" rev-parse HEAD 2>/dev/null)" || return 1
+  [ -f "$build/.src-rev" ] && [ "$(cat "$build/.src-rev")" = "$rev" ]
+}
+
+sdl_stamp_rev() {
+  git -C "$DEPS/SDL" rev-parse HEAD > "$1/.src-rev" 2>/dev/null || true
+}
+
 build_sdl3() {
   local src="$DEPS/SDL"
   local build="$src/build-$TAG"
-  if [ -f "$build/libSDL3.a" ]; then
+  if sdl_built_fresh "$build" "libSDL3.a"; then
     log "SDL3 already built (build-$TAG)"
     return 0
   fi
@@ -600,6 +616,7 @@ build_sdl3() {
   else
     ls -la "$build"/libSDL3.a
   fi
+  sdl_stamp_rev "$build"
 }
 
 # --- web-wasm (Phase 3f + 3g) -----------------------------------------------
@@ -670,7 +687,7 @@ build_skia_wasm() {
 build_sdl3_wasm() {
   local src="$DEPS/SDL"
   local build="$src/build-web-wasm"
-  if [ -f "$build/libSDL3.a" ]; then
+  if sdl_built_fresh "$build" "libSDL3.a"; then
     log "SDL3 wasm already built (build-web-wasm)"
     return 0
   fi
@@ -691,6 +708,7 @@ build_sdl3_wasm() {
     emmake cmake --build "$build" --parallel "$JOBS"
   )
   ls -la "$build"/libSDL3.a
+  sdl_stamp_rev "$build"
 }
 
 # --- web-wasm: embedded default font ----------------------------------------
@@ -883,7 +901,7 @@ build_skia_android() {
 build_sdl3_android() {
   local src="$DEPS/SDL"
   local build="$src/build-android-arm64"
-  if [ -f "$build/libSDL3.so" ]; then
+  if sdl_built_fresh "$build" "libSDL3.so"; then
     log "SDL3 android-arm64 already built (build-android-arm64)"
     return 0
   fi
@@ -902,6 +920,7 @@ build_sdl3_android() {
     -DSDL_GPU=OFF -DSDL_RENDER_GPU=OFF -DSDL_RENDER_VULKAN=OFF
   cmake --build "$build" --parallel "$JOBS"
   ls -la "$build"/libSDL3.so
+  sdl_stamp_rev "$build"
 }
 
 build_android_arm64() {
