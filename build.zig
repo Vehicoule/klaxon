@@ -784,8 +784,9 @@ fn linkRuntime(
 const SanitizerRuntime = struct {
     /// Extra link inputs (.so on linux; the stripped toolchain dylib on macOS).
     objects: []const std.Build.LazyPath = &.{},
-    /// Extra -rpath dirs (macOS only: the clang runtime dir, so dyld
-    /// resolves @rpath/libclang_rt.asan_osx_dynamic.dylib to the original).
+    /// Extra -rpath dirs: on macOS the clang runtime dir so dyld resolves
+    /// @rpath/libclang_rt.asan_osx_dynamic.dylib to the original; on linux
+    /// the dir holding libclang_rt.asan-*.so (outside ld.so's path).
     rpaths: []const std.Build.LazyPath = &.{},
 };
 
@@ -834,21 +835,31 @@ fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime
         else => @panic("-Dsanitize: no ASan runtime lookup for this linux arch"),
     };
     var objects: std.ArrayList(std.Build.LazyPath) = .empty;
+    var rpaths: std.ArrayList(std.Build.LazyPath) = .empty;
     // `clang -print-file-name` resolves inside clang's resource dir and
     // echoes the bare name back when the file isn't there. asan_cxx adds
-    // the operator new/delete interceptors.
+    // the operator new/delete interceptors. The .so lives outside ld.so's
+    // search path so its directory must land on the exe's rpath; fall
+    // back to the static archive when no shared runtime exists.
     for ([_][]const u8{ "asan", "asan_cxx" }) |rt| {
-        const name = b.fmt("libclang_rt.{s}-{s}.so", .{ rt, arch });
-        switch (b.runFallible(&.{ "clang", b.fmt("-print-file-name={s}", .{name}) }, .{ .stderr_behavior = .ignore })) {
-            .success => |out| {
-                // clang resolves to an absolute path inside its resource
-                // dir; a miss echoes the bare name back — and the bare
-                // name ends in .so too, so check for the leading slash.
-                const p = std.mem.trim(u8, out, &std.ascii.whitespace);
-                if (p.len > 0 and p[0] == '/' and std.mem.endsWith(u8, p, ".so"))
-                    objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
-            },
-            else => {},
+        const name = b.fmt("libclang_rt.{s}-{s}", .{ rt, arch });
+        for ([_][]const u8{ "so", "a" }) |ext| {
+            var hit = false;
+            switch (b.runFallible(&.{ "clang", b.fmt("-print-file-name={s}.{s}", .{ name, ext }) }, .{ .stderr_behavior = .ignore })) {
+                .success => |out| {
+                    const p = std.mem.trim(u8, out, &std.ascii.whitespace);
+                    if (p.len > 0 and p[0] == '/' and std.mem.endsWith(u8, p, ext)) {
+                        objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
+                        if (std.mem.eql(u8, ext, "so")) {
+                            if (std.fs.path.dirname(p)) |dir|
+                                rpaths.append(b.allocator, .{ .cwd_relative = dir }) catch @panic("OOM");
+                        }
+                        hit = true;
+                    }
+                },
+                else => {},
+            }
+            if (hit) break;
         }
     }
     if (objects.items.len == 0) {
@@ -860,13 +871,15 @@ fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime
         for (gcc_candidates) |p| {
             if (std.Io.Dir.accessAbsolute(b.graph.io, p, .{})) |_| {
                 objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
+                if (std.fs.path.dirname(p)) |dir|
+                    rpaths.append(b.allocator, .{ .cwd_relative = dir }) catch @panic("OOM");
                 break;
             } else |_| {}
         }
     }
     if (objects.items.len == 0)
         @panic("-Dsanitize needs an ASan runtime on linux: apt install libclang-rt-dev (preferred) or libasan8");
-    return .{ .objects = objects.items };
+    return .{ .objects = objects.items, .rpaths = rpaths.items };
 }
 
 /// Phase 3f web target (wasm32-emscripten). Zig cannot link an executable for
