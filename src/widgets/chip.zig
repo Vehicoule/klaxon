@@ -208,18 +208,23 @@ fn padEnd(s: *ChipState) f32 {
 fn chipMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const pad = padStart(s) + padEnd(s);
-    var content_w: f32 = 0;
-    var content_h: f32 = 0;
-    var first = true;
-    for (n.children.items) |child| {
-        if (!child.visible) continue; // the hidden filter check takes no space
-        const cs = child.measure(c.deflateEdge(.{ .left = padStart(s), .top = 0, .right = padEnd(s), .bottom = 0 }));
-        if (!first) content_w += icon_gap;
-        content_w += cs.w;
-        content_h = @max(content_h, cs.h);
-        first = false;
-    }
+    const slots = chipSlots(n, s);
+    const content_w = slots[0].w + slots[1].w + slots[2].w + icon_gap * 2;
     return c.constrain(.{ .w = @min(content_w + pad, max_chip_width), .h = chip_h });
+}
+
+/// Upstream's ChipContent row is three FIXED slots — [leading-or-Spacer(0),
+/// label, trailing-or-Spacer(0)] — with Arrangement.spacedBy(8): the gaps
+/// exist even when a slot is empty (Chip.kt:3392-3412). A hidden child (the
+/// unselected filter check) still occupies its slot at width 0.
+fn chipSlots(n: *Node, s: *ChipState) [3]Size {
+    var slots: [3]Size = .{ .{}, .{}, .{} };
+    const mc: Constraints = .{ .max_w = 2000, .max_h = chip_h };
+    for (n.children.items) |child| {
+        const i: usize = if (child == s.lead_child) 0 else if (child == s.trail_child) 2 else 1;
+        if (child.visible) slots[i] = child.measure(mc);
+    }
+    return slots;
 }
 
 fn chipLayout(n: *Node, bounds: Rect) void {
@@ -228,34 +233,28 @@ fn chipLayout(n: *Node, bounds: Rect) void {
     const rtl = ui.i18n.direction() == .rtl;
     const pad_l = if (rtl) padEnd(s) else padStart(s);
     const pad_r = if (rtl) padStart(s) else padEnd(s);
-    // the content row [leading?, label, trailing?] centered, gap 8
-    var sizes: [3]Size = .{ .{}, .{}, .{} };
-    var content_w: f32 = 0;
-    var count: usize = 0;
-    for (n.children.items) |child| {
-        if (!child.visible) continue; // the hidden filter check takes no space
-        const cs = child.measure(.{ .max_w = bounds.w, .max_h = bounds.h });
-        sizes[count] = cs;
-        content_w += cs.w;
-        count += 1;
-    }
-    if (count > 1) content_w += icon_gap * @as(f32, @floatFromInt(count - 1));
+    // three fixed slots, spacedBy(8) — the gaps persist on empty slots
+    // (upstream's Spacer(0) placeholders, Chip.kt:3392-3412)
+    const slots = chipSlots(n, s);
+    const content_w = slots[0].w + slots[1].w + slots[2].w + icon_gap * 2;
     const inner_x = bounds.x + pad_l;
     const inner_w = @max(0, bounds.w - pad_l - pad_r);
-    var x = inner_x + @max(0, (inner_w - content_w) / 2);
-    var i: usize = 0;
+    const x0 = inner_x + @max(0, (inner_w - content_w) / 2);
+    const xs: [3]f32 = .{
+        x0,
+        x0 + slots[0].w + icon_gap,
+        x0 + slots[0].w + slots[1].w + icon_gap * 2,
+    };
     for (n.children.items) |child| {
         if (!child.visible) continue;
-        const cs = sizes[i];
+        const i: usize = if (child == s.lead_child) 0 else if (child == s.trail_child) 2 else 1;
+        const cs = slots[i];
         child.layout(.{
-            .x = x,
+            .x = xs[i],
             .y = bounds.y + (bounds.h - cs.h) / 2,
             .w = cs.w,
             .h = cs.h,
         });
-        x += cs.w;
-        i += 1;
-        if (i < count) x += icon_gap;
     }
     // RTL: mirror the row around the inner box — the leading icon moves to
     // the end side (the gap is preserved)
@@ -597,13 +596,15 @@ fn clickCounterCb(userdata: ?*anyopaque) void {
     c.* += 1;
 }
 
-test "chip: measures height 32 + content + 16dp padding; the 48dp floor is the hit target" {
+test "chip: measures height 32 + content + 32dp padding; the 48dp floor is the hit target" {
     const b = try chip(std.testing.allocator, null, null, .{ .label = "Chip" });
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectEqual(chip_h, m.h);
     const tw = ui.paint.measureTextStyled("Chip", 14, 500, 0.1).width;
-    try std.testing.expectEqual(tw + 16, m.w); // label_large (14, weight 500) + 8*2
+    // label_large (14, w500) + padding 8*2 + spacedBy 8*2 over the three
+    // fixed slots (empty slots keep their gap — Chip.kt:3392-3412)
+    try std.testing.expectEqual(tw + 32, m.w);
     b.layout(.{ .x = 100, .y = 100, .w = m.w, .h = 32 });
     const hb = b.vtable.hit_bounds.?(b);
     const min_target = theme_mod.light.platform.hit_target_min;
@@ -638,7 +639,9 @@ test "chip: the automatic filter check follows the selected state" {
     try std.testing.expect(check.visible); // the check shows
     try std.testing.expect(b.layout_dirty); // the width changed → re-layout
     const w1 = b.measure(.{ .max_w = 2000, .max_h = 2000 }).w;
-    try std.testing.expectApproxEqAbs(w0 + icon_size + icon_gap, w1, 0.001);
+    // the leading slot always exists (0-width when hidden): only the icon's
+    // own width is added — the spacedBy gaps are constant.
+    try std.testing.expectApproxEqAbs(w0 + icon_size, w1, 0.001);
     sig.set(false);
     try std.testing.expect(!check.visible); // and hides again
     // starts selected: the check is visible from the start

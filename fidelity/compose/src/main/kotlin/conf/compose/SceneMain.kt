@@ -101,6 +101,16 @@ val ICON_CODEPOINTS = mapOf(
 fun glyph(name: String): String =
     String(Character.toChars(ICON_CODEPOINTS[name] ?: 0x2605))
 
+/// Upstream icon slots are fixed-size boxes (Icon = imageVector in a size()
+/// modifier): content-derived layouts — nav indicators, chip/button content
+/// widths — key off the slot, not the glyph advance. `slot` = the token size.
+@Composable
+fun iconSlot(name: String, slot: androidx.compose.ui.unit.Dp, dejavu: FontFamily, sp: Int) {
+    Box(Modifier.size(slot), contentAlignment = Alignment.Center) {
+        Text(glyph(name), fontFamily = dejavu, fontSize = sp.sp)
+    }
+}
+
 // --- interaction plumbing ---------------------------------------------------
 
 /// The widget's interaction source(s) + press offsets (captured from the
@@ -200,7 +210,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
             }
             val content: @Composable RowScope.() -> Unit = {
                 if (icon != null) {
-                    Text(glyph(icon), fontFamily = dejavu, fontSize = iconSp.sp)
+                    iconSlot(icon, iconSp.dp, dejavu, iconSp)
                     if (label != null) Spacer(Modifier.width(gap.dp))
                 }
                 if (label != null) Text(label, style = textStyle)
@@ -217,7 +227,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
         "icon_button" -> {
             val icon = glyph(o.str("icon", "star"))
             val mod = centerMod
-            val content: @Composable () -> Unit = { Text(icon, fontFamily = dejavu, fontSize = 24.sp) }
+            val content: @Composable () -> Unit = { iconSlot(icon, 24.dp, dejavu, 24) }
             when (o.str("variant", "standard")) {
                 "filled" -> FilledIconButton({}, mod, enabled, interactionSource = input.source, content = content)
                 "filled_tonal" -> FilledTonalIconButton({}, mod, enabled, interactionSource = input.source, content = content)
@@ -246,7 +256,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
                 checked = o.bool("checked"), onCheckedChange = {}, modifier = centerMod,
                 enabled = enabled, interactionSource = input.source,
                 thumbContent = if (showIcons) {
-                    { Text(glyph("check"), fontFamily = dejavu, fontSize = 16.sp) }
+                    { iconSlot("check", 16.dp, dejavu, 16) }
                 } else null,
             )
         }
@@ -266,6 +276,11 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
                             copts.str("text"),
                             fontSize = copts.num("size", 14.0).sp,
                             color = colorFromInt(copts.num("color", 0.0).toLong()),
+                            // bodyLarge's ambient lineHeight/letterSpacing —
+                            // stated explicitly so parity does not hinge on the
+                            // runner's LocalTextStyle default.
+                            lineHeight = copts.num("line_height", 24.0).sp,
+                            letterSpacing = copts.num("letter_spacing", 0.5).sp,
                         )
                     }
                 }
@@ -301,7 +316,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
                     val itemMod = Modifier.captureInto { input.itemCenters[i] = it }
                     NavigationBarItem(
                         selected = i == sel, onClick = {}, modifier = itemMod,
-                        icon = { Text(glyph(item.str("icon", "star")), fontFamily = dejavu, fontSize = 24.sp) },
+                        icon = { iconSlot(item.str("icon", "star"), 24.dp, dejavu, 24) },
                         label = { Text(item.str("label")) },
                         interactionSource = input.itemSources[i],
                     )
@@ -317,7 +332,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
                     val itemMod = Modifier.captureInto { input.itemCenters[i] = it }
                     Tab(
                         selected = i == sel, onClick = {}, modifier = itemMod,
-                        icon = { Text(glyph(item.str("icon", "star")), fontFamily = dejavu, fontSize = 24.sp) },
+                        icon = { iconSlot(item.str("icon", "star"), 24.dp, dejavu, 24) },
                         text = { Text(item.str("label"), fontSize = 14.sp) },
                         interactionSource = input.itemSources[i],
                         selectedContentColor = MaterialTheme.colorScheme.primary,
@@ -329,7 +344,7 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
 
         "fab" -> {
             val icon = glyph(o.str("icon", "plus"))
-            val content: @Composable () -> Unit = { Text(icon, fontFamily = dejavu, fontSize = 24.sp) }
+            val content: @Composable () -> Unit = { iconSlot(icon, 24.dp, dejavu, 24) }
             // Upstream's FloatingActionButton has no `enabled` parameter — a
             // disabled FAB is emulated with the generic disabled token pair
             // (OnSurface@0.12 container composited over surface, OnSurface@0.38
@@ -352,11 +367,11 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
             val label: @Composable () -> Unit = { Text(o.str("label")) }
             val leading: (@Composable () -> Unit)? =
                 o.str("leading_icon").ifEmpty { null }?.let { ic ->
-                    { Text(glyph(ic), fontFamily = dejavu, fontSize = 18.sp) }
+                    { iconSlot(ic, 18.dp, dejavu, 18) }
                 }
             val trailing: (@Composable () -> Unit)? =
                 o.str("trailing_icon").ifEmpty { null }?.let { ic ->
-                    { Text(glyph(ic), fontFamily = dejavu, fontSize = 18.sp) }
+                    { iconSlot(ic, 18.dp, dejavu, 18) }
                 }
             when (o.str("variant", "assist")) {
                 "filter" -> FilterChip(
@@ -483,12 +498,18 @@ fun renderScene(spec: SceneSpec, outDir: File) {
     try {
         // Frame 1 (t=1ns): layout — captures widget/item bounds centers.
         scene.render(1L).close()
+        // Frame 2: settle recomposition BEFORE seeding. NavigationBarItem and
+        // NavigationRailItem wrap the passed source in a MappedInteractionSource
+        // keyed on itemWidth — 0 at first composition — so the instance is
+        // swapped on recompose and any emission collected by the stale instance
+        // never reaches the (new) indicator ripple.
+        scene.render(2L).close()
         // Interactions are seeded at ~t0: tryEmit lands on the next frame's
         // collect pass, the ripple/press anim starts on the frame after —
         // the two settle frames mirror Klaxon's lazy arm at tick(0).
         seedState(spec, input)
-        scene.render(2L).close()
-        val t0 = 3L
+        scene.render(3L).close()
+        val t0 = 4L
         scene.render(t0).close()
         val img = scene.render(t0 + spec.t_ms * 1_000_000L)
         writePpm(img, w, h, File(outDir, "${spec.id}.ppm"))

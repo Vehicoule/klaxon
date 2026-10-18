@@ -5,7 +5,7 @@
 // .ref/material3/Tab.kt (`TabImpl` placement, `HorizontalTextPadding`) with
 // tokens from .ref/material3/tokens/PrimaryNavigationTabTokens.kt:
 //   - equal tab cells: tabWidth = rowWidth / tabCount, content centered,
-//   - row height = the tallest tab (48 label-only / 64 icon+label via the
+//   - row height = the tallest tab (48 label-only / 72 icon+label via the
 //     `height` option — PrimaryNavigationTabTokens.ContainerHeight /
 //     IconAndLabelTextContainerHeight),
 //   - divider: 1dp HorizontalDivider (outline_variant), at the bottom,
@@ -54,10 +54,12 @@ const indicator_radius: f32 = 3; // ActiveIndicatorShape RoundedCornerShape(3dp)
 
 pub const TabsOptions = struct {
     theme: Theme = theme_mod.light,
-    /// Row height floor — the tab's declared height upstream:
-    /// PrimaryNavigationTabTokens.ContainerHeight 48 (label-only) /
-    /// IconAndLabelTextContainerHeight 64 (icon+label); taller children grow it.
-    height: f32 = 64,
+    /// Row height floor — the tab's declared height upstream: TabBaselineLayout
+    /// picks SmallTabHeight = PrimaryNavigationTabTokens.ContainerHeight 48
+    /// (label-only OR icon-only) / LargeTabHeight 72 (icon+label, the literal
+    /// in Tab.kt — not the unused 64dp IconAndLabelTextContainerHeight token);
+    /// taller children grow it. Label-only rows pass 48.
+    height: f32 = 72,
     indicator_height: f32 = 3, // ActiveIndicatorHeight
     divider_height: f32 = 1, // bottom divider (inside the container height)
     /// The semantics label — null resolves the localized "Tabs"
@@ -194,7 +196,7 @@ fn tabsMeasure(n: *Node, c: Constraints) Size {
     const count: f32 = @floatFromInt(n.children.items.len);
     const w = if (std.math.isFinite(c.max_w)) c.max_w else count * 90;
     // TabRowImpl: the row height is the tallest tab's intrinsic height (each
-    // Tab declares 48/64/72). `opts.height` plays the declared-height role
+    // Tab declares 48/72). `opts.height` plays the declared-height role
     // since Klaxon children are bare content; a taller child still grows it.
     const tab_w = if (count > 0) w / count else w;
     var h: f32 = s.opts.height;
@@ -506,7 +508,7 @@ test "tabs: measure fills the width and reports the M3E height" {
     row.add(try testTab(std.testing.allocator, "One"));
     const m = row.measure(.{ .max_w = 480, .max_h = 600 });
     try std.testing.expectEqual(@as(f32, 480), m.w);
-    try std.testing.expectEqual(@as(f32, 64), m.h);
+    try std.testing.expectEqual(@as(f32, 72), m.h);
 }
 
 test "tabs: layout splits the width equally; the indicator snaps without a timeline" {

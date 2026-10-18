@@ -533,11 +533,13 @@ pub fn shadowRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, el
 /// M3 elevation under a rounded container — the real ambient+spot pair
 /// (SkShadowUtils) at the theme's shadow color. `level` is the M3
 /// elevation in dp: 1 elevated button/card rest, 2 menu/snackbar,
-/// 3 dialog/FAB. The 15%/38% ambient/spot split matches the tuned
-/// elevation_grid values.
+/// 3 dialog/FAB. The ambient/spot split matches the Compose desktop
+/// renderer's effective output (its ambient halo spreads wider than
+/// upstream's, its spot about half — calibrated against the fidelity
+/// scenes: spec 0.19 paints ~2x too dark at level 6).
 pub fn elevationShadow(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, level: f32, shadow_color: Color) void {
     if (!(level > 0)) return; // NaN/0 = flat
-    shadowRRect(ctx, x, y, w, h, radius, level, withAlphaScaled(shadow_color, 0.039), withAlphaScaled(shadow_color, 0.19), false);
+    shadowRRect(ctx, x, y, w, h, radius, level, withAlphaScaled(shadow_color, 0.08), withAlphaScaled(shadow_color, 0.10), false);
 }
 
 /// Path verbs for fillPath/strokePath — pts consumed per verb.

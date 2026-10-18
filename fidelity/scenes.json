@@ -10,11 +10,11 @@
     "baseline roles). dir: ltr|rtl. viewport: [w,h] logical px at density",
     "1.0; the widget is centered in it. t_ms: the virtual-timeline",
     "timestamp rendered (animations sampled at t_ms after a lazy start at",
-    "0). nav_bar/tabs carry options.items[{icon,label}] — the Klaxon",
+    "0). nav_bar/tabs carry options.items[{icon,label}] \u2014 the Klaxon",
     "runner builds nav_bar.destination / icon+text columns; the Compose",
     "runner builds matching NavigationBarItem/Tab content. card carries",
     "children[] (registry-serialized subtree). Icon names map to Unicode",
-    "codepoints (src/widgets/icon.zig) — Compose draws the same codepoint",
+    "codepoints (src/widgets/icon.zig) \u2014 Compose draws the same codepoint",
     "in the pinned DejaVu Sans."
   ],
   "scenes": [
@@ -597,7 +597,9 @@
           "options": {
             "text": "Card content",
             "size": 14,
-            "color": 488317183
+            "color": 488317183,
+            "line_height": 24,
+            "letter_spacing": 0.5
           }
         }
       ]
@@ -622,7 +624,9 @@
           "options": {
             "text": "Card content",
             "size": 14,
-            "color": 488317183
+            "color": 488317183,
+            "line_height": 24,
+            "letter_spacing": 0.5
           }
         }
       ]
@@ -647,7 +651,9 @@
           "options": {
             "text": "Card content",
             "size": 14,
-            "color": 3872954879
+            "color": 3872954879,
+            "line_height": 24,
+            "letter_spacing": 0.5
           }
         }
       ]
@@ -1048,7 +1054,8 @@
       "options": {
         "label": "Filter",
         "variant": "filter",
-        "selected": true
+        "selected": true,
+        "leading_icon": "check"
       }
     },
     {

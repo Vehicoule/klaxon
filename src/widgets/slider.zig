@@ -19,8 +19,9 @@
 //     the shared Tracker — ThumbContent's `interactions.isNotEmpty()`
 //     (Focus/Press/Drag, hover excluded upstream) IS the indication: the
 //     thumb squeezes 4 → 2dp (FocusHandleWidth / PressedHandleWidth), and
-//     the value-indicator bubble rides press+drag. Hover only feeds the
-//     tracker (upstream shows no hover overlay, just the hand cursor).
+//     the value-indicator bubble rides the drag only (isDragging). Hover
+//     only feeds the tracker (upstream shows no hover overlay, just the
+//     hand cursor).
 //   - hit target: max(width,48) x max(44,48) (the a11y floor is the hit area)
 //   - input: a down/drag sets the value from the pointer x (the drag IS the
 //     interaction — no slop cancel); arrows adjust by ±1% (keyboard,
@@ -32,7 +33,7 @@
 // range (the endpoints' ticks: index 0 draws on the active track's corner
 // center, the last is covered by the end stop dot), and maps the thumb
 // through the inset range between the corner centers while it isn't on an
-// endpoint. While pressed/dragging the value indicator bubble floats 12dp
+// endpoint. While dragging the value indicator bubble floats 12dp
 // above the thumb (ValueIndicatorActiveBottomSpace) — InverseSurface pill
 // with a tail, LabelLarge InverseOnSurface "{d}%" text.
 //
@@ -162,7 +163,10 @@ fn currentColors(s: *SliderState) SLColors {
 
 fn sliderMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
-    return c.constrain(.{ .w = s.opts.default_width, .h = thumb_h });
+    // Slider.kt:979 — Modifier.minimumInteractiveComponentSize() inflates the
+    // composable's own bounds to the fixed 48dp a11y minimum (not platform-
+    // themed; upstream's LocalMinimumInteractiveComponentSize is 48dp always).
+    return c.constrain(.{ .w = s.opts.default_width, .h = @max(thumb_h, 48) });
 }
 
 /// The interactive target: max(width,hit) x max(height,hit) centered on the
@@ -201,8 +205,10 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         s.handle_target = want;
         morphHandle(n, s, want);
     }
-    // Same lazy retarget for the indicator appear (pressed/dragging).
-    const want_ind: f32 = if ((s.inter.isPressed() or s.inter.isDragged()) and s.opts.enabled) 1 else 0;
+    // Same lazy retarget for the indicator appear — upstream drives the
+    // value indicator off `isDragging` (onDragStarted → isDragging,
+    // Slider.kt:920): a press that never converts shows nothing.
+    const want_ind: f32 = if (s.inter.isDragged() and s.opts.enabled) 1 else 0;
     if (want_ind != s.indicator_target) {
         s.indicator_target = want_ind;
         morphIndicator(n, s, want_ind);
@@ -600,14 +606,14 @@ fn changeCounterCb(userdata: ?*anyopaque) void {
     c.* += 1;
 }
 
-test "slider: measures default_width x 44; the hit target floors at 48 high" {
+test "slider: measures default_width x 48 (minimumInteractiveComponentSize)" {
     const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
     defer sig.deinit();
     const b = try slider(std.testing.allocator, sig, null, .{ .a11y_label = "x" });
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectEqual(@as(f32, 160), m.w);
-    try std.testing.expectEqual(thumb_h, m.h);
+    try std.testing.expectEqual(@as(f32, 48), m.h); // upstream's fixed 48dp floor
     b.layout(.{ .x = 0, .y = 0, .w = 160, .h = 44 });
     const hb = b.vtable.hit_bounds.?(b);
     try std.testing.expectEqual(@as(f32, 160), hb.w);
@@ -801,7 +807,7 @@ test "golden: slider steps paint the stop ticks with the contrast inversion" {
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(115, 24)); // on the inactive track → active color
 }
 
-test "golden: pressed slider paints the value indicator bubble above the track" {
+test "golden: dragged slider paints the value indicator bubble above the track" {
     const t = theme_mod.light;
     const sig = try ui.state.Signal(f32).init(std.testing.allocator, 0.5);
     defer sig.deinit();
@@ -810,19 +816,25 @@ test "golden: pressed slider paints the value indicator bubble above the track" 
     var r = try golden.Renderer.init(std.testing.allocator, 160, 130);
     defer r.deinit();
     b.layout(.{ .x = 0, .y = 60, .w = 160, .h = 44 });
-    // not pressed → no bubble (white above the bounds)
+    // not interacting → no bubble (white above the bounds)
     r.paint(b, 0xFFFFFFFF);
     var f0 = try r.readback(std.testing.allocator);
     defer f0.deinit();
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), f0.pixelAt(80, 30));
-    // pressed → the InverseSurface pill 12dp above the bounds
+    // down alone stays hidden too — upstream rides isDragging only.
     _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    r.paint(b, 0xFFFFFFFF);
+    var fp = try r.readback(std.testing.allocator);
+    defer fp.deinit();
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), fp.pixelAt(80, 30));
+    // past the slop → drag → the InverseSurface pill 12dp above the bounds
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .move, .x = 100, .y = 82, .raw_x = 100, .raw_y = 82 });
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // inside the pill's left padding — (80, 30) lands on the label glyphs
-    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(60, 30));
-    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(80, 50)); // tail tip
+    // the drag moved the value → the bubble follows the thumb near x=100
+    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(95, 30));
+    try std.testing.expectEqual(t.colors.inverse_surface, f.pixelAt(100, 50)); // tail tip
     // released → gone again
     _ = b.vtable.on_pointer.?(b, .{ .phase = .up, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
     r.paint(b, 0xFFFFFFFF);
@@ -846,6 +858,7 @@ test "slider: the value indicator morphs in/out on the timeline" {
     b.layout(.{ .x = 0, .y = 60, .w = 160, .h = 44 });
     const s = stateOf(b);
     _ = b.vtable.on_pointer.?(b, .{ .phase = .down, .x = 80, .y = 82, .raw_x = 80, .raw_y = 82 });
+    _ = b.vtable.on_pointer.?(b, .{ .phase = .move, .x = 100, .y = 82, .raw_x = 100, .raw_y = 82 });
     r.paint(b, 0xFFFFFFFF);
     try std.testing.expectEqual(@as(f32, 1), s.indicator_target);
     tl.tick(0); // lazy start

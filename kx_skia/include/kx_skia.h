@@ -183,6 +183,10 @@ typedef struct kx_text_style {
     // variation axes above actually reachable: a 'wght' coordinate only
     // moves glyphs when the resolved face is variable.
     const char* family;
+    // Line-height override in px (>0): maps to SkParagraph's
+    // height × fontSize multiplier + heightOverride — Compose's
+    // TextStyle.lineHeight. 0 keeps font-intrinsic line metrics.
+    float line_height;
 } kx_text_style;
 kx_text_layout* kx_text_layout_begin(float max_width); // <=0 = unconstrained
 void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text_style* style);

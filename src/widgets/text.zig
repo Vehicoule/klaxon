@@ -25,6 +25,9 @@ pub const TextOptions = struct {
     /// px of tracking added between glyphs (0 = font default) — the
     /// type_scale styles carry the token letterSpacing.
     letter_spacing: f32 = 0,
+    /// Line-height override in px (0 = font-intrinsic metrics) — Compose's
+    /// TextStyle.lineHeight; the type_scale line_height tokens.
+    line_height: f32 = 0,
     text_align: TextAlign = .left, // named text_align — `align` is a Zig keyword
     /// Variable-font axes (ABI 0.17.0): OpenType design coordinates, e.g.
     /// `.{ .axis = ui.paint.axis_wght, .value = 500 }`. A 'wght' axis
@@ -57,19 +60,24 @@ const VarText = struct {
     family_n: u8 = 0,
     layout: ?*ui.paint.TextLayout = null,
     layout_dirty: bool = false,
+    /// A line-height override needs the paragraph path too (the simple draw
+    /// call carries no line-box metric).
+    line_height: f32 = 0,
 
-    /// The layout path is needed for axes OR a family override — the simple
-    /// draw call carries neither.
+    /// The layout path is needed for axes OR a family override OR a
+    /// line-height override — the simple draw call carries none of them.
     fn needsLayout(self: *const VarText) bool {
-        return self.axes_n > 0 or self.family_n > 0;
+        return self.axes_n > 0 or self.family_n > 0 or self.line_height > 0;
     }
 
-    /// Copy the immutable-per-node font bits (axes + family) out of opts —
-    /// used at construction, BEFORE the node is attached (no dirty marks:
-    /// layout_dirty is set so the first measure/paint builds once).
+    /// Copy the immutable-per-node font bits (axes + family + line height)
+    /// out of opts — used at construction, BEFORE the node is attached (no
+    /// dirty marks: layout_dirty is set so the first measure/paint builds
+    /// once).
     fn seed(self: *VarText, opts: TextOptions) void {
         self.axes_n = @intCast(@min(opts.variations.len, ui.paint.max_font_variations));
         @memcpy(self.axes[0..self.axes_n], opts.variations[0..self.axes_n]);
+        self.line_height = opts.line_height;
         if (opts.family) |f| {
             const n: u8 = @intCast(@min(f.len, self.family.len - 1));
             @memcpy(self.family[0..n], f[0..n]);
@@ -81,6 +89,7 @@ const VarText = struct {
 
     fn styleOf(self: *const VarText, opts: TextOptions) ui.paint.TextStyle {
         var st = ui.paint.textStyle(opts.size, textWeight(opts), 0, opts.letter_spacing, opts.color);
+        st.line_height = opts.line_height;
         ui.paint.withVariations(&st, self.axes[0..self.axes_n]);
         if (self.family_n > 0)
             st.family = @ptrCast(self.family[0..self.family_n :0].ptr);

@@ -3534,6 +3534,10 @@ void kx_text_layout_span(kx_text_layout* layout, const char* text, const kx_text
             style->slant == 1 ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
     ts.setColor(kx_to_skcolor(style->color));
     if (style->letter_spacing != 0.0f) ts.setLetterSpacing(style->letter_spacing);
+    if (style->line_height > 0.0f && style->size > 0.0f) {
+        ts.setHeight(style->line_height / style->size);
+        ts.setHeightOverride(true);
+    }
     if (style->family && style->family[0])
         ts.setFontFamilies({SkString(style->family)}); // copied; per-glyph fallback still applies
     if (style->variation_count > 0) {

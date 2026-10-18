@@ -318,26 +318,43 @@ Each widget's header carries the same list; these are the tracked ones
 ## Fidelity harness — known reference-runner deltas (do not "fix" by regressing Klaxon)
 
 `fidelity/` compares our Skia raster output against a Compose M3 desktop
-runner (66 scenes, `tools/fidelity_diff.py`, mean 0.405%). The residual
+runner (66 scenes, `tools/fidelity_diff.py`, mean 0.156%). The residual
 nonzero scenes are version deltas in the runner's material3, not Klaxon
 bugs — the vendored `.ref/material3` spec is authoritative:
 
 - `checkbox_checked_pressed` (~3.9%) — the runner's checkbox is the
   legacy 20dp box with gray on_surface ink; the spec (styling-fix path)
-  is 18dp with checkedBoxColor/primary ink. Ours matches spec.
-- `nav_bar_pressed` (~2.4%) — the runner's NavigationBarItem does not
-  draw indicator ink through `itemSources` in its version; spec ink is
-  on_surface @0.12 clipped to the 56x32 pill. Ours paints it.
-- `chip_filter_hover` (~2.4%) — spec unselected-hover label/layer =
-  OnSurfaceVariant (FilterChipTokens); the runner renders the older
-  on_surface-family ink.
-- `card_filled_hover` (~2.7%) — label text metrics differ ~5px (their
-  bundled font vs ours); no state-layer defect on either side.
-- `fab_default`/`fab_small_pressed` (~2.3%) — shadow-parameter tuning
-  (ambient 0.039/spot 0.19, Android LightsComputer values) vs the
-  runner's renderer; geometry and ink match.
-- `slider_pressed`/`tabs_pressed` (~1.3-1.5%) — same state-layer color
-  family deltas as chip/nav_bar.
+  is 18dp with checkedBoxColor/primary ink. The published material3 lib
+  (1.9.0) predates `isCheckboxStylingFixEnabled` — `TriStateCheckbox`
+  hardcodes `ripple(color=Unspecified)` → on_surface. Ours matches spec.
+- `chip_filter_selected`/`chip_filter_hover` (~0.7%) — residual glyph AA
+  on the check icon + label after the layout fix (fixed 3-slot row,
+  spacedBy 8dp — see below). Spec unselected-hover label/layer =
+  OnSurfaceVariant (FilterChipTokens).
+- `fab_default`/`fab_small_pressed` (~0.7-1.1%) — shadow fringe: ambient
+  0.08/spot 0.10 calibrated against the runner's renderer; remaining
+  pixels are ±2-4 in the blurred band plus the pressed-ripple edge.
+- `card_*`/`nav_bar_*` (<0.3%) — anti-alias noise on card outline and the
+  indicator pill's rounded ends.
+- `slider_pressed` resolved (0.000%): upstream drives the value indicator
+  off `isDragging` only (Slider.kt:920) and the pinned Slider.kt has no
+  ValueIndicator paint path at all (tokens exist but are unused) — the
+  bubble is drag-gated in Klaxon, matching both the upstream model and
+  the runner. Slider measured height is 48dp — upstream
+  `minimumInteractiveComponentSize()` inflates the composable's own
+  bounds (Slider.kt:979), not just the hit area.
+- `chip` width model: upstream ChipContent is three FIXED slots
+  ([leading|Spacer0, label, trailing|Spacer0], Chip.kt:3392-3412) with
+  spacedBy(8) — a label-only chip measures label+32, not label+16. The
+  selected filter chip's check is caller-provided `leadingIcon` (no
+  automatic check upstream); the scene supplies `leading_icon: "check"`.
+- Runner-side fixes: a settle frame before `seedState` (the published
+  lib's NavigationBar/Rail item swaps in a fresh MappedInteractionSource
+  once itemWidth resolves at frame 2 — a press emitted earlier is
+  collected by the stale instance and lost); scene icons wrapped in
+  fixed-size boxes (`iconSlot`) because upstream icon slots are
+  token-sized and the indicator pill derives its width from the icon
+  slot (56 = 24+2·16), not the glyph advance.
 
 ## Benchmark-honesty invariants (do not regress)
 
