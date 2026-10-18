@@ -596,7 +596,7 @@ pub fn button(allocator: std.mem.Allocator, on_pressed: ?Callback, opts: ButtonO
     const txt = if (opts.label) |label| try text_w.text(allocator, label, .{
         .size = labelStyle(t, opts.size).size,
         .color = fg,
-        .bold = labelStyle(t, opts.size).weight >= 500,
+        .weight = labelStyle(t, opts.size).weight, .letter_spacing = labelStyle(t, opts.size).letter_spacing,
     }) else null;
     errdefer if (txt) |txtn| txtn.deinit();
     if (ic) |icn| {
@@ -639,8 +639,8 @@ test "button: small hugs the content + 16dp padding and enforces the 58dp min wi
     const b = try button(std.testing.allocator, null, .{ .label = "Add to cart" });
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
-    // label_large (14, weight 500 → bold) + 16dp horizontal padding
-    const tw = ui.paint.measureText("Add to cart", 14, true).width;
+    // label_large (14, weight 500 — Regular on static faces) + 16dp horizontal padding
+    const tw = ui.paint.measureTextStyled("Add to cart", 14, 500, 0.1).width;
     try std.testing.expect(tw + 32 > min_width); // this label exceeds the min width
     try std.testing.expectEqual(tw + 32, m.w);
     // a short label clamps to the 58dp min width
@@ -750,7 +750,7 @@ test "button: RTL mirrors the content row (the leading icon moves to the end sid
     // mirrored: the label is on the start (left) side, the icon on the end
     // (right) side, the 8dp gap preserved
     try std.testing.expect(ic.bounds.x > lb.bounds.x);
-    try std.testing.expectEqual(lb.bounds.x + lb.bounds.w + 8, ic.bounds.x);
+    try std.testing.expectApproxEqAbs(lb.bounds.x + lb.bounds.w + 8, ic.bounds.x, 0.001);
 }
 
 test "button: disabled swallows pointer input and fires nothing" {

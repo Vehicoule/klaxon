@@ -193,10 +193,9 @@ fn segWidth(s: *SegState, t: Theme) f32 {
     const count = s.items.items.len;
     if (count == 0) return seg_min_w;
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
     var sum: f32 = 0;
     for (s.items.items) |def| {
-        sum += seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText(def.label, ls.size, bold).width;
+        sum += seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing).width;
     }
     return @max(seg_min_w, sum / @as(f32, @floatFromInt(count)));
 }
@@ -462,9 +461,8 @@ fn segMeasure(n: *Node, c: Constraints) Size {
         const per_w = @max((c.max_w + @as(f32, @floatFromInt(count - 1)) * border_w) / @as(f32, @floatFromInt(count)), 0);
         const avail = labelBudget(per_w);
         const ls = t.type_scale.label_large;
-        const bold = ls.weight >= 500;
         for (s.items.items) |*def| {
-            const iw = ui.paint.measureText(def.label, ls.size, bold).width;
+            const iw = ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing).width;
             if (iw > avail) {
                 if (wrappedLabel(def, ls, avail, null)) |l| {
                     h = @max(h, ui.paint.textLayoutHeight(l) + 16);
@@ -502,7 +500,6 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     const sr = sh.sr;
     const selected = isSel(s, i);
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
     ui.paint.clipRect(ctx, sr.x, sr.y, sr.w, sr.h); // saves
     // container (a disabled+selected segment keeps the fill)
     if (selected) {
@@ -539,7 +536,7 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
         cs.on_secondary_container
     else
         cs.on_surface;
-    const lm = ui.paint.measureText(def.label, ls.size, bold);
+    const lm = ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing);
     // Upstream content box: the icon slot is ALWAYS reserved (IconSize +
     // IconSpacing) and the label's offset animates
     // -(IconSize+Spacing)/2 → 0 as the check enters (the measure
@@ -572,7 +569,7 @@ fn segPaintOne(n: *Node, s: *SegState, ctx: *kx.Ctx, i: usize, w: f32, focused: 
     if (wrap) |l|
         ui.paint.textLayoutPaint(ctx, l, cx + icon_size + icon_gap + label_off, baseline)
     else
-        ui.paint.text(ctx, def.label, cx + icon_size + icon_gap + label_off, baseline, ls.size, bold, fg);
+        ui.paint.textStyled(ctx, def.label, cx + icon_size + icon_gap + label_off, baseline, ls.size, ls.weight, ls.letter_spacing, fg);
     ui.paint.clipReset(ctx); // restores
     // border — upstream disabled*BorderColor = OutlineColor @ 0.12 (the
     // DisabledOutlineColor OnSurface token is not the one the colors use)
@@ -980,14 +977,14 @@ test "segmented_button: measures equal-width segments overlapping by the border;
     const ls = t.type_scale.label_large;
     // every segment reserves the 26dp icon slot (upstream measure policy);
     // weight(1f) shares the row's intrinsic width evenly — the MEAN
-    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + (ui.paint.measureText("Day", ls.size, true).width + ui.paint.measureText("Week", ls.size, true).width + ui.paint.measureText("Month", ls.size, true).width) / 3);
+    const w = @max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + (ui.paint.measureTextStyled("Day", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Week", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Month", ls.size, ls.weight, ls.letter_spacing).width) / 3);
     try std.testing.expectApproxEqAbs(@as(f32, 3) * w - 2 * border_w, sz.w, 0.001);
     try std.testing.expectEqual(seg_height, sz.h);
     // a single segment: full width, no overlap
     const one = try segmentedButton(a, &.{.{ .label = "Only" }}, null, null, .{});
     defer one.deinit();
     const sz1 = one.measure(.{ .max_w = 2000, .max_h = 2000 });
-    try std.testing.expectApproxEqAbs(@max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Only", ls.size, true).width), sz1.w, 0.001);
+    try std.testing.expectApproxEqAbs(@max(seg_min_w, seg_h_pad * 2 + icon_size + icon_gap + ui.paint.measureTextStyled("Only", ls.size, ls.weight, ls.letter_spacing).width), sz1.w, 0.001);
 }
 
 test "segmented_button: click selects (signal + on_change); arrows move AND select; a11y follows" {
@@ -1008,7 +1005,7 @@ test "segmented_button: click selects (signal + on_change); arrows move AND sele
     // the segment width; the segments overlap by 1dp)
     const t = theme_mod.light;
     const ls = t.type_scale.label_large;
-    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureText("Day", ls.size, true).width + ui.paint.measureText("Week", ls.size, true).width + ui.paint.measureText("Month", ls.size, true).width) / 3);
+    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureTextStyled("Day", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Week", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Month", ls.size, ls.weight, ls.letter_spacing).width) / 3);
     const x3 = @as(f32, @floatFromInt(2)) * (w - border_w) + 10;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x3, .y = 20, .raw_x = x3, .raw_y = 20 });
@@ -1060,7 +1057,7 @@ test "segmented_button: multi-choice toggles a bitmask — click, cursor+space, 
     // click segment 1 → toggles its bit ON without clearing segment 0
     const t = theme_mod.light;
     const ls = t.type_scale.label_large;
-    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureText("Bold", ls.size, true).width + ui.paint.measureText("Italic", ls.size, true).width + ui.paint.measureText("Underline", ls.size, true).width) / 3);
+    const w = @max(seg_min_w, (seg_h_pad * 2 + icon_size + icon_gap) + (ui.paint.measureTextStyled("Bold", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Italic", ls.size, ls.weight, ls.letter_spacing).width + ui.paint.measureTextStyled("Underline", ls.size, ls.weight, ls.letter_spacing).width) / 3);
     const x1 = w - border_w + 10;
     _ = n.vtable.on_pointer.?(n, .{ .phase = .down, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
     _ = n.vtable.on_pointer.?(n, .{ .phase = .up, .x = x1, .y = 20, .raw_x = x1, .raw_y = 20 });
@@ -1274,11 +1271,11 @@ test "golden: the selected icon-less segment paints the check glyph; the label s
     // is centered in the box, so the icon zone is the slot's left band.
     // Icon ink = on_secondary_container over the secondary_container fill
     // (AA'd — probe approximately).
-    const icon_x = 20 + (w - (icon_size + icon_gap + ui.paint.measureText("Day", t.type_scale.label_large.size, true).width)) / 2;
+    const icon_x = 20 + (w - (icon_size + icon_gap + ui.paint.measureTextStyled("Day", t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width)) / 2;
     try std.testing.expect(f.countColorApproxIn(.{ .x = icon_x, .y = 30, .w = icon_size, .h = icon_size }, t.colors.on_secondary_container) > 0);
     // the unselected segment has NO check: its leading icon zone is clear
     // of glyph ink (the "Week" label is inset by the reserved slot)
-    const week_w = ui.paint.measureText("Week", t.type_scale.label_large.size, true).width;
+    const week_w = ui.paint.measureTextStyled("Week", t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width;
     const cx1 = 20 + (w - border_w) + (w - (icon_size + icon_gap + week_w)) / 2;
     try std.testing.expectEqual(@as(u32, 0), f.countColorApproxIn(.{ .x = cx1 + 2, .y = 32, .w = 8, .h = 16 }, t.colors.on_surface));
 }
@@ -1324,6 +1321,6 @@ test "segmented_button: a squeezed segment wraps its label and the row grows" {
     try std.testing.expect(s.items.items[0].wrap == null); // "A" still fits
     // The wrapped layout is narrower than the single-line intrinsic.
     const ls = theme_mod.light.type_scale.label_large;
-    const iw = ui.paint.measureText(s.items.items[1].label, ls.size, true).width;
+    const iw = ui.paint.measureTextStyled(s.items.items[1].label, ls.size, ls.weight, ls.letter_spacing).width;
     try std.testing.expect(ui.paint.textLayoutWidth(s.items.items[1].wrap.?) < iw);
 }

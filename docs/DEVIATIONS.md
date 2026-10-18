@@ -118,11 +118,12 @@ Each widget's header carries the same list; these are the tracked ones
 - `icon_button.zig` — no deviations: upstream IconButton.kt carries no
   elevation/shadow either (the variants are flat); shape morphs spring
   via the timeline (AnimatedShape parity).
-- `button.zig` — the pressed corner morph springs on fast_spatial
-  (AnimatedShape parity with icon_button); the ripple clip tracks the
-  live radius.
+- `button.zig` — the pressed corner morph springs on effects_spring
+  (MotionSchemeKeyTokens.DefaultEffects — upstream picks it expressly
+  "to prevent any bounce"; icon_button does the same); the ripple clip
+  tracks the live radius.
 - `fab.zig` — the checked/unchecked toggle morph springs the container
-  size + radius on fast_spatial; ink rides the interpolated rect.
+  size + radius on spatial_spring; ink rides the interpolated rect.
 - `nav_bar.zig` / `navigation_rail.zig` — the active indicator's width
   expands on fast_spatial per item (NavigationBar.kt:561,
   NavigationItem.kt:694/924) around the collapsed center / the expanded
@@ -148,7 +149,8 @@ Each widget's header carries the same list; these are the tracked ones
   inserts '\n', wheel-scrolled capped viewport, caret-follow on input);
   search_bar/search_view stay single-line (upstream DockedSearchBar is
   single-line too). No selection handles or undo; the text_field label
-  lerps size, not weight/tracking. All three ride the shared
+  lerps size AND letter spacing (bodyLarge→bodySmall on both axes — the
+  weight is 400 at both ends). All three ride the shared
   `text_edit.zig` core: real caret (click-to-position hit test, 500ms
   blink), selection
   (shift/drag + highlight + range edits), grapheme-cluster arrows and
@@ -162,6 +164,19 @@ Each widget's header carries the same list; these are the tracked ones
   core — caret,
   selection, grapheme arrows, word select, clipboard, underlined IME
   preedit.
+- **Type-scale fidelity** — every `type_scale` call site now paints at
+  the style's real `weight` + `letter_spacing` (the old bool path
+  collapsed weight>=500 → synthetic Bold and dropped tracking): buttons,
+  chips, segmented/split buttons + groups, FAB menu, nav bar/rail,
+  menus, list items, tables, trees, steppers, calendar/date/time
+  pickers, sliders, search bar/view and text fields. The
+  measure/paint/caret paths share the same styled metrics
+  (`measureTextStyled`/`textStyled`/`measureTextLenStyled` + the
+  `text_edit` `hit_weight`/`hit_spacing` bake), so layout, ink and hit
+  tests agree. Native side: `kx_text_style` now carries weight +
+  letterSpacing through the paragraph cache (the bool APIs delegate at
+  700/400); `TextOptions`/`TextSpan` keep `.bold` as the public toggle —
+  it resolves to 700 unless `.weight` overrides.
 - `time_picker.zig` — the text-input variant (`opts.mode = .input`,
   upstream `TimeInput`) landed on the shared `text_edit.zig` core: the
   selected field is a real editable box (caret/selection/clipboard,

@@ -546,7 +546,7 @@ pub fn chip(allocator: std.mem.Allocator, sig: ?*ui.state.Signal(bool), on_click
     const txt = if (opts.label.len > 0) try text_w.text(allocator, opts.label, .{
         .size = t.type_scale.label_large.size,
         .color = cc.label,
-        .bold = t.type_scale.label_large.weight >= 500,
+        .weight = t.type_scale.label_large.weight, .letter_spacing = t.type_scale.label_large.letter_spacing,
     }) else null;
     errdefer if (txt) |txn| txn.deinit();
     const trail = if (opts.trailing_icon) |iname| try icon_w.icon(allocator, iname, .{ .size = icon_size, .color = cc.trailing_icon }) else null;
@@ -602,8 +602,8 @@ test "chip: measures height 32 + content + 16dp padding; the 48dp floor is the h
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectEqual(chip_h, m.h);
-    const tw = ui.paint.measureText("Chip", 14, true).width;
-    try std.testing.expectEqual(tw + 16, m.w); // label_large (14, 500 -> bold) + 8*2
+    const tw = ui.paint.measureTextStyled("Chip", 14, 500, 0.1).width;
+    try std.testing.expectEqual(tw + 16, m.w); // label_large (14, weight 500) + 8*2
     b.layout(.{ .x = 100, .y = 100, .w = m.w, .h = 32 });
     const hb = b.vtable.hit_bounds.?(b);
     const min_target = theme_mod.light.platform.hit_target_min;
@@ -670,7 +670,7 @@ test "chip: RTL mirrors the content row (the leading icon moves to the end side)
     // mirrored: the label is on the start (left) side, the icon on the end
     // (right) side, the 8dp gap preserved
     try std.testing.expect(ic.bounds.x > lb.bounds.x);
-    try std.testing.expectEqual(lb.bounds.x + lb.bounds.w + 8, ic.bounds.x);
+    try std.testing.expectApproxEqAbs(lb.bounds.x + lb.bounds.w + 8, ic.bounds.x, 0.001);
 }
 
 test "chip: the content row lays out centered with the 8dp icon gap" {

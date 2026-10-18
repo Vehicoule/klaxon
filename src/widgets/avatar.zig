@@ -145,10 +145,10 @@ fn avPaint(n: *Node, ctx: *kx.Ctx) void {
             const font_size = initialsFontSize(s.opts.size);
             if (s.initials_len > 0) {
                 const text_z: [:0]const u8 = s.initials[0..s.initials_len :0];
-                const metrics = ui.paint.measureText(text_z, font_size, true);
+                const metrics = ui.paint.measureTextStyled(text_z, font_size, 700, 0);
                 const tx = b.x + (b.w - metrics.width) / 2;
                 const ty = b.y + (b.h - metrics.height) / 2 + metrics.height * 0.8;
-                ui.paint.text(ctx, text_z, tx, ty, font_size, true, t.colors.on_primary_container);
+                ui.paint.textStyled(ctx, text_z, tx, ty, font_size, 700, 0, t.colors.on_primary_container);
             }
         },
         .icon => {

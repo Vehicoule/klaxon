@@ -216,8 +216,7 @@ fn splitMeasure(n: *Node, c: Constraints) Size {
     const t = s.opts.theme;
     const d = dimsFor(s.opts.size);
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    var lead_w = d.lead_pad_l + d.lead_pad_r + ui.paint.measureText(s.label, ls.size, bold).width;
+    var lead_w = d.lead_pad_l + d.lead_pad_r + ui.paint.measureTextStyled(s.label, ls.size, ls.weight, ls.letter_spacing).width;
     if (s.opts.leading_icon != null) lead_w += d.lead_icon + d.lead_icon_gap;
     lead_w = @max(lead_w, min_w);
     const tw = trailWidth(s);
@@ -328,7 +327,6 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
     const container: Color = if (s.opts.enabled) cs.primary else ui.paint.withAlphaScaled(cs.on_surface, 0.10);
     const fg: Color = if (s.opts.enabled) cs.on_primary else ui.paint.withAlphaScaled(cs.on_surface_variant, 0.38);
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
     // --- the leading half: pill on the start side, the size's inner corner
     // on the end (s.lead_inner morphs rest ↔ pressed on the effects
     // spring — upstream's rememberAnimatedShape). Its content is clipped
@@ -366,7 +364,7 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         // content: [icon, gap, label] centered (mirrored in RTL: the leading
         // icon moves to the end side)
-        const lm = ui.paint.measureText(s.label, ls.size, bold);
+        const lm = ui.paint.measureTextStyled(s.label, ls.size, ls.weight, ls.letter_spacing);
         var content_w = lm.width;
         if (s.opts.leading_icon != null) content_w += d.lead_icon + d.lead_icon_gap;
         var icon_x = lx + (lead_w - content_w) / 2;
@@ -380,7 +378,7 @@ fn splitPaint(n: *Node, ctx: *kx.Ctx) void {
         if (s.opts.leading_icon) |iname| {
             paintIcon(ctx, iname, icon_x, b.y + (b.h - d.lead_icon) / 2, d.lead_icon, fg);
         }
-        ui.paint.text(ctx, s.label, label_x, baseline, ls.size, bold, fg);
+        ui.paint.textStyled(ctx, s.label, label_x, baseline, ls.size, ls.weight, ls.letter_spacing, fg);
         ui.paint.clipReset(ctx); // restores
     }
     // --- the trailing half: the size's inner corner on the start side
@@ -706,7 +704,7 @@ test "split_button: measures the two halves + the gap; the container height per 
     const t = theme_mod.light;
     const ls = t.type_scale.label_large;
     const d = dimsFor(.small);
-    const lead_w = @max(min_w, d.lead_pad_l + d.lead_pad_r + ui.paint.measureText("Save", ls.size, true).width);
+    const lead_w = @max(min_w, d.lead_pad_l + d.lead_pad_r + ui.paint.measureTextStyled("Save", ls.size, ls.weight, ls.letter_spacing).width);
     const tw = @max(min_w, d.trail_pad * 2 + d.trail_icon);
     const sz = n.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectApproxEqAbs(lead_w + between + tw, sz.w, 0.001);
@@ -907,7 +905,7 @@ test "split_button: RTL mirrors the content row (the leading icon moves to the e
     // the content row's geometry as the widget computes it (LTR), then the
     // widget-mirrored positions the RTL paint must use
     const ls = t.type_scale.label_large;
-    const lm = ui.paint.measureText("Save", ls.size, true);
+    const lm = ui.paint.measureTextStyled("Save", ls.size, ls.weight, ls.letter_spacing);
     const tw = trailWidth(stateOf(n));
     const lead_w = bw - between - tw;
     const dd = dimsFor(.small); // the default size

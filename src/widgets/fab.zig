@@ -824,7 +824,7 @@ pub fn extendedFab(allocator: std.mem.Allocator, on_pressed: ?Callback, opts: Ex
     const txt = if (opts.label.len > 0) try text_w.text(allocator, opts.label, .{
         .size = d.text_style.size,
         .color = cc.icon, // label shares the content color
-        .bold = d.text_style.weight >= 500,
+        .weight = d.text_style.weight, .letter_spacing = d.text_style.letter_spacing,
     }) else null;
     errdefer if (txt) |txn| txn.deinit();
     if (ic) |icn| {
@@ -1002,7 +1002,7 @@ test "extended_fab: measures the size's height; content + pads is the width" {
         defer b.deinit();
         const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
         try std.testing.expectEqual(c.h, m.h);
-        const tw = ui.paint.measureText("Add", extDims(theme_mod.light, c.size).text_style.size, extDims(theme_mod.light, c.size).text_style.weight >= 500).width;
+        const tw = ui.paint.measureTextStyled("Add", extDims(theme_mod.light, c.size).text_style.size, extDims(theme_mod.light, c.size).text_style.weight, extDims(theme_mod.light, c.size).text_style.letter_spacing).width;
         try std.testing.expectEqual(@max(c.h, c.pad * 2 + c.icon + extDims(theme_mod.light, c.size).gap + tw), m.w);
     }
 }
@@ -1050,7 +1050,7 @@ test "extended_fab: text-only (no icon) measures label + pads" {
     defer b.deinit();
     const m = b.measure(.{ .max_w = 2000, .max_h = 2000 });
     const d = extDims(theme_mod.light, .small);
-    const tw = ui.paint.measureText("Go", d.text_style.size, d.text_style.weight >= 500).width;
+    const tw = ui.paint.measureTextStyled("Go", d.text_style.size, d.text_style.weight, d.text_style.letter_spacing).width;
     try std.testing.expectEqual(@max(d.height, tw + d.pad_start + d.pad_end), m.w);
     try std.testing.expectEqual(@as(usize, 1), b.children.items.len); // label only
 }

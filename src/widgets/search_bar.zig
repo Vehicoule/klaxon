@@ -160,7 +160,7 @@ fn searchBarMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
     const str = if (hasText(s)) s.text() else s.placeholder;
-    const m = ui.paint.measureText(str, t.type_scale.body_large.size, false);
+    const m = ui.paint.measureTextStyled(str, t.type_scale.body_large.size, t.type_scale.body_large.weight, t.type_scale.body_large.letter_spacing);
     const right = if (hasText(s)) iconBox(t) + text_gap_trail else text_end_no_icon;
     const w = std.math.clamp(textStart(t) + m.width + right, min_w, max_w);
     return c.constrain(.{ .w = w, .h = container_h });
@@ -255,14 +255,14 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
     s.edit.ensureTicker(); // the caret blink (focused bars stay awake)
     if (hasText(s) or s.edit.comp.items.len > 0) {
         const str = s.text();
-        const m = ui.paint.measureText(str, style.size, false);
-        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        const m = ui.paint.measureTextStyled(str, style.size, style.weight, style.letter_spacing);
+        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLenStyled(str[0..s.edit.caret], style.size, style.weight, style.letter_spacing).width;
         var comp_m = ui.paint.TextMetrics{};
         if (s.edit.comp.items.len > 0) {
             const comp = s.composition();
-            comp_m = ui.paint.measureText(comp, style.size, false);
+            comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
             const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+            caret_rel = m.width + ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
         }
         s.edit.updateScroll(caret_rel, caret_w, m.width + comp_m.width, clip_w);
         const tx = mx(b.x, b.w, tr.x, m.width, rtl) - s.edit.scroll_x;
@@ -277,19 +277,19 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
                 for (boxes[0..nb]) |bx|
                     ui.paint.fillRect(ctx, tx + bx[0], tr.y, bx[2], m.height, ui.paint.withAlphaScaled(caret, 0.4));
             } else {
-                const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
-                const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+                const hx0 = tx + ui.paint.measureTextLenStyled(str[0..sel.lo], style.size, style.weight, style.letter_spacing).width;
+                const hx1 = tx + ui.paint.measureTextLenStyled(str[0..sel.hi], style.size, style.weight, style.letter_spacing).width;
                 ui.paint.fillRect(ctx, hx0, tr.y, hx1 - hx0, m.height, ui.paint.withAlphaScaled(caret, 0.4));
             }
         }
-        ui.paint.text(ctx, str, tx, baseline, style.size, false, content);
+        ui.paint.textStyled(ctx, str, tx, baseline, style.size, style.weight, style.letter_spacing, content);
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
         const caret_x = tx + caret_rel;
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
             const comp = s.composition();
-            ui.paint.text(ctx, comp, tx + m.width, baseline, style.size, false, content);
+            ui.paint.textStyled(ctx, comp, tx + m.width, baseline, style.size, style.weight, style.letter_spacing, content);
             ui.paint.fillRect(ctx, tx + m.width, baseline + 1, comp_m.width, 1, content);
         }
         if (focused and s.edit.caret_on) {
@@ -298,9 +298,9 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
     } else {
         s.edit.scroll_x = 0;
         if (s.placeholder.len > 0) {
-            const m = ui.paint.measureText(s.placeholder, style.size, false);
+            const m = ui.paint.measureTextStyled(s.placeholder, style.size, style.weight, style.letter_spacing);
             const tx = mx(b.x, b.w, tr.x, m.width, rtl);
-            ui.paint.text(ctx, s.placeholder, tx, tr.y + m.ascent, style.size, false, muted);
+            ui.paint.textStyled(ctx, s.placeholder, tx, tr.y + m.ascent, style.size, style.weight, style.letter_spacing, muted);
         }
         if (focused and s.edit.caret_on) {
             // the caret at the (mirrored) start (empty text)
@@ -317,7 +317,7 @@ fn searchBarPaint(n: *Node, ctx: *kx.Ctx) void {
 fn caretAt(n: *Node, s: *SearchBarState, x: f32, y: f32) usize {
     const str = s.text();
     const tr = textRect(n);
-    const m = ui.paint.measureText(str, s.opts.theme.type_scale.body_large.size, false);
+    const m = ui.paint.measureTextStyled(str, s.opts.theme.type_scale.body_large.size, s.opts.theme.type_scale.body_large.weight, s.opts.theme.type_scale.body_large.letter_spacing);
     const b = n.bounds;
     const tx = (if (ui.i18n.direction() == .rtl) b.x + b.w - (tr.x - b.x) - m.width else tr.x) - s.edit.scroll_x;
     return s.edit.caretAt(x - tx, y - tr.y, s.opts.theme.type_scale.body_large.size);
@@ -530,8 +530,11 @@ pub fn searchBar(allocator: std.mem.Allocator, sig: ?*ui.state.TextSignal, on_ch
         return err;
     };
     errdefer allocator.destroy(s);
+    var edit = text_edit.Edit.init(allocator, node);
+    edit.hit_weight = @intCast(opts.theme.type_scale.body_large.weight);
+    edit.hit_spacing = opts.theme.type_scale.body_large.letter_spacing;
     s.* = .{
-        .edit = text_edit.Edit.init(allocator, node),
+        .edit = edit,
         .placeholder = placeholder,
         .opts = opts,
         .sig = sig,
@@ -608,14 +611,14 @@ test "search_bar: measures 56 tall; width clamped to [360, 720]" {
     // long content (non-empty → the clear button shows): 52 + text + 52
     const long = try searchBar(std.testing.allocator, null, null, null, .{ .initial = "a very long search query that overflows the minimum width for sure", .theme = t });
     defer long.deinit();
-    const lw = ui.paint.measureText("a very long search query that overflows the minimum width for sure", 16, false).width;
+    const lw = ui.paint.measureTextStyled("a very long search query that overflows the minimum width for sure", 16, 400, 0.5).width;
     const mw = long.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectApproxEqAbs(@min(max_w, @max(min_w, textStart(t) + lw + iconBox(t) + text_gap_trail)), mw.w, 0.001);
     // with text the clear button adds the trailing box: 52 + text + 52
     const ic = try searchBar(std.testing.allocator, null, null, null, .{ .initial = "Hi", .theme = t });
     defer ic.deinit();
     const iw = ic.measure(.{ .max_w = 2000, .max_h = 2000 }).w;
-    const hw = ui.paint.measureText("Hi", 16, false).width;
+    const hw = ui.paint.measureTextStyled("Hi", 16, 400, 0.5).width;
     try std.testing.expectApproxEqAbs(@max(min_w, textStart(t) + hw + iconBox(t) + text_gap_trail), iw, 0.001);
 }
 
@@ -741,7 +744,7 @@ test "golden: RTL paints the input text at the end side (the clip mirrors with i
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    const m = ui.paint.measureText("Hi", 16, false);
+    const m = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
     // the text run mirrors to the end side: its right edge is at
     // b.x + b.w - textStart (the trailing clear zone starts at the end)
     const mirrored_x = 20 + 380 - textStart(t) - m.width;
@@ -794,7 +797,7 @@ test "golden: with text, the input text + caret + clear button paint; hover laye
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
     // the input text ink (on_surface) at x = 20 + 52
-    const m = ui.paint.measureText("Hi", 16, false);
+    const m = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
     try std.testing.expect(f.countColorIn(.{ .x = 72, .y = 28, .w = m.width, .h = 24 }, t.colors.on_surface) > 0);
     // the caret at the text end: a 1dp bar (AA'd at the fractional text
     // end) — assert non-pill ink in the band right of the last glyph

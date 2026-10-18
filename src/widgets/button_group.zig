@@ -167,7 +167,7 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
 fn itemContentWidth(t: Theme, opts: ButtonGroupOptions, def: ItemDef) f32 {
     const d = button_w.dimsFor(opts.size);
     const ls = button_w.labelStyle(t, opts.size);
-    var w: f32 = 2 * d.h_padding + ui.paint.measureText(def.label, ls.size, ls.weight >= 500).width;
+    var w: f32 = 2 * d.h_padding + ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing).width;
     if (def.icon != null) w += d.icon + d.icon_gap;
     return w;
 }
@@ -314,7 +314,6 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
     const vc = button_w.variantColors(t, s.opts.variant);
     const d = button_w.dimsFor(s.opts.size);
     const ls = button_w.labelStyle(t, s.opts.size);
-    const bold = ls.weight >= 500;
     const focused = input.isFocused(n);
     for (0..count) |i| {
         const def = &s.items.items[i]; // the machinery mutates through this
@@ -346,7 +345,7 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         // content: [icon, gap, label] centered
         const fg: Color = if (def.enabled) vc.on else vc.disabled_on;
-        const lm = ui.paint.measureText(def.label, ls.size, bold);
+        const lm = ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing);
         var content_w = lm.width;
         if (def.icon != null) content_w += d.icon + d.icon_gap;
         const cx = r.x + (r.w - content_w) / 2;
@@ -356,7 +355,7 @@ fn groupPaint(n: *Node, ctx: *kx.Ctx) void {
             paintIcon(ctx, iname, tx, r.y + (r.h - d.icon) / 2, d.icon, fg);
             tx += d.icon + d.icon_gap;
         }
-        ui.paint.text(ctx, def.label, tx, baseline, ls.size, bold, fg);
+        ui.paint.textStyled(ctx, def.label, tx, baseline, ls.size, ls.weight, ls.letter_spacing, fg);
         ui.paint.clipReset(ctx); // restores
         // outline variant's border — over the state layer, centered on the
         // edge like the button's own stroke.

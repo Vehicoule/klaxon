@@ -94,6 +94,10 @@
 //            edges. Plus kx_text_rects_for_range (per-run glyph boxes
 //            covering a UTF-16 range — the selection highlight).
 //            Additive.
+//   0.25.0 — weight/letter-spacing text: kx_draw_text_weight,
+//            kx_measure_text_weight + kx_measure_text_len_weight; the
+//            bool delegates map bold->700/400 (the cache keys on the
+//            resolved style). Additive.
 #ifndef KX_SKIA_H
 #define KX_SKIA_H
 
@@ -141,6 +145,13 @@ void kx_draw_text(kx_ctx* ctx, const char* text, float x, float y, float size, u
 // Bold-aware text variant (added in 0.2.0; kx_draw_text is unchanged for ABI
 // stability — it delegates with bold=false).
 void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float size, bool bold, uint32_t rgba);
+// Weight + tracking variant (0.25.0): fontStyle weight 100..900 resolves to
+// the nearest static face (the same snap SkParagraph's FontCollection
+// performs — 500 lands on Regular when no Medium face exists, matching
+// Compose's FontWeight.Medium on the bundled fonts); letter_spacing is px
+// added between glyphs (forces the paragraph path — the simple blob shaper
+// carries raw advances). The bool delegates map bold->700/400.
+void kx_draw_text_weight(kx_ctx* ctx, const char* text, float x, float y, float size, int32_t weight, float letter_spacing, uint32_t rgba);
 
 // Multi-style shaped text (0.15.0): a paragraph built from styled spans —
 // real rich text (weight 100..900, italic, letter-spacing, per-span color)
@@ -333,9 +344,13 @@ typedef struct kx_text_metrics {
     float descent;
 } kx_text_metrics;
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold);
+// Weight + tracking variants (0.25.0) — same cache, keyed on
+// (text,size,weight,letter-spacing); the bool delegates map 700/400.
+kx_text_metrics kx_measure_text_weight(const char* text, float size, int32_t weight, float letter_spacing);
 // Length-taking variant (0.22.0) — substring prefixes have no sentinel;
 // rides the same cache entry keyed on (ptr,len).
 kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bool bold);
+kx_text_metrics kx_measure_text_len_weight(const char* text, size_t len, float size, int32_t weight, float letter_spacing);
 
 // Images (per-ctx registry). Create once from RGBA pixels (memory order
 // R,G,B,A, unpremultiplied), draw many times — no per-frame allocation.

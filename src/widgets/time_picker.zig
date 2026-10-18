@@ -900,9 +900,9 @@ const FooterRects = struct { cancel: Rect, ok: Rect };
 fn footerRects(n: *Node) FooterRects {
     const s = stateOf(n);
     const ls = s.opts.theme.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    const ok_m = ui.paint.measureTextLen(i18n_mod.tr("OK"), ls.size, bold);
-    const cancel_m = ui.paint.measureTextLen(i18n_mod.tr("Cancel"), ls.size, bold);
+    
+    const ok_m = ui.paint.measureTextLenStyled(i18n_mod.tr("OK"), ls.size, ls.weight, ls.letter_spacing);
+    const cancel_m = ui.paint.measureTextLenStyled(i18n_mod.tr("Cancel"), ls.size, ls.weight, ls.letter_spacing);
     const ok_w = ok_m.width + 2 * footer_pad_x;
     const cancel_w = cancel_m.width + 2 * footer_pad_x;
     const right = n.bounds.x + n.bounds.w - footer_pad_bottom;
@@ -977,9 +977,9 @@ fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, zone: Zon
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, r.h / 2, theme_mod.stateLayer(0, t.colors.primary, alpha));
     }
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    const m = ui.paint.measureTextLen(label, ls.size, bold);
-    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
+    
+    const m = ui.paint.measureTextLenStyled(label, ls.size, ls.weight, ls.letter_spacing);
+    ui.paint.textSliceStyled(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, ls.weight, ls.letter_spacing, t.colors.primary);
 }
 
 /// A time plate (96x80, CornerSmall): the active mode gets the
@@ -999,8 +999,8 @@ fn paintPlate(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, active: bool, 
     }
     if (active) ui.paint.strokeRRect(ctx, r.x, r.y, r.w, r.h, plate_corner, plate_border, cs.primary);
     const dl = t.type_scale.display_large;
-    const m = ui.paint.measureTextLen(label, dl.size, dl.weight >= 500);
-    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, dl.size, dl.weight >= 500, fg);
+    const m = ui.paint.measureTextLenStyled(label, dl.size, dl.weight, dl.letter_spacing);
+    ui.paint.textSliceStyled(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, dl.size, dl.weight, dl.letter_spacing, fg);
 }
 
 /// A 24dp keyboard glyph (input variant → dial affordance) — a rounded
@@ -1133,7 +1133,7 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, corner, theme_mod.stateLayer(fill, fg, alpha));
     }
     const dm = fieldFont(s);
-    const dm_bold = dm.weight >= 500;
+    
     var tx: f32 = 0;
     var baseline: f32 = 0;
     var m: ui.paint.TextMetrics = undefined;
@@ -1150,7 +1150,7 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
             ui.paint.strokeRRect(ctx, r.x, r.y, r.w, r.h, corner, bw, bc);
         }
         str = e.text();
-        m = ui.paint.measureText(str, dm.size, dm_bold);
+        m = ui.paint.measureTextStyled(str, dm.size, dm.weight, dm.letter_spacing);
         tx = r.x + (r.w - m.width) / 2;
         baseline = r.y + (r.h - m.height) / 2 + m.ascent;
         e.ensureTicker(); // lazy — the host timeline may not exist at init
@@ -1164,24 +1164,24 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
                     for (boxes[0..nb]) |bx|
                         ui.paint.fillRect(ctx, tx + bx[0], baseline - m.ascent, bx[2], m.ascent + m.descent, ui.paint.withAlphaScaled(cs.primary, 0.4));
                 } else {
-                    const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], dm.size, dm_bold).width;
-                    const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], dm.size, dm_bold).width;
+                    const hx0 = tx + ui.paint.measureTextLenStyled(str[0..sel.lo], dm.size, dm.weight, dm.letter_spacing).width;
+                    const hx1 = tx + ui.paint.measureTextLenStyled(str[0..sel.hi], dm.size, dm.weight, dm.letter_spacing).width;
                     ui.paint.fillRect(ctx, hx0, baseline - m.ascent, hx1 - hx0, m.ascent + m.descent, ui.paint.withAlphaScaled(cs.primary, 0.4));
                 }
             }
         }
-        ui.paint.text(ctx, str, tx, baseline, dm.size, dm_bold, fg);
+        ui.paint.textStyled(ctx, str, tx, baseline, dm.size, dm.weight, dm.letter_spacing, fg);
         // The IME preedit rides after the buffer text (underlined).
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
-        var cx = tx + (e.caretX(e.caret, dm.size) orelse ui.paint.measureTextLen(str[0..e.caret], dm.size, dm_bold).width);
+        var cx = tx + (e.caretX(e.caret, dm.size) orelse ui.paint.measureTextLenStyled(str[0..e.caret], dm.size, dm.weight, dm.letter_spacing).width);
         if (e.comp.items.len > 0) {
             const comp = e.composition();
-            const pre_w = ui.paint.measureTextLen(str, dm.size, dm_bold).width;
-            const cm = ui.paint.measureText(comp, dm.size, dm_bold);
-            ui.paint.text(ctx, comp, tx + pre_w, baseline, dm.size, dm_bold, fg);
+            const pre_w = ui.paint.measureTextLenStyled(str, dm.size, dm.weight, dm.letter_spacing).width;
+            const cm = ui.paint.measureTextStyled(comp, dm.size, dm.weight, dm.letter_spacing);
+            ui.paint.textStyled(ctx, comp, tx + pre_w, baseline, dm.size, dm.weight, dm.letter_spacing, fg);
             ui.paint.fillRect(ctx, tx + pre_w, baseline + 1, cm.width, 1, fg);
             const at: usize = @intCast(@min(@max(e.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            cx = tx + pre_w + ui.paint.measureTextLen(comp[0..at], dm.size, dm_bold).width;
+            cx = tx + pre_w + ui.paint.measureTextLenStyled(comp[0..at], dm.size, dm.weight, dm.letter_spacing).width;
         }
         // The caret (focused only) — upstream's middle-80% glyph block.
         if (focused and e.caret_on) {
@@ -1192,10 +1192,10 @@ fn paintInputField(n: *Node, ctx: *kx.Ctx, which: DialMode) void {
         // input), no border, centered.
         var b: [8]u8 = undefined;
         str = canonicalFieldText(s, which, &b);
-        m = ui.paint.measureText(str, dm.size, dm_bold);
+        m = ui.paint.measureTextStyled(str, dm.size, dm.weight, dm.letter_spacing);
         tx = r.x + (r.w - m.width) / 2;
         baseline = r.y + (r.h - m.height) / 2 + m.ascent;
-        ui.paint.text(ctx, str, tx, baseline, dm.size, dm_bold, fg);
+        ui.paint.textStyled(ctx, str, tx, baseline, dm.size, dm.weight, dm.letter_spacing, fg);
     }
     // The supporting text: "Hour"/"Minute" (or the error text), BodySmall
     // in the field's x band — laid out through the paragraph ABI at the
@@ -1251,10 +1251,10 @@ fn paintPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
             ui.paint.fillRRectCorners(ctx, pr.x, h.y, pr.w, half_h, tl, tr, br, bl, theme_mod.stateLayer(0, on, alpha));
         }
         const tm_style = t.type_scale.title_medium;
-        const bold = tm_style.weight >= 500;
-        const m = ui.paint.measureTextLen(h.label, tm_style.size, bold);
+        const weight: i32 = @intCast(tm_style.weight);
+        const m = ui.paint.measureTextLenStyled(h.label, tm_style.size, weight, tm_style.letter_spacing);
         const fg: Color = if (h.selected) cs.on_tertiary_container else cs.on_surface_variant;
-        ui.paint.textSlice(ctx, h.label, pr.x + (pr.w - m.width) / 2, h.y + (half_h - m.height) / 2 + m.ascent, tm_style.size, bold, fg);
+        ui.paint.textSliceStyled(ctx, h.label, pr.x + (pr.w - m.width) / 2, h.y + (half_h - m.height) / 2 + m.ascent, tm_style.size, weight, tm_style.letter_spacing, fg);
     }
     // the 1dp divider between the halves
     ui.paint.fillRect(ctx, pr.x, pr.y + half_h - 0.5, pr.w, 1, cs.outline);
@@ -1293,9 +1293,9 @@ fn paintVibrantPeriodToggle(n: *Node, ctx: *kx.Ctx, pr: Rect, tm: i32) void {
             const alpha = if (pressed) t.state.pressed else t.state.hover;
             ui.paint.fillRRect(ctx, ir.x, ir.y, ir.w, ir.h, corner, theme_mod.stateLayer(0, fg, alpha));
         }
-        const bold = h.checked or tm_style.weight >= 500;
-        const m = ui.paint.measureTextLen(h.label, tm_style.size, bold);
-        ui.paint.textSlice(ctx, h.label, ir.x + (ir.w - m.width) / 2, ir.y + (ir.h - m.height) / 2 + m.ascent, tm_style.size, bold, fg);
+        const weight: i32 = if (h.checked) 700 else @intCast(tm_style.weight);
+        const m = ui.paint.measureTextLenStyled(h.label, tm_style.size, weight, tm_style.letter_spacing);
+        ui.paint.textSliceStyled(ctx, h.label, ir.x + (ir.w - m.width) / 2, ir.y + (ir.h - m.height) / 2 + m.ascent, tm_style.size, weight, tm_style.letter_spacing, fg);
     }
 }
 
@@ -1323,8 +1323,8 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
         // DisplayMedium classic / DisplayLarge vibrant), the -4dp nudge.
         const dm0 = fieldFont(s);
         const sep0 = inputSeparatorRect(b, s);
-        const sep0_m = ui.paint.measureText(":", dm0.size, dm0.weight >= 500);
-        ui.paint.text(ctx, ":", sep0.x + (sep0.w - sep0_m.width) / 2, sep0.y + sep_offset_y + (sep0.h - sep0_m.height) / 2 + sep0_m.ascent, dm0.size, dm0.weight >= 500, cs.on_surface);
+        const sep0_m = ui.paint.measureTextStyled(":", dm0.size, dm0.weight, dm0.letter_spacing);
+        ui.paint.textStyled(ctx, ":", sep0.x + (sep0.w - sep0_m.width) / 2, sep0.y + sep_offset_y + (sep0.h - sep0_m.height) / 2 + sep0_m.ascent, dm0.size, dm0.weight, dm0.letter_spacing, cs.on_surface);
         if (!s.opts.is_24h) {
             const pr = inputPeriodRect(b, s);
             if (s.opts.vibrant) paintVibrantPeriodToggle(n, ctx, pr, tm) else paintPeriodToggle(n, ctx, pr, tm);
@@ -1344,8 +1344,8 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
     paintPlate(n, ctx, plateRect(b, .minute, s.opts.is_24h), minute_lbl, s.mode == .minute, .minute_plate);
     const dl = t.type_scale.display_large;
     const sep = separatorRect(b, s.opts.is_24h);
-    const sep_m = ui.paint.measureText(":", dl.size, dl.weight >= 500);
-    ui.paint.text(ctx, ":", sep.x + (sep.w - sep_m.width) / 2, sep.y + (sep.h - sep_m.height) / 2 + sep_m.ascent, dl.size, dl.weight >= 500, cs.on_surface);
+    const sep_m = ui.paint.measureTextStyled(":", dl.size, dl.weight, dl.letter_spacing);
+    ui.paint.textStyled(ctx, ":", sep.x + (sep.w - sep_m.width) / 2, sep.y + (sep.h - sep_m.height) / 2 + sep_m.ascent, dl.size, dl.weight, dl.letter_spacing, cs.on_surface);
     if (!s.opts.is_24h) paintPeriodToggle(n, ctx, periodRect(b), tm);
     // the dial
     const d = dialRect(b);
@@ -1353,7 +1353,7 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
     const cy = d.y + d.h / 2;
     ui.paint.fillRRect(ctx, d.x, d.y, d.w, d.h, dial_size / 2, cs.surface_container_highest);
     const bl = t.type_scale.body_large;
-    const bl_bold = bl.weight >= 500;
+    
     const is_24h = s.opts.is_24h and s.mode == .hour;
     const sel_val = dialValue(tm, s.mode, s.opts.is_24h);
     // the labels on the ring(s): the 24h hour dial has two rings — 00..11 on
@@ -1392,8 +1392,8 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
                 sel_y = ly;
                 continue;
             }
-            const m = ui.paint.measureText(vstr, bl.size, bl_bold);
-            ui.paint.text(ctx, vstr, lx - m.width / 2, ly - m.height / 2 + m.ascent, bl.size, bl_bold, cs.on_surface);
+            const m = ui.paint.measureTextStyled(vstr, bl.size, bl.weight, bl.letter_spacing);
+            ui.paint.textStyled(ctx, vstr, lx - m.width / 2, ly - m.height / 2 + m.ascent, bl.size, bl.weight, bl.letter_spacing, cs.on_surface);
         }
     }
     // the selector: the track + the knob + the center dot
@@ -1409,8 +1409,8 @@ fn tpPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRRect(ctx, cx - center_d / 2, cy - center_d / 2, center_d, center_d, center_d / 2, cs.primary);
     // the selected label on top of the knob (OnPrimary)
     if (sel_str) |vstr| {
-        const m = ui.paint.measureText(vstr, bl.size, bl_bold);
-        ui.paint.text(ctx, vstr, sel_x - m.width / 2, sel_y - m.height / 2 + m.ascent, bl.size, bl_bold, cs.on_primary);
+        const m = ui.paint.measureTextStyled(vstr, bl.size, bl.weight, bl.letter_spacing);
+        ui.paint.textStyled(ctx, vstr, sel_x - m.width / 2, sel_y - m.height / 2 + m.ascent, bl.size, bl.weight, bl.letter_spacing, cs.on_primary);
     }
     // the keyboard-focused numeral's indication (upstream's focusable
     // ClockText ripple — a ring at the numeral's bounds while the node
@@ -1437,7 +1437,7 @@ fn fieldCaretFromPoint(n: *Node, s: *TpState, which: DialMode, x: f32, y: f32) u
     const str = e.text();
     const r = inputFieldRect(n.bounds, which, s);
     const dm = fieldFont(s);
-    const m = ui.paint.measureText(str, dm.size, dm.weight >= 500);
+    const m = ui.paint.measureTextStyled(str, dm.size, dm.weight, dm.letter_spacing);
     const tx = r.x + (r.w - m.width) / 2;
     return e.caretAt(x - tx, y - r.y, dm.size);
 }

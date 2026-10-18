@@ -296,6 +296,10 @@ fn baselineIn(box_y: f32, box_h: f32, m: ui.paint.TextMetrics) f32 {
 fn labelSize(s: *TextFieldState, t: Theme) f32 {
     return lerpF(t.type_scale.body_large.size, t.type_scale.body_small.size, s.label_progress);
 }
+/// The label's letter spacing rides the same lerp as its size.
+fn labelSpacing(s: *TextFieldState, t: Theme) f32 {
+    return lerpF(t.type_scale.body_large.letter_spacing, t.type_scale.body_small.letter_spacing, s.label_progress);
+}
 /// The label box's min height — lerp(MinTextLineHeight, MinFocusedLabelLineHeight).
 fn labelBoxH(s: *TextFieldState) f32 {
     return lerpF(min_text_line_h, min_label_line_h, s.label_progress);
@@ -346,7 +350,7 @@ pub fn labelRect(n: *Node) ?Rect {
     const rtl = ui.i18n.direction() == .rtl;
     const size = labelSize(s, t);
     const box_h = labelBoxH(s);
-    const w = ui.paint.measureText(s.label, size, false).width;
+    const w = ui.paint.measureTextStyled(s.label, size, t.type_scale.body_large.weight, labelSpacing(s, t)).width;
     var x: f32 = undefined;
     var y: f32 = undefined;
     if (s.opts.variant == .filled) {
@@ -409,7 +413,7 @@ fn syncLineParas(s: *TextFieldState, ink: ?Color) bool {
 /// must already be at the current wrap: callers syncWrap / set the
 /// measure budget first.
 fn visibleTextHeight(s: *TextFieldState) f32 {
-    const line_h = ui.paint.measureText(" ", bodyLarge(s.opts.theme).size, false).height;
+    const line_h = ui.paint.measureTextStyled(" ", bodyLarge(s.opts.theme).size, bodyLarge(s.opts.theme).weight, bodyLarge(s.opts.theme).letter_spacing).height;
     var lines: f32 = @floatFromInt(@max(1, s.opts.min_lines));
     if (syncLineParas(s, null))
         lines = @round(s.edit.linesHeight() / line_h);
@@ -584,7 +588,7 @@ fn fieldMetrics(s: *TextFieldState) ui.paint.TextMetrics {
             s.segs.allocator.free(@constCast(last.text.ptr)[0 .. last.text.len + 1]);
             last.text = merged[0 .. last.text.len + tail.len :0];
             last.size = size;
-            last.m = ui.paint.measureText(last.text, size, false);
+            last.m = ui.paint.measureTextStyled(last.text, size, s.edit.hit_weight, s.edit.hit_spacing);
         }
     }
     var m = ui.paint.TextMetrics{};
@@ -630,7 +634,7 @@ fn compactSegs(s: *TextFieldState) void {
         s.segs.allocator.free(@constCast(a.text.ptr)[0 .. a.text.len + 1]);
         s.segs.allocator.free(@constCast(b.text.ptr)[0 .. b.text.len + 1]);
         a.text = buf[0..best_len :0];
-        a.m = ui.paint.measureText(a.text, a.size, false);
+        a.m = ui.paint.measureTextStyled(a.text, a.size, s.edit.hit_weight, s.edit.hit_spacing);
         _ = s.segs.orderedRemove(i + 1);
     }
 }
@@ -639,7 +643,7 @@ fn segPush(s: *TextFieldState, piece: [:0]const u8, size: f32) void {
     const buf = s.segs.allocator.alloc(u8, piece.len + 1) catch @panic("klaxon: out of memory");
     @memcpy(buf[0..piece.len], piece);
     buf[piece.len] = 0;
-    seg.* = .{ .text = buf[0..piece.len :0], .size = size, .m = ui.paint.measureText(buf[0..piece.len :0], size, false) };
+    seg.* = .{ .text = buf[0..piece.len :0], .size = size, .m = ui.paint.measureTextStyled(buf[0..piece.len :0], size, s.edit.hit_weight, s.edit.hit_spacing) };
 }
 fn freeSeg(s: *TextFieldState, seg: TextFieldState.Seg) void {
     s.segs.allocator.free(@constCast(seg.text.ptr)[0 .. seg.text.len + 1]);
@@ -691,9 +695,9 @@ fn syncScroll(n: *Node, s: *TextFieldState) void {
     var total_w = m.width;
     if (s.edit.comp.items.len > 0) {
         const comp = s.edit.composition();
-        const comp_m = ui.paint.measureText(comp, style.size, false);
+        const comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
         const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-        caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        caret_rel = m.width + ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
         total_w += comp_m.width;
     }
     s.edit.updateScroll(caret_rel, caret_w, total_w, clip_w);
@@ -727,7 +731,7 @@ fn runXAt(s: *TextFieldState, pos: usize) f32 {
         // Strict: an offset on a segment's end boundary is the same x as
         // the next segment's start — falling through skips the measure.
         if (pos < covered + seg.text.len) {
-            return x + ui.paint.measureTextLen(seg.text[0 .. pos - covered], size, false).width;
+            return x + ui.paint.measureTextLenStyled(seg.text[0 .. pos - covered], size, s.edit.hit_weight, s.edit.hit_spacing).width;
         }
         x += seg.m.width;
         covered += seg.text.len;
@@ -739,11 +743,11 @@ fn textFieldMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
     const str = if (s.edit.buf.items.len > 0) s.text() else s.placeholder;
-    const m = if (s.edit.buf.items.len > 0) fieldMetrics(s) else ui.paint.measureText(str, bodyLarge(t).size, false);
+    const m = if (s.edit.buf.items.len > 0) fieldMetrics(s) else ui.paint.measureTextStyled(str, bodyLarge(t).size, bodyLarge(t).weight, bodyLarge(t).letter_spacing);
     const outlined = s.opts.variant == .outlined;
     // The measured label box: the text at the lerped size + the inner
     // padding the filled variant carries (the cutout label has none).
-    const label_w = if (hasLabel(s)) ui.paint.measureText(s.label, labelSize(s, t), false).width else 0;
+    const label_w = if (hasLabel(s)) ui.paint.measureTextStyled(s.label, labelSize(s, t), t.type_scale.body_large.weight, labelSpacing(s, t)).width else 0;
     // InsideTextFieldLayout.calculateWidth: icons occupy their 48dp boxes;
     // the middle section is max(text|placeholder, label) plus the
     // icon-reduced paddings. The cutout layout drops the label's width as
@@ -851,7 +855,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             // ClipOp.Difference — a REAL hole behind the label (whatever
             // background shows through), not a surface-colored patch.
             if (hasLabel(s) and s.label_progress > 0) {
-                const cut_w = ui.paint.measureText(s.label, labelSize(s, t), false).width * s.label_progress;
+                const cut_w = ui.paint.measureTextStyled(s.label, labelSize(s, t), t.type_scale.body_large.weight, labelSpacing(s, t)).width * s.label_progress;
                 const hole_x = mx(c.x, c.w, c.x + h_padding - cutout_pad, cut_w + cutout_pad * 2, rtl);
                 // ±2px past the stroke's outer edge so no AA fringe survives.
                 ui.paint.clipRectDiff(ctx, hole_x, c.y - fc.outline_w - 2, cut_w + cutout_pad * 2, fc.outline_w * 2 + 4);
@@ -918,7 +922,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             // but issuing the op still pays strlen+probe+blob emit per seg
             // (a long IME-grown buffer was ~560 ops/frame in input_ime).
             if (sx + seg.m.width > clip_x and sx < clip_x + clip_w)
-                ui.paint.text(ctx, seg.text, sx, baseline, style.size, false, fc.input);
+                ui.paint.textStyled(ctx, seg.text, sx, baseline, style.size, style.weight, style.letter_spacing, fc.input);
             sx += seg.m.width;
         }
         // The caret's visual edge — direction-aware under RTL via the
@@ -931,11 +935,11 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
             // range; a 1px underline is the standard visual). SDL's
             // comp_start positions the IME cursor INSIDE the composition.
             const comp = s.edit.composition();
-            const comp_m = ui.paint.measureText(comp, style.size, false);
-            ui.paint.text(ctx, comp, sx, baseline, style.size, false, fc.input);
+            const comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
+            ui.paint.textStyled(ctx, comp, sx, baseline, style.size, style.weight, style.letter_spacing, fc.input);
             ui.paint.fillRect(ctx, sx, baseline + 1, comp_m.width, 1, fc.input);
             const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_x = sx + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+            caret_x = sx + ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
         }
         if (focused and s.edit.caret_on) {
             // the caret at its position (inside the composition when open)
@@ -948,14 +952,14 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
         if (focused or !hasLabel(s)) {
             if (s.placeholder.len > 0) {
                 const style = bodyLarge(t);
-                const m = ui.paint.measureText(s.placeholder, style.size, false);
+                const m = ui.paint.measureTextStyled(s.placeholder, style.size, style.weight, style.letter_spacing);
                 const tx = mx(c.x, c.w, tr.x, m.width, rtl);
-                ui.paint.text(ctx, s.placeholder, tx, baselineIn(tr.y, tr.h, m), style.size, false, fc.placeholder);
+                ui.paint.textStyled(ctx, s.placeholder, tx, baselineIn(tr.y, tr.h, m), style.size, style.weight, style.letter_spacing, fc.placeholder);
             }
         }
         if (focused and s.edit.caret_on) {
             // the caret at the start (empty text)
-            const m = ui.paint.measureText(" ", bodyLarge(t).size, false);
+            const m = ui.paint.measureTextStyled(" ", bodyLarge(t).size, bodyLarge(t).weight, bodyLarge(t).letter_spacing);
             ui.paint.fillRect(ctx, mx(c.x, c.w, tr.x, caret_w, rtl), baselineIn(tr.y, tr.h, m) - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
         }
     }
@@ -965,16 +969,16 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
     if (hasLabel(s)) {
         const lr = labelRect(n).?;
         const size = labelSize(s, t);
-        const m = ui.paint.measureText(s.label, size, false);
-        ui.paint.text(ctx, s.label, lr.x, baselineIn(lr.y, lr.h, m), size, false, fc.label);
+        const m = ui.paint.measureTextStyled(s.label, size, t.type_scale.body_large.weight, labelSpacing(s, t));
+        ui.paint.textStyled(ctx, s.label, lr.x, baselineIn(lr.y, lr.h, m), size, t.type_scale.body_large.weight, labelSpacing(s, t), fc.label);
     }
 
     // --- supporting text (below the container) ---
     if (hasSupporting(s)) {
         const style = bodySmall(t);
-        const m = ui.paint.measureText(s.supporting, style.size, false);
+        const m = ui.paint.measureTextStyled(s.supporting, style.size, style.weight, style.letter_spacing);
         const sx = mx(c.x, c.w, c.x + h_padding, m.width, rtl);
-        ui.paint.text(ctx, s.supporting, sx, baselineIn(c.y + c.h + supporting_top, min_supporting_line_h, m), style.size, false, fc.supporting);
+        ui.paint.textStyled(ctx, s.supporting, sx, baselineIn(c.y + c.h + supporting_top, min_supporting_line_h, m), style.size, style.weight, style.letter_spacing, fc.supporting);
     }
 }
 
@@ -988,7 +992,7 @@ fn textFieldPaint(n: *Node, ctx: *kx.Ctx) void {
 fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColors, focused: bool) void {
     const style = bodyLarge(s.opts.theme);
     const region = textRegion(n); // syncWrap inside — wrap = the region width
-    const line_m = ui.paint.measureText(" ", style.size, false);
+    const line_m = ui.paint.measureTextStyled(" ", style.size, style.weight, style.letter_spacing);
     const rtl = ui.paint.textDirectionRtl();
     const has_comp = s.edit.comp.items.len > 0;
     ui.paint.clipRect(ctx, region.x, region.y, region.w, region.h);
@@ -1004,9 +1008,9 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         // first line box — it's a hint, not content.
         if (focused or !hasLabel(s)) {
             if (s.placeholder.len > 0) {
-                const pm = ui.paint.measureText(s.placeholder, style.size, false);
+                const pm = ui.paint.measureTextStyled(s.placeholder, style.size, style.weight, style.letter_spacing);
                 const px = if (rtl) region.x + region.w - pm.width else region.x;
-                ui.paint.text(ctx, s.placeholder, px, baselineIn(region.y, line_m.height, pm), style.size, false, fc.placeholder);
+                ui.paint.textStyled(ctx, s.placeholder, px, baselineIn(region.y, line_m.height, pm), style.size, style.weight, style.letter_spacing, fc.placeholder);
             }
         }
         if (focused and s.edit.caret_on) {
@@ -1022,18 +1026,18 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         // at the region's top — the same degradation the single-line
         // path faces when the paragraph can't build.
         const str = s.edit.text();
-        const m = ui.paint.measureText(str, style.size, false);
+        const m = ui.paint.measureTextStyled(str, style.size, style.weight, style.letter_spacing);
         const tx = if (rtl) region.x + region.w - m.width else region.x;
         const baseline = baselineIn(region.y, line_m.height, m);
-        if (str.len > 0) ui.paint.text(ctx, str, tx, baseline, style.size, false, fc.input);
+        if (str.len > 0) ui.paint.textStyled(ctx, str, tx, baseline, style.size, style.weight, style.letter_spacing, fc.input);
         var caret_x = tx + m.width;
         if (has_comp) {
             const comp = s.edit.composition();
-            const comp_m = ui.paint.measureText(comp, style.size, false);
-            ui.paint.text(ctx, comp, caret_x, baseline, style.size, false, fc.input);
+            const comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
+            ui.paint.textStyled(ctx, comp, caret_x, baseline, style.size, style.weight, style.letter_spacing, fc.input);
             ui.paint.fillRect(ctx, caret_x, baseline + 1, comp_m.width, 1, fc.input);
             const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_x += ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+            caret_x += ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
         }
         if (focused and s.edit.caret_on)
             ui.paint.fillRect(ctx, caret_x, baseline - m.ascent, caret_w, m.ascent + m.descent, fc.caret);
@@ -1116,15 +1120,15 @@ fn paintMultilineText(n: *Node, ctx: *kx.Ctx, s: *TextFieldState, fc: FieldColor
         // conventional mark). Deviation: upstream reflows the comp
         // inside the paragraph; here it overlays the caret's line.
         const comp = s.edit.composition();
-        const comp_m = ui.paint.measureText(comp, style.size, false);
+        const comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
         // The caret line's baseline — the uniform style makes every row's
         // baseline offset equal, so the caret row's top + base is the
         // caret row's baseline.
         const comp_base = caret_y + if (s.edit.lineIndexOf(s.edit.caret)) |ci| s.edit.lineParas()[ci].base else 0;
-        ui.paint.text(ctx, comp, caret_x, comp_base, style.size, false, fc.input);
+        ui.paint.textStyled(ctx, comp, caret_x, comp_base, style.size, style.weight, style.letter_spacing, fc.input);
         ui.paint.fillRect(ctx, caret_x, comp_base + 1, comp_m.width, 1, fc.input);
         const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-        caret_x += ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+        caret_x += ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
     }
     if (focused and s.edit.caret_on) {
         // the caret at its position (inside the composition when open)
@@ -1425,7 +1429,7 @@ test "text_field: measures 56/64 (+supporting), MinWidth 280, content width + pa
     // wide content: width = the text + the icon-reduced paddings
     const w2 = try textField(std.testing.allocator, null, null, null, .{ .initial = "a very long piece of input text that exceeds the minimum width" });
     defer w2.deinit();
-    const tw2 = ui.paint.measureText("a very long piece of input text that exceeds the minimum width", 16, false).width;
+    const tw2 = ui.paint.measureTextStyled("a very long piece of input text that exceeds the minimum width", 16, 400, 0.5).width;
     try std.testing.expectApproxEqAbs(h_padding * 2 + tw2, w2.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
     // outlined without a label keeps 56 (no cutout pad)
     const nl = try textField(std.testing.allocator, null, null, null, .{ .placeholder = "hint" });
@@ -1439,7 +1443,7 @@ test "text_field: measures 56/64 (+supporting), MinWidth 280, content width + pa
     // 48 + (16-12) + text + (16-12) + 48 — the icon test needs text > 280-104
     const ic = try textField(std.testing.allocator, null, null, null, .{ .leading_icon = .search, .trailing_icon = .close, .initial = "another fairly long piece of input text for measure" });
     defer ic.deinit();
-    const tw = ui.paint.measureText("another fairly long piece of input text for measure", 16, false).width;
+    const tw = ui.paint.measureTextStyled("another fairly long piece of input text for measure", 16, 400, 0.5).width;
     try std.testing.expectApproxEqAbs((iconBox(t) + h_padding - iconPad(t)) * 2 + tw, ic.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
 }
 
@@ -1598,7 +1602,7 @@ test "text_field: the seg rope compacts past 64 pieces (IME-style commit growth)
     _ = fieldMetrics(s); // reconcile + compact
     try std.testing.expect(s.segs.items.len <= 64);
     // the merged rope still covers the whole buffer, measured identically
-    const want = ui.paint.measureTextLen(s.text(), bodyLarge(s.opts.theme).size, false);
+    const want = ui.paint.measureTextLenStyled(s.text(), bodyLarge(s.opts.theme).size, bodyLarge(s.opts.theme).weight, bodyLarge(s.opts.theme).letter_spacing);
     try std.testing.expectApproxEqAbs(fieldMetrics(s).width, want.width, 0.5);
     // and the seg texts concat back to the buffer bytes
     var total: usize = 0;
@@ -1637,7 +1641,7 @@ test "text_field: RTL mirrors the chrome (the label moves to the end side)" {
     defer b.deinit();
     b.layout(.{ .x = 0, .y = 0, .w = 260, .h = 56 });
     const lr = labelRect(b).?;
-    const lw = ui.paint.measureText("Email", 16, false).width;
+    const lw = ui.paint.measureTextStyled("Email", 16, 400, 0.5).width;
     // mirrored: the label's END is at the end-side icon offset (the leading
     // icon moved to the end side): 48dp box + 4dp reduced padding
     try std.testing.expectEqual(@as(f32, 260 - (iconBox(theme_mod.light) + h_padding - iconPad(theme_mod.light)) - lw), lr.x);
@@ -1661,7 +1665,7 @@ test "golden: RTL paints the input text at the end side" {
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    const m = ui.paint.measureText("Hi", 16, false);
+    const m = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
     // the run is end-aligned: ink at the right side, none where LTR paints
     try std.testing.expect(f.countNotIn(.{ .x = 36, .y = 28, .w = m.width, .h = 24 }, 0xFFFFFFFF) == 0);
     try std.testing.expect(f.countNotIn(.{ .x = 280 - m.width, .y = 28, .w = m.width, .h = 24 }, 0xFFFFFFFF) > 0);
@@ -1704,7 +1708,7 @@ test "golden: outlined focused field — 2dp primary outline + the cutout patch"
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(150, 20));
     // the cutout: no primary stroke in the patch's padding zone (left of the
     // label glyphs — the patch erased it); the stroke resumes right of the label
-    const lw = ui.paint.measureText("Email", 12, false).width;
+    const lw = ui.paint.measureTextStyled("Email", 12, 400, 0.4).width;
     try std.testing.expectEqual(@as(u64, 0), f.countColorIn(.{ .x = 32.5, .y = 20, .w = 3, .h = 1 }, t.colors.primary));
     try std.testing.expectEqual(t.colors.primary, f.pixelAt(200, 20));
     // the minimized label ink (primary, focused) straddles the container's
@@ -1788,7 +1792,7 @@ test "golden: the caret paints at the end of the text when focused" {
     r.paint(b, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    const m = ui.paint.measureText("Hi", 16, false);
+    const m = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
     const caret_x = 20 + 16 + m.width; // text_x + the text width
     const tr = textRect(b);
     // the caret band (primary ink) right after the text...
@@ -2060,8 +2064,8 @@ test "golden: the caret paints at its position mid-text, not just the end" {
     // changed pixels in the mid-text band (a 1dp rect at a fractional x
     // anti-aliases across two columns, so pixel-exact color matching is
     // unreliable; the diff is the honest assertion).
-    const m_all = ui.paint.measureText("Hi", 16, false);
-    const m_h = ui.paint.measureText("H", 16, false);
+    const m_all = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
+    const m_h = ui.paint.measureTextStyled("H", 16, 400, 0.5);
     const tr = textRect(b);
     const mid_x = 20 + 16 + m_h.width; // the H|i boundary
     const y0: i32 = @intFromFloat(@ceil(tr.y));
@@ -2157,8 +2161,8 @@ test "golden: the selection paints a primary@0.4 highlight over the range" {
     defer f_plain.deinit();
     // The highlight is the ONLY difference: it tints the H band's
     // background (glyph pixels are opaque ink and don't change).
-    const m_h = ui.paint.measureText("H", 16, false);
-    const m_all = ui.paint.measureText("Hi", 16, false);
+    const m_h = ui.paint.measureTextStyled("H", 16, 400, 0.5);
+    const m_all = ui.paint.measureTextStyled("Hi", 16, 400, 0.5);
     const tr = textRect(b);
     const y0: i32 = @intFromFloat(@ceil(tr.y));
     const y1: i32 = @intFromFloat(@floor(tr.y + m_all.height));

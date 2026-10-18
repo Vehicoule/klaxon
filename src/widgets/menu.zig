@@ -130,9 +130,9 @@ fn dupeZ(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
 fn panelWidth(s: *MenuState, t: Theme) f32 {
     var w: f32 = 0;
     for (s.items.items) |def| {
-        var cw = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.label_large.size, false).width;
+        var cw = item_h_pad * 2 + ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width;
         if (def.leading_icon != null) cw += icon_size + icon_gap;
-        if (def.trailing_text.len > 0) cw += trail_gap + ui.paint.measureText(def.trailing_text, t.type_scale.label_small.size, false).width;
+        if (def.trailing_text.len > 0) cw += trail_gap + ui.paint.measureTextStyled(def.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
         w = @max(w, cw);
     }
     return @min(@max(w, item_min_w), item_max_w);
@@ -291,9 +291,9 @@ fn itemMeasure(n: *Node, c: Constraints) Size {
     const ms = stateOf(s.owner);
     const t = ms.opts.theme;
     const def = ms.items.items[s.def_index];
-    var w = item_h_pad * 2 + ui.paint.measureText(def.label, t.type_scale.label_large.size, false).width;
+    var w = item_h_pad * 2 + ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing).width;
     if (def.leading_icon != null) w += icon_size + icon_gap;
-    if (def.trailing_text.len > 0) w += trail_gap + ui.paint.measureText(def.trailing_text, t.type_scale.label_small.size, false).width;
+    if (def.trailing_text.len > 0) w += trail_gap + ui.paint.measureTextStyled(def.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
     return c.constrain(.{ .w = @min(@max(w, item_min_w), item_max_w), .h = item_h });
 }
 
@@ -338,10 +338,10 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
         s.ripples.paint(ctx, n, .rect);
     }
     // the label (vertically centered, upstream ProvideTextStyle labelLarge)
-    const lm = ui.paint.measureText(def.label, t.type_scale.label_large.size, false);
+    const lm = ui.paint.measureTextStyled(def.label, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing);
     const label_x = b.x + item_h_pad + (if (def.leading_icon != null) icon_size + icon_gap else 0);
     const label_y = b.y + (b.h - lm.height) / 2 + lm.ascent;
-    ui.paint.text(ctx, def.label, mx(b.x, b.w, label_x, lm.width, rtl), label_y, t.type_scale.label_large.size, false, label_col);
+    ui.paint.textStyled(ctx, def.label, mx(b.x, b.w, label_x, lm.width, rtl), label_y, t.type_scale.label_large.size, t.type_scale.label_large.weight, t.type_scale.label_large.letter_spacing, label_col);
     // the leading icon (start side, vertically centered)
     if (def.leading_icon) |iname| {
         const ix = mx(b.x, b.w, b.x + item_h_pad, icon_size, rtl);
@@ -349,10 +349,10 @@ fn itemPaint(n: *Node, ctx: *kx.Ctx) void {
     }
     // the trailing text (end side, vertically centered)
     if (def.trailing_text.len > 0) {
-        const tm = ui.paint.measureText(def.trailing_text, t.type_scale.label_small.size, false);
+        const tm = ui.paint.measureTextStyled(def.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing);
         const ty = b.y + (b.h - tm.height) / 2 + tm.ascent;
         const tx = mx(b.x, b.w, b.x + b.w - item_h_pad - tm.width, tm.width, rtl);
-        ui.paint.text(ctx, def.trailing_text, tx, ty, t.type_scale.label_small.size, false, trail_col);
+        ui.paint.textStyled(ctx, def.trailing_text, tx, ty, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing, trail_col);
     }
 }
 
@@ -760,11 +760,11 @@ test "menu: measures like the anchor; lays the panel out below it (start-aligned
     // the panel width = the widest item (icon + label + trailing text),
     // clamped to the upstream [112, 280] item band
     const t = theme_mod.light;
-    const ls = t.type_scale.label_large.size;
-    const ts = t.type_scale.label_small.size;
-    const w_copy = item_h_pad * 2 + ui.paint.measureText("Copy", ls, false).width;
-    const w_paste = item_h_pad * 2 + icon_size + icon_gap + ui.paint.measureText("Paste", ls, false).width;
-    const w_delete = item_h_pad * 2 + ui.paint.measureText("Delete", ls, false).width + trail_gap + ui.paint.measureText("Del", ts, false).width;
+    const ls = t.type_scale.label_large;
+    const ts = t.type_scale.label_small;
+    const w_copy = item_h_pad * 2 + ui.paint.measureTextStyled("Copy", ls.size, ls.weight, ls.letter_spacing).width;
+    const w_paste = item_h_pad * 2 + icon_size + icon_gap + ui.paint.measureTextStyled("Paste", ls.size, ls.weight, ls.letter_spacing).width;
+    const w_delete = item_h_pad * 2 + ui.paint.measureTextStyled("Delete", ls.size, ls.weight, ls.letter_spacing).width + trail_gap + ui.paint.measureTextStyled("Del", ts.size, ts.weight, ts.letter_spacing).width;
     const expect_w = @min(@max(@max(w_copy, @max(w_paste, w_delete)), item_min_w), item_max_w);
     try std.testing.expectApproxEqAbs(expect_w, item0.bounds.w, 0.001);
 }

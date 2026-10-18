@@ -193,7 +193,7 @@ fn railChildBounds(n: *Node, index: usize) Rect {
 /// HorizontalItemTokens.LabelTextFont).
 fn labelMetrics(s: *RailState, def: ItemDef) ui.paint.TextMetrics {
     const ls = if (s.opts.expanded) s.opts.theme.type_scale.label_large else s.opts.theme.type_scale.label_medium;
-    return ui.paint.measureText(def.label, ls.size, ls.weight >= 500);
+    return ui.paint.measureTextStyled(def.label, ls.size, ls.weight, ls.letter_spacing);
 }
 
 /// The collapsed labeled item's verticals (placeAnimatedLabelAndIcon at
@@ -413,7 +413,7 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
     const cs = t.colors;
     const rtl = ui.i18n.direction() == .rtl;
     const ls = if (s.opts.expanded) t.type_scale.label_large else t.type_scale.label_medium;
-    const bold = ls.weight >= 500;
+    const weight: i32 = @intCast(ls.weight);
     const group_focused = input.isFocused(n);
 
     // the container (Surface, CornerNone)
@@ -500,7 +500,7 @@ fn railPaint(n: *Node, ctx: *kx.Ctx) void {
         // the label: LabelMedium under the icon (collapsed) / LabelLarge
         // inside the pill (expanded); the rail-bounds clip covers overflow
         if (has_label) {
-            ui.paint.text(ctx, def.label, label_x, label_y + lm.ascent, ls.size, bold, label_c);
+            ui.paint.textStyled(ctx, def.label, label_x, label_y + lm.ascent, ls.size, weight, ls.letter_spacing, label_c);
         }
         // The indication — upstream's indicator ripple composable places
         // LAST in the item (over the icon+label): the animated state layer
@@ -812,7 +812,7 @@ test "navigation_rail: measures the collapsed 96dp width; expanded clamps to [22
     const e = try navigationRail(a, &items, null, null, .{ .expanded = true, .theme = t });
     defer e.deinit();
     const ls = t.type_scale.label_large;
-    const lw = ui.paint.measureText("Music", ls.size, true).width;
+    const lw = ui.paint.measureTextStyled("Music", ls.size, ls.weight, ls.letter_spacing).width;
     const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     const em = e.measure(.{ .max_w = 2000, .max_h = 2000 });
     try std.testing.expectApproxEqAbs(@max(expanded_min_w, pw + item_hpad * 2), em.w, 0.001);
@@ -927,7 +927,7 @@ test "golden: expanded — the selected item paints the pill (label_w + 64) at x
     }, null, null, .{ .expanded = true, .selected = 1, .theme = t });
     defer n.deinit();
     const ls = t.type_scale.label_large;
-    const lw = ui.paint.measureText("Music", ls.size, true).width;
+    const lw = ui.paint.measureTextStyled("Music", ls.size, ls.weight, ls.letter_spacing).width;
     const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     var r = try golden.Renderer.init(a, 300, 200);
     defer r.deinit();
@@ -1013,7 +1013,7 @@ test "navigation_rail: RTL mirrors the expanded row (the icon sits at the end si
     const n = try navigationRail(a, &.{.{ .label = "Home", .icon = .home }}, null, null, .{ .expanded = true, .selected = 0, .theme = t });
     defer n.deinit();
     const ls = t.type_scale.label_large;
-    const lw = ui.paint.measureText("Home", ls.size, true).width;
+    const lw = ui.paint.measureTextStyled("Home", ls.size, ls.weight, ls.letter_spacing).width;
     const pw = icon_size + icon_label_gap + lw + pill_lead * 2;
     var r = try golden.Renderer.init(a, 300, 200);
     defer r.deinit();

@@ -631,8 +631,8 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
     // highlight behind the glyphs and the blinked caret at its position.
     const hex_z = s.hex_edit.text();
     const ts = t.type_scale.body_large;
-    const bold = ts.weight >= 500;
-    const hm = ui.paint.measureText(hex_z, ts.size, bold);
+    const weight: i32 = @intCast(ts.weight);
+    const hm = ui.paint.measureTextStyled(hex_z, ts.size, weight, ts.letter_spacing);
     const text_x = hx_rect.x + 16;
     const text_y = hx_rect.y + (hx_rect.h - ts.line_height) / 2 + ts.line_height * 0.8;
     if (s.focus == .hex) {
@@ -644,17 +644,17 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
                 for (boxes[0..nb]) |bx|
                     ui.paint.fillRect(ctx, text_x + bx[0], text_y - hm.ascent, bx[2], hm.ascent + hm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
             } else {
-                const hx0 = text_x + ui.paint.measureTextLen(hex_z[0..sel.lo], ts.size, bold).width;
-                const hx1 = text_x + ui.paint.measureTextLen(hex_z[0..sel.hi], ts.size, bold).width;
+                const hx0 = text_x + ui.paint.measureTextLenStyled(hex_z[0..sel.lo], ts.size, weight, ts.letter_spacing).width;
+                const hx1 = text_x + ui.paint.measureTextLenStyled(hex_z[0..sel.hi], ts.size, weight, ts.letter_spacing).width;
                 ui.paint.fillRect(ctx, hx0, text_y - hm.ascent, hx1 - hx0, hm.ascent + hm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
             }
         }
         s.hex_edit.ensureTicker(); // the caret blink
     }
-    ui.paint.text(ctx, hex_z, text_x, text_y, ts.size, bold, t.colors.on_surface);
+    ui.paint.textStyled(ctx, hex_z, text_x, text_y, ts.size, weight, ts.letter_spacing, t.colors.on_surface);
     if (s.focus == .hex and s.hex_edit.caret_on) {
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
-        const caret_x = text_x + (s.hex_edit.caretX(s.hex_edit.caret, ts.size) orelse ui.paint.measureTextLen(hex_z[0..s.hex_edit.caret], ts.size, bold).width);
+        const caret_x = text_x + (s.hex_edit.caretX(s.hex_edit.caret, ts.size) orelse ui.paint.measureTextLenStyled(hex_z[0..s.hex_edit.caret], ts.size, weight, ts.letter_spacing).width);
         ui.paint.fillRect(ctx, caret_x, text_y - hm.ascent, 1, hm.ascent + hm.descent, t.colors.primary);
     }
 
@@ -668,12 +668,12 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
         const ind_c = if (focused) t.colors.primary else t.colors.on_surface_variant;
         const ind_h: f32 = if (focused) 2 else 1;
         ui.paint.fillRect(ctx, fr.x, fr.y + fr.h - ind_h, fr.w, ind_h, ind_c);
-        const lw = ui.paint.measureTextLen(chan_labels[i], ts.size, bold).width;
+        const lw = ui.paint.measureTextLenStyled(chan_labels[i], ts.size, weight, ts.letter_spacing).width;
         const ly = fr.y + (fr.h - ts.line_height) / 2 + ts.line_height * 0.8;
-        ui.paint.textSlice(ctx, chan_labels[i], fr.x + 10, ly, ts.size, bold, t.colors.on_surface_variant);
+        ui.paint.textSliceStyled(ctx, chan_labels[i], fr.x + 10, ly, ts.size, weight, ts.letter_spacing, t.colors.on_surface_variant);
         const digits = e.text();
         const dx = fr.x + 10 + lw + 4;
-        const dm = ui.paint.measureText(digits, ts.size, bold);
+        const dm = ui.paint.measureTextStyled(digits, ts.size, weight, ts.letter_spacing);
         if (focused) {
             const sel = e.selRange();
             if (sel.hi > sel.lo) {
@@ -683,17 +683,17 @@ fn cpPaint(n: *Node, ctx: *kx.Ctx) void {
                     for (boxes[0..nb]) |bx|
                         ui.paint.fillRect(ctx, dx + bx[0], ly - dm.ascent, bx[2], dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
                 } else {
-                    const sx0 = dx + ui.paint.measureTextLen(digits[0..sel.lo], ts.size, bold).width;
-                    const sx1 = dx + ui.paint.measureTextLen(digits[0..sel.hi], ts.size, bold).width;
+                    const sx0 = dx + ui.paint.measureTextLenStyled(digits[0..sel.lo], ts.size, weight, ts.letter_spacing).width;
+                    const sx1 = dx + ui.paint.measureTextLenStyled(digits[0..sel.hi], ts.size, weight, ts.letter_spacing).width;
                     ui.paint.fillRect(ctx, sx0, ly - dm.ascent, sx1 - sx0, dm.ascent + dm.descent, ui.paint.withAlphaScaled(t.colors.primary, 0.4));
                 }
             }
             e.ensureTicker();
         }
-        ui.paint.text(ctx, digits, dx, ly, ts.size, bold, t.colors.on_surface);
+        ui.paint.textStyled(ctx, digits, dx, ly, ts.size, weight, ts.letter_spacing, t.colors.on_surface);
         if (focused and e.caret_on) {
             // The caret's visual x — direction-aware under RTL (prefix-width fallback).
-            const caret_dx = dx + (e.caretX(e.caret, ts.size) orelse ui.paint.measureTextLen(digits[0..e.caret], ts.size, bold).width);
+            const caret_dx = dx + (e.caretX(e.caret, ts.size) orelse ui.paint.measureTextLenStyled(digits[0..e.caret], ts.size, weight, ts.letter_spacing).width);
             ui.paint.fillRect(ctx, caret_dx, ly - dm.ascent, 1, dm.ascent + dm.descent, t.colors.primary);
         }
     }
@@ -716,7 +716,7 @@ fn chanTextX(s: *CPState, i: usize) f32 {
     const t = s.opts.theme;
     const ts = t.type_scale.body_large;
     const chan_labels = [_][]const u8{ "R", "G", "B", "H", "S", "L" };
-    return s.chan_rects[i].x + 10 + ui.paint.measureTextLen(chan_labels[i], ts.size, ts.weight >= 500).width + 4;
+    return s.chan_rects[i].x + 10 + ui.paint.measureTextLenStyled(chan_labels[i], ts.size, ts.weight, ts.letter_spacing).width + 4;
 }
 
 /// Byte offset in RGB field `i`'s digits nearest to the press.
@@ -1138,6 +1138,15 @@ pub fn colorPicker(
         .hex_edit = text_edit.Edit.init(allocator, node),
     };
     for (&s.chan_edits) |*e| e.* = text_edit.Edit.init(allocator, node);
+    // The painted mono style (label_large) sets the hit metrics — caret /
+    // selection geometry must measure what the paint path draws.
+    const ts = opts.theme.type_scale.label_large;
+    s.hex_edit.hit_weight = @intCast(ts.weight);
+    s.hex_edit.hit_spacing = ts.letter_spacing;
+    for (&s.chan_edits) |*e| {
+        e.hit_weight = @intCast(ts.weight);
+        e.hit_spacing = ts.letter_spacing;
+    }
     resetHex(s, initial);
     resetChans(s, initial);
 

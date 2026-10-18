@@ -18,6 +18,13 @@ pub const TextOptions = struct {
     size: f32 = 16,
     color: Color = 0x000000FF, // opaque black (0xRRGGBBAA)
     bold: bool = false,
+    /// Full M3E weight 100..900 (0 = derive from `bold` → 400/700) — the
+    /// type_scale styles carry the real value (label_large is 500, not
+    /// bold).
+    weight: u16 = 0,
+    /// px of tracking added between glyphs (0 = font default) — the
+    /// type_scale styles carry the token letterSpacing.
+    letter_spacing: f32 = 0,
     text_align: TextAlign = .left, // named text_align — `align` is a Zig keyword
     /// Variable-font axes (ABI 0.17.0): OpenType design coordinates, e.g.
     /// `.{ .axis = ui.paint.axis_wght, .value = 500 }`. A 'wght' axis
@@ -30,6 +37,11 @@ pub const TextOptions = struct {
     /// actually move the glyphs.
     family: ?[]const u8 = null,
 };
+
+/// The resolved fontStyle weight — `weight` wins, else `bold` → 700/400.
+fn textWeight(opts: TextOptions) i32 {
+    return if (opts.weight != 0) @intCast(opts.weight) else if (opts.bold) 700 else 400;
+}
 
 /// Variable-font paint state shared by Text and BoundText: when `axes_n > 0`
 /// or a family override is set the node paints through a retained
@@ -68,7 +80,7 @@ const VarText = struct {
     }
 
     fn styleOf(self: *const VarText, opts: TextOptions) ui.paint.TextStyle {
-        var st = ui.paint.textStyle(opts.size, if (opts.bold) 700 else 400, 0, 0, opts.color);
+        var st = ui.paint.textStyle(opts.size, textWeight(opts), 0, opts.letter_spacing, opts.color);
         ui.paint.withVariations(&st, self.axes[0..self.axes_n]);
         if (self.family_n > 0)
             st.family = @ptrCast(self.family[0..self.family_n :0].ptr);
@@ -171,7 +183,7 @@ fn textPaint(n: *Node, ctx: *kx.Ctx) void {
     if (s.vt.layout) |l| {
         ui.paint.textLayoutPaint(ctx, l, x, n.bounds.y + s.m.ascent);
     } else {
-        ui.paint.text(ctx, s.text, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+        ui.paint.textStyled(ctx, s.text, x, n.bounds.y + s.m.ascent, s.opts.size, textWeight(s.opts), s.opts.letter_spacing, s.opts.color);
     }
 }
 fn textDeinit(n: *Node) void {
@@ -207,7 +219,7 @@ pub fn text(allocator: std.mem.Allocator, str: []const u8, opts: TextOptions) !*
     errdefer allocator.free(buf);
     @memcpy(buf[0..str.len], str);
     buf[str.len] = 0;
-    s.* = .{ .text = buf[0..str.len :0], .opts = opts, .m = ui.paint.measureText(buf[0..str.len :0], opts.size, opts.bold) };
+    s.* = .{ .text = buf[0..str.len :0], .opts = opts, .m = ui.paint.measureTextStyled(buf[0..str.len :0], opts.size, textWeight(opts), opts.letter_spacing) };
     // Seed the axes/family WITHOUT the dirty marks — setAxes dereferences
     // n.state for the damage paths and this node isn't attached yet.
     s.vt.seed(opts);
@@ -237,7 +249,7 @@ pub fn setText(n: *Node, str: []const u8) void {
         n.allocator.free(@constCast(s.text.ptr)[0 .. s.text.len + 1]);
         s.text = buf[0..str.len :0];
     }
-    s.m = ui.paint.measureText(s.text, s.opts.size, s.opts.bold);
+    s.m = ui.paint.measureTextStyled(s.text, s.opts.size, textWeight(s.opts), s.opts.letter_spacing);
     s.vt.layout_dirty = s.vt.needsLayout();
     if (n.semantics) |sem| {
         if (sem.role == .text) sem.label = s.text;
@@ -342,7 +354,7 @@ pub fn BoundText(comptime T: type) type {
             s.buf.items[s.buf.items.len - 1] = 0;
             s.buf.items.len -= 1;
             const str = s.buf.items.ptr[0..s.buf.items.len :0];
-            s.m = ui.paint.measureText(str, s.opts.size, s.opts.bold); // reformatted → re-measure once
+            s.m = ui.paint.measureTextStyled(str, s.opts.size, textWeight(s.opts), s.opts.letter_spacing); // reformatted → re-measure once
             s.vt.layout_dirty = true; // new string → retained paragraph rebuilds on next use
             if (n.semantics) |sem| sem.label = str; // re-point: a grow may have moved the buffer
             return str;
@@ -366,7 +378,7 @@ pub fn BoundText(comptime T: type) type {
             if (s.vt.layout) |l| {
                 ui.paint.textLayoutPaint(ctx, l, x, n.bounds.y + s.m.ascent);
             } else {
-                ui.paint.text(ctx, str, x, n.bounds.y + s.m.ascent, s.opts.size, s.opts.bold, s.opts.color);
+                ui.paint.textStyled(ctx, str, x, n.bounds.y + s.m.ascent, s.opts.size, textWeight(s.opts), s.opts.letter_spacing, s.opts.color);
             }
         }
         fn dirtyCb(userdata: ?*anyopaque) void {

@@ -162,10 +162,27 @@ pub fn text(ctx: *kx.Ctx, str: [:0]const u8, x: f32, baseline_y: f32, size: f32,
     kx.c.kx_draw_text_styled(ctx, str, x, baseline_y, size, bold, color);
 }
 
+/// Weight + tracking text (ABI 0.25.0) — `weight` is a fontStyle weight
+/// (100..900; resolves to the nearest static face, same snap Compose's
+/// FontWeight performs on the bundled fonts) and `letter_spacing` px of
+/// tracking. The type_scale styles carry all three.
+pub fn textStyled(ctx: *kx.Ctx, str: [:0]const u8, x: f32, baseline_y: f32, size: f32, weight: i32, letter_spacing: f32, color: Color) void {
+    kx.c.kx_draw_text_weight(ctx, str, x, baseline_y, size, weight, letter_spacing, color);
+}
+
 /// Length-taking text draw — sentinel-less slices (tr() results, substrings
 /// of a field) stack-copy into a zero-terminated buffer before the ABI call.
 /// Strings beyond 1 KiB truncate (labels are far below that; a sentinel
 /// slice keeps the full path via text()).
+/// Weight + tracking variant for sentinel-less slices (see textStyled).
+pub fn textSliceStyled(ctx: *kx.Ctx, str: []const u8, x: f32, baseline_y: f32, size: f32, weight: i32, letter_spacing: f32, color: Color) void {
+    var buf: [512]u8 = undefined;
+    const n = @min(str.len, buf.len - 1);
+    @memcpy(buf[0..n], str[0..n]);
+    buf[n] = 0;
+    kx.c.kx_draw_text_weight(ctx, buf[0..n :0], x, baseline_y, size, weight, letter_spacing, color);
+}
+
 pub fn textSlice(ctx: *kx.Ctx, str: []const u8, x: f32, baseline_y: f32, size: f32, bold: bool, color: Color) void {
     var buf: [1025]u8 = undefined;
     const n = @min(str.len, 1024);
@@ -197,10 +214,21 @@ pub fn measureText(str: [:0]const u8, size: f32, bold: bool) TextMetrics {
     return kx.c.kx_measure_text(str, size, bold);
 }
 
+/// Weight + tracking measure (ABI 0.25.0) — same cache, keyed on the
+/// resolved style.
+pub fn measureTextStyled(str: [:0]const u8, size: f32, weight: i32, letter_spacing: f32) TextMetrics {
+    return kx.c.kx_measure_text_weight(str, size, weight, letter_spacing);
+}
+
 /// Length-taking measure (ABI 0.22.0) — substring prefixes carry no
 /// sentinel; rides the same (text,size,bold) cache entry.
 pub fn measureTextLen(str: []const u8, size: f32, bold: bool) TextMetrics {
     return kx.c.kx_measure_text_len(str.ptr, str.len, size, bold);
+}
+
+/// Weight + tracking variant of measureTextLen.
+pub fn measureTextLenStyled(str: []const u8, size: f32, weight: i32, letter_spacing: f32) TextMetrics {
+    return kx.c.kx_measure_text_len_weight(str.ptr, str.len, size, weight, letter_spacing);
 }
 
 // --- Multi-style shaped text (ABI 0.15.0) ---

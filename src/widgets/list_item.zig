@@ -201,9 +201,9 @@ fn listItemMeasure(n: *Node, c: Constraints) Size {
     const s = stateOf(n);
     const t = s.opts.theme;
     var text_w: f32 = 0;
-    if (s.headline.len > 0) text_w = @max(text_w, ui.paint.measureText(s.headline, t.type_scale.body_large.size, false).width);
-    if (hasSupporting(s)) text_w = @max(text_w, ui.paint.measureText(s.supporting, t.type_scale.body_medium.size, false).width);
-    if (hasOverline(s)) text_w = @max(text_w, ui.paint.measureText(s.overline, t.type_scale.label_small.size, false).width);
+    if (s.headline.len > 0) text_w = @max(text_w, ui.paint.measureTextStyled(s.headline, t.type_scale.body_large.size, t.type_scale.body_large.weight, t.type_scale.body_large.letter_spacing).width);
+    if (hasSupporting(s)) text_w = @max(text_w, ui.paint.measureTextStyled(s.supporting, t.type_scale.body_medium.size, t.type_scale.body_medium.weight, t.type_scale.body_medium.letter_spacing).width);
+    if (hasOverline(s)) text_w = @max(text_w, ui.paint.measureTextStyled(s.overline, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width);
     var w = h_padding + text_w + h_padding;
     if (s.opts.leading_icon != null) w += icon_size + icon_gap;
     // the trailing zone: [icon?][8dp gap][text?] ending 16dp from the end
@@ -213,7 +213,7 @@ fn listItemMeasure(n: *Node, c: Constraints) Size {
         var zone_w: f32 = trailing_space;
         if (has_trail_icon) zone_w += icon_size;
         if (has_trail_icon and has_trail_text) zone_w += 8;
-        if (has_trail_text) zone_w += ui.paint.measureText(s.trailing_text, t.type_scale.label_small.size, false).width;
+        if (has_trail_text) zone_w += ui.paint.measureTextStyled(s.trailing_text, t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
         w += icon_gap + zone_w; // TrailingContentStartPadding + the zone
     }
     // upstream calculateHeight: max(minHeight, vpad*2 + max(leading, text, trailing))
@@ -272,20 +272,20 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
     const text_x = b.x + h_padding + (if (s.opts.leading_icon != null) icon_size + icon_gap else 0);
     if (hasOverline(s)) {
         const style = t.type_scale.label_small;
-        const m = ui.paint.measureText(s.overline, style.size, false);
-        ui.paint.text(ctx, s.overline, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, false, fc.overline);
+        const m = ui.paint.measureTextStyled(s.overline, style.size, style.weight, style.letter_spacing);
+        ui.paint.textStyled(ctx, s.overline, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, style.weight, style.letter_spacing, fc.overline);
         y += style.line_height;
     }
     {
         const style = t.type_scale.body_large;
-        const m = ui.paint.measureText(s.headline, style.size, false);
-        ui.paint.text(ctx, s.headline, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, false, fc.headline);
+        const m = ui.paint.measureTextStyled(s.headline, style.size, style.weight, style.letter_spacing);
+        ui.paint.textStyled(ctx, s.headline, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, style.weight, style.letter_spacing, fc.headline);
         y += style.line_height;
     }
     if (hasSupporting(s)) {
         const style = t.type_scale.body_medium;
-        const m = ui.paint.measureText(s.supporting, style.size, false);
-        ui.paint.text(ctx, s.supporting, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, false, fc.supporting);
+        const m = ui.paint.measureTextStyled(s.supporting, style.size, style.weight, style.letter_spacing);
+        ui.paint.textStyled(ctx, s.supporting, mx(b.x, b.w, text_x, m.width, rtl), y + m.ascent, style.size, style.weight, style.letter_spacing, fc.supporting);
     }
 
     // --- leading icon (start side, vertically centered) ---
@@ -304,10 +304,10 @@ fn listItemPaint(n: *Node, ctx: *kx.Ctx) void {
             var zone_end = b.x + b.w - trailing_space;
             if (has_trail_text) {
                 const style = t.type_scale.label_small;
-                const m = ui.paint.measureText(s.trailing_text, style.size, false);
+                const m = ui.paint.measureTextStyled(s.trailing_text, style.size, style.weight, style.letter_spacing);
                 const ty = if (three) b.y + verticalPadding(s) + m.ascent else b.y + (b.h - m.height) / 2 + m.ascent;
                 const tx = mx(b.x, b.w, zone_end - m.width, m.width, rtl);
-                ui.paint.text(ctx, s.trailing_text, tx, ty, style.size, false, fc.trailing_text);
+                ui.paint.textStyled(ctx, s.trailing_text, tx, ty, style.size, style.weight, style.letter_spacing, fc.trailing_text);
                 zone_end -= m.width;
                 if (has_trail_icon) zone_end -= 8;
             }
@@ -516,7 +516,7 @@ test "list_item: measures the per-lines min heights (56/72/88), content + paddin
     defer three.deinit();
     try std.testing.expectEqual(@as(f32, 88), three.measure(.{ .max_w = 2000, .max_h = 2000 }).h);
     // width: 16 + headline + 16 (no icons)
-    const hw = ui.paint.measureText("Title", 16, false).width;
+    const hw = ui.paint.measureTextStyled("Title", 16, t.type_scale.body_large.weight, t.type_scale.body_large.letter_spacing).width;
     try std.testing.expectApproxEqAbs(h_padding * 2 + hw, one.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
     // with a leading + trailing icon: + 24 + 16 per side
     const ic = try listItem(std.testing.allocator, null, null, .{ .headline = "Title", .leading_icon = .star, .trailing_icon = .close, .theme = t });
@@ -525,7 +525,7 @@ test "list_item: measures the per-lines min heights (56/72/88), content + paddin
     // both trailing options: the zone is [icon][8][text] + the 16 end space
     const both = try listItem(std.testing.allocator, null, null, .{ .headline = "Title", .trailing_icon = .close, .trailing_text = "Edit", .theme = t });
     defer both.deinit();
-    const tw = ui.paint.measureText("Edit", 11, false).width;
+    const tw = ui.paint.measureTextStyled("Edit", 11, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing).width;
     try std.testing.expectApproxEqAbs(h_padding * 2 + hw + icon_gap + icon_size + 8 + tw + trailing_space, both.measure(.{ .max_w = 2000, .max_h = 2000 }).w, 0.001);
 }
 
@@ -555,7 +555,7 @@ test "list_item: the item type derives from the content; three-line top-aligns a
     defer f.deinit();
     // the overline's first line is at the top padding — a centered layout
     // would start ~14px lower (88-60)/2
-    const m = ui.paint.measureText("Over", t.type_scale.label_small.size, false);
+    const m = ui.paint.measureTextStyled("Over", t.type_scale.label_small.size, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing);
     const ink_y: i32 = @intFromFloat(12 + m.ascent - 1); // near the overline's ink top
     var found = false;
     var x: i32 = 16;
@@ -650,7 +650,7 @@ test "golden: trailing icon + text lay out sequentially (no overlap)" {
     r.paint(li, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    const tw = ui.paint.measureText("Edit", 11, false);
+    const tw = ui.paint.measureTextStyled("Edit", 11, t.type_scale.label_small.weight, t.type_scale.label_small.letter_spacing);
     // the text ends 16dp from the end; the icon sits 8dp before the text
     const text_end = 20 + 280 - 16;
     const icon_end = text_end - tw.width - 8;
@@ -675,7 +675,7 @@ test "golden: RTL list item paints the headline at the end side" {
     r.paint(li, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    const m = ui.paint.measureText("Title", 16, false);
+    const m = ui.paint.measureTextStyled("Title", 16, t.type_scale.body_large.weight, t.type_scale.body_large.letter_spacing);
     // the headline run is end-aligned (past the mirrored leading icon)
     const run_end = 20 + 280 - 16 - (icon_size + icon_gap);
     try std.testing.expect(f.countColorIn(.{ .x = run_end - m.width, .y = 24, .w = m.width, .h = 24 }, t.colors.on_surface) > 0);

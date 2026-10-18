@@ -930,7 +930,7 @@ pub const Edit = struct {
                     e.empty_para = e.buildLinePara(" ", size);
                     ok = ok and e.empty_para != null;
                 }
-                lp.h = if (e.empty_para) |p| ui.paint.textLayoutHeight(p) else ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+                lp.h = if (e.empty_para) |p| ui.paint.textLayoutHeight(p) else ui.paint.measureTextStyled(" ", size, e.hit_weight, e.hit_spacing).height;
                 lp.base = if (e.empty_para) |p| ui.paint.textLayoutBaseline(p) else 0;
                 lp.w = 0;
             } else if (lp.segs.items.len > 0) {
@@ -948,7 +948,7 @@ pub const Edit = struct {
                     e.maybeSegment(lp, str, size);
                 } else {
                     ok = false;
-                    lp.h = ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+                    lp.h = ui.paint.measureTextStyled(" ", size, e.hit_weight, e.hit_spacing).height;
                     lp.w = 0;
                     lp.base = 0;
                 }
@@ -972,7 +972,7 @@ pub const Edit = struct {
     fn paraRowH(e: *const Edit, p: *ui.paint.TextLayout, size: f32) f32 {
         var r: [4]f32 = undefined;
         if (ui.paint.textLayoutCaretRect(p, 0, &r) and r[3] > 0) return r[3];
-        return ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+        return ui.paint.measureTextStyled(" ", size, e.hit_weight, e.hit_spacing).height;
     }
 
     /// Visual row count of a laid-out paragraph.
@@ -1130,7 +1130,7 @@ pub const Edit = struct {
                 lp.base = ui.paint.textLayoutBaseline(p);
                 return true;
             }
-            lp.h = ui.paint.measureText(" ", size, e.hit_weight >= 600).height;
+            lp.h = ui.paint.measureTextStyled(" ", size, e.hit_weight, e.hit_spacing).height;
             lp.w = 0;
             lp.base = 0;
             return false;
@@ -1451,7 +1451,7 @@ pub const Edit = struct {
             const str = e.text();
             const off = @min(byte_off, str.len);
             if (e.measure_prefix) |mp| return mp(e, off, size);
-            return ui.paint.measureTextLen(str[0..off], size, e.hit_weight >= 600).width;
+            return ui.paint.measureTextLenStyled(str[0..off], size, e.hit_weight, e.hit_spacing).width;
         }
         return (e.caretRect(byte_off, size) orelse return null)[0];
     }

@@ -209,7 +209,7 @@ fn columnHeight(count: usize) f32 {
 /// titleMedium.
 fn itemWidth(t: Theme, def: ItemDef) f32 {
     const ts = t.type_scale.title_medium;
-    const lm = ui.paint.measureText(def.label, ts.size, ts.weight >= 500);
+    const lm = ui.paint.measureTextStyled(def.label, ts.size, ts.weight, ts.letter_spacing);
     return @max(item_min_w, item_h_pad * 2 + item_icon_size + item_label_gap + lm.width);
 }
 
@@ -457,7 +457,6 @@ fn fabMenuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     const cs = t.colors;
     const b = n.bounds;
     const ts = t.type_scale.title_medium;
-    const bold = ts.weight >= 500;
     const focused = input.isFocused(n);
     for (s.items.items, 0..) |*def, i| {
         const idx: i32 = @intCast(i);
@@ -485,12 +484,12 @@ fn fabMenuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
         }
         // the pill content: [icon 24, gap 8, label] centered (upstream
         // Arrangement.spacedBy(ListItemIconLabelSpace, CenterHorizontally))
-        const lm = ui.paint.measureText(def.label, ts.size, bold);
+        const lm = ui.paint.measureTextStyled(def.label, ts.size, ts.weight, ts.letter_spacing);
         const content_w = item_icon_size + item_label_gap + lm.width;
         const cx = pr.x + (pr.w - content_w) / 2;
         paintIcon(ctx, def.icon, cx, pr.y + (pr.h - item_icon_size) / 2, item_icon_size, content);
         const baseline = pr.y + (pr.h - lm.height) / 2 + lm.ascent;
-        ui.paint.text(ctx, def.label, cx + item_icon_size + item_label_gap, baseline, ts.size, bold, content);
+        ui.paint.textStyled(ctx, def.label, cx + item_icon_size + item_label_gap, baseline, ts.size, ts.weight, ts.letter_spacing, content);
     }
 }
 
@@ -839,7 +838,7 @@ test "fab_menu: measures the baseline FAB square (56x56); items are overlay chro
     try std.testing.expectEqual(fr.y - fab_gap, pr1.y + item_height); // last pill 8dp above the FAB
     // the pill: max(56, 24 + icon24 + gap8 + title_medium label + 24)
     const ts = t.type_scale.title_medium;
-    const lm = ui.paint.measureText("Star", ts.size, ts.weight >= 500);
+    const lm = ui.paint.measureTextStyled("Star", ts.size, ts.weight, ts.letter_spacing);
     try std.testing.expectApproxEqAbs(@max(item_min_w, item_h_pad * 2 + item_icon_size + item_label_gap + lm.width), pr0.w, 0.001);
     try std.testing.expectEqual(item_height, pr0.h);
 }

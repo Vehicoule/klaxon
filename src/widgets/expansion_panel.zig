@@ -106,7 +106,7 @@ fn epMeasure(n: *Node, c: Constraints) Size {
     // Header width: title + chevron + paddings.
     const t = s.opts.theme;
     const ts = t.type_scale.title_medium;
-    const title_w = ui.paint.measureText(s.title, ts.size, ts.weight >= 500).width;
+    const title_w = ui.paint.measureTextStyled(s.title, ts.size, ts.weight, ts.letter_spacing).width;
     const header_w = header_pad + title_w + 8 + chevron_size + header_pad;
     var w = @max(header_w, c.min_w);
     w = @min(w, c.max_w);
@@ -171,7 +171,7 @@ fn epPaint(n: *Node, ctx: *kx.Ctx) void {
     const ts = t.type_scale.title_medium;
     const title_x = b.x + header_pad;
     const title_y = b.y + (headerH(t) - ts.line_height) / 2 + ts.line_height * 0.8;
-    ui.paint.text(ctx, s.title, title_x, title_y, ts.size, ts.weight >= 500, t.colors.on_surface);
+    ui.paint.textStyled(ctx, s.title, title_x, title_y, ts.size, ts.weight, ts.letter_spacing, t.colors.on_surface);
 
     // Chevron (▼ when collapsed, ▲ when expanded — v1: static glyph swap).
     const expanded = isExpanded(s);
@@ -406,7 +406,7 @@ test "expansion_panel: a long title measures + labels whole (no truncation)" {
     defer n.deinit();
     try std.testing.expectEqualStrings(long_title, n.semantics.?.label);
     const ts = theme_mod.light.type_scale.title_medium;
-    const title_w = ui.paint.measureText(long_title, ts.size, ts.weight >= 500).width;
+    const title_w = ui.paint.measureTextStyled(long_title, ts.size, ts.weight, ts.letter_spacing).width;
     const m = n.measure(.{ .max_w = 4000, .max_h = 200 });
     // the full title (not a truncated prefix) drives the measured width
     try std.testing.expectApproxEqAbs(header_pad + title_w + 8 + chevron_size + header_pad, m.w, 0.001);

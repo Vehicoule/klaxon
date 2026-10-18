@@ -392,14 +392,14 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     s.edit.ensureTicker(); // the caret blink (a focused view stays awake)
     if (hasText(s) or s.edit.comp.items.len > 0) {
         const str = s.text();
-        const m = ui.paint.measureText(str, style.size, false);
-        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLen(str[0..s.edit.caret], style.size, false).width;
+        const m = ui.paint.measureTextStyled(str, style.size, style.weight, style.letter_spacing);
+        var caret_rel = s.edit.caretX(s.edit.caret, style.size) orelse ui.paint.measureTextLenStyled(str[0..s.edit.caret], style.size, style.weight, style.letter_spacing).width;
         var comp_m = ui.paint.TextMetrics{};
         if (s.edit.comp.items.len > 0) {
             const comp = s.composition();
-            comp_m = ui.paint.measureText(comp, style.size, false);
+            comp_m = ui.paint.measureTextStyled(comp, style.size, style.weight, style.letter_spacing);
             const at: usize = @intCast(@min(@max(s.edit.comp_cursor, 0), @as(i32, @intCast(comp.len))));
-            caret_rel = m.width + ui.paint.measureTextLen(comp[0..at], style.size, false).width;
+            caret_rel = m.width + ui.paint.measureTextLenStyled(comp[0..at], style.size, style.weight, style.letter_spacing).width;
         }
         s.edit.updateScroll(caret_rel, caret_w, m.width + comp_m.width, clip_w);
         const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl) - s.edit.scroll_x;
@@ -413,19 +413,19 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
                 for (boxes[0..nb]) |hb|
                     ui.paint.fillRect(ctx, tx + hb[0], ty, hb[2], m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
             } else {
-                const hx0 = tx + ui.paint.measureTextLen(str[0..sel.lo], style.size, false).width;
-                const hx1 = tx + ui.paint.measureTextLen(str[0..sel.hi], style.size, false).width;
+                const hx0 = tx + ui.paint.measureTextLenStyled(str[0..sel.lo], style.size, style.weight, style.letter_spacing).width;
+                const hx1 = tx + ui.paint.measureTextLenStyled(str[0..sel.hi], style.size, style.weight, style.letter_spacing).width;
                 ui.paint.fillRect(ctx, hx0, ty, hx1 - hx0, m.height, ui.paint.withAlphaScaled(header_primary, 0.4));
             }
         }
-        ui.paint.text(ctx, str, tx, ty + m.ascent, style.size, false, header_ink);
+        ui.paint.textStyled(ctx, str, tx, ty + m.ascent, style.size, style.weight, style.letter_spacing, header_ink);
         // The caret's visual x — direction-aware under RTL (prefix-width fallback).
         const caret_x = tx + caret_rel;
         if (s.edit.comp.items.len > 0) {
             // Preedit after the committed text, underlined (IME convention);
             // SDL's comp_start puts the caret INSIDE the composition.
             const comp = s.composition();
-            ui.paint.text(ctx, comp, tx + m.width, ty + m.ascent, style.size, false, header_ink);
+            ui.paint.textStyled(ctx, comp, tx + m.width, ty + m.ascent, style.size, style.weight, style.letter_spacing, header_ink);
             ui.paint.fillRect(ctx, tx + m.width, ty + m.ascent + 1, comp_m.width, 1, header_ink);
         }
         if (focused and s.edit.caret_on) {
@@ -434,9 +434,9 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
     } else {
         s.edit.scroll_x = 0;
         if (s.placeholder.len > 0) {
-            const m = ui.paint.measureText(s.placeholder, style.size, false);
+            const m = ui.paint.measureTextStyled(s.placeholder, style.size, style.weight, style.letter_spacing);
             const tx = mirrorX(b.x, b.w, b.x + textStart(t), m.width, rtl);
-            ui.paint.text(ctx, s.placeholder, tx, ty + m.ascent, style.size, false, header_muted);
+            ui.paint.textStyled(ctx, s.placeholder, tx, ty + m.ascent, style.size, style.weight, style.letter_spacing, header_muted);
         }
         if (focused and s.edit.caret_on) {
             // the caret at the (mirrored) start (empty text)
@@ -494,9 +494,9 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
         const max_tw = @max(0, r.w - (label_x - r.x) - trail_w);
         const lclip_x = mirrorX(b.x, b.w, label_x, max_tw, rtl);
         ui.paint.clipRect(ctx, lclip_x, r.y, max_tw, r.h);
-        const lm = ui.paint.measureText(it.label, style.size, false);
+        const lm = ui.paint.measureTextStyled(it.label, style.size, style.weight, style.letter_spacing);
         const ltx = mirrorX(b.x, b.w, label_x, lm.width, rtl);
-        ui.paint.text(ctx, it.label, ltx, r.y + (row_h - style.line_height) / 2 + lm.ascent, style.size, false, content);
+        ui.paint.textStyled(ctx, it.label, ltx, r.y + (row_h - style.line_height) / 2 + lm.ascent, style.size, style.weight, style.letter_spacing, content);
         ui.paint.clipReset(ctx);
     }
     ui.paint.clipReset(ctx);
@@ -509,7 +509,7 @@ fn searchViewPaint(n: *Node, ctx: *kx.Ctx) void {
 fn caretAt(n: *Node, s: *SearchViewState, x: f32, y: f32) usize {
     const str = s.text();
     const style = s.opts.theme.type_scale.body_large;
-    const m = ui.paint.measureText(str, style.size, false);
+    const m = ui.paint.measureTextStyled(str, style.size, style.weight, style.letter_spacing);
     const b = n.bounds;
     const tx = mirrorX(b.x, b.w, b.x + textStart(s.opts.theme), m.width, ui.i18n.direction() == .rtl) - s.edit.scroll_x;
     const ty = b.y + (header_h - style.line_height) / 2;
@@ -1033,8 +1033,11 @@ pub fn searchView(
     errdefer allocator.free(label_z);
     const s = try allocator.create(SearchViewState);
     errdefer allocator.destroy(s);
+    var edit = text_edit.Edit.init(allocator, node);
+    edit.hit_weight = @intCast(opts.theme.type_scale.body_large.weight);
+    edit.hit_spacing = opts.theme.type_scale.body_large.letter_spacing;
     s.* = .{
-        .edit = text_edit.Edit.init(allocator, node),
+        .edit = edit,
         .placeholder = placeholder,
         .label_z = label_z,
         .items = std.array_list.Managed(ItemDef).init(allocator),

@@ -117,7 +117,7 @@ pub fn badge(allocator: std.mem.Allocator, opts: BadgeOptions) !*Node {
         const ls = t.type_scale.label_small; // BadgeTokens.LargeLabelTextFont
         node.add(try text_w.text(allocator, label, .{
             .size = ls.size,
-            .bold = ls.weight >= 500,
+            .weight = ls.weight, .letter_spacing = ls.letter_spacing,
             .color = t.colors.on_error, // BadgeTokens.LargeLabelTextColor
         }));
         ui.semantics.attach(node, .{ .role = .text, .label = label }); // Phase 2c
@@ -209,7 +209,7 @@ test "badge: small dot measures 6x6; large pill fits the label + padding" {
     try std.testing.expect(mb.h >= large_min);
     // upstream has no width cap: w = label width + 2x4 padding
     const ls = theme_mod.light.type_scale.label_small;
-    const lw = ui.paint.measureText("99+", ls.size, ls.weight >= 500).width;
+    const lw = ui.paint.measureTextStyled("99+", ls.size, ls.weight, ls.letter_spacing).width;
     try std.testing.expectApproxEqAbs(@max(large_min, lw + large_h_padding * 2), mb.w, 0.001);
 }
 

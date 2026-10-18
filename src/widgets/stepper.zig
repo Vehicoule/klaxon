@@ -85,7 +85,7 @@ fn stMeasure(n: *Node, c: Constraints) Size {
     const ls = t.type_scale.body_small;
     var total_w: f32 = 0;
     for (s.steps.items) |step| {
-        const label_w = ui.paint.measureText(step.label, ls.size, false).width;
+        const label_w = ui.paint.measureTextStyled(step.label, ls.size, ls.weight, ls.letter_spacing).width;
         total_w += @max(min_step_w, label_w + 16);
     }
     if (s.steps.items.len > 1) {
@@ -103,7 +103,7 @@ fn stMeasure(n: *Node, c: Constraints) Size {
 fn stepColumnWidth(s: *StepperState, index: usize) f32 {
     const t = s.opts.theme;
     const ls = t.type_scale.body_small;
-    const label_w = ui.paint.measureText(s.steps.items[index].label, ls.size, false).width;
+    const label_w = ui.paint.measureTextStyled(s.steps.items[index].label, ls.size, ls.weight, ls.letter_spacing).width;
     return @max(min_step_w, label_w + 16);
 }
 
@@ -152,18 +152,18 @@ fn stPaint(n: *Node, ctx: *kx.Ctx) void {
             },
         };
         const font_size = circle_d * 0.5;
-        const metrics = ui.paint.measureText(content, font_size, state == .active);
+        const metrics = ui.paint.measureTextStyled(content, font_size, if (state == .active) 700 else 400, 0);
         const tx = circle_cx - metrics.width / 2;
         const ty = b.y + (circle_d - metrics.height) / 2 + metrics.height * 0.8;
-        ui.paint.text(ctx, content, tx, ty, font_size, state == .active, content_color);
+        ui.paint.textStyled(ctx, content, tx, ty, font_size, if (state == .active) 700 else 400, 0, content_color);
 
         // Label.
         const label = s.steps.items[i].label;
-        const label_metrics = ui.paint.measureText(label, ls.size, false);
+        const label_metrics = ui.paint.measureTextStyled(label, ls.size, ls.weight, ls.letter_spacing);
         const label_x = circle_cx - label_metrics.width / 2;
         const label_y = b.y + circle_d + circle_gap + ls.line_height * 0.8;
         const label_color = if (state == .upcoming) t.colors.on_surface_variant else t.colors.on_surface;
-        ui.paint.text(ctx, label, label_x, label_y, ls.size, false, label_color);
+        ui.paint.textStyled(ctx, label, label_x, label_y, ls.size, ls.weight, ls.letter_spacing, label_color);
 
         // Connector to the next step.
         if (i + 1 < s.steps.items.len) {

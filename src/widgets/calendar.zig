@@ -103,7 +103,7 @@ fn calPaint(n: *Node, ctx: *kx.Ctx) void {
     const ts = t.type_scale.title_medium;
     const title_x = b.x + h_pad + 16;
     const title_y = b.y + (header_h - ts.line_height) / 2 + ts.line_height * 0.8;
-    ui.paint.text(ctx, month_str, title_x, title_y, ts.size, true, t.colors.on_surface);
+    ui.paint.textStyled(ctx, month_str, title_x, title_y, ts.size, ts.weight, ts.letter_spacing, t.colors.on_surface);
 
     // Chevrons — vector triangles, not text glyphs: font fallback resolves
     // U+25C0/U+25B6 through the color-emoji font (a blue emoji button with
@@ -125,8 +125,8 @@ fn calPaint(n: *Node, ctx: *kx.Ctx) void {
     for (0..7) |col| {
         const letter = date_picker_w.weekdayLetter(col);
         const cx = b.x + h_pad + @as(f32, @floatFromInt(col)) * (cell_w + cell_gap) + cell_w / 2;
-        const m = ui.paint.measureText(letter, ls.size, false);
-        ui.paint.text(ctx, letter, cx - m.width / 2, wd_y + (weekday_h - ls.line_height) / 2 + ls.line_height * 0.8, ls.size, false, t.colors.on_surface_variant);
+        const m = ui.paint.measureTextStyled(letter, ls.size, ls.weight, ls.letter_spacing);
+        ui.paint.textStyled(ctx, letter, cx - m.width / 2, wd_y + (weekday_h - ls.line_height) / 2 + ls.line_height * 0.8, ls.size, ls.weight, ls.letter_spacing, t.colors.on_surface_variant);
     }
 
     // Day grid.
@@ -167,8 +167,8 @@ fn calPaint(n: *Node, ctx: *kx.Ctx) void {
                     t.colors.primary
                 else
                     t.colors.on_surface;
-                const dm = ui.paint.measureText(day_str, ls.size, is_sel);
-                ui.paint.text(ctx, day_str, cx + (cell_w - dm.width) / 2, cy + (cell - dm.height) / 2 + dm.height * 0.8, ls.size, is_sel, day_color);
+                const dm = ui.paint.measureTextStyled(day_str, ls.size, if (is_sel) 700 else ls.weight, ls.letter_spacing);
+                ui.paint.textStyled(ctx, day_str, cx + (cell_w - dm.width) / 2, cy + (cell - dm.height) / 2 + dm.height * 0.8, ls.size, if (is_sel) 700 else ls.weight, ls.letter_spacing, day_color);
 
                 day += 1;
             }

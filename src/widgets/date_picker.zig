@@ -476,7 +476,7 @@ fn yearMenuRect(n: *Node) Rect {
     const ls = s.opts.theme.type_scale.label_large;
     var my_buf: [32]u8 = undefined;
     const my = formatMonthYear(s.disp.peek(), &my_buf);
-    const my_m = ui.paint.measureText(my, ls.size, ls.weight >= 500);
+    const my_m = ui.paint.measureTextStyled(my, ls.size, ls.weight, ls.letter_spacing);
     const w = 4 + my_m.width + year_menu_gap + year_menu_icon + year_menu_pad;
     return .{
         .x = mx(b, b.x + h_pad - 4, w),
@@ -515,9 +515,9 @@ const FooterRects = struct { cancel: Rect, ok: Rect };
 fn footerRects(n: *Node) FooterRects {
     const s = stateOf(n);
     const ls = s.opts.theme.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    const ok_m = ui.paint.measureTextLen(i18n_mod.tr("OK"), ls.size, bold);
-    const cancel_m = ui.paint.measureTextLen(i18n_mod.tr("Cancel"), ls.size, bold);
+    
+    const ok_m = ui.paint.measureTextLenStyled(i18n_mod.tr("OK"), ls.size, ls.weight, ls.letter_spacing);
+    const cancel_m = ui.paint.measureTextLenStyled(i18n_mod.tr("Cancel"), ls.size, ls.weight, ls.letter_spacing);
     const ok_w = ok_m.width + 2 * footer_pad_x;
     const cancel_w = cancel_m.width + 2 * footer_pad_x;
     const right = n.bounds.x + n.bounds.w - footer_pad_bottom;
@@ -632,9 +632,9 @@ fn paintTextButton(n: *Node, ctx: *kx.Ctx, r: Rect, label: []const u8, zone: Zon
         ui.paint.fillRRect(ctx, r.x, r.y, r.w, r.h, r.h / 2, theme_mod.stateLayer(0, t.colors.primary, alpha));
     }
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    const m = ui.paint.measureTextLen(label, ls.size, bold);
-    ui.paint.textSlice(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, bold, t.colors.primary);
+    
+    const m = ui.paint.measureTextLenStyled(label, ls.size, ls.weight, ls.letter_spacing);
+    ui.paint.textSliceStyled(ctx, label, r.x + (r.w - m.width) / 2, r.y + (r.h - m.height) / 2 + m.ascent, ls.size, ls.weight, ls.letter_spacing, t.colors.primary);
 }
 
 fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
@@ -646,30 +646,30 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
     ui.paint.fillRRect(ctx, b.x, b.y, b.w, b.h, container_corner, cs.surface_container_high);
     // the header: title (top), headline (bottom), divider
     const ls = t.type_scale.label_large;
-    const bold = ls.weight >= 500;
-    const title_m = ui.paint.measureText(s.title_z, ls.size, bold);
-    ui.paint.text(ctx, s.title_z, mx(b, b.x + 24, title_m.width), b.y + title_pad_top + (ls.line_height - title_m.height) / 2 + title_m.ascent, ls.size, bold, cs.on_surface_variant);
+    
+    const title_m = ui.paint.measureTextStyled(s.title_z, ls.size, ls.weight, ls.letter_spacing);
+    ui.paint.textStyled(ctx, s.title_z, mx(b, b.x + 24, title_m.width), b.y + title_pad_top + (ls.line_height - title_m.height) / 2 + title_m.ascent, ls.size, ls.weight, ls.letter_spacing, cs.on_surface_variant);
     const hl = t.type_scale.headline_large;
-    const hl_bold = hl.weight >= 500;
+    const hl_weight: i32 = @intCast(hl.weight);
     var hl_buf: [32]u8 = undefined;
     const headline: [:0]const u8 = if (s.sel.peek()) |d| formatDay(d, &hl_buf) else s.title_z;
-    const hl_m = ui.paint.measureText(headline, hl.size, hl_bold);
+    const hl_m = ui.paint.measureTextStyled(headline, hl.size, hl.weight, hl.letter_spacing);
     const hl_box_y = b.y + header_h - headline_pad_bottom - hl.line_height;
-    ui.paint.text(ctx, headline, mx(b, b.x + 24, hl_m.width), hl_box_y + (hl.line_height - hl_m.height) / 2 + hl_m.ascent, hl.size, hl_bold, cs.on_surface_variant);
+    ui.paint.textStyled(ctx, headline, mx(b, b.x + 24, hl_m.width), hl_box_y + (hl.line_height - hl_m.height) / 2 + hl_m.ascent, hl.size, hl_weight, hl.letter_spacing, cs.on_surface_variant);
     ui.paint.fillRect(ctx, b.x, b.y + header_h - 1, b.w, 1, cs.outline_variant);
     // the month/year nav row: the menu button (TextButton + ArrowDropDown,
     // rotated 180° while the year picker is open) + the chevrons (hidden
     // while open — MonthsNavigation collapses to Arrangement.Start)
     var my_buf: [32]u8 = undefined;
     const my = formatMonthYear(s.disp.peek(), &my_buf);
-    const my_m = ui.paint.measureText(my, ls.size, bold);
+    const my_m = ui.paint.measureTextStyled(my, ls.size, ls.weight, ls.letter_spacing);
     const nav_cy = b.y + header_h + nav_h / 2;
     const yr = yearMenuRect(n);
     if (std.meta.eql(s.hover, .year_menu) or std.meta.eql(s.pressed, .year_menu)) {
         const alpha = if (std.meta.eql(s.pressed, .year_menu)) t.state.pressed else t.state.hover;
         ui.paint.fillRRect(ctx, yr.x, yr.y, yr.w, yr.h, yr.h / 2, theme_mod.stateLayer(0, cs.on_surface_variant, alpha));
     }
-    ui.paint.text(ctx, my, mx(b, b.x + h_pad, my_m.width), nav_cy - my_m.height / 2 + my_m.ascent, ls.size, bold, cs.on_surface_variant);
+    ui.paint.textStyled(ctx, my, mx(b, b.x + h_pad, my_m.width), nav_cy - my_m.height / 2 + my_m.ascent, ls.size, ls.weight, ls.letter_spacing, cs.on_surface_variant);
     paintIcon(ctx, if (s.year_open) .triangle_up else .triangle_down, mx(b, b.x + h_pad + my_m.width + year_menu_gap, year_menu_icon), nav_cy - year_menu_icon / 2, year_menu_icon, cs.on_surface_variant);
     if (!s.year_open) {
         const chev = chevronRects(b);
@@ -677,9 +677,9 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
         paintChevron(n, ctx, chev.next, .chevron_right, .next, canNext(n));
     }
     const bl = t.type_scale.body_large;
-    const bl_bold = bl.weight >= 500;
+    const bl_weight: i32 = @intCast(bl.weight);
     if (s.year_open) {
-        paintYearGrid(n, ctx, b, bl.size, bl_bold);
+        paintYearGrid(n, ctx, b, bl);
         paintFooter(n, ctx);
         return;
     }
@@ -690,8 +690,8 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
     for (0..7) |col| {
         const cx = g.x + g.gap + @as(f32, @floatFromInt(col)) * (cell + g.gap) + cell / 2;
         const wl = weekdayLetter(if (rtl()) 6 - col else col);
-        const lm = ui.paint.measureText(wl, bl.size, bl_bold);
-        ui.paint.text(ctx, wl, cx - lm.width / 2, weekday_y + (weekdayRowH(t) - lm.height) / 2 + lm.ascent, bl.size, bl_bold, cs.on_surface);
+        const lm = ui.paint.measureTextStyled(wl, bl.size, bl.weight, bl.letter_spacing);
+        ui.paint.textStyled(ctx, wl, cx - lm.width / 2, weekday_y + (weekdayRowH(t) - lm.height) / 2 + lm.ascent, bl.size, bl_weight, bl.letter_spacing, cs.on_surface);
     }
     // the day grid
     const sel = s.sel.peek();
@@ -713,9 +713,9 @@ fn dpPaint(n: *Node, ctx: *kx.Ctx) void {
         }
         var dbuf: [4]u8 = undefined;
         const dstr = std.fmt.bufPrintSentinel(&dbuf, "{d}", .{civilFromDays(day).d}, 0) catch return;
-        const dm = ui.paint.measureText(dstr, bl.size, bl_bold);
+        const dm = ui.paint.measureTextStyled(dstr, bl.size, bl.weight, bl.letter_spacing);
         const fg: Color = if (is_sel) cs.on_primary else if (is_today) cs.primary else cs.on_surface;
-        ui.paint.text(ctx, dstr, cr.x + (cell - dm.width) / 2, cr.y + (cell - dm.height) / 2 + dm.ascent, bl.size, bl_bold, fg);
+        ui.paint.textStyled(ctx, dstr, cr.x + (cell - dm.width) / 2, cr.y + (cell - dm.height) / 2 + dm.ascent, bl.size, bl_weight, bl.letter_spacing, fg);
     }
     // the footer
     paintFooter(n, ctx);
@@ -732,7 +732,7 @@ fn paintFooter(n: *Node, ctx: *kx.Ctx) void {
 /// Selected year = the displayed month's year (Primary + OnPrimary);
 /// the current year carries the 1dp Primary outline + Primary label;
 /// the rest are OnSurfaceVariant BodyLarge.
-fn paintYearGrid(n: *Node, ctx: *kx.Ctx, b: Rect, size: f32, bold: bool) void {
+fn paintYearGrid(n: *Node, ctx: *kx.Ctx, b: Rect, ys: anytype) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     const cs = t.colors;
@@ -763,9 +763,9 @@ fn paintYearGrid(n: *Node, ctx: *kx.Ctx, b: Rect, size: f32, bold: bool) void {
         }
         var ybuf: [8]u8 = undefined;
         const ystr = std.fmt.bufPrintSentinel(&ybuf, "{d}", .{y}, 0) catch break;
-        const ym = ui.paint.measureText(ystr, size, bold);
+        const ym = ui.paint.measureTextStyled(ystr, ys.size, ys.weight, ys.letter_spacing);
         const fg: Color = if (is_sel) cs.on_primary else if (is_cur) cs.primary else cs.on_surface_variant;
-        ui.paint.text(ctx, ystr, cr.x + (cr.w - ym.width) / 2, cr.y + (cr.h - ym.height) / 2 + ym.ascent, size, bold, fg);
+        ui.paint.textStyled(ctx, ystr, cr.x + (cr.w - ym.width) / 2, cr.y + (cr.h - ym.height) / 2 + ym.ascent, ys.size, ys.weight, ys.letter_spacing, fg);
     }
     ui.paint.clipReset(ctx);
     ui.paint.restore(ctx);

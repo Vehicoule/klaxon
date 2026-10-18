@@ -332,7 +332,7 @@ fn treeMeasure(n: *Node, c: Constraints) Size {
     while (stack.items.len > 0) {
         const item = stack.pop().?;
         const icon_extra: f32 = if (item.node.icon != null) icon_size + label_pad else 0;
-        const w = indent * @as(f32, @floatFromInt(item.depth)) + chevron_size + label_pad + icon_extra + ui.paint.measureText(item.node.label, bs.size, false).width + 16;
+        const w = indent * @as(f32, @floatFromInt(item.depth)) + chevron_size + label_pad + icon_extra + ui.paint.measureTextStyled(item.node.label, bs.size, bs.weight, bs.letter_spacing).width + 16;
         max_w = @max(max_w, w);
         count += 1;
         if (item.node.expanded) {
@@ -407,13 +407,13 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
         }
 
         // Label (the drag source dims — the floating chip carries it).
-        const lm = ui.paint.measureText(node.label, bs.size, false);
+        const lm = ui.paint.measureTextStyled(node.label, bs.size, bs.weight, bs.letter_spacing);
         const ly = row_y + (rowH(t) - lm.height) / 2 + lm.height * 0.8;
         var label_color = if (is_sel) t.colors.on_secondary_container else t.colors.on_surface;
         if (s.dragging != null and item.node == s.dragging.?) {
             label_color = ui.paint.withAlphaScaled(label_color, 0.38);
         }
-        ui.paint.text(ctx, node.label, lx, ly, bs.size, false, label_color);
+        ui.paint.textStyled(ctx, node.label, lx, ly, bs.size, bs.weight, bs.letter_spacing, label_color);
 
         y += rowH(t);
     }
@@ -425,13 +425,13 @@ fn treePaint(n: *Node, ctx: *kx.Ctx) void {
             const gy = b.y + @as(f32, @floatFromInt(s.drop_gap)) * rowH(t);
             ui.paint.fillRRect(ctx, b.x + 4, gy - 1, b.w - 8, 2, 1, t.colors.primary);
         }
-        const lm = ui.paint.measureText(dragged.label, bs.size, false);
+        const lm = ui.paint.measureTextStyled(dragged.label, bs.size, bs.weight, bs.letter_spacing);
         const chip_w = lm.width + 20;
         const chip_h = rowH(t) * 0.72;
         const chip_x = s.drag_x + 8;
         const chip_y = s.drag_y - chip_h / 2;
         ui.paint.fillRRect(ctx, chip_x, chip_y, chip_w, chip_h, 8, t.colors.secondary_container);
-        ui.paint.text(ctx, dragged.label, chip_x + 10, chip_y + (chip_h - lm.height) / 2 + lm.height * 0.8, bs.size, false, t.colors.on_secondary_container);
+        ui.paint.textStyled(ctx, dragged.label, chip_x + 10, chip_y + (chip_h - lm.height) / 2 + lm.height * 0.8, bs.size, bs.weight, bs.letter_spacing, t.colors.on_secondary_container);
     }
 }
 

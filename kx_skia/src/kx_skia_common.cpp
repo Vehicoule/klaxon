@@ -99,6 +99,8 @@ struct KxRecOp {
     /// 0x00000000 must replay transparent, not fall back to opaque.
     bool has_color = false;
     float size = 0;
+    int32_t weight = 0;        // Text ops: fontStyle weight
+    float letter_spacing = 0;  // Text ops: px tracking
     std::string text;
     std::vector<float> xs, ys;
     std::vector<uint32_t> cols;
@@ -625,38 +627,42 @@ static size_t kx_utf16_len(const char* text, size_t len) {
 // memoize (family, bold) -> typeface in a tiny fixed table.
 struct KxFaceEntry {
     std::string family;
-    bool bold = false;
+    int32_t weight = 400;
     sk_sp<SkTypeface> tf;
 };
 static KxFaceEntry kx_face_cache[8];
 static size_t kx_face_cache_n = 0;
 
-static sk_sp<SkTypeface> kx_resolve_typeface(const char* family, bool bold) {
+static sk_sp<SkTypeface> kx_resolve_typeface(const char* family, int32_t weight) {
     // nullptr family = "platform default typeface" (darwin) — a valid,
-    // cacheable key stored as the empty string.
+    // cacheable key stored as the empty string. A non-matching weight
+    // resolves to the nearest static face — the same snap the paragraph's
+    // FontCollection performs, so blob and paragraph runs agree.
     for (size_t i = 0; i < kx_face_cache_n; ++i) {
         KxFaceEntry& e = kx_face_cache[i];
         const bool same = family ? e.family == family : e.family.empty();
-        if (e.bold == bold && same) return e.tf;
+        if (e.weight == weight && same) return e.tf;
     }
     sk_sp<SkTypeface> tf = kx_fonts()->legacyMakeTypeface(
-        family, bold ? SkFontStyle::Bold() : SkFontStyle::Normal());
+        family, SkFontStyle(std::clamp(weight, 1, 1000),
+                            SkFontStyle::kNormal_Width,
+                            SkFontStyle::kUpright_Slant));
     if (tf && kx_face_cache_n < std::size(kx_face_cache)) {
         KxFaceEntry& e = kx_face_cache[kx_face_cache_n++];
         e.family = family ? family : "";
-        e.bold = bold;
+        e.weight = weight;
         e.tf = tf;
     }
     return tf;
 }
 
-static SkFont kx_make_font(const char* text, float size, bool bold) {
+static SkFont kx_make_font(const char* text, float size, int32_t weight) {
     SkFont font;
     if (kx_fonts()) {
-        sk_sp<SkTypeface> tf = kx_resolve_typeface(kx::platform_font_family(), bold);
+        sk_sp<SkTypeface> tf = kx_resolve_typeface(kx::platform_font_family(), weight);
         const char* fallback = kx::platform_fallback_font_family();
         if (tf && fallback && text && !kx_typeface_covers(tf.get(), text)) {
-            if (sk_sp<SkTypeface> fbtf = kx_resolve_typeface(fallback, bold)) {
+            if (sk_sp<SkTypeface> fbtf = kx_resolve_typeface(fallback, weight)) {
                 if (kx_typeface_covers(fbtf.get(), text)) tf = std::move(fbtf);
             }
         }
@@ -703,7 +709,8 @@ struct KxTextSlot {
     std::string text;       // owned key bytes — allocated on insert only
     uint64_t hash = 0;
     float size = 0.0f;
-    bool bold = false;
+    int32_t weight = 400;   // fontStyle weight (100..900; bold delegates 700)
+    float letter_spacing = 0.0f; // px added between glyphs (TextStyle)
     int dir = 0; // paragraph base direction the entry was built under
     KxTextSlotState state = KxTextSlotState::kEmpty;
     uint64_t last_used = 0; // LRU tick
@@ -828,8 +835,8 @@ static std::unique_ptr<SkShaper>& kx_simple_shaper() {
 
 // Shape a verified-simple string into a blob + metrics. Returns false to
 // fall back to the paragraph path (no font, empty coverage).
-static bool kx_shape_simple(const char* text, size_t len, float size, bool bold,
-                            KxTextSlot& slot) {
+static bool kx_shape_simple(const char* text, size_t len, float size,
+                            int32_t weight, KxTextSlot& slot) {
     if (!kx_simple_shaper()) return false;
     // The PRIMARY face only — kx_make_font's single-fallback swap would pin
     // a face the FontCollection doesn't order first (its fallback walks the
@@ -838,7 +845,7 @@ static bool kx_shape_simple(const char* text, size_t len, float size, bool bold,
     // the paragraph's collection makes — identical faces, identical ink.
     SkFont font;
     if (kx_fonts()) {
-        font.setTypeface(kx_resolve_typeface(kx::platform_font_family(), bold));
+        font.setTypeface(kx_resolve_typeface(kx::platform_font_family(), weight));
     }
     font.setSize(size);
     if (!font.getTypeface()) return false;
@@ -888,14 +895,19 @@ static uint64_t kx_fnv_bytes(uint64_t h, const void* p, size_t bytes) {
     return h;
 }
 
-uint64_t kx_text_key_hash(const char* text, size_t len, float size, bool bold) {
+uint64_t kx_text_key_hash(const char* text, size_t len, float size,
+                          int32_t weight, float letter_spacing) {
     // FNV-1a over the UTF-8 bytes
     uint64_t h = kx_fnv_bytes(14695981039346656037ull, text, len);
     uint32_t size_bits;
     std::memcpy(&size_bits, &size, sizeof(size_bits));
     h ^= size_bits;
     h *= 1099511628211ull;
-    h ^= bold ? 0xFFu : 0x33u;
+    h ^= static_cast<uint32_t>(weight);
+    h *= 1099511628211ull;
+    uint32_t ls_bits;
+    std::memcpy(&ls_bits, &letter_spacing, sizeof(ls_bits));
+    h ^= ls_bits;
     h *= 1099511628211ull;
     return h;
 }
@@ -933,11 +945,12 @@ int kx_text_cache_victim(uint64_t h) {
     }
 }
 
-// The slot for (text,size,bold) — the shared entry for kx_measure_text and
-// kx_draw_text_styled. On a miss the full font path runs ONCE (typeface
-// resolution + coverage fallback + shaping + metrics) and the result is
-// inserted; hits only refresh the LRU tick.
-KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
+// The slot for (text,size,weight,letter-spacing) — the shared entry for
+// kx_measure_text* and kx_draw_text*. On a miss the full font path runs
+// ONCE (typeface resolution + coverage fallback + shaping + metrics) and
+// the result is inserted; hits only refresh the LRU tick.
+KxTextSlot* kx_text_entry(const char* text, size_t len, float size,
+                          int32_t weight, float letter_spacing) {
     // Only bidi-relevant strings depend on the paragraph base direction:
     // simple-path entries (pure strong-LTR runs) are direction-agnostic and
     // stay shared across locales instead of splitting the cache. Under the
@@ -945,7 +958,7 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     // cache hits pay nothing for the feature.
     const int dir = kx_paragraph_dir == 0 ? 0
                                           : (kx_text_simple(text, len) ? 0 : kx_paragraph_dir);
-    const uint64_t h = kx_text_key_hash(text, len, size, bold) ^
+    const uint64_t h = kx_text_key_hash(text, len, size, weight, letter_spacing) ^
                        (static_cast<uint64_t>(dir) * 0x9E3779B97F4A7C15ull);
     const uint64_t tick = ++kx_text_cache_tick;
     const size_t mask = kTextCacheCap - 1;
@@ -957,8 +970,8 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
         if (s.state == KxTextSlotState::kEmpty) { hit_empty = true; break; }
         if (s.state == KxTextSlotState::kTombstone) {
             if (insert_at < 0) insert_at = static_cast<int>(i);
-        } else if (s.hash == h && s.size == size && s.bold == bold &&
-                   s.dir == dir &&
+        } else if (s.hash == h && s.size == size && s.weight == weight &&
+                   s.letter_spacing == letter_spacing && s.dir == dir &&
                    s.text.size() == len && std::memcmp(s.text.data(), text, len) == 0) {
             s.last_used = tick;
             return &s;
@@ -978,21 +991,23 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
     s.text.assign(text, len); // owned key copy — the only per-entry alloc
     s.hash = h;
     s.size = size;
-    s.bold = bold;
+    s.weight = weight;
+    s.letter_spacing = letter_spacing;
     s.dir = dir;
     s.last_used = tick;
     s.utf16_len = kx_utf16_len(text, len);
     // Simple single-run strings take the direct shaper (same HarfBuzz,
     // without the ParagraphBuilder/ICU machinery); everything else gets
     // the real paragraph — laid out once on the miss, re-painted per hit.
+    // Letter-spacing bails to the paragraph: the blob's glyph advances are
+    // raw HarfBuzz positions — per-glyph tracking is a paragraph feature.
     static const bool kVerify = std::getenv("KX_TEXT_VERIFY") != nullptr;
-    bool built = kx_text_simple(text, len) &&
-                 kx_shape_simple(text, len, size, bold, s);
+    bool built = letter_spacing == 0.0f &&
+                 kx_text_simple(text, len) &&
+                 kx_shape_simple(text, len, size, weight, s);
     if (kVerify && built) {
-        auto para = kx_build_paragraph(text, len, size,
-                                       bold ? SkFontStyle::kBold_Weight
-                                            : SkFontStyle::kNormal_Weight,
-                                       0, 0, SK_ColorBLACK);
+        auto para = kx_build_paragraph(text, len, size, weight, 0, 0,
+                                       SK_ColorBLACK);
         if (para) {
             kx_text_metrics pm;
             pm.width = para->getLongestLine();
@@ -1003,19 +1018,17 @@ KxTextSlot* kx_text_entry(const char* text, size_t len, float size, bool bold) {
             const float da = std::fabs(pm.ascent - s.metrics.ascent);
             const float dh = std::fabs(pm.height - s.metrics.height);
             if (dw > 0.05f || da > 0.05f || dh > 0.05f) {
-                std::fprintf(stderr, "KX_TEXT_VERIFY mismatch '%s' s=%g b=%d: "
+                std::fprintf(stderr, "KX_TEXT_VERIFY mismatch '%s' s=%g w=%d: "
                     "blob(w %.2f a %.2f h %.2f) vs para(w %.2f a %.2f h %.2f)\n",
-                    s.text.c_str(), size, bold, s.metrics.width, s.metrics.ascent,
+                    s.text.c_str(), size, weight, s.metrics.width, s.metrics.ascent,
                     s.metrics.height, pm.width, pm.ascent, pm.height);
             }
         }
     }
     if (!built) {
         const uint64_t T0 = kx_prof_on() ? kx_prof_ns() : 0;
-        s.paragraph = kx_build_paragraph(text, len, size,
-                                         bold ? SkFontStyle::kBold_Weight
-                                              : SkFontStyle::kNormal_Weight,
-                                         0 /*upright*/, 0 /*letter-spacing*/,
+        s.paragraph = kx_build_paragraph(text, len, size, weight,
+                                         0 /*upright*/, letter_spacing,
                                          SK_ColorBLACK);
         if (s.paragraph) {
             s.metrics.width = s.paragraph->getLongestLine();
@@ -1385,8 +1398,9 @@ void kx_replay_ops(kx_ctx* ctx, const std::vector<KxRecOp>& ops) {
                 kx_backdrop_blur(ctx, op.f[0], op.f[1], op.f[2], op.f[3], op.f[4]);
                 break;
             case KxRecOp::K::Text:
-                kx_draw_text_styled(ctx, op.text.c_str(), op.f[0], op.f[1],
-                                    op.size, op.flag, op.color);
+                kx_draw_text_weight(ctx, op.text.c_str(), op.f[0], op.f[1],
+                                    op.size, op.weight, op.letter_spacing,
+                                    op.color);
                 break;
             case KxRecOp::K::TextLayout:
                 kx_text_paint_layout(ctx, reinterpret_cast<const kx_text_layout*>(op.image),
@@ -1672,15 +1686,22 @@ void kx_draw_text(kx_ctx* ctx, const char* text, float x, float y, float size, u
 }
 
 void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float size, bool bold, uint32_t rgba) {
+    kx_draw_text_weight(ctx, text, x, y, size, bold ? 700 : 400, 0, rgba);
+}
+
+void kx_draw_text_weight(kx_ctx* ctx, const char* text, float x, float y,
+                         float size, int32_t weight, float letter_spacing,
+                         uint32_t rgba) {
     if (!ctx || !ctx->canvas || !text) return;
     const size_t len = std::strlen(text);
     if (kx_recording(ctx)) {
         KxRecOp op{KxRecOp::K::Text};
         op.f[0] = x; op.f[1] = y;
-        op.size = size; op.flag = bold; op.color = rgba;
+        op.size = size; op.weight = weight;
+        op.letter_spacing = letter_spacing; op.color = rgba;
         op.text.assign(text, len);
         if (size > 0.0f) {
-            const KxTextSlot* e = kx_text_entry(text, len, size, bold);
+            const KxTextSlot* e = kx_text_entry(text, len, size, weight, letter_spacing);
             op.local_bounds = SkRect::MakeLTRB(x - 1, y - e->metrics.ascent - 1,
                                                x + e->metrics.width + 2,
                                                y + e->metrics.descent + 1);
@@ -1692,14 +1713,14 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
     // Degenerate keys bypass the cache: NaN never matches itself (it would
     // re-insert forever), and non-positive sizes draw nothing anyway.
     if (!(size > 0.0f)) {
-        SkFont font = kx_make_font(text, size, bold);
+        SkFont font = kx_make_font(text, size, weight);
         SkPaint paint;
         paint.setColor(kx_to_skcolor(rgba));
         paint.setAntiAlias(true);
         ctx->canvas->drawSimpleText(text, len, SkTextEncoding::kUTF8, x, y, font, paint);
         return;
     }
-    const KxTextSlot* e = kx_text_entry(text, len, size, bold);
+    const KxTextSlot* e = kx_text_entry(text, len, size, weight, letter_spacing);
     if (e->blob) {
         // Simple path: the blob's glyph origins are top-of-line, so the
         // draw origin is (x, baseline - ascent) — same as paragraph paint.
@@ -1721,12 +1742,17 @@ void kx_draw_text_styled(kx_ctx* ctx, const char* text, float x, float y, float 
 }
 
 kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
+    return kx_measure_text_weight(text, size, bold ? 700 : 400, 0);
+}
+
+kx_text_metrics kx_measure_text_weight(const char* text, float size,
+                                       int32_t weight, float letter_spacing) {
     kx_text_metrics m = {0, 0, 0, 0};
     if (!text) return m;
     if (!(size > 0.0f)) {
-        // Degenerate key (NaN/<=0 bypasses the cache — see kx_draw_text_styled):
+        // Degenerate key (NaN/<=0 bypasses the cache — see kx_draw_text_weight):
         // run the uncached path so the returned metrics are unchanged.
-        const SkFont font = kx_make_font(text, size, bold);
+        const SkFont font = kx_make_font(text, size, weight);
         SkFontMetrics fm;
         font.getMetrics(&fm);
         m.ascent = -fm.fAscent;
@@ -1737,19 +1763,25 @@ kx_text_metrics kx_measure_text(const char* text, float size, bool bold) {
         }
         return m;
     }
-    return kx_measure_text_len(text, std::strlen(text), size, bold);
+    return kx_measure_text_len_weight(text, std::strlen(text), size, weight, letter_spacing);
 }
 
 // Length-taking measure (0.22.0) — substring prefixes for caret geometry
 // have no null sentinel; rides the same cache entry keyed on (ptr,len).
 kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bool bold) {
+    return kx_measure_text_len_weight(text, len, size, bold ? 700 : 400, 0);
+}
+
+kx_text_metrics kx_measure_text_len_weight(const char* text, size_t len,
+                                           float size, int32_t weight,
+                                           float letter_spacing) {
     kx_text_metrics m = {0, 0, 0, 0};
     if (!text) return m;
     // An empty string degenerates the paragraph path (SkParagraph reports
     // -FLT_MAX-scale metrics on no text) — the font's own metrics with a
     // zero width are the honest answer (the caret/selection prefix case).
     if (len == 0 || !(size > 0.0f)) {
-        const SkFont font = kx_make_font(text, size, bold);
+        const SkFont font = kx_make_font(text, size, weight);
         SkFontMetrics fm;
         font.getMetrics(&fm);
         m.ascent = -fm.fAscent;
@@ -1760,7 +1792,7 @@ kx_text_metrics kx_measure_text_len(const char* text, size_t len, float size, bo
         }
         return m;
     }
-    return kx_text_entry(text, len, size, bold)->metrics;
+    return kx_text_entry(text, len, size, weight, letter_spacing)->metrics;
 }
 
 // True when every 4-byte pixel's alpha byte (offset 3 for all our 8888

@@ -593,7 +593,7 @@ fn destMeasure(n: *Node, c: Constraints) Size {
     // Refresh metrics against the live theme — the type style comes from
     // the parent bar, not from construction-time options.
     const ls = destContext(n).theme.type_scale.label_medium;
-    s.m = ui.paint.measureText(s.label, ls.size, ls.weight >= 500);
+    s.m = ui.paint.measureTextStyled(s.label, ls.size, ls.weight, ls.letter_spacing);
     return c.constrain(.{ .w = @max(icon_size, s.m.width), .h = icon_size + dest_icon_label_gap + s.m.height });
 }
 
@@ -613,7 +613,7 @@ fn destPaint(n: *Node, ctx: *kx.Ctx) void {
     icon_w.drawIcon(ctx, s.icon, ix, n.bounds.y, icon_size / 24.0, icon_c);
     const ls = dc.theme.type_scale.label_medium;
     const lx = n.bounds.x + (n.bounds.w - s.m.width) / 2;
-    ui.paint.text(ctx, s.label, lx, n.bounds.y + icon_size + dest_icon_label_gap + s.m.ascent, ls.size, ls.weight >= 500, label_c);
+    ui.paint.textStyled(ctx, s.label, lx, n.bounds.y + icon_size + dest_icon_label_gap + s.m.ascent, ls.size, ls.weight, ls.letter_spacing, label_c);
 }
 
 fn destDeinit(n: *Node) void {
@@ -636,7 +636,7 @@ pub fn destination(allocator: std.mem.Allocator, icon: icon_w.IconName, label: [
     @memcpy(buf[0..label.len], label);
     buf[label.len] = 0;
     const ls = theme_mod.light.type_scale.label_medium;
-    s.* = .{ .icon = icon, .label = buf[0..label.len :0], .m = ui.paint.measureText(buf[0..label.len :0], ls.size, ls.weight >= 500) };
+    s.* = .{ .icon = icon, .label = buf[0..label.len :0], .m = ui.paint.measureTextStyled(buf[0..label.len :0], ls.size, ls.weight, ls.letter_spacing) };
     node.state = s;
     // The bar's syncItemSemantics upgrades this descriptor (focusable,
     // checked, actions) while keeping the label.

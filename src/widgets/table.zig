@@ -223,14 +223,14 @@ fn computeColWidths(s: *TableState) void {
     const bs = t.type_scale.body_medium;
     s.col_ws.clearRetainingCapacity();
     for (s.columns.items) |col| {
-        const w = ui.paint.measureText(col, hs.size, true).width + cell_pad_x * 2;
+        const w = ui.paint.measureTextStyled(col, hs.size, hs.weight, hs.letter_spacing).width + cell_pad_x * 2;
         s.col_ws.append(@max(col_min_w, w)) catch @panic("klaxon: out of memory");
     }
     // Expand with cell content.
     for (s.rows.items) |row| {
         for (row.cells, 0..) |cell, ci| {
             if (ci >= s.col_ws.items.len) break;
-            const w = ui.paint.measureText(cell, bs.size, false).width + cell_pad_x * 2;
+            const w = ui.paint.measureTextStyled(cell, bs.size, bs.weight, bs.letter_spacing).width + cell_pad_x * 2;
             if (w > s.col_ws.items[ci]) s.col_ws.items[ci] = w;
         }
     }
@@ -528,7 +528,7 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
                     if (!painted) {
                         const tx = cx + cell_pad_x;
                         const ty = ry + (row_h - bs.line_height) / 2 + bs.line_height * 0.8;
-                        ui.paint.text(ctx, cell, tx, ty, bs.size, false, t.colors.on_surface);
+                        ui.paint.textStyled(ctx, cell, tx, ty, bs.size, bs.weight, bs.letter_spacing, t.colors.on_surface);
                     }
                     cx += w;
                 }
@@ -560,7 +560,7 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
         const w = s.col_ws.items[ci];
         const tx = cx + cell_pad_x;
         const ty = b.y + (header_h - hs.line_height) / 2 + hs.line_height * 0.8;
-        ui.paint.text(ctx, col, tx, ty, hs.size, true, t.colors.on_surface);
+        ui.paint.textStyled(ctx, col, tx, ty, hs.size, hs.weight, hs.letter_spacing, t.colors.on_surface);
         const cii: i32 = @intCast(ci);
         // The sorted column's arrow is always painted (the programmatic
         // setSort can sort a non-`sortable` column — upstream's
@@ -568,7 +568,7 @@ fn tblPaint(n: *Node, ctx: *kx.Ctx) void {
         // unsorted sortable column's appears on hover at half alpha.
         if (s.sort_col == cii or (isSortable(s, ci) and s.hovered_header_col == cii)) {
             const active = s.sort_col == cii;
-            const tw = ui.paint.measureText(col, hs.size, true).width;
+            const tw = ui.paint.measureTextStyled(col, hs.size, hs.weight, hs.letter_spacing).width;
             const ax = tx + tw + sort_arrow_gap + sort_arrow_w / 2;
             paintSortArrow(ctx, ax, b.y + header_h / 2, if (active) s.arrow_rot else 0, ui.paint.withAlphaScaled(t.colors.on_surface, if (active) 1 else 0.5));
         }
@@ -1108,7 +1108,7 @@ test "golden: a sorted column paints the sort arrow" {
     defer r.deinit();
     n.layout(.{ .x = 10, .y = 10, .w = 180, .h = header_h + row_h });
     // The arrow lands right of the header text — compute its slot.
-    const tw = ui.paint.measureText("Name", t.type_scale.title_small.size, true).width;
+    const tw = ui.paint.measureTextStyled("Name", t.type_scale.title_small.size, t.type_scale.title_small.weight, t.type_scale.title_small.letter_spacing).width;
     const ax = 10 + cell_pad_x + tw + sort_arrow_gap + sort_arrow_w / 2;
     const arrow_rect = Rect{ .x = ax - 8, .y = 10 + header_h / 2 - 8, .w = 16, .h = 16 };
     r.paint(n, 0xFFFFFFFF);

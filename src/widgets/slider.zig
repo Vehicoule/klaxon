@@ -290,7 +290,7 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         const ink = ui.paint.withAlphaScaled(cs.inverse_on_surface, ia);
         const ls = s.opts.theme.type_scale.label_large;
         const txt = s.value_buf[0..s.value_len :0];
-        const lm = ui.paint.measureText(txt, ls.size, false);
+        const lm = ui.paint.measureTextStyled(txt, ls.size, ls.weight, ls.letter_spacing);
         const scale = 0.6 + 0.4 * ia;
         const pw = @max(lm.width + indicator_h_pad * 2, 24) * scale;
         const ph = (ls.line_height + indicator_v_pad * 2) * scale;
@@ -304,7 +304,7 @@ fn sliderPaint(n: *Node, ctx: *kx.Ctx) void {
         const verbs = [4]i32{ @backingInt(ui.paint.PathVerb.move), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.line), @backingInt(ui.paint.PathVerb.close) };
         ui.paint.fillPath(ctx, &pts, &verbs, bubble, false);
         if (ia > 0.5) { // the label rides the tail of the fade
-            ui.paint.text(ctx, txt, cx - lm.width / 2, by - ph + (ph - (lm.ascent + lm.descent)) / 2 + lm.ascent, ls.size, false, ink);
+            ui.paint.textStyled(ctx, txt, cx - lm.width / 2, by - ph + (ph - (lm.ascent + lm.descent)) / 2 + lm.ascent, ls.size, ls.weight, ls.letter_spacing, ink);
         }
     }
 }
