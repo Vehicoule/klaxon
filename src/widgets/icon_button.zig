@@ -229,7 +229,9 @@ fn retargetCorner(n: *Node, s: *IconButtonState) void {
     if (ui.anim.timeline()) |tl| {
         if (s.corner >= 0 and s.corner != target) {
             _ = tl.play(.{
-                .kind = ui.anim.Animation.springAnim(.{ s.corner, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.fast_spatial, tl.channelVelocity(@ptrCast(&s.corner_channel))),
+                // IconButton.kt:1579-1584 — the press/toggle morph rides
+                // DefaultEffects (upstream: "to prevent any bounce").
+                .kind = ui.anim.Animation.springAnim(.{ s.corner, 0, 0, 0 }, .{ target, 0, 0, 0 }, s.opts.theme.motion.springs.effects_spring, tl.channelVelocity(@ptrCast(&s.corner_channel))),
                 .from = .{ s.corner, 0, 0, 0 },
                 .channel = @ptrCast(&s.corner_channel),
                 .on_update = .{ .fn_ptr = cornerCb, .userdata = n },
