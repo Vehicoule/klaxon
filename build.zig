@@ -272,6 +272,50 @@ pub fn build(b: *std.Build) void {
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
 
+    // --- fuzz harnesses (test-only, src/fuzz/) ---
+    // `zig build fuzz` runs the embedded corpus once as normal unit tests.
+    // `zig build fuzz -Dfuzz-target=X --fuzz=<runs>` makes the build runner
+    // rebuild the target's test exe with -ffuzz and drive it for <runs>
+    // executions (scripts/fuzz.sh wraps this with a seconds bound).
+    // Harnesses always build Debug — ReleaseFast would strip the bounds
+    // checks these targets exist to trip.
+    const fuzz_target = b.option([]const u8, "fuzz-target", "Fuzz target: text_edit|tree_json|arb|input|all (default: all)") orelse "all";
+    const fuzz_step = b.step("fuzz", "Build and run fuzz harnesses (use -Dfuzz-target=X, --fuzz=<runs>)");
+    // One klaxon module instance shared by the harness roots — the same
+    // pattern addExternalApp uses so all file-relative imports inside src/
+    // resolve to a single set of types + process globals (router, timeline).
+    const fuzz_klaxon = b.createModule(.{
+        .root_source_file = b.path("src/klaxon.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+        .link_libcpp = !is_windows_local(target),
+    });
+    fuzz_klaxon.addImport("sdl_c", translate_sdl.createModule());
+    fuzz_klaxon.addImport("kx_c", translate_kx.createModule());
+    const fuzz_targets = [_][]const u8{ "text_edit", "tree_json", "arb", "input" };
+    var fuzz_any = false;
+    for (fuzz_targets) |t| {
+        if (!std.mem.eql(u8, fuzz_target, "all") and !std.mem.eql(u8, fuzz_target, t)) continue;
+        fuzz_any = true;
+        const fuzz_tests = b.addTest(.{
+            .name = b.fmt("fuzz-{s}", .{t}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("src/fuzz/fuzz_{s}.zig", .{t})),
+                .target = target,
+                .optimize = .Debug,
+                .link_libc = true,
+                .link_libcpp = !is_windows_local(target),
+            }),
+        });
+        fuzz_tests.root_module.addImport("klaxon", fuzz_klaxon);
+        linkRuntime(b, fuzz_tests.root_module, kx_skia, target, is_macos, tag);
+        const run_fuzz = b.addRunArtifact(fuzz_tests);
+        fuzz_step.dependOn(&run_fuzz.step);
+    }
+    if (!fuzz_any)
+        @panic("unknown -Dfuzz-target (expected text_edit|tree_json|arb|input|all)");
+
     // --- dynamic color tests (deps/mcu) ---
     // src/dynamic_color.zig is deliberately self-contained (std only — it
     // cannot import theme.zig without dragging the kx_c module into a bare
