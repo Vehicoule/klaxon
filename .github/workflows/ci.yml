@@ -110,11 +110,11 @@ jobs:
           size=$(wc -c < "$bin")
           echo "hello (ReleaseSmall): $size bytes"
           # Every desktop binary now links the real text stack (skparagraph
-          # + skshaper + skunicode_icu + harfbuzz) and mcu — ~20,9 Mo on
-          # macOS (graphite-metal + ganesh-gl). Windows builds dawn+graphite
-          # into libskia (kx_skia_win.cpp uses webgpu) and lands ~19,4 Mo.
-          # 22 Mio gate on all desktop targets.
-          limit=23068672
+          # + skshaper + skunicode_icu + harfbuzz) and mcu — ~22,0 Mio on
+          # linux, ~20,9 Mo on macOS (graphite-metal + ganesh-gl), ~19,4 Mo
+          # on Windows (dawn+graphite into libskia). 24 Mio gate leaves a
+          # few MiB of headroom on the fattest target.
+          limit=25165824
           if [ "$size" -ge "$limit" ]; then
             echo "SIZE GATE FAILED: $size >= $limit"; exit 1
           fi
