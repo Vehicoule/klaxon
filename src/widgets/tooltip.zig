@@ -68,6 +68,9 @@ const action_bottom: f32 = 8; // ActionLabelBottomPadding
 /// start/end are layout-direction aware (start = left in LTR, right in RTL).
 pub const Placement = enum { above, below, start, end };
 
+/// The concrete side after resolving direction + collision flip.
+const Side = enum { above, below, left, right };
+
 pub const TooltipOptions = struct {
     text: []const u8 = "",
     theme: Theme = theme_mod.light,
@@ -92,6 +95,9 @@ const TooltipState = struct {
     theme: Theme,
     caret: bool,
     placement: Placement,
+    /// The side actually used after the position provider ran (may flip from
+    /// `placement` when the preferred side doesn't fit the window).
+    resolved_side: Side = .above,
     rich: bool = false, // plain | rich variant (tokens + bubble vtable differ)
     has_title: bool = false, // rich: a subhead child precedes the text
     has_action: bool = false, // rich: an action label follows the text
@@ -124,7 +130,7 @@ fn tooltipMeasure(n: *Node, c: Constraints) Size {
 
 /// Resolve `placement` to a concrete side (start/end follow the layout
 /// direction: start = left in LTR, right in RTL).
-fn sideOf(s: *const TooltipState) enum { above, below, left, right } {
+fn sideOf(s: *const TooltipState) Side {
     const rtl = ui.i18n.direction() == .rtl;
     return switch (s.placement) {
         .above => .above,
@@ -134,6 +140,16 @@ fn sideOf(s: *const TooltipState) enum { above, below, left, right } {
     };
 }
 
+fn windowOf(n: *Node) ?Rect {
+    var p = n.parent orelse return null;
+    while (p.parent) |pp| p = pp;
+    return p.bounds;
+}
+
+/// Upstream TooltipPositionProvider (`abovePositioning`/`belowPositioning`):
+/// center on the anchor, fall back to the opposite side when the preferred
+/// one overflows the window, then clamp inside it. start/end mirror the same
+/// scheme on the cross axis. Standalone (no parent) keeps the raw position.
 fn tooltipLayout(n: *Node, bounds: Rect) void {
     const anchor = anchorOf(n) orelse return;
     anchor.layout(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = bounds.h });
@@ -145,13 +161,49 @@ fn tooltipLayout(n: *Node, bounds: Rect) void {
     const cs = bubble.measure(.{ .max_w = mw, .max_h = 400 });
     const bw = @min(@max(min_width, cs.w), mw);
     const bh = @max(min_height, cs.h);
-    const br: Rect = switch (sideOf(s)) {
-        .above => .{ .x = bounds.x + (bounds.w - bw) / 2, .y = bounds.y - anchor_spacing - bh, .w = bw, .h = bh },
-        .below => .{ .x = bounds.x + (bounds.w - bw) / 2, .y = bounds.y + bounds.h + anchor_spacing, .w = bw, .h = bh },
-        .left => .{ .x = bounds.x - anchor_spacing - bw, .y = bounds.y + (bounds.h - bh) / 2, .w = bw, .h = bh },
-        .right => .{ .x = bounds.x + bounds.w + anchor_spacing, .y = bounds.y + (bounds.h - bh) / 2, .w = bw, .h = bh },
-    };
-    bubble.layout(br);
+    var side = sideOf(s);
+    var bx = bounds.x + (bounds.w - bw) / 2;
+    var by = bounds.y - anchor_spacing - bh;
+    switch (side) {
+        .above, .below => by = if (side == .below) bounds.y + bounds.h + anchor_spacing else by,
+        .left => {
+            bx = bounds.x - anchor_spacing - bw;
+            by = bounds.y + (bounds.h - bh) / 2;
+        },
+        .right => {
+            bx = bounds.x + bounds.w + anchor_spacing;
+            by = bounds.y + (bounds.h - bh) / 2;
+        },
+    }
+    if (windowOf(n)) |win| {
+        switch (side) {
+            .above, .below => {
+                // vertical preference: preferred side → opposite side → clamp
+                if (side == .above and by < win.y) {
+                    by = bounds.y + bounds.h + anchor_spacing;
+                    side = .below;
+                } else if (side == .below and by + bh > win.y + win.h) {
+                    by = bounds.y - anchor_spacing - bh;
+                    side = .above;
+                }
+                by = std.math.clamp(by, win.y, @max(win.y, win.y + win.h - bh));
+                bx = std.math.clamp(bx, win.x, @max(win.x, win.x + win.w - bw));
+            },
+            .left, .right => {
+                if (side == .left and bx < win.x) {
+                    bx = bounds.x + bounds.w + anchor_spacing;
+                    side = .right;
+                } else if (side == .right and bx + bw > win.x + win.w) {
+                    bx = bounds.x - anchor_spacing - bw;
+                    side = .left;
+                }
+                bx = std.math.clamp(bx, win.x, @max(win.x, win.x + win.w - bw));
+                by = std.math.clamp(by, win.y, @max(win.y, win.y + win.h - bh));
+            },
+        }
+    }
+    s.resolved_side = side;
+    bubble.layout(.{ .x = bx, .y = by, .w = bw, .h = bh });
 }
 
 fn tooltipOnPointer(n: *Node, ev: input.PointerEvent) bool {
@@ -308,7 +360,7 @@ fn paintCaret(bubble: *Node, ctx: *kx.Ctx, b: Rect, color: Color) void {
     const a = anchor.bounds;
     var xs: [3]f32 = undefined;
     var ys: [3]f32 = undefined;
-    switch (sideOf(s)) {
+    switch (s.resolved_side) {
         .above => {
             // hangs below the bubble, pointing down; centered on the anchor
             const cx = @min(@max(a.x + a.w / 2, b.x + caret_w / 2 + corner), b.x + b.w - caret_w / 2 - corner);
@@ -587,6 +639,27 @@ test "tooltip: placement puts the bubble on each side of the anchor" {
     tip.markLayoutDirty();
     tip.layout(.{ .x = 100, .y = 100, .w = 80, .h = 24 });
     try std.testing.expect(std.math.approxEqAbs(f32, 100 - anchor_spacing, s.bubble.bounds.x + s.bubble.bounds.w, 0.01));
+}
+
+test "tooltip: the bubble flips below when above overflows the window" {
+    // Upstream TooltipPositionProvider: above → below, then clamped inside
+    // the window (needs a parent — standalone keeps the raw position).
+    const a = std.testing.allocator;
+    const anchor = try golden.solidBox(a, 80, 24, 0x112233FF);
+    const tip = try tooltip(a, anchor, .{ .text = "Save" });
+    const col = try layout_w.column(a, .{ .gap = 0 });
+    col.add(tip);
+    defer col.deinit();
+    col.layout(.{ .x = 0, .y = 0, .w = 320, .h = 200 });
+    const s = stateOf(tip);
+    // anchor at the window top: above (y < 0) flips below the anchor
+    tip.layout(.{ .x = 100, .y = 0, .w = 80, .h = 24 });
+    try std.testing.expect(std.math.approxEqAbs(f32, 24 + anchor_spacing, s.bubble.bounds.y, 0.01));
+    try std.testing.expectEqual(Side.below, s.resolved_side);
+    // mid-window keeps above
+    tip.layout(.{ .x = 100, .y = 100, .w = 80, .h = 24 });
+    try std.testing.expect(s.bubble.bounds.y + s.bubble.bounds.h <= 100);
+    try std.testing.expectEqual(Side.above, s.resolved_side);
 }
 
 test "golden: a caret tooltip paints the 16x8 caret pointing at the anchor" {

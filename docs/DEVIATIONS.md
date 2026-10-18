@@ -247,6 +247,25 @@ Each widget's header carries the same list; these are the tracked ones
   the upstream `updateAmplitudeAnimation` spec: a 500ms tween (standard
   easing up, emphasized-accelerate down, quantized to 1/12 morph steps)
   between the ring and the rounded-star path.
+- `menu.zig` / `tooltip.zig` — popup positioning is the upstream
+  `PopupPositionProvider` model: `menu.zig` ports
+  `DropdownMenuPositionProvider` (MenuAnchorPosition.Below candidate order —
+  x: startToAnchorStart → endToAnchorEnd → window edge by anchor half,
+  gated on the window band; y: topToAnchorBottom → bottomToAnchorTop →
+  centerToAnchorTop → window edge, gated on the 48dp MenuVerticalMargin
+  band; last candidate unconditional), and the scale-from-anchor transform
+  origin follows the resolved side (top edge below, bottom when flipped).
+  `tooltip.zig` ports `abovePositioning`/`belowPositioning` — centered on
+  the anchor, flips to the opposite side when the preferred one overflows,
+  then clamps inside the window; the caret reads the resolved side.
+  Standalone nodes (no parent — tests/goldens) keep the raw position.
+- `ui/scroll.zig` / `scroll_view.zig` — overscroll keeps the rubber-band
+  offset (bounded loose clamp) without a visual stretch: upstream desktop
+  (`Overscroll.desktop.kt`) returns a null `OverscrollEffect`, and the
+  Android stretch runs on `RenderNode.stretch` — a platform mesh warp with
+  no portable raster equivalent (no reference to validate an imitation
+  against). Predictive back is likewise Android-only — desktop back is an
+  instantaneous pop (hardware key/Escape), which `navigator.pop` covers.
 - `drawer.zig` — no predictive back (no system back-progress events to
   feed `DrawerPredictiveBackHandler`; Escape/edge dismissal works). The
   overshoot gap upstream covers with `horizontalScaleUp` +

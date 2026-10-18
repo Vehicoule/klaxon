@@ -79,6 +79,7 @@ const trail_gap: f32 = 12; // label→trailing (DropdownMenuItemHorizontalPaddin
 const item_min_w: f32 = 112; // DropdownMenuItemDefaultMinWidth
 const item_max_w: f32 = 280; // DropdownMenuItemDefaultMaxWidth
 const menu_h_margin: f32 = 8; // MenuHorizontalMargin — min inset to the window edge
+const menu_v_margin: f32 = 48; // MenuVerticalMargin — fit margin top/bottom
 const panel_v_pad: f32 = 8; // DropdownMenuVerticalPadding
 const panel_radius: f32 = 4; // CornerExtraSmall
 // The open anim (scale 0.8→1 + alpha 0→1, Menu.kt) rides
@@ -109,6 +110,8 @@ const MenuState = struct {
     open_progress: f32 = 0,
     open_target: f32 = 0,
     open_channel: u8 = 0, // channel marker (stable address)
+    /// The laid-out panel rect (overlay pass + flips when it would overflow).
+    panel: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     i18n: ?*i18n_mod.I18n = null,
 };
 
@@ -441,22 +444,73 @@ fn menuMeasure(n: *Node, c: Constraints) Size {
     return s.anchor.measure(c); // the items are overlay chrome (not measured)
 }
 
+/// The panel rect: upstream `DropdownMenuPositionProvider` (MenuAnchorPosition
+/// .Below) tries candidates in order and takes the first that fits the window
+/// (with margins); the last is unconditional.
+///   x: startToAnchorStart → endToAnchorEnd → window edge (by anchor half)
+///   y: topToAnchorBottom → bottomToAnchorTop → centerToAnchorTop → window edge
+/// A standalone menu (no parent — tests/goldens) always opens below.
+fn panelRect(n: *Node, s: *MenuState, t: Theme, b: Rect) Rect {
+    const pw = panelWidthFit(n, s, t, b);
+    const ph = panel_v_pad * 2 + @as(f32, @floatFromInt(s.items.items.len)) * item_h;
+    const rtl = ui.i18n.direction() == .rtl;
+    var root: ?*Node = null;
+    if (n.parent) |p| {
+        var r = p;
+        while (r.parent) |pp| r = pp;
+        root = r;
+    }
+    const win = if (root) |r| r.bounds else return .{
+        .x = if (rtl) b.x + b.w - pw else b.x,
+        .y = b.y + b.h,
+        .w = pw,
+        .h = ph,
+    };
+    // x candidates — RTL resolves start/end to the opposite edges.
+    const x_start = if (rtl) b.x + b.w - pw else b.x;
+    const x_end = if (rtl) b.x else b.x + b.w - pw;
+    const x_win = if (b.x + b.w / 2 < win.x + win.w / 2)
+        win.x + menu_h_margin
+    else
+        win.x + win.w - menu_h_margin - pw;
+    const xs = [3]f32{ x_start, x_end, x_win };
+    var px = x_win;
+    for (xs, 0..) |cx, i| {
+        if (i == xs.len - 1 or (cx >= win.x and cx + pw <= win.x + win.w)) {
+            px = cx;
+            break;
+        }
+    }
+    // y candidates: below → above → centered on the anchor's top edge →
+    // window-aligned, gated on the MenuVerticalMargin fit band.
+    const y_win = if (b.y + b.h / 2 < win.y + win.h / 2)
+        win.y + menu_v_margin
+    else
+        win.y + win.h - menu_v_margin - ph;
+    const ys = [4]f32{ b.y + b.h, b.y - ph, b.y - ph / 2, y_win };
+    var py = y_win;
+    for (ys, 0..) |cy, i| {
+        if (i == ys.len - 1 or (cy >= win.y + menu_v_margin and cy + ph <= win.y + win.h - menu_v_margin)) {
+            py = cy;
+            break;
+        }
+    }
+    return .{ .x = px, .y = py, .w = pw, .h = ph };
+}
+
 fn menuLayout(n: *Node, bounds: Rect) void {
     const s = stateOf(n);
     const t = s.opts.theme;
     // the anchor fills the menu's bounds (the menu sizes to the anchor)
     s.anchor.layout(bounds);
-    // the panel overlays below the anchor, start-aligned, intrinsic width
-    // (clamped to the window — a long label can't push it offscreen)
-    const pw = panelWidthFit(n, s, t, bounds);
-    const rtl = ui.i18n.direction() == .rtl;
-    const px = if (rtl) bounds.x + bounds.w - pw else bounds.x;
-    const py = bounds.y + bounds.h + panel_v_pad;
+    // the panel overlays relative to the anchor (positioned by panelRect —
+    // flips above when below would overflow), items fill its interior
+    s.panel = panelRect(n, s, t, bounds);
     for (n.children.items[1..], 0..) |child, i| {
         child.layout(.{
-            .x = px,
-            .y = py + @as(f32, @floatFromInt(i)) * item_h,
-            .w = pw,
+            .x = s.panel.x,
+            .y = s.panel.y + panel_v_pad + @as(f32, @floatFromInt(i)) * item_h,
+            .w = s.panel.w,
             .h = item_h,
         });
     }
@@ -489,24 +543,28 @@ fn menuPaintOverlay(n: *Node, ctx: *kx.Ctx) void {
     if (!s.open and s.open_progress <= 0) return;
     const t = s.opts.theme;
     const b = n.bounds;
-    const pw = panelWidthFit(n, s, t, b);
-    const ph = panel_v_pad * 2 + @as(f32, @floatFromInt(s.items.items.len)) * item_h;
-    const rtl = ui.i18n.direction() == .rtl;
-    const px = if (rtl) b.x + b.w - pw else b.x;
+    const panel = s.panel;
     // the open animation: scale 0.8→1 from the anchor's overlap center +
-    // fade 0→1 (upstream ExpandedScaleTarget/ExpandedAlphaTarget)
+    // fade 0→1 (upstream ExpandedScaleTarget/ExpandedAlphaTarget). The
+    // vertical pivot is the panel edge toward the anchor — top below,
+    // bottom when flipped, the overlap midpoint when they intersect.
     const p = std.math.clamp(s.open_progress, 0, 1);
     const sc = 0.8 + 0.2 * p;
-    const ox = transformOriginX(b, px, pw);
-    const oy = b.y + b.h; // top edge of the panel
+    const ox = transformOriginX(b, panel.x, panel.w);
+    const oy = if (panel.y >= b.y + b.h)
+        panel.y
+    else if (panel.y + panel.h <= b.y)
+        panel.y + panel.h
+    else
+        (@max(b.y, panel.y) + @min(b.y + b.h, panel.y + panel.h)) / 2;
     ui.paint.save(ctx);
     ui.paint.translate(ctx, ox, oy);
     ui.paint.scale(ctx, sc, sc);
     ui.paint.translate(ctx, -ox, -oy);
     ui.paint.layerAlpha(ctx, p);
     // M3 menu elevation = 2dp.
-    ui.paint.elevationShadow(ctx, px, b.y + b.h, pw, ph, panel_radius, 2, t.colors.shadow);
-    ui.paint.fillRRect(ctx, px, b.y + b.h, pw, ph, panel_radius, t.colors.surface_container);
+    ui.paint.elevationShadow(ctx, panel.x, panel.y, panel.w, panel.h, panel_radius, 2, t.colors.shadow);
+    ui.paint.fillRRect(ctx, panel.x, panel.y, panel.w, panel.h, panel_radius, t.colors.surface_container);
     for (n.children.items[1..]) |child| { // [0] = the anchor
         if (child.visible) itemPaint(child, ctx);
     }
@@ -941,23 +999,51 @@ test "golden: the open menu paints ABOVE a later sibling (the overlay pass)" {
     const m = try menu(a, anchor, &.{ .{ .label = "Copy" }, .{ .label = "Paste" } }, null, null, .{ .theme = t });
     const cover = try golden.solidBox(a, 300, 200, 0xFF00FFFF); // opaque magenta
     const col = try layout_w.column(a, .{ .gap = 0 });
+    const spacer = try golden.solidBox(a, 320, 60, 0xFFFFFFFF);
+    col.add(spacer);
     col.add(m);
     col.add(cover);
     defer col.deinit();
-    var r = try golden.Renderer.init(std.testing.allocator, 320, 260);
+    var r = try golden.Renderer.init(std.testing.allocator, 320, 320);
     defer r.deinit();
-    col.layout(.{ .x = 0, .y = 0, .w = 320, .h = 260 });
+    col.layout(.{ .x = 0, .y = 0, .w = 320, .h = 320 });
     setOpen(m, true);
     r.paint(col, 0xFFFFFFFF);
     var f = try r.readback(std.testing.allocator);
     defer f.deinit();
-    // the anchor paints in the normal pass
-    try std.testing.expectEqual(@as(Color, 0x888888FF), f.pixelAt(60, 20));
-    // the panel's top padding (y = 40..48) is NOT covered by the magenta box:
+    // the anchor paints in the normal pass (y = 60..100)
+    try std.testing.expectEqual(@as(Color, 0x888888FF), f.pixelAt(60, 80));
+    // the panel's top padding (y = 100..108) is NOT covered by the magenta box:
     // it paints in the overlay pass, above the later sibling
-    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(30, 44));
-    // below the panel (y > 40 + 8 + 96 + 8 = 152) the sibling shows through
-    try std.testing.expectEqual(@as(Color, 0xFF00FFFF), f.pixelAt(30, 200));
+    try std.testing.expectEqual(t.colors.surface_container, f.pixelAt(30, 104));
+    // below the panel (y > 100 + 8 + 96 + 8 = 212) the sibling shows through
+    try std.testing.expectEqual(@as(Color, 0xFF00FFFF), f.pixelAt(30, 260));
+}
+
+test "menu: the panel flips above the anchor when below overflows the window" {
+    // Upstream DropdownMenuPositionProvider: topToAnchorBottom →
+    // bottomToAnchorTop → centerToAnchorTop → window edge, gated on the
+    // 48dp MenuVerticalMargin fit band.
+    const a = std.testing.allocator;
+    const anchor = try anchorBox(a, 120, 40);
+    const m = try menu(a, anchor, &.{ .{ .label = "Copy" }, .{ .label = "Paste" } }, null, null, .{});
+    const col = try layout_w.column(a, .{ .gap = 0 });
+    col.add(m);
+    defer col.deinit();
+    // 260 window: below the anchor (y = 220) ends at 332 > 212 (260-48) →
+    // flips above at y = 180 - 112 = 68 (inside the 48..212 margin band)
+    col.layout(.{ .x = 0, .y = 0, .w = 320, .h = 260 });
+    m.layout(.{ .x = 0, .y = 180, .w = 120, .h = 40 });
+    const s = stateOf(m);
+    try std.testing.expect(std.math.approxEqAbs(f32, 68, s.panel.y, 0.01));
+    try std.testing.expect(std.math.approxEqAbs(f32, 112, s.panel.h, 0.01));
+    // a mid-window anchor still opens below
+    m.layout(.{ .x = 0, .y = 60, .w = 120, .h = 40 });
+    try std.testing.expect(std.math.approxEqAbs(f32, 100, s.panel.y, 0.01));
+    // an anchor flush with the window bottom can't satisfy either anchored
+    // candidate → bottomToWindowBottom (panel bottom at window - margin)
+    m.layout(.{ .x = 0, .y = 220, .w = 120, .h = 40 });
+    try std.testing.expect(std.math.approxEqAbs(f32, 260 - menu_v_margin - 112, s.panel.y, 0.01));
 }
 
 test "menu: i18n — the framework label localizes + re-resolves on a locale switch" {
