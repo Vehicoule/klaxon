@@ -248,6 +248,7 @@ pub fn build(b: *std.Build) void {
     // Golden tests render through the shim: the test exe links the same runtime.
     linkRuntime(b, tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     const run_tests = b.addRunArtifact(tests);
+    stageIcuDataForTest(b, run_tests, tests, target, tag);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
@@ -269,6 +270,7 @@ pub fn build(b: *std.Build) void {
     golden_tests.root_module.addImport("kx_c", translate_kx.createModule());
     linkRuntime(b, golden_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     const run_golden = b.addRunArtifact(golden_tests);
+    stageIcuDataForTest(b, run_golden, golden_tests, target, tag);
     const golden_step = b.step("test-golden", "Run golden tests only");
     golden_step.dependOn(&run_golden.step);
 
@@ -431,6 +433,7 @@ fn addExternalApp(
     linkRuntime(b, app_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
     b.installArtifact(app_tests);
     const run_tests = b.addRunArtifact(app_tests);
+    stageIcuDataForTest(b, run_tests, app_tests, target, tag);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
@@ -661,6 +664,17 @@ fn addApp(
 
 /// Link the runtime (SDL3 static + kx_skia shim + Skia static libs + macOS
 /// frameworks) into a module. Shared by the exe and the test exe.
+/// Windows only: skparagraph's SkLoadICU mmaps icudtl.dat next to the exe —
+/// zig runs test binaries out of .zig-cache, so stage the data file beside
+/// the emitted test exe before the run step executes it.
+fn stageIcuDataForTest(b: *std.Build, run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, tag: []const u8) void {
+    if (target.result.os.tag != .windows or b.graph.host.result.os.tag != .windows) return;
+    const copy = b.addSystemCommand(&.{ "cmd", "/c", "copy", "/Y" });
+    copy.addFileArg(b.path(b.fmt("deps/skia/out/{s}/icudtl.dat", .{tag})));
+    copy.addFileArg(artifact.getEmittedBin().dirname());
+    run.step.dependOn(&copy.step);
+}
+
 fn linkRuntime(
     b: *std.Build,
     module: *std.Build.Module,
