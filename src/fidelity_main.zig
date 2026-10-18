@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             _ = std.c.fclose(f);
             break :blk "assets/fonts";
         } else "deps/fonts";
-        _ = setenv("KLAXON_FONT_DIR", dir, 0);
+        _ = SDL_setenv_unsafe("KLAXON_FONT_DIR", dir, 0);
     }
 
     const opts = try optsFromArgs(init.args, allocator);
@@ -382,10 +382,12 @@ fn writeMeta(a: Allocator, path: [:0]const u8, sv: Value, bounds: Rect, theme: t
     _ = std.c.fwrite(json.ptr, 1, json.len, f);
 }
 
-// std.c has no fseek/ftell/setenv — same extern pattern as conformance_main.zig.
+// std.c has no fseek/ftell — same extern pattern as conformance_main.zig.
+// setenv is POSIX-only; SDL_setenv_unsafe is the portable equivalent and
+// SDL3 is linked into every app exe already.
 extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 extern "c" fn ftell(stream: *std.c.FILE) c_long;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn SDL_setenv_unsafe(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn readFile(allocator: Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeSentinel(u8, path, 0);
