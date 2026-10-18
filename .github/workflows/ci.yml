@@ -109,12 +109,12 @@ jobs:
           bin=zig-out/bin/hello; [ -f "$bin" ] || bin="$bin.exe"
           size=$(wc -c < "$bin")
           echo "hello (ReleaseSmall): $size bytes"
-          # 10,5 Mio on linux/macOS: ganesh-gl adds ~1,5 Mo of GL backend
-          # objects to libskia — the linux gpu binary is ~7,8 Mo. Windows
-          # builds dawn+graphite into libskia (kx_skia_win.cpp uses webgpu),
-          # which lands the binary at ~19,4 Mo — windows gate is 22 Mio.
-          limit=10485760
-          [ "$RUNNER_OS" = Windows ] && limit=23068672
+          # Every desktop binary now links the real text stack (skparagraph
+          # + skshaper + skunicode_icu + harfbuzz) and mcu — ~20,9 Mo on
+          # macOS (graphite-metal + ganesh-gl). Windows builds dawn+graphite
+          # into libskia (kx_skia_win.cpp uses webgpu) and lands ~19,4 Mo.
+          # 22 Mio gate on all desktop targets.
+          limit=23068672
           if [ "$size" -ge "$limit" ]; then
             echo "SIZE GATE FAILED: $size >= $limit"; exit 1
           fi
