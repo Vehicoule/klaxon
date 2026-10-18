@@ -1578,6 +1578,7 @@ fn compileMsvcShims(b: *std.Build, target: std.Build.ResolvedTarget) []const std
         run.addArg("/DNDEBUG");
         run.addArg("/D_CRT_SECURE_NO_WARNINGS");
         run.addArg("/DNOMINMAX");
+        run.addArg("/D_USE_MATH_DEFINES");
         if (s.lean) run.addArg("/DWIN32_LEAN_AND_MEAN");
         run.addArg("/DSK_GANESH");
         run.addArg("/DSK_GRAPHITE");
