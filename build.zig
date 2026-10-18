@@ -309,7 +309,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         fuzz_tests.root_module.addImport("klaxon", fuzz_klaxon);
-        linkRuntime(b, fuzz_tests.root_module, kx_skia, target, is_macos, tag);
+        linkRuntime(b, fuzz_tests.root_module, kx_skia, target, is_macos, tag, san_rt);
         const run_fuzz = b.addRunArtifact(fuzz_tests);
         fuzz_step.dependOn(&run_fuzz.step);
     }
