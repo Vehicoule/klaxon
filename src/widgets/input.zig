@@ -1391,7 +1391,19 @@ test "golden: checkbox shows the check mark after click" {
     defer f2.deinit();
     // On: accent box (AA edges) + white check glyph ink.
     try std.testing.expect(f2.countColor(accent) > 300);
-    try std.testing.expect(f2.countColor(white) > 0);
+    // The ✓ stroke is thin enough to be all anti-alias on some faces —
+    // count ink by luminance over the accent, not exact white pixels.
+    var ink: u32 = 0;
+    var gy: i32 = 4;
+    while (gy < 16) : (gy += 1) {
+        var gx: i32 = 4;
+        while (gx < 16) : (gx += 1) {
+            const c = f2.pixelAt(gx, gy);
+            const luma = ((c >> 24 & 0xFF) * 77 + (c >> 16 & 0xFF) * 150 + (c >> 8 & 0xFF) * 29) >> 8;
+            if (luma > 160) ink += 1;
+        }
+    }
+    try std.testing.expect(ink > 0);
 }
 
 test "golden: radio moves the dot to the clicked radio" {
