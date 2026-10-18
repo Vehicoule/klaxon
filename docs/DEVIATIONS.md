@@ -327,10 +327,14 @@ bugs — the vendored `.ref/material3` spec is authoritative:
   is 18dp with checkedBoxColor/primary ink. The published material3 lib
   (1.9.0) predates `isCheckboxStylingFixEnabled` — `TriStateCheckbox`
   hardcodes `ripple(color=Unspecified)` → on_surface. Ours matches spec.
-- `chip_filter_selected`/`chip_filter_hover` (~0.7%) — residual glyph AA
-  on the check icon + label after the layout fix (fixed 3-slot row,
-  spacedBy 8dp — see below). Spec unselected-hover label/layer =
-  OnSurfaceVariant (FilterChipTokens).
+- `chip_filter_selected`/`chip_filter_hover`/`chip_input_disabled`
+  (~0.6-0.7%) — chip corner-shape version delta: the pinned spec morphs
+  selectable chips via `ChipsTokens` (UnselectedShape=CornerMedium,
+  SelectedShape=CornerFull, PressedShape=CornerSmall — Chip.kt:2616);
+  the published 1.9.0 lib has no `shapeByInteraction` on chips and
+  paints a fixed `CornerSmall`(8). Ours matches spec; the runner shows
+  the older fixed shape, so every corner AA fringe differs. Residual
+  subpixel label-width deltas (~0.7px) ride along.
 - `fab_default`/`fab_small_pressed` (~0.3%) — residual ripple-ink edge AA.
   The elevation shadow itself now uses the real Compose Desktop model
   (extracted from `GraphicsLayerOwnerLayer.skiko.kt` bytecode + skiko
