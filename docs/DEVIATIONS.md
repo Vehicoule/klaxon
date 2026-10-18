@@ -118,6 +118,16 @@ Each widget's header carries the same list; these are the tracked ones
 - `icon_button.zig` — no deviations: upstream IconButton.kt carries no
   elevation/shadow either (the variants are flat); shape morphs spring
   via the timeline (AnimatedShape parity).
+- `button.zig` — the pressed corner morph springs on fast_spatial
+  (AnimatedShape parity with icon_button); the ripple clip tracks the
+  live radius.
+- `fab.zig` — the checked/unchecked toggle morph springs the container
+  size + radius on fast_spatial; ink rides the interpolated rect.
+- `nav_bar.zig` / `navigation_rail.zig` — the active indicator's width
+  expands on fast_spatial per item (NavigationBar.kt:561,
+  NavigationItem.kt:694/924) around the collapsed center / the expanded
+  leading edge; the state layer + ripple stay on the unanimated pill
+  like upstream's indicatorRipple measure.
 - `switch.zig` — no deviations beyond the header (mid-flight retargets
   carry channel velocity since `Animation.velocityAt`).
 - `slider.zig` — the value indicator now morphs on the timeline (150ms
@@ -289,6 +299,30 @@ Each widget's header carries the same list; these are the tracked ones
   `failing*` stubs (a compile workaround, never app I/O).
 - `inspector.zig` — debug-tool only. (The rebuild is now O(rows) — a
   node→row index map serves the prune, select and selection-resync.)
+
+## Fidelity harness — known reference-runner deltas (do not "fix" by regressing Klaxon)
+
+`fidelity/` compares our Skia raster output against a Compose M3 desktop
+runner (66 scenes, `tools/fidelity_diff.py`, mean 0.405%). The residual
+nonzero scenes are version deltas in the runner's material3, not Klaxon
+bugs — the vendored `.ref/material3` spec is authoritative:
+
+- `checkbox_checked_pressed` (~3.9%) — the runner's checkbox is the
+  legacy 20dp box with gray on_surface ink; the spec (styling-fix path)
+  is 18dp with checkedBoxColor/primary ink. Ours matches spec.
+- `nav_bar_pressed` (~2.4%) — the runner's NavigationBarItem does not
+  draw indicator ink through `itemSources` in its version; spec ink is
+  on_surface @0.12 clipped to the 56x32 pill. Ours paints it.
+- `chip_filter_hover` (~2.4%) — spec unselected-hover label/layer =
+  OnSurfaceVariant (FilterChipTokens); the runner renders the older
+  on_surface-family ink.
+- `card_filled_hover` (~2.7%) — label text metrics differ ~5px (their
+  bundled font vs ours); no state-layer defect on either side.
+- `fab_default`/`fab_small_pressed` (~2.3%) — shadow-parameter tuning
+  (ambient 0.039/spot 0.19, Android LightsComputer values) vs the
+  runner's renderer; geometry and ink match.
+- `slider_pressed`/`tabs_pressed` (~1.3-1.5%) — same state-layer color
+  family deltas as chip/nav_bar.
 
 ## Benchmark-honesty invariants (do not regress)
 

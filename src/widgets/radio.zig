@@ -116,13 +116,12 @@ const RColors = struct { circle: Color, on: Color };
 fn currentColors(s: *RadioState) RColors {
     const cs = s.opts.theme.colors;
     if (!s.opts.enabled) return .{ .circle = ui.paint.withAlphaScaled(cs.on_surface, 0.38), .on = ui.paint.withAlphaScaled(cs.on_surface, 0.38) };
-    if (isChecked(s)) return .{ .circle = cs.primary, .on = cs.primary };
-    // the Unselected{Hover,Focus,Pressed}IconColor tokens — all OnSurface
-    // (the style system resolves them; defaultRadioButtonColors itself is
-    // interaction-static)
-    const interacting = s.inter.len > 0;
-    const c = if (interacting) cs.on_surface else cs.on_surface_variant;
-    return .{ .circle = c, .on = c };
+    // defaultRadioButtonColors is interaction-static (radioColor keys on
+    // {enabled, selected}); the Unselected*IconColor tokens resolve only in
+    // custom styles. The ink is the ripple's unspecified color → the
+    // content color ≈ OnSurface in either selection state.
+    if (isChecked(s)) return .{ .circle = cs.primary, .on = cs.on_surface };
+    return .{ .circle = cs.on_surface_variant, .on = cs.on_surface };
 }
 
 fn radioMeasure(n: *Node, c: Constraints) Size {

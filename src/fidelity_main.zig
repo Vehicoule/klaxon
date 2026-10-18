@@ -155,8 +155,10 @@ const Globals = struct {
     fm: *sem.FocusManager,
     i18n: *i18n_mod.I18n,
 
-    fn init(arena: Allocator, dir: i18n_mod.Direction) !Globals {
-        var g: Globals = undefined;
+    /// Out-param init: the globals are process-wide pointers — they must be
+    /// installed on the CALLER's `g`, not on a return-value temporary (the
+    /// copy would leave `anim.timeline()` etc. dangling at the init-local).
+    fn init(g: *Globals, arena: Allocator, dir: i18n_mod.Direction) !void {
         g.router = .{};
         g.timeline = anim_mod.Timeline.init(arena);
         g.fm = try sem.FocusManager.init(arena);
@@ -171,7 +173,6 @@ const Globals = struct {
         anim_mod.setCurrent(&g.timeline);
         sem.setCurrentFocus(g.fm);
         i18n_mod.setCurrent(g.i18n);
-        return g;
     }
 
     /// Clear the process globals first (widgets may still touch them while
@@ -208,7 +209,8 @@ fn runScene(allocator: Allocator, sv: Value, opts: Options) !void {
     const t_ms: u64 = @intCast(@max(0, @as(i64, @intFromFloat(num(sv.get("t_ms"), 0)))));
     const theme: theme_mod.Theme = if (dark) theme_mod.dark else theme_mod.light;
 
-    var g = try Globals.init(a, dir);
+    var g: Globals = undefined;
+    try Globals.init(&g, a, dir);
     defer g.clear();
 
     // The scene's options + the resolved theme — widgets take their Theme
@@ -264,8 +266,9 @@ fn runScene(allocator: Allocator, sv: Value, opts: Options) !void {
     switch (state) {
         .hover => g.router.dispatchPointer(root, .{ .phase = .move, .x = cx, .y = cy }),
         .pressed => {
-            // A real press arrives with a move first (hover, then down).
-            g.router.dispatchPointer(root, .{ .phase = .move, .x = cx, .y = cy });
+            // Press-only, matching the Compose runner's PressInteraction
+            // (a touch-model press without hover — a preceding .move would
+            // also raise Hover.Enter and stack the 0.08 layer under the ink).
             g.router.dispatchPointer(root, .{ .phase = .down, .x = cx, .y = cy });
         },
         .focused => g.fm.focusNode(widget_node),

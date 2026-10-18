@@ -35,6 +35,7 @@ import androidx.compose.ui.ImageComposeScene
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.TextStyle
@@ -185,6 +186,18 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
             }
             val icon = o.str("icon").ifEmpty { null }
             val mod = Modifier.height(h.dp).then(centerMod)
+            // Button doesn't adapt content padding to its height itself —
+            // this material3 predates the expressive <Size>ContentPadding
+            // constants, so the per-size token LeadingSpace/TrailingSpace and
+            // vertical values are inlined from the vendored tokens (the
+            // legacy default differs: 24/24 vs the spec's 16/8 for small).
+            val pads = when (size) {
+                "xsmall" -> PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                "medium" -> PaddingValues(horizontal = 24.dp, vertical = 16.dp)
+                "large" -> PaddingValues(horizontal = 48.dp, vertical = 32.dp)
+                "xlarge" -> PaddingValues(horizontal = 64.dp, vertical = 48.dp)
+                else -> PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+            }
             val content: @Composable RowScope.() -> Unit = {
                 if (icon != null) {
                     Text(glyph(icon), fontFamily = dejavu, fontSize = iconSp.sp)
@@ -193,11 +206,11 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
                 if (label != null) Text(label, style = textStyle)
             }
             when (o.str("variant", "filled")) {
-                "filled_tonal" -> FilledTonalButton({}, mod, enabled, interactionSource = input.source, content = content)
-                "elevated" -> ElevatedButton({}, mod, enabled, interactionSource = input.source, content = content)
-                "outlined" -> OutlinedButton({}, mod, enabled, interactionSource = input.source, content = content)
+                "filled_tonal" -> FilledTonalButton({}, mod, enabled, contentPadding = pads, interactionSource = input.source, content = content)
+                "elevated" -> ElevatedButton({}, mod, enabled, contentPadding = pads, interactionSource = input.source, content = content)
+                "outlined" -> OutlinedButton({}, mod, enabled, contentPadding = pads, interactionSource = input.source, content = content)
                 "text" -> TextButton({}, mod, enabled, interactionSource = input.source, content = content)
-                else -> Button({}, mod, enabled, interactionSource = input.source, content = content)
+                else -> Button({}, mod, enabled, contentPadding = pads, interactionSource = input.source, content = content)
             }
         }
 
@@ -214,7 +227,11 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
         }
 
         "checkbox" -> Checkbox(
-            checked = o.bool("checked"), onCheckedChange = null, modifier = centerMod,
+            // onCheckedChange = {} installs triStateToggleable — with null
+            // upstream drops the whole interaction set (no indication at
+            // all), so the hover/press scenes would compare against a
+            // non-interactive checkbox.
+            checked = o.bool("checked"), onCheckedChange = {}, modifier = centerMod,
             enabled = enabled, interactionSource = input.source,
         )
 
@@ -313,10 +330,21 @@ fun WidgetContent(spec: SceneSpec, input: SceneInput, dejavu: FontFamily) {
         "fab" -> {
             val icon = glyph(o.str("icon", "plus"))
             val content: @Composable () -> Unit = { Text(icon, fontFamily = dejavu, fontSize = 24.sp) }
+            // Upstream's FloatingActionButton has no `enabled` parameter — a
+            // disabled FAB is emulated with the generic disabled token pair
+            // (OnSurface@0.12 container composited over surface, OnSurface@0.38
+            // content, no shadow) so the fab_disabled scene still compares.
+            val scheme = MaterialTheme.colorScheme
+            val cc = if (enabled) FloatingActionButtonDefaults.containerColor
+                else scheme.onSurface.copy(alpha = 0.12f).compositeOver(scheme.surface)
+            val ic = if (enabled) contentColorFor(cc)
+                else scheme.onSurface.copy(alpha = 0.38f)
+            val elev = if (enabled) FloatingActionButtonDefaults.elevation()
+                else FloatingActionButtonDefaults.elevation(0.dp, 0.dp, 0.dp, 0.dp)
             when (o.str("size", "standard")) {
-                "small" -> SmallFloatingActionButton({}, centerMod, interactionSource = input.source, content = content)
-                "large" -> LargeFloatingActionButton({}, centerMod, interactionSource = input.source, content = content)
-                else -> FloatingActionButton({}, centerMod, interactionSource = input.source, content = content)
+                "small" -> SmallFloatingActionButton({}, centerMod, containerColor = cc, contentColor = ic, elevation = elev, interactionSource = input.source, content = content)
+                "large" -> LargeFloatingActionButton({}, centerMod, containerColor = cc, contentColor = ic, elevation = elev, interactionSource = input.source, content = content)
+                else -> FloatingActionButton({}, centerMod, containerColor = cc, contentColor = ic, elevation = elev, interactionSource = input.source, content = content)
             }
         }
 

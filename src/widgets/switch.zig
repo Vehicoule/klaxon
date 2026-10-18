@@ -185,27 +185,25 @@ fn currentColors(s: *SwitchState) SWColors {
             .on = overSurface(cs.on_surface, 0.38, cs.surface),
         };
     }
-    // the {Selected,Unselected}{Hover,Focus,Pressed}HandleColor tokens —
-    // PrimaryContainer / OnSurfaceVariant, all equal per state (the style
-    // system resolves them; the default colors are interaction-static)
-    const interacting = s.inter.len > 0;
+    // defaultSwitchColors is interaction-static (Switch.kt thumbColor keys
+    // on {enabled, checked}) — the {Selected,Unselected}{Hover,Focus,
+    // Pressed}HandleColor tokens resolve only in custom styles. The ink is
+    // the thumb ripple's unspecified color → the content color ≈ OnSurface.
     if (isChecked(s)) {
-        const h = if (interacting) cs.primary_container else cs.on_primary;
         return .{
             .track = cs.primary, // SelectedTrackColor
             .outline = 0x00000000, // checkedBorderColor = Transparent
-            .handle = h, // SelectedHandleColor / *HandleColor
+            .handle = cs.on_primary, // SelectedHandleColor
             .icon = cs.on_primary_container, // SelectedIconColor
-            .on = h,
+            .on = cs.on_surface,
         };
     }
-    const h = if (interacting) cs.on_surface_variant else cs.outline;
     return .{
         .track = cs.surface_container_highest, // UnselectedTrackColor
-        .outline = cs.outline, // Unselected{Focus}TrackOutlineColor
-        .handle = h, // UnselectedHandleColor / *HandleColor
+        .outline = cs.outline, // UnselectedTrackOutlineColor
+        .handle = cs.outline, // UnselectedHandleColor
         .icon = cs.surface_container_highest, // UnselectedIconColor
-        .on = h,
+        .on = cs.on_surface,
     };
 }
 

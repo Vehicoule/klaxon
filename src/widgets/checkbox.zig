@@ -163,15 +163,15 @@ fn currentColors(s: *CheckboxState) CBColors {
             .indicator = 0x00000000,
         };
     }
-    // the Unselected{Hover,Focus,Pressed}OutlineColor tokens — all OnSurface
-    // (defaultCheckboxColors itself is interaction-static; the style system
-    // resolves these)
-    const interacting = s.inter.len > 0;
+    // defaultCheckboxColors is interaction-static (Checkbox.kt:984 —
+    // ToggleableState only): the Unselected{Hover,Focus,Pressed}OutlineColor
+    // tokens are reachable only through custom styles, so the default border
+    // stays UnselectedOutlineColor = OnSurfaceVariant in every state.
     if (isChecked(s)) {
         const c = if (err) cs.@"error" else cs.primary;
         return .{ .box = c, .outline = c, .check = if (err) cs.on_error else cs.on_primary, .indicator = c };
     }
-    const outline = if (interacting or err) (if (err) cs.@"error" else cs.on_surface) else cs.on_surface_variant;
+    const outline = if (err) cs.@"error" else cs.on_surface_variant;
     // the spec's unselected state layer is On Surface (upstream's flag-on
     // ripple would pass the Transparent uncheckedBoxColor — the flag-off
     // Unspecified ripple resolves to ≈OnSurface via contentColor, so

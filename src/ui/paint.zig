@@ -509,7 +509,7 @@ pub fn shadowRRect(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, el
 /// elevation_grid values.
 pub fn elevationShadow(ctx: *kx.Ctx, x: f32, y: f32, w: f32, h: f32, radius: f32, level: f32, shadow_color: Color) void {
     if (!(level > 0)) return; // NaN/0 = flat
-    shadowRRect(ctx, x, y, w, h, radius, level, withAlphaScaled(shadow_color, 0.15), withAlphaScaled(shadow_color, 0.38), false);
+    shadowRRect(ctx, x, y, w, h, radius, level, withAlphaScaled(shadow_color, 0.039), withAlphaScaled(shadow_color, 0.19), false);
 }
 
 /// Path verbs for fillPath/strokePath — pts consumed per verb.
