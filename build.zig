@@ -825,9 +825,9 @@ fn macOsAsanRt(b: *std.Build) SanitizerRuntime {
 }
 
 /// zig cc instruments the shim for ASan but has no runtime to link; find
-/// the host's. clang's own libclang_rt.asan-*.so is preferred (same vintage
-/// as the instrumenter); gcc's libasan.so.8 is ABI-compatible (upstream
-/// ASan v8) and is a plain `apt install libasan8` away.
+/// the host's. clang's own libclang_rt.asan-*.a is preferred (same vintage
+/// as the instrumenter, statically linked like clang's own C++ default);
+/// falling back to its .so (+rpath) then gcc's ABI-compatible libasan.so.8.
 fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime {
     const arch: []const u8 = switch (target.result.cpu.arch) {
         .x86_64 => "x86_64",
@@ -838,29 +838,34 @@ fn linuxAsanRt(b: *std.Build, target: std.Build.ResolvedTarget) SanitizerRuntime
     var rpaths: std.ArrayList(std.Build.LazyPath) = .empty;
     // `clang -print-file-name` resolves inside clang's resource dir and
     // echoes the bare name back when the file isn't there. asan_cxx adds
-    // the operator new/delete interceptors. The .so lives outside ld.so's
-    // search path so its directory must land on the exe's rpath; fall
-    // back to the static archive when no shared runtime exists.
-    for ([_][]const u8{ "asan", "asan_cxx" }) |rt| {
-        const name = b.fmt("libclang_rt.{s}-{s}", .{ rt, arch });
-        for ([_][]const u8{ "so", "a" }) |ext| {
-            var hit = false;
-            switch (b.runFallible(&.{ "clang", b.fmt("-print-file-name={s}.{s}", .{ name, ext }) }, .{ .stderr_behavior = .ignore })) {
-                .success => |out| {
+    // the operator new/delete interceptors and only ever ships as a
+    // static archive — mixing it with the asan .so leaves the internal
+    // __asan::* symbols undefined, so the pair must stay consistent:
+    // both static (clang's own C++ default, no runtime path needed) or
+    // both shared (whose dir must land on the exe's rpath).
+    const resolve = struct {
+        fn call(bb: *std.Build, path: []const u8) ?[]const u8 {
+            return switch (bb.runFallible(&.{ "clang", bb.fmt("-print-file-name={s}", .{path}) }, .{ .stderr_behavior = .ignore })) {
+                .success => |out| blk: {
                     const p = std.mem.trim(u8, out, &std.ascii.whitespace);
-                    if (p.len > 0 and p[0] == '/' and std.mem.endsWith(u8, p, ext)) {
-                        objects.append(b.allocator, .{ .cwd_relative = p }) catch @panic("OOM");
-                        if (std.mem.eql(u8, ext, "so")) {
-                            if (std.fs.path.dirname(p)) |dir|
-                                rpaths.append(b.allocator, .{ .cwd_relative = dir }) catch @panic("OOM");
-                        }
-                        hit = true;
-                    }
+                    break :blk if (p.len > 0 and p[0] == '/' and std.mem.endsWith(u8, p, std.fs.path.extension(path))) p else null;
                 },
-                else => {},
-            }
-            if (hit) break;
+                else => null,
+            };
         }
+    }.call;
+    const asan_name = b.fmt("libclang_rt.asan-{s}", .{arch});
+    const cxx_name = b.fmt("libclang_rt.asan_cxx-{s}", .{arch});
+    if (resolve(b, b.fmt("{s}.a", .{asan_name}))) |asan_a| {
+        objects.append(b.allocator, .{ .cwd_relative = asan_a }) catch @panic("OOM");
+        if (resolve(b, b.fmt("{s}.a", .{cxx_name}))) |cxx_a|
+            objects.append(b.allocator, .{ .cwd_relative = cxx_a }) catch @panic("OOM");
+    } else if (resolve(b, b.fmt("{s}.so", .{asan_name}))) |asan_so| {
+        objects.append(b.allocator, .{ .cwd_relative = asan_so }) catch @panic("OOM");
+        if (std.fs.path.dirname(asan_so)) |dir|
+            rpaths.append(b.allocator, .{ .cwd_relative = dir }) catch @panic("OOM");
+        if (resolve(b, b.fmt("{s}.so", .{cxx_name}))) |cxx_so|
+            objects.append(b.allocator, .{ .cwd_relative = cxx_so }) catch @panic("OOM");
     }
     if (objects.items.len == 0) {
         const triplet: []const u8 = if (target.result.cpu.arch == .x86_64) "x86_64-linux-gnu" else "aarch64-linux-gnu";
